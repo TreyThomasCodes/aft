@@ -59,8 +59,8 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 
 AFT reads config from two levels, project overrides user:
 
-- **User:** `~/.pi/agent/aft.jsonc` (or `.json`)
-- **Project:** `<project>/.pi/aft.jsonc` (or `.json`)
+- **User:** `~/.config/cortexkit/aft.jsonc` (or `.json`)
+- **Project:** `<project>/.cortexkit/aft.jsonc` (or `.json`)
 
 All keys are optional. Example:
 
