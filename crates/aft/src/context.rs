@@ -1880,6 +1880,11 @@ impl AppContext {
             (Some(dead_code), Some(unused_exports), Some(duplicates)) => {
                 let (errors, warnings) = match self.canonical_cache_root_opt() {
                     Some(root) => {
+                        // The cache root is identity-domain (bare-canonical,
+                        // verbatim on Windows) while diagnostics store keys are
+                        // normalized; normalize a comparison-local copy or the
+                        // starts_with filter drops every diagnostic.
+                        let root = crate::inspect::job::normalize_path(&root);
                         let mut membership = self.tsconfig_membership.lock();
                         lsp.filtered_error_warning_counts(|file| {
                             file.starts_with(&root) && !membership.should_skip_diagnostics(file)

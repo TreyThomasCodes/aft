@@ -68,8 +68,19 @@ impl TsconfigMembershipCache {
             .or_insert_with(|| find_workspace_root(&canonical_file, &[TSCONFIG_JSON]))
             .clone();
         let Some(tsconfig_dir) = tsconfig_dir else {
+            eprintln!(
+                "PROBE3 no tsconfig root: file = {} canonical = {}",
+                file.display(),
+                canonical_file.display()
+            );
             return false;
         };
+        eprintln!(
+            "PROBE3 file = {} | canonical = {} | tsconfig_dir = {}",
+            file.display(),
+            canonical_file.display(),
+            tsconfig_dir.display()
+        );
 
         let project = self
             .projects
