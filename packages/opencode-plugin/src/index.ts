@@ -192,11 +192,11 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.49.0";
+const ANNOUNCEMENT_VERSION = "0.49.1";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "One unified tool surface: every tool now takes `path` (old spellings keep working), `edit` has one calling shape, and `occurrence` is 1-based. Fewer ways for models to get a call wrong; prompt caches re-warm once after this upgrade.",
-  "aft_search now routes queries itself — the hint parameter is gone, and searches that find no exact match are re-ranked by their terms instead of returning nothing.",
-  "Corporate and custom certificate authorities now work: HTTPS requests verify through the OS trust store (Keychain, Windows certificate store, SSL_CERT_FILE on Linux).",
+  "Windows: language servers spawn again under extended-length paths, config edits reach running servers, and dead-code/diagnostics results no longer silently drop — one canonical path form across the LSP and inspect surface.",
+  "Faster answers under load: completed bash commands respond immediately instead of waiting behind background maintenance (thanks @hheei), and chained commands like `cargo test && ...` keep every command's output.",
+  "Permission rules with absolute paths outside the project root now match (thanks @iceteaSA), and slow embedding providers get a clear timeout message naming the setting that raises the budget.",
 ];
 
 /**
