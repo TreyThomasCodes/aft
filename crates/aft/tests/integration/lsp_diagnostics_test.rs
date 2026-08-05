@@ -417,7 +417,10 @@ fn watched_config_file_event_types_follow_current_file_state() {
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     ctx.lsp_post_write(
@@ -454,7 +457,10 @@ fn watched_config_file_event_types_accept_explicit_created_changed_deleted() {
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     ctx.lsp_post_write(
@@ -487,7 +493,10 @@ fn write_command_reports_created_for_new_config_file() {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -517,7 +526,10 @@ fn write_command_reports_created_for_new_tsconfig_file() {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -548,7 +560,10 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -670,7 +685,14 @@ fn custom_lsp_root_marker_edit_notifies_workspace_server() {
         fake_server_path(),
     );
 
-    ctx.lsp_notify_file_changed(&source, "export const value = 2;\n");
+    // Post-write notifications no longer cold-start servers (they are
+    // best-effort against RUNNING servers), so the workspace server must be
+    // established through the explicit versioned path first, the way an
+    // actual diagnostics request would.
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(&source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -700,7 +722,10 @@ fn write_command_reports_changed_for_existing_config_file() {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -731,7 +756,10 @@ fn delete_file_command_reports_deleted_for_config_file() {
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -1541,7 +1569,14 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
 
-    ctx.lsp_notify_file_changed(file, "fn main() { println!(\"before\"); }\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(
+            file,
+            "fn main() { println!(\"before\"); }\n",
+            &config_snapshot,
+        )
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
     let before = {
         let lsp = ctx.lsp();
@@ -1979,7 +2014,10 @@ fn directory_mode_requires_each_matching_server_to_cover_file() {
         lsp.override_binary(ServerKind::Biome, fake_server_path());
     }
 
-    ctx.lsp_notify_file_changed(source, "export const value = 2;\n");
+    let config_snapshot = ctx.config();
+    ctx.lsp()
+        .notify_file_changed_versioned(source, "export const value = 2;\n", &config_snapshot)
+        .expect("versioned notify spawns the workspace server");
     wait_for_publish(&mut ctx.lsp());
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
