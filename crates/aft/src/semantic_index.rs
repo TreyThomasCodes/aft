@@ -616,6 +616,24 @@ fn embedding_response_read_error_is_transient(error: &reqwest::Error) -> bool {
     embedding_send_error_is_transient(error) || error.is_body() || error.is_decode()
 }
 
+/// Returns the query-timeout marker for a request error when the active policy
+/// is a `Query(budget)` and reqwest classifies the error as a timeout. Returns
+/// an empty string otherwise — build-policy timeouts and non-timeout query
+/// errors carry no marker. This is the single site that decides whether a
+/// failure is "the configured query budget fired", so the fallback message can
+/// name the knob (`semantic.query_timeout_ms`) without re-parsing reqwest text.
+fn query_timeout_marker_for_error(
+    error: &reqwest::Error,
+    policy: EmbeddingRequestPolicy,
+) -> String {
+    match policy {
+        EmbeddingRequestPolicy::Query(budget) if error.is_timeout() => {
+            query_embedding_timeout_marker(budget.timeout_ms)
+        }
+        _ => String::new(),
+    }
+}
+
 /// Stable machine marker prefixed onto embedding error strings whose root cause
 /// is transient — the backend is down, timing out, or returning 5xx/429, not
 /// misconfigured. The build and corpus-refresh layers key retry-vs-give-up on
@@ -633,6 +651,57 @@ pub fn embedding_failure_is_transient(error: &str) -> bool {
 /// Remove the machine transient marker so the message is clean for display.
 pub fn strip_transient_embedding_marker(error: &str) -> String {
     error.replace(TRANSIENT_EMBEDDING_MARKER, "")
+}
+
+/// Stable machine marker prefixed onto a *query* embedding error string when
+/// the failure was a request timeout — i.e. reqwest's `is_timeout()` fired
+/// while running under a `Query(budget)` policy. The marker carries the budget
+/// that fired (`[query-timeout:{ms}]`) so the consumer can name both the
+/// mechanism and the knob (`semantic.query_timeout_ms`) without re-parsing
+/// reqwest's rendered error text, which varies by backend and locale.
+///
+/// Classification lives here — next to the one site that knows both the policy
+/// (Query with a budget) and the typed reqwest error — so it cannot drift from
+/// the error shape. Stripped before user-facing display via
+/// [`strip_query_embedding_timeout_marker`]; the budget is recovered via
+/// [`query_embedding_timeout_budget`].
+pub const QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX: &str = "[query-timeout:";
+pub const QUERY_EMBEDDING_TIMEOUT_MARKER_SUFFIX: &str = "]";
+
+/// Build the timeout marker for a given query budget. Kept here so the format
+/// and the parser below stay in lockstep. `pub(crate)` so the classification
+/// test in `semantic_search` can construct a marked error without duplicating
+/// the format string.
+pub(crate) fn query_embedding_timeout_marker(timeout_ms: u64) -> String {
+    format!("{QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX}{timeout_ms}{QUERY_EMBEDDING_TIMEOUT_MARKER_SUFFIX}")
+}
+
+/// Recover the timeout budget (ms) a query embedding error carries, or `None`
+/// when the failure was not a query timeout. This is the single authoritative
+/// way to detect the timeout case — never substring-match on reqwest's text.
+pub fn query_embedding_timeout_budget(error: &str) -> Option<u64> {
+    let start = error.find(QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX)?;
+    let rest = &error[start + QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX.len()..];
+    let end = rest.find(QUERY_EMBEDDING_TIMEOUT_MARKER_SUFFIX)?;
+    rest[..end].parse::<u64>().ok()
+}
+
+/// Remove the query-timeout marker so the message is clean for display. The
+/// budget is recovered separately via [`query_embedding_timeout_budget`] before
+/// stripping.
+pub fn strip_query_embedding_timeout_marker(error: &str) -> String {
+    if let (Some(start), Some(budget)) = (
+        error.find(QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX),
+        query_embedding_timeout_budget(error),
+    ) {
+        let marker = query_embedding_timeout_marker(budget);
+        let end = start + marker.len();
+        let mut cleaned = error.to_string();
+        cleaned.replace_range(start..end, "");
+        cleaned
+    } else {
+        error.to_string()
+    }
 }
 
 fn sleep_before_embedding_retry(attempt_index: usize) {
@@ -672,8 +741,14 @@ where
                 } else {
                     ""
                 };
+                // A query-timeout is a distinct, actionable failure: the
+                // configured `semantic.query_timeout_ms` budget fired. Tag it
+                // here — the only site that has both the typed reqwest error
+                // and the Query budget — so the fallback can name the knob
+                // without guessing at reqwest's rendered text.
+                let timeout_marker = query_timeout_marker_for_error(&error, policy);
                 return Err(format!(
-                    "{marker}{backend_label} request failed: {}",
+                    "{timeout_marker}{marker}{backend_label} request failed: {}",
                     render_error_source_chain(&error)
                 ));
             }
@@ -692,8 +767,11 @@ where
                 } else {
                     ""
                 };
+                // A body-read timeout under a Query policy is the same budget
+                // firing mid-exchange; tag it identically to the send case.
+                let timeout_marker = query_timeout_marker_for_error(&error, policy);
                 return Err(format!(
-                    "{marker}{backend_label} response read failed: {}",
+                    "{timeout_marker}{marker}{backend_label} response read failed: {}",
                     render_error_source_chain(&error)
                 ));
             }
@@ -4698,6 +4776,39 @@ mod tests {
         assert!(!is_retryable_embedding_status(
             reqwest::StatusCode::BAD_REQUEST
         ));
+    }
+
+    #[test]
+    fn query_timeout_marker_round_trips_and_classifies() {
+        // A query-timeout error carries the budget that fired; the budget is
+        // recoverable and the marker strips cleanly for display.
+        let marked = format!(
+            "{}openai compatible request failed: operation timed out",
+            query_embedding_timeout_marker(3_000)
+        );
+        assert_eq!(query_embedding_timeout_budget(&marked), Some(3_000));
+        let clean = strip_query_embedding_timeout_marker(&marked);
+        assert!(!clean.contains(QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX));
+        assert!(clean.starts_with("openai compatible request failed:"));
+
+        // Non-timeout errors carry no marker and no budget — they must not be
+        // misclassified as timeouts.
+        for permanent in [
+            "openai compatible request failed (HTTP 401): Unauthorized",
+            "failed to embed query: embedding model was not initialized",
+            "openai compatible request failed: connection refused",
+        ] {
+            assert_eq!(
+                query_embedding_timeout_budget(permanent),
+                None,
+                "{permanent:?} must not classify as a query timeout"
+            );
+            assert_eq!(
+                strip_query_embedding_timeout_marker(permanent),
+                permanent,
+                "stripping a marker-free string is a no-op"
+            );
+        }
     }
 
     fn install_test_crypto_provider() {

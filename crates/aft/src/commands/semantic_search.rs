@@ -25,7 +25,8 @@ use crate::search_index::{
     SearchIndex, SearchIndexSnapshot,
 };
 use crate::semantic_index::{
-    EmbeddingModel, QueryBudget, SemanticIndex, SemanticIndexFingerprint, SemanticResult,
+    query_embedding_timeout_budget, strip_query_embedding_timeout_marker, EmbeddingModel,
+    QueryBudget, SemanticIndex, SemanticIndexFingerprint, SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 
@@ -684,6 +685,7 @@ fn handle_external_semantic_or_hybrid_search(
             mode,
             &shape,
             "Semantic search is not available for the external root.".to_string(),
+            "unavailable",
             lexical,
             warnings,
             &external_root,
@@ -707,12 +709,14 @@ fn handle_external_semantic_or_hybrid_search(
                         &external_root,
                     )
                 };
+                let classified = classify_embed_query_error(&error);
                 return external_lexical_only_response(
                     req,
                     &params,
                     mode,
                     &shape,
-                    format!("Semantic search unavailable: {error}"),
+                    classified.detail,
+                    classified.footer_reason,
                     lexical,
                     warnings,
                     &external_root,
@@ -825,6 +829,7 @@ fn external_lexical_only_response(
     mode: SearchMode,
     shape: &QueryShape,
     detail: String,
+    footer_reason: &str,
     lexical: LexicalCollection,
     mut warnings: Vec<String>,
     external_root: &Path,
@@ -848,7 +853,7 @@ fn external_lexical_only_response(
             .to_string(),
     );
     let display_root = absolute_display_root(external_root);
-    let text = format_lexical_unavailable_text(&detail, &results, &display_root);
+    let text = format_lexical_unavailable_text(&detail, &results, &display_root, footer_reason);
     let mut extras = semantic_unavailable_extras(true);
     for (key, value) in external_response_extras(external_root, borrow_metadata)
         .as_object()
@@ -1327,6 +1332,7 @@ fn handle_semantic_or_hybrid_search(
                 "disabled",
                 "disabled",
                 "Semantic search is not enabled.".to_string(),
+                "disabled",
                 false,
                 lexical,
                 warnings,
@@ -1337,18 +1343,20 @@ fn handle_semantic_or_hybrid_search(
         SemanticIndexStatus::Failed(error) => {
             let retrying_read_only_snapshot = ctx.shared_artifacts_read_only()
                 && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
-            let (semantic_status, status, detail) = if retrying_read_only_snapshot {
+            let (semantic_status, status, detail, footer_reason) = if retrying_read_only_snapshot {
                 (
                     "building",
                     "reloading",
                     "Semantic index is reloading from the shared read-only snapshot; retry shortly."
                         .to_string(),
+                    "reloading",
                 )
             } else {
                 (
                     "unavailable",
                     "unavailable",
                     format!("Semantic search unavailable: {error}"),
+                    "unavailable",
                 )
             };
             return semantic_unavailable_or_fallback_response(
@@ -1360,6 +1368,7 @@ fn handle_semantic_or_hybrid_search(
                 semantic_status,
                 status,
                 detail,
+                footer_reason,
                 false,
                 lexical,
                 warnings,
@@ -1392,6 +1401,7 @@ fn handle_semantic_or_hybrid_search(
                     &shape,
                     "building",
                     detail,
+                    "building",
                     warnings,
                     project_root,
                     top_k,
@@ -1480,6 +1490,7 @@ fn handle_semantic_or_hybrid_search(
             "unavailable",
             "not_ready",
             detail.to_string(),
+            "not_ready",
             false,
             lexical,
             warnings,
@@ -1503,6 +1514,7 @@ fn handle_semantic_or_hybrid_search(
                 lexical
             };
 
+            let classified = classify_embed_query_error(&error);
             return semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
@@ -1511,7 +1523,8 @@ fn handle_semantic_or_hybrid_search(
                 &shape,
                 "unavailable",
                 "unavailable",
-                format!("Semantic search unavailable: {error}"),
+                classified.detail,
+                classified.footer_reason,
                 true,
                 lexical,
                 warnings,
@@ -1791,6 +1804,7 @@ fn semantic_unavailable_or_fallback_response(
     semantic_status: &'static str,
     unavailable_status: &'static str,
     detail: String,
+    footer_reason: &str,
     force_lexical_fallback: bool,
     lexical: LexicalCollection,
     mut warnings: Vec<String>,
@@ -1825,7 +1839,12 @@ fn semantic_unavailable_or_fallback_response(
                 semantic_status,
                 status: "ready",
                 complete: false,
-                text: format_lexical_unavailable_text(&detail, &results, project_root),
+                text: format_lexical_unavailable_text(
+                    &detail,
+                    &results,
+                    project_root,
+                    footer_reason,
+                ),
                 results: result_values,
                 more_available: lexical_count > top_k || lexical_engine_capped,
                 engine_capped: lexical_engine_capped,
@@ -1844,6 +1863,7 @@ fn semantic_unavailable_or_fallback_response(
             shape,
             semantic_status,
             detail,
+            footer_reason,
             warnings,
             project_root,
             top_k,
@@ -1910,6 +1930,7 @@ fn semantic_unavailable_grep_fallback_response(
     shape: &QueryShape,
     semantic_status: &'static str,
     detail: String,
+    footer_reason: &str,
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
@@ -1973,7 +1994,12 @@ fn semantic_unavailable_grep_fallback_response(
             semantic_status,
             status: "ready",
             complete: false,
-            text: format_grep_lexical_unavailable_text(&detail, result, project_root),
+            text: format_grep_lexical_unavailable_text(
+                &detail,
+                result,
+                project_root,
+                footer_reason,
+            ),
             results: result_values,
             more_available,
             engine_capped: result.engine_capped,
@@ -2359,6 +2385,9 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
+    // Preserve the raw error so the timeout marker injected by
+    // `send_embedding_request` survives — `classify_embed_query_error` reads it
+    // to decide whether the configured query budget fired.
     let query_vector = model
         .embed_query_cached(query, query_budget)
         .map_err(|error| format!("failed to embed query: {error}"))?;
@@ -2375,6 +2404,43 @@ fn embed_query_for_dimension(
     }
 
     Ok(query_vector)
+}
+
+/// Classified query-embedding failure: the user-facing `detail` line that names
+/// the mechanism and the remedy when the configured query budget fired, and a
+/// short `footer_reason` token for the `[semantic: ...]` status footer the agent
+/// sees. Non-timeout errors keep the current message shape and an `unavailable`
+/// footer.
+///
+/// The timeout case is detected via the stable marker
+/// [`crate::semantic_index::query_embedding_timeout_budget`] injects at the one
+/// site that knows both the typed reqwest error and the Query budget — never by
+/// substring-matching reqwest's rendered text, which varies by backend/locale.
+struct ClassifiedEmbedQueryError {
+    detail: String,
+    footer_reason: &'static str,
+}
+
+fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
+    if let Some(timeout_ms) = query_embedding_timeout_budget(error) {
+        let clean = strip_query_embedding_timeout_marker(error);
+        // Name the mechanism (the budget fired) and the remedy (raise the knob
+        // for slow providers) so the agent can act, not just observe.
+        let detail = format!(
+            "Semantic search unavailable: query embedding timed out after {timeout_ms}ms (semantic.query_timeout_ms; raise it for slow providers). {clean}"
+        );
+        let footer_reason =
+            Box::leak(format!("query embed timeout ({timeout_ms}ms)").into_boxed_str());
+        ClassifiedEmbedQueryError {
+            detail,
+            footer_reason,
+        }
+    } else {
+        ClassifiedEmbedQueryError {
+            detail: format!("Semantic search unavailable: {error}"),
+            footer_reason: "unavailable",
+        }
+    }
 }
 
 fn rerank_semantic_candidates(results: &mut Vec<SemanticResult>, shape: &QueryShape, query: &str) {
@@ -2698,15 +2764,16 @@ fn format_lexical_unavailable_text(
     detail: &str,
     results: &[HybridResult],
     project_root: &Path,
+    footer_reason: &str,
 ) -> String {
     if results.is_empty() {
         return format!(
-            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]"
+            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: {footer_reason}]"
         );
     }
 
     format!(
-        "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: unavailable]",
+        "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: {footer_reason}]",
         format_result_sections(results, project_root),
         results.len()
     )
@@ -2716,15 +2783,16 @@ fn format_grep_lexical_unavailable_text(
     detail: &str,
     result: &GrepResult,
     project_root: &Path,
+    footer_reason: &str,
 ) -> String {
     if result.matches.is_empty() {
         return format!(
-            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: unavailable]"
+            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: {footer_reason}]"
         );
     }
 
     format!(
-        "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: unavailable]",
+        "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: {footer_reason}]",
         crate::commands::grep::format_grep_text(result, project_root),
         result.matches.len()
     )
@@ -3699,6 +3767,67 @@ mod tests {
             "successful retry should install the constructed model"
         );
         handle.join().expect("embedding server thread");
+    }
+
+    #[test]
+    fn classify_embed_query_error_names_timeout_budget_and_knob() {
+        // A query-embedding timeout carries the budget that fired. The
+        // classified detail must name the mechanism, the budget value, and the
+        // knob that raises it — and the footer reason must carry the budget so
+        // the agent sees the cause in the status line, not just the body.
+        let timeout_error = format!(
+            "failed to embed query: {}openai compatible request failed: operation timed out",
+            crate::semantic_index::query_embedding_timeout_marker(3_000)
+        );
+        let classified = classify_embed_query_error(&timeout_error);
+        assert!(
+            classified.detail.contains("timed out after 3000ms"),
+            "timeout detail must name the budget: {}",
+            classified.detail
+        );
+        assert!(
+            classified.detail.contains("semantic.query_timeout_ms"),
+            "timeout detail must name the knob: {}",
+            classified.detail
+        );
+        assert!(
+            classified.detail.contains("raise it for slow providers"),
+            "timeout detail must name the remedy: {}",
+            classified.detail
+        );
+        assert_eq!(classified.footer_reason, "query embed timeout (3000ms)");
+    }
+
+    #[test]
+    fn classify_embed_query_error_non_timeout_keeps_current_shape() {
+        // A non-timeout failure (HTTP 4xx, connection refused, dimension
+        // mismatch) must NOT claim a timeout. It keeps the current message
+        // shape and the plain "unavailable" footer reason.
+        for non_timeout in [
+            "failed to embed query: openai compatible request failed (HTTP 401): Unauthorized",
+            "failed to embed query: openai compatible request failed: connection refused",
+            "semantic embedding dimension mismatch: query backend returned 768, index expects 384",
+        ] {
+            let classified = classify_embed_query_error(non_timeout);
+            assert!(
+                !classified.detail.contains("timed out"),
+                "non-timeout must not claim timeout: {}",
+                classified.detail
+            );
+            assert!(
+                !classified.detail.contains("query_timeout_ms"),
+                "non-timeout must not name the knob: {}",
+                classified.detail
+            );
+            assert_eq!(classified.footer_reason, "unavailable");
+            assert!(
+                classified
+                    .detail
+                    .starts_with("Semantic search unavailable: "),
+                "non-timeout keeps current message shape: {}",
+                classified.detail
+            );
+        }
     }
 
     #[test]
