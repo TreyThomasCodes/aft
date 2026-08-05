@@ -687,7 +687,9 @@ fn parse_severity_filter(value: Option<&str>) -> Result<SeverityFilter, String> 
 }
 
 fn normalize_query_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // Same normalized form as the LSP subsystem's storage keys; a bare
+    // canonicalize would query with Windows verbatim spellings and miss.
+    crate::inspect::job::canonicalize_normalized(path)
 }
 
 #[cfg(test)]

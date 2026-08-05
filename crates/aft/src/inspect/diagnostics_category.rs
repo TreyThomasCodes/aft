@@ -214,7 +214,10 @@ fn collect_scoped_file(
     collection: &mut DiagnosticsCollection,
     opened_documents: &mut ScopedInspectDocuments<'_>,
 ) {
-    let canonical = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    // One canonical form across the LSP boundary: bare fs::canonicalize
+    // yields verbatim paths on Windows, which no longer match the
+    // normalized server keys and diagnostics-store paths.
+    let canonical = crate::inspect::job::canonicalize_normalized(file);
     let outcomes: EnsureServerOutcomes = {
         let mut lsp = ctx.lsp();
         lsp.ensure_server_for_file_detailed(&canonical, config)
@@ -419,7 +422,7 @@ fn scoped_lsp_files(
                 explicit_files_without_server += 1;
                 continue;
             }
-            files.insert(std::fs::canonicalize(&root).unwrap_or(root));
+            files.insert(crate::inspect::job::canonicalize_normalized(&root));
             continue;
         }
 
@@ -453,7 +456,7 @@ fn scoped_lsp_files(
             if servers_for_file(path, config).is_empty() {
                 continue;
             }
-            files.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+            files.insert(crate::inspect::job::canonicalize_normalized(path));
             if files.len() >= SCOPED_FILE_CAP {
                 truncated = true;
                 break;
