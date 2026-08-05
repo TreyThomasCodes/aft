@@ -1557,10 +1557,13 @@ fn store_re_roots_relative_metadata_after_project_move() {
         vec![root_b.display().to_string()]
     );
     let snapshot = project_dead_code_snapshot(reopened.sqlite_path()).unwrap();
+    // Projection paths carry the normalized (verbatim-stripped) canonical
+    // form, so the expectation must not use bare fs::canonicalize (verbatim
+    // on Windows).
     assert!(
         snapshot
             .files
-            .contains(&fs::canonicalize(root_b.join("main.ts")).unwrap()),
+            .contains(&canonicalize_like_projection(&root_b.join("main.ts"))),
         "projection should serve paths under moved root: {:#?}",
         snapshot.files
     );
@@ -2708,4 +2711,21 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
             panic!("expected ready read-only store, got unavailable")
         }
     }
+}
+
+/// Canonicalize the way the dead-code projection reports paths: canonical
+/// form with the Windows verbatim (`\\?\`) prefix stripped.
+fn canonicalize_like_projection(path: &std::path::Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize projection expectation");
+    let display = canonical.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    std::path::PathBuf::from(display)
 }

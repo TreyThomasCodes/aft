@@ -11,8 +11,6 @@ use serde_json::{json, Value};
 use super::cache::{InspectCache, InspectCacheRead, InspectDbTimings, Tier2ContributionUpdates};
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
-#[cfg(test)]
-use super::job::normalize_path;
 use super::job::{
     is_test_file, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob, InspectResult,
     InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
