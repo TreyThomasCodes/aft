@@ -3263,18 +3263,18 @@
     },
     {
       "path": "packages/opencode-plugin/src/tools/hoisted.ts",
-      "location": "line 859, column 14",
-      "line": 859,
-      "column": 14,
+      "location": "line 858, column 10",
+      "line": 858,
+      "column": 10,
       "token": "filePath",
       "class": "compatibility-boundary",
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
       "path": "packages/opencode-plugin/src/tools/hoisted.ts",
-      "location": "line 859, column 51",
-      "line": 859,
-      "column": 51,
+      "location": "line 858, column 47",
+      "line": 858,
+      "column": 47,
       "token": "filePath",
       "class": "compatibility-boundary",
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
