@@ -29,8 +29,8 @@ import { createBashWriteTool } from "./bash_write.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
-  permissionPath,
   permissionDeniedResponse,
+  permissionPath,
   runAsk,
 } from "./permissions.js";
 
@@ -854,15 +854,15 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 
       const affectedRelPaths = stringArray(preview.affected_rel_paths);
       const affectedPaths = stringArray(preview.affected_paths);
-      const permissionPatterns = (
-        affectedPaths.length > 0 ? affectedPaths : affectedRelPaths
-      ).map((filePath) => permissionPath(context, filePath));
+      const permissionPatterns = (affectedPaths.length > 0 ? affectedPaths : affectedRelPaths).map(
+        (filePath) => permissionPath(context, filePath),
+      );
       const denial = await askEditPermission(context, permissionPatterns, {
         diff: typeof preview.preview_diff === "string" ? preview.preview_diff : "",
         filepath:
           typeof preview.filepath === "string"
             ? preview.filepath
-            : affectedPaths[0] ?? affectedRelPaths[0],
+            : (affectedPaths[0] ?? affectedRelPaths[0]),
       });
       if (denial) return permissionDeniedResponse(denial);
 

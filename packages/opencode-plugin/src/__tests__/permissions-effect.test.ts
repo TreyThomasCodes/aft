@@ -23,6 +23,7 @@
 import { describe, expect, test } from "bun:test";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { hoistedTools } from "../tools/hoisted.js";
 import {
   askEditPermission,
   askGlobPermission,
@@ -30,7 +31,6 @@ import {
   permissionPath,
   runAsk,
 } from "../tools/permissions.js";
-import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
 
 describe("runAsk + Promise", () => {
