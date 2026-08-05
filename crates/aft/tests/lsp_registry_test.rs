@@ -24,7 +24,7 @@ fn test_deepest_root_wins_in_monorepo() {
     .unwrap();
     fs::write(&main_rs, "fn main() {}\n").unwrap();
 
-    let expected_root = fs::canonicalize(&crate_root).unwrap();
+    let expected_root = canonicalize_like_product(&crate_root);
     assert_eq!(
         find_workspace_root(&main_rs, &["Cargo.toml"]),
         Some(expected_root)
@@ -42,7 +42,7 @@ fn test_typescript_root_with_tsconfig() {
     fs::write(root.join("tsconfig.json"), "{}\n").unwrap();
     fs::write(&file, "export const value = 1;\n").unwrap();
 
-    let expected_root = fs::canonicalize(&root).unwrap();
+    let expected_root = canonicalize_like_product(&root);
     assert_eq!(
         find_workspace_root(&file, &["tsconfig.json", "package.json"]),
         Some(expected_root)
@@ -64,7 +64,7 @@ fn test_registry_and_root_combined() {
     let servers = servers_for_file(&file, &config);
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].kind, ServerKind::Rust);
-    let expected_root = fs::canonicalize(&root).unwrap();
+    let expected_root = canonicalize_like_product(&root);
     assert_eq!(
         find_workspace_root(&file, &servers[0].root_markers),
         Some(expected_root)
@@ -89,7 +89,7 @@ fn test_pyright_config_root_wins_over_nearer_fallback_marker() {
         .find(|server| server.kind == ServerKind::Python)
         .expect("pyright server definition");
 
-    let expected_root = fs::canonicalize(&project_root).unwrap();
+    let expected_root = canonicalize_like_product(&project_root);
     assert_eq!(pyright.workspace_root_for_file(&file), Some(expected_root));
 }
 
@@ -118,7 +118,7 @@ fn test_pyright_user_root_marker_override_disables_builtin_priority() {
         .find(|server| server.kind == ServerKind::Python)
         .expect("pyright server definition");
 
-    let expected_root = fs::canonicalize(&src_dir).unwrap();
+    let expected_root = canonicalize_like_product(&src_dir);
     assert_eq!(pyright.workspace_root_for_file(&file), Some(expected_root));
 }
 
@@ -241,4 +241,21 @@ fn test_disabled_lsp_filters_builtins_and_custom_servers() {
 
     assert!(servers_for_file(std::path::Path::new("/tmp/main.rs"), &config).is_empty());
     assert!(servers_for_file(std::path::Path::new("/tmp/main.typ"), &config).is_empty());
+}
+
+/// Canonicalize the way find_workspace_root reports roots: canonical form
+/// with the Windows verbatim prefix stripped.
+fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
+    let canonical = fs::canonicalize(path).expect("canonicalize expectation");
+    let display = canonical.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    std::path::PathBuf::from(display)
 }
