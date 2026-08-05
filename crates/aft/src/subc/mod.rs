@@ -284,7 +284,8 @@ pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
                 || module_id == "aft"
                 || module_id == "broca"
                 || module_id == "alfonso-core"
-                || module_id == "prefrontal" =>
+                || module_id == "prefrontal"
+                || module_id == "prefrontal-core" =>
         {
             BindTrust::FirstParty
         }
@@ -6265,7 +6266,14 @@ mod tests {
         // single entry (the rename hazard) reddens exactly the missing name.
         // Both halves of each transitional rename pair stay listed until the
         // flip settles (see the allowlist comment).
-        for module_id in ["llm-runner", "aft", "broca", "alfonso-core", "prefrontal"] {
+        for module_id in [
+            "llm-runner",
+            "aft",
+            "broca",
+            "alfonso-core",
+            "prefrontal",
+            "prefrontal-core",
+        ] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string(),
