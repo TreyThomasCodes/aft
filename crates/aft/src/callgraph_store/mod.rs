@@ -12783,7 +12783,9 @@ fn planted_dead() {}
     }
 
     fn projected_target(root: &Path, target_rel: &str, symbol: &str) -> String {
-        let path = fs::canonicalize(root.join(target_rel)).expect("canonical target path");
+        // Projection targets carry the normalized (verbatim-stripped)
+        // canonical form; bare fs::canonicalize diverges on Windows.
+        let path = crate::inspect::job::canonicalize_normalized(&root.join(target_rel));
         format!("{}::{symbol}", path.display())
     }
 

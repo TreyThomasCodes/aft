@@ -2309,7 +2309,9 @@ fn callgraph_store_dirs_from_inspect_dir(inspect_dir: &Path, project_root: &Path
 
 #[cfg(test)]
 fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    // Mirrors the projection's normalizer: snapshot paths are
+    // verbatim-stripped, so test expectations must be too.
+    crate::inspect::job::canonicalize_normalized(path)
 }
 
 fn load_contribution_freshness(

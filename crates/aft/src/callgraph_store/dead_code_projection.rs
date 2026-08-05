@@ -500,11 +500,11 @@ impl OtherType {
             .cold_build(&[source.clone(), target_source.clone()])
             .expect("cold build type-match constructor fixture");
         let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        // Expectations mirror the projection's normalized (verbatim-stripped)
+        // canonical form.
         let expected_target = format!(
             "{}::new",
-            std::fs::canonicalize(&target_source)
-                .expect("canonical target source")
-                .display()
+            crate::inspect::job::canonicalize_normalized(&target_source).display()
         );
         let type_match_calls = snapshot
             .outbound_calls
