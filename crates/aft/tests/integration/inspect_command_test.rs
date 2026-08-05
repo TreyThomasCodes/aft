@@ -2752,7 +2752,7 @@ fn scoped_diagnostics_deadline_closes_documents_opened_before_truncation() {
     );
     let scope = aft::inspect::JobScope::from_roots(
         canonical_root,
-        vec![fs::canonicalize(root.join("src")).expect("canonical scope")],
+        vec![crate::helpers::canonicalize_like_product(&root.join("src"))],
     );
     let outcome = aft::inspect::run_scoped_diagnostics_with_deadline_for_test(
         &ctx,

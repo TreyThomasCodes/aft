@@ -90,7 +90,7 @@ fn custom_event(ctx: &AppContext, method: &str) -> serde_json::Value {
 }
 
 fn file_uri(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).expect("canonical path");
+    let canonical = crate::helpers::canonicalize_like_product(path);
     let url = url::Url::from_file_path(&canonical).expect("file url");
     url.to_string()
 }

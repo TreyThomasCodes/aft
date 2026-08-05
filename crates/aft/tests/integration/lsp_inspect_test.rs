@@ -90,7 +90,9 @@ fn lsp_inspect_reports_missing_pyright_binary() {
     assert_eq!(servers[0]["binary_name"], "pyright-langserver");
     assert_eq!(servers[0]["binary_path"], serde_json::Value::Null);
     assert_eq!(servers[0]["binary_source"], "not_found");
-    let canonical_package_dir = std::fs::canonicalize(&package_dir).unwrap();
+    // Workspace roots are reported in the product's normalized form
+    // (verbatim-stripped); bare canonicalize is verbatim on Windows.
+    let canonical_package_dir = crate::helpers::canonicalize_like_product(&package_dir);
     assert_eq!(
         servers[0]["workspace_root"],
         canonical_package_dir.display().to_string()
