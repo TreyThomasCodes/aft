@@ -103,7 +103,10 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
     "model": "all-MiniLM-L6-v2",       // model id understood by the backend
     // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
-    "timeout_ms": 25000,                // per-request timeout, kept under bridge limit
+    "timeout_ms": 25000,                // per-request timeout for INDEX BUILDS, kept under bridge limit
+    "query_timeout_ms": 3000,           // per-request timeout for interactive QUERY embeds (500-15000).
+                                        // Raise for slow providers; on timeout, search degrades to
+                                        // lexical for that query instead of failing.
     "max_batch_size": 64,               // embeddings batched in groups of this size
     "max_files": 20000                  // max files indexed (default 20000); raise for remote backends
   },
