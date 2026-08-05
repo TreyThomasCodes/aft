@@ -417,7 +417,7 @@ impl SearchIndexSnapshot {
     }
 
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
             !file.path.as_os_str().is_empty() && is_within_search_root(&search_root, &file.path)
         })
@@ -1656,7 +1656,7 @@ impl SearchIndexSnapshot {
             Ok(filters) => filters,
             Err(_) => PathFilters::default(),
         };
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
 
         let trigram_started = Instant::now();
         let raw_pattern = pattern.raw_pattern_for_trigrams();
@@ -1852,7 +1852,7 @@ impl SearchIndexSnapshot {
             Ok(filters) => filters,
             Err(_) => return (Vec::new(), false, 0),
         };
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
         let entries_visited = self.files.len();
         let mut scope_has_files = false;
         let mut entries = self
@@ -3600,19 +3600,17 @@ pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
 
 pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
     let relative = validate_cached_relative_path(relative_path)?;
-    let normalized_root = normalize_path(root);
-    let full_path = normalize_path(&normalized_root.join(relative));
+    let normalized_root = crate::inspect::job::normalize_path(root);
+    let full_path = crate::inspect::job::normalize_path(&normalized_root.join(relative));
 
     match fs::canonicalize(&full_path) {
         Ok(canonical_path) => {
-            if canonical_path.starts_with(&normalized_root) {
-                return Some(full_path);
-            }
-
-            let canonical_root = fs::canonicalize(&normalized_root).ok()?;
-            canonical_path
-                .starts_with(&canonical_root)
-                .then_some(full_path)
+            // Both paths must use the non-verbatim comparison form: Windows
+            // canonical children have a `\\?\` prefix, while cache roots may
+            // already be normalized. Mixing those spellings makes containment
+            // checks reject a file that is actually inside its cache root.
+            let canonical_root = crate::inspect::job::canonicalize_normalized(&normalized_root);
+            is_within_search_root(&canonical_root, &canonical_path).then_some(full_path)
         }
         Err(_) => full_path.starts_with(&normalized_root).then_some(full_path),
     }
@@ -3758,12 +3756,12 @@ fn sort_shared_grep_matches_by_cached_mtime_desc<F>(
 }
 
 pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> SearchScope {
-    let resolved_project_root = canonicalize_or_normalize(project_root);
+    let resolved_project_root = canonicalize_for_search_membership(project_root);
     let root = match path {
         Some(path) => {
             let path = PathBuf::from(path);
             if path.is_absolute() {
-                canonicalize_or_normalize(&path)
+                canonicalize_for_search_membership(&path)
             } else {
                 normalize_path(&resolved_project_root.join(path))
             }
@@ -4427,6 +4425,14 @@ impl PathFilters {
     }
 }
 
+fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
+    // Indexed files and requested scope roots meet in containment checks. Bare
+    // `fs::canonicalize` yields a Windows verbatim (`\\?\`) path, while the
+    // lexical fallback does not, so the two success/failure forms would silently
+    // miss each other without this shared non-verbatim normalizer.
+    crate::inspect::job::canonicalize_normalized(path)
+}
+
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
@@ -4570,7 +4576,8 @@ fn verify_file_mtimes(
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    normalize_path(path).starts_with(normalize_path(search_root))
+    crate::inspect::job::normalize_path(path)
+        .starts_with(crate::inspect::job::normalize_path(search_root))
 }
 
 impl QueryBuild {
@@ -5039,11 +5046,68 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
         let root = fs::canonicalize(&project).expect("canonicalize project");
+        let normalized_root = crate::inspect::job::canonicalize_normalized(&project);
 
         let path = cached_path_under_root(&root, Path::new("future/file.rs"))
             .expect("missing child should fall back to lexical validation");
 
-        assert_eq!(path, root.join("future/file.rs"));
+        assert_eq!(path, normalized_root.join("future/file.rs"));
+    }
+
+    #[cfg(windows)]
+    fn verbatim_path(path: &std::path::Path) -> PathBuf {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_path_under_root_strips_verbatim_root_prefix() {
+        let dir = tempfile::tempdir().expect("create temporary project");
+        let project = dir.path().join("project");
+        let file = project.join("src/main.rs");
+        fs::create_dir_all(file.parent().expect("source directory"))
+            .expect("create source directory");
+        fs::write(&file, "fn main() {}\n").expect("write source file");
+        let normalized_root = crate::inspect::job::canonicalize_normalized(&project);
+
+        let restored =
+            cached_path_under_root(&verbatim_path(&normalized_root), Path::new("src/main.rs"))
+                .expect("restore cached child");
+
+        assert_eq!(restored, normalized_root.join("src/main.rs"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn search_root_membership_matches_verbatim_file_to_normalized_root() {
+        let dir = tempfile::tempdir().expect("create temporary project");
+        let project = dir.path().join("project");
+        let file = project.join("src/main.rs");
+        fs::create_dir_all(file.parent().expect("source directory"))
+            .expect("create source directory");
+        fs::write(&file, "fn main() {}\n").expect("write source file");
+
+        let normalized_root = crate::inspect::job::canonicalize_normalized(&project);
+        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+
+        assert!(is_within_search_root(
+            &normalized_root,
+            &verbatim_path(&normalized_file)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_search_scope_strips_verbatim_root_prefix() {
+        let dir = tempfile::tempdir().expect("create temporary project");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project directory");
+        let normalized_root = crate::inspect::job::canonicalize_normalized(&project);
+
+        let scope = resolve_search_scope(&verbatim_path(&normalized_root), None);
+
+        assert_eq!(scope.root, normalized_root);
+        assert!(scope.use_index);
     }
 
     #[cfg(unix)]
@@ -6234,7 +6298,7 @@ mod tests {
 
         assert_eq!(
             scope.root,
-            fs::canonicalize(&outside).expect("canonicalize outside")
+            crate::inspect::job::canonicalize_normalized(&outside)
         );
         assert!(!scope.use_index);
     }
