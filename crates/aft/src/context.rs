@@ -4619,7 +4619,10 @@ impl AppContext {
             .project_root
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+        // Normalized, not bare-canonical: scoped diagnostics compare
+        // LSP-reported paths (normalized form) against this root with
+        // starts_with, and a verbatim root on Windows matches nothing.
+        let project_root = crate::inspect::job::canonicalize_normalized(&project_root);
         Some(InspectSnapshot::new(
             project_root,
             self.inspect_dir(),

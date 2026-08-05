@@ -280,7 +280,10 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
         .project_root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+    // Normalized, not bare-canonical: the diagnostics collection filters
+    // LSP-reported (normalized) paths against this root with starts_with,
+    // so a Windows verbatim root here silently drops every diagnostic.
+    let project_root = crate::inspect::job::canonicalize_normalized(&project_root);
     Ok(InspectSnapshot::new_with_capabilities(
         project_root,
         ctx.inspect_dir(),
