@@ -1938,9 +1938,14 @@ fn forced_relative_paths(job: &InspectJob, paths: &BTreeSet<PathBuf>) -> BTreeSe
             job.project_root.join(path)
         };
         keys.insert(relative_cache_key(&job.project_root, &absolute));
-        if let Ok(canonical) = std::fs::canonicalize(&absolute) {
-            keys.insert(relative_cache_key(&job.project_root, &canonical));
-        }
+        // Normalized, not bare-canonical: the project root is verbatim-stripped,
+        // so a verbatim canonical path would fail strip_prefix and produce an
+        // absolute key no cached contribution matches (the forced rescan then
+        // silently misses).
+        keys.insert(relative_cache_key(
+            &job.project_root,
+            &crate::inspect::job::canonicalize_normalized(&absolute),
+        ));
     }
     keys
 }
@@ -1964,9 +1969,11 @@ fn downgrade_unchanged_forced_paths_with_freshness(
             project_root.join(&path)
         };
         let direct_key = relative_cache_key(project_root, &absolute);
-        let canonical_key = std::fs::canonicalize(&absolute)
-            .ok()
-            .map(|canonical| relative_cache_key(project_root, &canonical));
+        // Same normalized form as forced_relative_paths; see the comment there.
+        let canonical_key = Some(relative_cache_key(
+            project_root,
+            &crate::inspect::job::canonicalize_normalized(&absolute),
+        ));
         let freshness = cached
             .get(&direct_key)
             .or_else(|| canonical_key.as_ref().and_then(|key| cached.get(key)));
