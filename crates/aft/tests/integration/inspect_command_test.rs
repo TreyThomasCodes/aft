@@ -54,7 +54,7 @@ fn write_file(root: &Path, relative_path: &str, contents: &str) -> PathBuf {
 }
 
 fn file_uri(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).expect("canonical file path");
+    let canonical = crate::helpers::canonicalize_like_product(path);
     url::Url::from_file_path(canonical)
         .expect("file URL")
         .to_string()
@@ -2743,7 +2743,7 @@ fn scoped_diagnostics_deadline_closes_documents_opened_before_truncation() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "200");
 
-    let canonical_root = fs::canonicalize(&root).expect("canonical project root");
+    let canonical_root = crate::helpers::canonicalize_like_product(&root);
     let snapshot = InspectSnapshot::new(
         canonical_root.clone(),
         ctx.inspect_dir(),

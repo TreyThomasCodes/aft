@@ -644,7 +644,7 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
         "expected inline diagnostics: {resp:?}"
     );
 
-    let canonical_file = fs::canonicalize(&file).expect("canonical file");
+    let canonical_file = crate::helpers::canonicalize_like_product(&file);
     assert_eq!(diagnostics[0]["file"], canonical_file.display().to_string());
     assert_eq!(diagnostics[0]["line"], 1);
     assert_eq!(diagnostics[0]["column"], 1);

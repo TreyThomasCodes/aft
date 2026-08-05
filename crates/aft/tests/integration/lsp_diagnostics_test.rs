@@ -884,7 +884,7 @@ fn test_wait_for_diagnostics_returns_after_matching_publish() {
         .expect("open main");
 
     let diagnostics = manager.wait_for_diagnostics_default(main_rs, Duration::from_secs(2));
-    let canonical_main = fs::canonicalize(main_rs).expect("canonical main");
+    let canonical_main = crate::helpers::canonicalize_like_product(main_rs);
 
     assert_eq!(diagnostics.len(), 2);
     assert!(diagnostics
@@ -910,7 +910,7 @@ fn test_diagnostics_for_file_vs_all() {
 
     let file_diagnostics = manager.get_diagnostics_for_file(main_rs);
     let all_diagnostics = manager.get_all_diagnostics();
-    let canonical_main = fs::canonicalize(main_rs).expect("canonical main");
+    let canonical_main = crate::helpers::canonicalize_like_product(main_rs);
 
     assert_eq!(file_diagnostics.len(), 2);
     assert_eq!(all_diagnostics.len(), 4);
@@ -1137,7 +1137,7 @@ fn test_lsp_diagnostics_command_response_format() {
 
     let diagnostics = resp["diagnostics"].as_array().expect("diagnostics array");
     assert_eq!(diagnostics.len(), 1);
-    let canonical_file = fs::canonicalize(file).expect("canonical file");
+    let canonical_file = crate::helpers::canonicalize_like_product(file);
     assert_eq!(diagnostics[0]["file"], canonical_file.display().to_string());
     assert_eq!(diagnostics[0]["line"], 5);
     assert_eq!(diagnostics[0]["column"], 1);
@@ -1755,7 +1755,7 @@ fn post_edit_diagnostics_are_root_aware() {
         .expect("notify");
     wait_for_publish(&mut manager);
 
-    let canonical_file = fs::canonicalize(file).expect("canonical");
+    let canonical_file = crate::helpers::canonicalize_like_product(file);
     let entries: Vec<_> = manager
         .diagnostics_store_for_test()
         .entries_for_file(&canonical_file)
@@ -1767,7 +1767,7 @@ fn post_edit_diagnostics_are_root_aware() {
         !entries.is_empty(),
         "expected at least one entry after publish"
     );
-    let canonical_root = fs::canonicalize(&root).expect("canonical root");
+    let canonical_root = crate::helpers::canonicalize_like_product(&root);
     for key in &entries {
         assert!(
             !key.root.as_os_str().is_empty(),

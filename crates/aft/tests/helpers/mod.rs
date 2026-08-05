@@ -1205,3 +1205,23 @@ mod exit_timeout_forensics_tests {
         "<non-string panic payload>".to_string()
     }
 }
+
+/// Canonicalize a path the way the LSP subsystem reports it: canonical form
+/// with the Windows verbatim (`\\?\`) prefix stripped. Test expectations that
+/// compare against server-reported file paths must use this instead of bare
+/// `fs::canonicalize`, whose verbatim output on Windows never matches the
+/// normalized paths the product emits.
+pub fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize test path");
+    let display = canonical.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    std::path::PathBuf::from(display)
+}
