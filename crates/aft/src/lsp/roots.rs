@@ -2,18 +2,24 @@ use std::path::{Path, PathBuf};
 
 use crate::lsp::registry::ServerKind;
 
-/// Find the workspace root for a file given root marker filenames.
-/// Walks up from the file's parent directory looking for any of the markers.
-/// Returns the deepest directory containing a marker (closest to the file).
-/// If no marker is found, returns None.
 pub fn find_workspace_root<S>(file_path: &Path, markers: &[S]) -> Option<PathBuf>
 where
     S: AsRef<str>,
 {
-    let resolved_path = match std::fs::canonicalize(file_path) {
-        Ok(path) => path,
-        Err(_) => file_path.to_path_buf(),
-    };
+    // Route canonicalization through `canonicalize_normalized` so the returned
+    // root is never a Windows verbatim (`\\?\C:\...`) path. This root flows into
+    // `LspClient::spawn` -> `Command::current_dir(&root)`, and `CreateProcess`
+    // rejects extended-length verbatim paths as `lpCurrentDirectory` (documented
+    // Win32 limitation: "The lpCurrentDirectory string ... must not be a \\?\
+    // prefixed path"). Without this strip EVERY LSP spawn on Windows fails
+    // with "The system cannot find the path specified" and aft_inspect reports
+    // servers as not installed (#174). On Unix `canonicalize_normalized` is
+    // identity-equivalent to `fs::canonicalize` followed by lexical `.`/`..`
+    // collapse, so non-Windows behavior is unchanged.
+    // `canonicalize_normalized` falls back to lexical `.`/`..` collapse when
+    // `fs::canonicalize` fails (e.g. the file is gone), matching the prior
+    // fallback to the raw `file_path` for paths without `.`/`..` components.
+    let resolved_path = crate::inspect::job::canonicalize_normalized(file_path);
 
     let start_dir = if resolved_path.is_dir() {
         resolved_path
@@ -52,6 +58,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{find_workspace_root, ServerKey};
+    use crate::inspect::job::canonicalize_normalized;
     use crate::lsp::registry::ServerKind;
 
     #[test]
@@ -141,5 +148,51 @@ mod tests {
 
         assert_eq!(same, equal);
         assert_ne!(same, different);
+    }
+
+    /// Regression test for #174: the workspace root returned for a nested file
+    /// must never carry a Windows verbatim (`\\?\`) prefix, because it flows
+    /// into `LspClient::spawn` -> `Command::current_dir`, and `CreateProcess`
+    /// rejects verbatim paths as `lpCurrentDirectory` (every LSP spawn on
+    /// Windows would otherwise fail with "The system cannot find the path
+    /// specified").
+    ///
+    /// This runs on every platform (not `cfg(windows)`-gated) because the
+    /// normalization is platform-independent: on Unix `canonicalize_normalized`
+    /// is identity-equivalent to `fs::canonicalize` plus lexical `.`/`..`
+    /// collapse, so the assertion is a no-op there; on Windows (MSVC CI) it
+    /// asserts the verbatim strip. The byte-equality check against
+    /// `canonicalize_normalized` is the platform-independent property that
+    /// fails locally on macOS if the roots.rs chokepoint is reverted to a bare
+    /// `fs::canonicalize` (whose output diverges from the normalized form only
+    /// on Windows, but the equality contract holds everywhere).
+    #[test]
+    fn test_find_root_strips_windows_verbatim_prefix() {
+        let temp_dir = tempdir().unwrap();
+        let root = temp_dir.path().join("workspace");
+        let src_dir = root.join("src");
+        let nested = src_dir.join("deep").join("lib.rs");
+
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(&nested, "fn main() {}\n").unwrap();
+
+        let found = find_workspace_root(&nested, &["Cargo.toml"]).expect("root found");
+
+        // No verbatim prefix on any platform.
+        let display = found.to_string_lossy();
+        assert!(
+            !display.starts_with("\\\\?\\"),
+            "workspace root must not carry a Windows verbatim prefix: {display}"
+        );
+
+        // Byte-for-byte equality with the shared normalizer for the same
+        // fixture. This is the platform-independent mutation control: reverting
+        // roots.rs to a bare `fs::canonicalize` makes `find_workspace_root`
+        // diverge from `canonicalize_normalized` on Windows, and on Unix the
+        // equality still holds (both reduce to the canonical form), so the
+        // test fails on Windows CI while passing locally on macOS.
+        let expected = canonicalize_normalized(&root);
+        assert_eq!(found, expected);
     }
 }
