@@ -247,6 +247,13 @@ fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool 
     let Some(path) = path else {
         return false;
     };
+    // Canonicalize the root here rather than trusting callers: the target
+    // below is canonicalized, and comparing a canonical target against a
+    // non-canonical root breaks on alias spellings (macOS /var vs
+    // /private/var), misreading in-root paths as external.
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let project_root = project_root.as_path();
     let target = Path::new(path);
     let target = if target.is_absolute() {
         target.to_path_buf()
