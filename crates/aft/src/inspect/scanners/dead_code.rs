@@ -2849,8 +2849,10 @@ fn exported_symbols_for_resolved_file<'a>(
         return Some((relative, symbols));
     }
 
-    let canonical_root = fs::canonicalize(project_root).ok()?;
-    let canonical_file = fs::canonicalize(file).ok()?;
+    // Normalized, not bare-canonical: the map keys being probed are built
+    // from job-normalized (verbatim-stripped) paths.
+    let canonical_root = canonicalize_normalized(project_root);
+    let canonical_file = canonicalize_normalized(file);
     let relative = relative_path(&canonical_root, &canonical_file);
     exported_symbols_by_file
         .get(&relative)
@@ -2867,8 +2869,10 @@ fn default_export_symbol_for_resolved_file(
         return Some(symbol.clone());
     }
 
-    let canonical_root = fs::canonicalize(project_root).ok()?;
-    let canonical_file = fs::canonicalize(file).ok()?;
+    // Normalized, not bare-canonical: the map keys being probed are built
+    // from job-normalized (verbatim-stripped) paths.
+    let canonical_root = canonicalize_normalized(project_root);
+    let canonical_file = canonicalize_normalized(file);
     let relative = relative_path(&canonical_root, &canonical_file);
     default_export_symbols_by_file.get(&relative).cloned()
 }

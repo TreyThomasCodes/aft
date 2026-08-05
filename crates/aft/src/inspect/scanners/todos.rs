@@ -639,8 +639,9 @@ fn bump_file_read_count(path: &Path) {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn reset_file_read_count_for_debug(project_root: &Path) {
-    let project_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    // Normalized like the scanned paths themselves: bare canonicalize is
+    // verbatim on Windows and the starts_with filter would miss every entry.
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
     if let Ok(mut reads) = debug_file_reads().lock() {
         reads.retain(|path, _| !path.starts_with(&project_root));
     }
@@ -649,8 +650,9 @@ pub fn reset_file_read_count_for_debug(project_root: &Path) {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn file_read_count_for_debug(project_root: &Path) -> usize {
-    let project_root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    // Normalized like the scanned paths themselves: bare canonicalize is
+    // verbatim on Windows and the starts_with filter would miss every entry.
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
     debug_file_reads()
         .lock()
         .map(|reads| {
