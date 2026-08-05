@@ -2041,8 +2041,11 @@ fn update_manifest_fingerprint_hash(
     hasher: &mut blake3::Hasher,
     project_root: &Path,
 ) -> Result<(), InspectCacheError> {
-    let manifest_root =
-        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    // Entry-point manifests are normalized snapshots. A bare canonical root is
+    // verbatim (`\\?\`) on Windows, so mixing it with those non-verbatim
+    // manifests makes `strip_prefix` hash an absolute path instead of its
+    // project-relative name.
+    let manifest_root = crate::inspect::job::canonicalize_normalized(project_root);
     hasher.update(b"entry-point-manifests\0");
     for manifest in super::entry_points::collect_entry_point_manifests(project_root) {
         let relative_path = manifest
@@ -2137,6 +2140,35 @@ mod tests {
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
         );
+    }
+
+    #[cfg(windows)]
+    fn verbatim_path(path: &Path) -> PathBuf {
+        PathBuf::from(format!(r"\\?\{}", path.display()))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manifest_fingerprint_uses_relative_paths_for_verbatim_roots() {
+        let temp = tempfile::tempdir().expect("create temporary project");
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("create project directory");
+        let manifest = project.join("package.json");
+        let content = br#"{"name":"fixture"}"#;
+        fs::write(&manifest, content).expect("write package manifest");
+
+        let normalized_project = crate::inspect::job::canonicalize_normalized(&project);
+        let mut actual = blake3::Hasher::new();
+        update_manifest_fingerprint_hash(&mut actual, &verbatim_path(&normalized_project))
+            .expect("hash entry-point manifest");
+
+        let mut expected = blake3::Hasher::new();
+        expected.update(b"entry-point-manifests\0");
+        expected.update(b"package.json\0");
+        expected.update(blake3::hash(content).as_bytes());
+        expected.update(b"\0");
+
+        assert_eq!(actual.finalize(), expected.finalize());
     }
 
     #[test]
