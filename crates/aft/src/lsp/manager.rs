@@ -2073,12 +2073,22 @@ fn infer_package_manager(stderr_tail: &str) -> &'static str {
 }
 
 fn canonicalize_for_lsp(file_path: &Path) -> Result<PathBuf, LspError> {
-    std::fs::canonicalize(file_path).map_err(LspError::from)
+    // The whole LSP subsystem must agree on ONE canonical form. Workspace
+    // roots are normalized (verbatim prefix stripped on Windows) because
+    // CreateProcess rejects verbatim cwds; document and watched-file paths
+    // are compared against those roots with starts_with, so a bare
+    // fs::canonicalize here would produce verbatim paths on Windows that
+    // never match any client root.
+    std::fs::canonicalize(file_path)
+        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .map_err(LspError::from)
 }
 
 fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
+    // Same normalized form as canonicalize_for_lsp and the client roots;
+    // see the comment there.
     if let Ok(path) = std::fs::canonicalize(file_path) {
-        return path;
+        return crate::inspect::job::normalize_path(&path);
     }
 
     let mut existing = file_path.to_path_buf();
@@ -2094,7 +2104,9 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
         existing = parent.to_path_buf();
     }
 
-    let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    let mut resolved = std::fs::canonicalize(&existing)
+        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .unwrap_or(existing);
     for segment in missing.into_iter().rev() {
         resolved.push(segment);
     }
@@ -2116,7 +2128,12 @@ fn language_id_for_extension(ext: &str) -> &'static str {
 }
 
 fn normalize_lookup_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // Normalized like every other LSP-subsystem path (see canonicalize_for_lsp):
+    // store keys and lookups must share one canonical form or Windows verbatim
+    // spellings silently miss.
+    std::fs::canonicalize(path)
+        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Classify an error returned by `spawn_server` into a structured

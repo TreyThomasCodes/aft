@@ -147,7 +147,12 @@ pub fn uri_for_path(path: &Path) -> Result<lsp_types::Uri, LspError> {
 }
 
 fn normalize_lookup_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    // Normalized like every other LSP-subsystem path (see canonicalize_for_lsp):
+    // store keys and lookups must share one canonical form or Windows verbatim
+    // spellings silently miss.
+    std::fs::canonicalize(path)
+        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Convert an LSP URI to a PathBuf.
