@@ -26,6 +26,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many trailing stderr lines the exit-timeout panic keeps in memory for
+/// the flake-queue forensics message. Mirrors the LSP client's stderr tail
+/// (crates/aft/src/lsp/client.rs) so the two read identically.
+const STDERR_TAIL_LINES: usize = 40;
 
 static DISABLE_IN_PROCESS_FILE_WATCHER: Once = Once::new();
 
@@ -72,6 +76,10 @@ pub struct AftProcess {
     stdout_capture_thread: Option<JoinHandle<()>>,
     stderr_log_path: Option<PathBuf>,
     stderr_capture_thread: Option<JoinHandle<String>>,
+    /// Rolling tail of the child's stderr, kept by the always-on drain thread
+    /// so the exit-timeout panic can report what the child was saying right
+    /// before it hung. Shared with the AFT_TEST_DIAG capture thread.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     _cache_dir: tempfile::TempDir,
 }
 
@@ -83,19 +91,23 @@ impl AftProcess {
     /// Spawn the aft binary with piped stdin/stdout/stderr.
     /// Sets AFT_CACHE_DIR to a temp path so tests don't pollute the user's cache.
     pub fn spawn() -> Self {
-        Self::spawn_inner(&[], false)
+        Self::spawn_inner(&[])
     }
 
     /// Spawn the aft binary with additional environment variables.
-    /// Stderr is suppressed by default. Use `spawn_with_stderr()` for tests
-    /// that need to inspect stderr output.
+    /// Stderr is captured in memory (for the exit-timeout panic message) but
+    /// not echoed to the test process unless `AFT_TEST_DIAG=1` is set.
     pub fn spawn_with_env(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
-        Self::spawn_inner(envs, false)
+        Self::spawn_inner(envs)
     }
 
     /// Spawn with stderr piped so tests can read it via `stderr_output()`.
+    ///
+    /// Stderr is now always piped (the drain thread keeps a rolling tail for
+    /// the exit-timeout forensics message), so this is equivalent to
+    /// `spawn()`; it is kept for existing call sites that read stderr back.
     pub fn spawn_with_stderr() -> Self {
-        Self::spawn_inner(&[], true)
+        Self::spawn_inner(&[])
     }
 
     /// Spawn the aft binary with a REAL OS file watcher installed on configure.
@@ -122,10 +134,10 @@ impl AftProcess {
             ),
         ];
         full.extend_from_slice(envs);
-        Self::spawn_inner(&full, false)
+        Self::spawn_inner(&full)
     }
 
-    fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)], pipe_stderr: bool) -> Self {
+    fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")));
@@ -166,11 +178,14 @@ impl AftProcess {
             .env("AFT_TEST_RAW_PATH", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if pipe_stderr || diag_enabled {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
+            // Stderr is always piped. A drain thread (spawn_stderr_drain_thread)
+            // keeps a rolling tail so the exit-timeout panic can report what
+            // the child was doing right before it hung — the flake-queue
+            // forensics this whole change exists for. Under AFT_TEST_DIAG=1 the
+            // same drain also tees to a log file and the test process's stderr;
+            // without DIAG the tail is still captured in memory for the panic
+            // message, and stderr_output() reads it back from the buffer.
+            .stderr(Stdio::piped());
 
         for (key, value) in envs {
             command.env(key, value);
@@ -200,6 +215,8 @@ impl AftProcess {
         let child_pid = child.id();
 
         let spawned_at = Instant::now();
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+
         let (stdout_trace_log_path, stdout_trace_log, stderr_log_path, stderr_capture_thread) =
             if diag_enabled {
                 let target_tmpdir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
@@ -218,8 +235,14 @@ impl AftProcess {
                 let stderr_log_path =
                     target_tmpdir.join(format!("aft-test-stderr-{child_pid}.log"));
                 let stderr = child.stderr.take().expect("stderr handle");
-                let stderr_capture_thread =
-                    Some(spawn_stderr_capture_thread(stderr, stderr_log_path.clone()));
+                // DIAG mode: tee to the log file + the test process's stderr
+                // (existing behavior) AND feed the in-memory tail ring buffer
+                // so the exit-timeout panic can quote it without reading a file.
+                let stderr_capture_thread = Some(spawn_stderr_capture_thread(
+                    stderr,
+                    stderr_log_path.clone(),
+                    Arc::clone(&stderr_tail),
+                ));
 
                 (
                     Some(stdout_trace_log_path),
@@ -228,7 +251,18 @@ impl AftProcess {
                     stderr_capture_thread,
                 )
             } else {
-                (None, None, None, None)
+                // Non-DIAG mode: stderr is still piped (so the exit-timeout
+                // panic has a tail to quote), but it is NOT echoed to the test
+                // process's stderr and NOT written to a log file — preserving
+                // the "stderr is suppressed by default" contract that lets
+                // ~600 integration spawns run without noisy interleaving. Only
+                // the in-memory tail ring buffer is kept.
+                let stderr = child.stderr.take().expect("stderr handle");
+                let stderr_capture_thread = Some(spawn_stderr_tail_only_thread(
+                    stderr,
+                    Arc::clone(&stderr_tail),
+                ));
+                (None, None, None, stderr_capture_thread)
             };
 
         let stdout = child.stdout.take().expect("stdout handle");
@@ -247,6 +281,7 @@ impl AftProcess {
             stdout_capture_thread: Some(stdout_capture_thread),
             stderr_log_path,
             stderr_capture_thread,
+            stderr_tail,
             _cache_dir: cache_dir,
         }
     }
@@ -365,6 +400,19 @@ impl AftProcess {
     #[cfg(test)]
     pub(crate) fn queue_pending_frame_for_test(&mut self, frame: serde_json::Value) {
         self.pending_frames.push_back(frame);
+    }
+
+    /// Test-only entry point that drives `wait_for_child_exit` with a caller-
+    /// supplied short timeout. Used by the exit-timeout forensics unit test to
+    /// provoke the panic on a deliberately-still-alive child without widening
+    /// any production timeout.
+    #[cfg(test)]
+    pub(crate) fn wait_for_child_exit_with_timeout(
+        &mut self,
+        timeout: Duration,
+        context: &str,
+    ) -> std::process::ExitStatus {
+        self.wait_for_child_exit(timeout, context)
     }
 
     /// Send a configure command with project_root.
@@ -504,9 +552,11 @@ impl AftProcess {
             let _ = handle.join();
         }
         if let Some(handle) = self.stderr_capture_thread.take() {
-            // Join the AFT_TEST_DIAG=1 capture thread before returning so
-            // parallel test processes cannot leave detached stderr writers
-            // interleaving with later tests.
+            // Join the stderr drain thread before returning so parallel test
+            // processes cannot leave detached stderr readers interleaving with
+            // later tests. This is now always present (stderr is always piped
+            // for the exit-timeout forensics tail), not just under
+            // AFT_TEST_DIAG=1.
             let _ = handle.join();
         }
         status
@@ -535,10 +585,10 @@ impl AftProcess {
             let _ = handle.join();
         }
         let mut stderr_content = String::new();
-        if let Some(mut stderr) = self.child.stderr.take() {
-            use std::io::Read;
-            stderr.read_to_string(&mut stderr_content).ok();
-        } else if let Some(stderr_capture_thread) = self.stderr_capture_thread.take() {
+        if let Some(stderr_capture_thread) = self.stderr_capture_thread.take() {
+            // The drain thread (DIAG log+tee or tail-only) returns the full
+            // captured stderr on join. child.stderr was already taken by the
+            // drain thread at spawn time, so there is no handle to read here.
             stderr_content = stderr_capture_thread.join().unwrap_or_default();
         }
         (status, stderr_content)
@@ -557,15 +607,65 @@ impl AftProcess {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 Ok(None) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    // Flake-queue forensics: before killing the child, snapshot
+                    // what it was doing. A Windows-CI-only timeout failure in
+                    // `configure_test::configure_does_not_warn_for_file_discovered_non_auto_installable_lsp`
+                    // has been sighted multiple times as a bare timeout panic
+                    // at this site with zero evidence about the child's state,
+                    // and reruns pass — so the next sighting must explain
+                    // itself. We capture the stderr tail, pid, and how long we
+                    // waited; on Windows we also record the kill result so a
+                    // PID-recycle reads differently from a genuine hang. The
+                    // control flow is unchanged — this is still a panic — only
+                    // the message is richer. No timeout widening (that is the
+                    // masking move this repo forbids).
+                    let pid = self.child.id();
+                    let stderr_tail = self.read_stderr_tail();
+                    let waited_secs = timeout.as_secs();
+                    // On Windows, record the kill result so a PID-recycle
+                    // (process gone between try_wait and kill) reads
+                    // differently from a genuine hang. Unix kill results are
+                    // not inspected — the stderr tail is the forensics there.
+                    #[cfg(windows)]
+                    let kill_note = match self.kill_child_for_timeout() {
+                        Ok(()) => "kill returned Ok (process was still alive at kill time)".to_string(),
+                        Err(error) => format!("kill returned Err: {error} (process may have exited between try_wait and kill — PID recycling?)"),
+                    };
+                    #[cfg(not(windows))]
+                    let kill_note = {
+                        let _ = self.kill_child_for_timeout();
+                        "kill issued (Unix kill result not inspected; see stderr tail for child state)".to_string()
+                    };
                     panic!(
-                        "timed out after {}s waiting for aft process exit during {context}; child was killed",
-                        timeout.as_secs()
+                        "timed out after {waited_secs}s waiting for aft process exit during {context}\n\
+                         ↳ child pid: {pid}\n\
+                         ↳ {kill_note}\n\
+                         ↳ stderr tail (last {STDERR_TAIL_LINES} lines):\n{stderr_tail}"
                     );
                 }
                 Err(error) => panic!("wait for process exit during {context}: {error}"),
             }
+        }
+    }
+
+    /// Kill the child and wait for it to be reaped. Returns the kill result
+    /// (used by the Windows exit-timeout panic to distinguish a genuine hang
+    /// from a PID that was already gone — i.e. PID recycling).
+    fn kill_child_for_timeout(&mut self) -> std::io::Result<()> {
+        self.child.kill()?;
+        let _ = self.child.wait();
+        Ok(())
+    }
+
+    /// Return the last `STDERR_TAIL_LINES` lines of the child's stderr as a
+    /// single string, joined by newlines. Reads from the in-memory ring buffer
+    /// fed by the always-on drain thread, so it works even after the child has
+    /// been killed and without touching a log file.
+    fn read_stderr_tail(&self) -> String {
+        let guard = self.stderr_tail.lock();
+        match guard {
+            Ok(tail) => tail.iter().cloned().collect::<Vec<_>>().join("\n"),
+            Err(_) => "<stderr tail mutex poisoned>".to_string(),
         }
     }
 
@@ -705,6 +805,7 @@ fn write_trace_event(
 fn spawn_stderr_capture_thread(
     stderr: std::process::ChildStderr,
     stderr_log_path: PathBuf,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 ) -> JoinHandle<String> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
@@ -725,6 +826,7 @@ fn spawn_stderr_capture_thread(
                         .expect("write aft stderr capture log");
                     log.flush().expect("flush aft stderr capture log");
                     captured.extend_from_slice(&buffer);
+                    append_stderr_tail(&stderr_tail, &buffer);
                     eprint!("{}", String::from_utf8_lossy(&buffer));
                 }
                 Err(error) => {
@@ -733,6 +835,7 @@ fn spawn_stderr_capture_thread(
                         .expect("write aft stderr capture error");
                     log.flush().expect("flush aft stderr capture error");
                     captured.extend_from_slice(message.as_bytes());
+                    append_stderr_tail(&stderr_tail, message.as_bytes());
                     eprint!("{message}");
                     break;
                 }
@@ -740,6 +843,55 @@ fn spawn_stderr_capture_thread(
         }
         String::from_utf8_lossy(&captured).into_owned()
     })
+}
+
+/// Drain stderr into the in-memory tail ring buffer only — no log file, no
+/// `eprint!`. This is the non-DIAG path: stderr stays suppressed (so ~600
+/// integration spawns don't interleave noise), but the rolling tail is still
+/// available for the exit-timeout panic message. Returns the full captured
+/// stderr on join so `stderr_output()` keeps working.
+fn spawn_stderr_tail_only_thread(
+    stderr: std::process::ChildStderr,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut captured = Vec::new();
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {
+                    append_stderr_tail(&stderr_tail, &buffer);
+                    captured.extend_from_slice(&buffer);
+                }
+                Err(error) => {
+                    let message = format!("[aft-test stderr capture read error: {error}]\n");
+                    append_stderr_tail(&stderr_tail, message.as_bytes());
+                    captured.extend_from_slice(message.as_bytes());
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&captured).into_owned()
+    })
+}
+
+/// Append a raw stderr byte chunk (one read_until line) to the rolling tail
+/// ring buffer, trimming a trailing newline. Mirrors the LSP client's
+/// `append_stderr_tail` (crates/aft/src/lsp/client.rs) so the two read
+/// identically.
+fn append_stderr_tail(tail: &Arc<Mutex<VecDeque<String>>>, bytes: &[u8]) {
+    let Ok(mut guard) = tail.lock() else {
+        return;
+    };
+    let line = String::from_utf8_lossy(bytes);
+    let line = line.trim_end_matches(['\r', '\n']);
+    if guard.len() == STDERR_TAIL_LINES {
+        guard.pop_front();
+    }
+    guard.push_back(line.to_string());
 }
 
 fn truncate_for_trace(line: &str) -> String {
@@ -980,4 +1132,76 @@ pub fn init_test_logger() {
 /// the last `init_test_logger()` / `take_logs()`.
 pub fn take_logs() -> Vec<String> {
     THREAD_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+}
+
+#[cfg(test)]
+mod exit_timeout_forensics_tests {
+    use super::*;
+
+    /// A deliberately-still-alive `aft` child must produce an exit-timeout
+    /// panic whose message carries evidence: the stderr tail (so the next
+    /// Windows-CI sighting of the
+    /// `configure_test::configure_does_not_warn_for_file_discovered_non_auto_installable_lsp`
+    /// timeout flake explains what the child was doing) and the request
+    /// context string.
+    ///
+    /// We spawn `aft`, drive a ping round-trip so the child has emitted its
+    /// `[aft] ... started` stderr banner, then call `wait_for_child_exit` with
+    /// a 50 ms timeout. The child is still waiting on stdin, so the deadline
+    /// elapses and the panic fires. `catch_unwind` lets us inspect the message
+    /// without failing the test.
+    #[test]
+    fn exit_timeout_panic_carries_stderr_tail_and_context() {
+        let mut aft = AftProcess::spawn();
+        // Drive the child through a request so it has fully initialized its
+        // logger and emitted the `[aft] ... started` banner to stderr. A ping
+        // round-trip proves the dispatch loop is live and the stderr drain
+        // thread has had time to read the startup line into the tail buffer.
+        let pong = aft.send(r#"{"id":"forensics-ping","command":"ping"}"#);
+        assert_eq!(
+            pong["success"], true,
+            "ping should succeed before forensics probe: {pong:?}"
+        );
+        // Give the stderr drain thread a beat to land the startup line.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let context = "deliberately-hung-child forensics probe";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aft.wait_for_child_exit_with_timeout(Duration::from_millis(50), context)
+        }));
+
+        let payload =
+            result.expect_err("wait_for_child_exit should have panicked on the still-alive child");
+        let message = panic_message_string(&payload);
+
+        assert!(
+            message.contains(context),
+            "panic message should contain the context string; got: {message}"
+        );
+        assert!(
+            message.contains("stderr tail"),
+            "panic message should label the stderr tail section; got: {message}"
+        );
+        assert!(
+            message.contains("[aft]"),
+            "panic message should carry the child's stderr tail marker `[aft]`; \
+             got: {message}"
+        );
+        assert!(
+            message.contains("child pid"),
+            "panic message should report the child pid; got: {message}"
+        );
+    }
+
+    /// Extract a String from a panic payload (the form `panic!` with a format
+    /// string produces).
+    fn panic_message_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            return (*s).to_string();
+        }
+        if let Some(s) = payload.downcast_ref::<String>() {
+            return s.clone();
+        }
+        "<non-string panic payload>".to_string()
+    }
 }
