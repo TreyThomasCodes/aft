@@ -1,6 +1,6 @@
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -3159,19 +3159,10 @@ fn normalize_absolute(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
+    // Delegates to the subsystem-wide normalizer: a components-only local
+    // version kept Windows verbatim prefixes, so map keys built here failed
+    // to join lookups built from verbatim-stripped roots.
+    crate::inspect::job::normalize_path(path)
 }
 
 #[derive(Debug, Clone, Deserialize)]

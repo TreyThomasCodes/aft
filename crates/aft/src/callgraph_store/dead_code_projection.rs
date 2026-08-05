@@ -351,7 +351,12 @@ fn absolute_store_path(project_root: &Path, store_path: &str) -> PathBuf {
 }
 
 fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| crate::inspect::job::normalize_path(path))
+    // Never let the two branches disagree on Windows verbatim form: bare
+    // fs::canonicalize returns \?\-prefixed paths while the fallback is
+    // clean, so snapshot path spellings depended on whether canonicalize
+    // succeeded — and every downstream join against normalized paths broke
+    // only when it did. One canonical (verbatim-stripped) form, both branches.
+    crate::inspect::job::canonicalize_normalized(path)
 }
 
 #[derive(Debug)]
