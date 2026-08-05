@@ -72,7 +72,10 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
         fs::write(&file, "fn main() {}\n").unwrap();
 
-        let expected_root = fs::canonicalize(&root).unwrap();
+        // Expectations go through the same normalization as production:
+        // bare fs::canonicalize returns verbatim (\\?\) paths on Windows,
+        // which find_workspace_root deliberately strips.
+        let expected_root = crate::inspect::job::canonicalize_normalized(&root);
         assert_eq!(
             find_workspace_root(&file, &["Cargo.toml"]),
             Some(expected_root)
@@ -92,7 +95,7 @@ mod tests {
         fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"foo\"\n").unwrap();
         fs::write(&file, "fn main() {}\n").unwrap();
 
-        let expected_root = fs::canonicalize(&crate_root).unwrap();
+        let expected_root = crate::inspect::job::canonicalize_normalized(&crate_root);
         assert_eq!(
             find_workspace_root(&file, &["Cargo.toml"]),
             Some(expected_root)
@@ -123,7 +126,7 @@ mod tests {
         fs::create_dir(root.join("package.json")).unwrap();
         fs::write(&file, "export {};\n").unwrap();
 
-        let expected_root = fs::canonicalize(&root).unwrap();
+        let expected_root = crate::inspect::job::canonicalize_normalized(&root);
         assert_eq!(
             find_workspace_root(&file, &["tsconfig.json", "package.json"]),
             Some(expected_root)
