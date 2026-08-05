@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::Value;
@@ -463,22 +463,11 @@ fn path_relative_to(base: &Path, path: &Path) -> String {
 }
 
 fn canonical_or_normalized(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
+    // Both branches must agree on verbatim form: bare canonicalize returns
+    // \?\-prefixed paths on Windows while the lexical fallback is clean, so
+    // membership decisions flipped with filesystem luck. Route the canonical
+    // branch through the same verbatim-stripping normalizer.
+    crate::inspect::job::canonicalize_normalized(path)
 }
 
 #[cfg(test)]
