@@ -1121,7 +1121,7 @@ impl BgTaskRegistry {
             .unwrap_or_else(resolve_posix_shell);
         let pipeline = single_top_level_pipeline(command);
         let capture_pipeline_status =
-            pipeline.is_some() && super::process::pipeline_shell_kind(&shell).is_some();
+            should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell);
         if capture_pipeline_status {
             metadata.pipeline_segments = pipeline
                 .as_ref()
@@ -3927,6 +3927,20 @@ impl BgTaskRegistry {
     }
 }
 
+#[cfg(unix)]
+fn should_capture_pipeline_status(
+    spawn_plan: &SpawnPlan,
+    has_pipeline: bool,
+    shell: &Path,
+) -> bool {
+    if spawn_plan.is_native_launcher() {
+        // Landlock closes fd 5 and above before exec; sandboxed tasks therefore
+        // cannot safely pass CHILD_PIPE_STATUS_FD to the payload wrapper.
+        return false;
+    }
+    has_pipeline && super::process::pipeline_shell_kind(shell).is_some()
+}
+
 fn canonical_artifact_root(paths: &TaskPaths) -> PathBuf {
     fs::canonicalize(&paths.io_dir).unwrap_or_else(|_| paths.io_dir.clone())
 }
@@ -5218,6 +5232,36 @@ mod tests {
 
     #[cfg(unix)]
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_plans_disable_pipeline_status_capture() {
+        let launcher = SpawnPlan::launcher_for_test(
+            crate::sandbox_profile::SandboxProfile {
+                v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+                writable_roots: Vec::new(),
+                write_deny: Vec::new(),
+                write_deny_nested: Vec::new(),
+                read_allow: Vec::new(),
+                read_deny: Vec::new(),
+                socket_deny: Vec::new(),
+                cache_roots: Vec::new(),
+                temp_dir: PathBuf::from("/tmp/aft-test-sandbox"),
+            },
+            PathBuf::from("/bin/true"),
+        );
+        assert!(!should_capture_pipeline_status(
+            &launcher,
+            true,
+            Path::new("/bin/bash")
+        ));
+        assert!(should_capture_pipeline_status(
+            &SpawnPlan::Unsandboxed,
+            true,
+            Path::new("/bin/bash")
+        ));
+    }
+
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
 
