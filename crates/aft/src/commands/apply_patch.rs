@@ -959,7 +959,6 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
