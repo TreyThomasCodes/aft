@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+  "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -377,7 +377,7 @@
             }
           },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1061,7 +1061,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1286,7 +1286,7 @@
             }
           },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -2081,7 +2081,7 @@
       "profile_id": "REG-V049-PI-MIN",
       "harness": "pi",
       "host_version": {
-        "value": "0.82.0",
+        "value": "0.84.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -2090,7 +2090,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2272,7 +2272,7 @@
       "profile_id": "REG-V049-PI-REC",
       "harness": "pi",
       "host_version": {
-        "value": "0.82.0",
+        "value": "0.84.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -2281,7 +2281,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3240,7 +3240,7 @@
       "profile_id": "REG-V049-PI-ALL",
       "harness": "pi",
       "host_version": {
-        "value": "0.82.0",
+        "value": "0.84.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -3249,7 +3249,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "801346b18f0f6ccf769af375fad50249024ecd15",
+      "source_commit": "acb1d1d26113cc4e5bf0ee9e51e55e9bd64847d8",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
