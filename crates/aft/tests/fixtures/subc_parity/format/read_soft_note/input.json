@@ -11,7 +11,7 @@
   },
   "ctx": {
     "agent_args": {
-      "filePath": "README.md"
+      "path": "README.md"
     },
     "project_root": "<PROJECT_ROOT>"
   }
