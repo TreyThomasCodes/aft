@@ -195,9 +195,22 @@ mod tests {
             ]);
             unsafe {
                 command.pre_exec(move || {
-                    if libc::dup2(exit_fd, 3) < 0 || libc::dup2(status_fd, 5) < 0 {
+                    // Mirror apply_marker_fd_allowlist's two-step: a raw
+                    // dup2(fd, N) is a no-op when fd == N already, which keeps
+                    // the descriptor CLOEXEC and silently closes it at exec.
+                    // Parking above the target range first makes the final
+                    // dup2 a real copy that clears CLOEXEC.
+                    let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 6);
+                    let status_copy = libc::fcntl(status_fd, libc::F_DUPFD_CLOEXEC, 6);
+                    if exit_copy < 0
+                        || status_copy < 0
+                        || libc::dup2(exit_copy, 3) < 0
+                        || libc::dup2(status_copy, 5) < 0
+                    {
                         return Err(std::io::Error::last_os_error());
                     }
+                    libc::close(exit_copy);
+                    libc::close(status_copy);
                     Ok(())
                 });
             }
