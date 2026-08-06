@@ -93,7 +93,7 @@
 2. Translate tool arguments to command parameters -- `crates/aft/src/subc_translate.rs`. This includes resolving and normalizing path arguments. RFC 8089 `file:` URLs (e.g., `file:///path`, `file:/path`, or `file://localhost/path`) are percent-decoded using a byte-wise tolerant algorithm to ensure both the plugin-side permission check and the server-side resolution agree on the target filesystem path.
 3. Check edit permissions -- `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents). Under Pi, project-internal mutations apply without confirmation prompts, while external paths are validated by Rust path restrictions to avoid unanswered-prompt hangs.
 4. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
-5. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`. By default, edits return immediately without waiting for LSP diagnostics; pass `diagnostics: true` to enable synchronous wait for diagnostics, or run `aft_inspect` (diagnostics category) to check them asynchronously.
+5. Auto-format and optionally collect diagnostics after write -- `crates/aft/src/format.rs`, `crates/aft/src/context.rs`. By default, edits return immediately without waiting for LSP diagnostics; pass `diagnostics: true` to enable synchronous wait for diagnostics, or run `aft_inspect` (diagnostics category) to check them asynchronously. Post-write LSP notifications are best-effort against running servers to avoid cold starts.
 
 **Call-graph and navigation flow:**
 
@@ -187,7 +187,7 @@
 **BindTrust:**
 - Purpose: Enforce caller-identity (principal) trust levels on the subconscious routing daemon connection.
 - Location: `crates/aft/src/subc/mod.rs`
-- Pattern: Map route binds onto `FirstParty` or `Untrusted` levels by inspecting the caller's principal metadata. `Principal::Direct` and reserved `llm-runner`/`aft` module principals resolve to `FirstParty` trust. Other callers (e.g., facade `subc-mcp` module, unverified principal, or absent principal) map to `Untrusted` trust. `Untrusted` routes deny bash/shell executions, force project-root path restriction check validation even if globally disabled in user config, and block background task observation/wake replay.
+- Pattern: Map route binds onto `FirstParty` or `Untrusted` levels by inspecting the caller's principal metadata. `Principal::Direct` and reserved module principals (`llm-runner`, `aft`, `broca`, `alfonso-core`, `prefrontal`, `prefrontal-core`) resolve to `FirstParty` trust. Other callers (e.g., facade `subc-mcp` module, unverified principal, or absent principal) map to `Untrusted` trust. `Untrusted` routes deny bash/shell executions, force project-root path restriction check validation even if globally disabled in user config, and block background task observation/wake replay.
 
 **Tool groups (OpenCode):**
 - Purpose: Group related OpenCode tool definitions by capability surface.
