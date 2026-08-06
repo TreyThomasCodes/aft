@@ -630,6 +630,70 @@ fn background_output_preview_updates_and_completes() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn abort_inflight_leaves_explicit_background_and_pty_tasks_alive() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let background = spawn_bg(&mut aft, "abort-explicit-background", "sleep 5");
+    let background_status = status(&mut aft, &background);
+    let background_pid = background_status["child_pid"]
+        .as_u64()
+        .expect("background child pid") as i32;
+
+    let pty = spawn_bg_params(
+        &mut aft,
+        "abort-explicit-pty",
+        json!({
+            "command": "sleep 5",
+            "background": true,
+            "pty": true,
+        }),
+    );
+    let pty_status = status(&mut aft, &pty);
+    let pty_pid = pty_status["child_pid"].as_u64().expect("pty child pid") as i32;
+
+    let abort = aft.send(
+        &json!({
+            "id": "abort-no-foreground",
+            "command": "bash_abort_inflight",
+            "params": { "session_id": "spoofed-session" },
+        })
+        .to_string(),
+    );
+    assert_eq!(abort["success"], true, "abort failed: {abort:?}");
+    assert_eq!(
+        abort["killed"], 0,
+        "abort touched detached tasks: {abort:?}"
+    );
+    assert_eq!(status(&mut aft, &background)["status"], "running");
+    assert_eq!(status(&mut aft, &pty)["status"], "running");
+    assert!(
+        process_exists(background_pid),
+        "explicit background task was killed"
+    );
+    assert!(process_exists(pty_pid), "explicit PTY task was killed");
+
+    let _ = aft.send(
+        &json!({
+            "id": "cleanup-explicit-background",
+            "command": "bash_kill",
+            "params": { "task_id": background },
+        })
+        .to_string(),
+    );
+    let _ = aft.send(
+        &json!({
+            "id": "cleanup-explicit-pty",
+            "command": "bash_kill",
+            "params": { "task_id": pty },
+        })
+        .to_string(),
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn background_kill_running_task() {
     let mut aft = AftProcess::spawn();

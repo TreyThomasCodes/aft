@@ -1627,6 +1627,48 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
     expect(calls[3]?.params.filePath).toBe("created.ts");
   });
 
+  test("foreground bash abort calls bash_abort_inflight", async () => {
+    tmpDir = await makeTempDir();
+    const controller = new AbortController();
+    controller.abort();
+    const calls: SendCall[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown> = {}) => {
+        calls.push({ command, params });
+        if (command === "bash_abort_inflight") return { success: true, killed: 0 };
+        return { success: true, status: "completed", output: "ok", task_id: "bash-test" };
+      },
+    };
+    const pool = { getBridge: () => bridge } as unknown as BridgePool;
+    const tools = hoistedTools(createPluginContext(pool));
+    const runtime = { ...createMockSdkContext(tmpDir), abort: controller.signal } as ToolContext;
+
+    await tools.bash.execute({ command: "sleep 1", wait: true }, runtime);
+
+    expect(calls.map((call) => call.command)).toContain("bash_abort_inflight");
+  });
+
+  test("foreground bash completion removes the abort listener", async () => {
+    tmpDir = await makeTempDir();
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const bridge = {
+      send: async (command: string) => {
+        calls.push(command);
+        return { success: true, status: "completed", output: "ok", task_id: "bash-test" };
+      },
+    };
+    const pool = { getBridge: () => bridge } as unknown as BridgePool;
+    const tools = hoistedTools(createPluginContext(pool));
+    const runtime = { ...createMockSdkContext(tmpDir), abort: controller.signal } as ToolContext;
+
+    await tools.bash.execute({ command: "echo ok", wait: true }, runtime);
+    controller.abort();
+    await Promise.resolve();
+
+    expect(calls).toEqual(["bash"]);
+  });
+
   test("apply_patch passes server per-file diff metadata to the OpenCode renderer", async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);

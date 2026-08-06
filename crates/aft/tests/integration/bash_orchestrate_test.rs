@@ -394,3 +394,123 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
 
     assert!(aft.shutdown().success());
 }
+
+#[test]
+fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response() {
+    let mut aft = spawn_with_wait("5000");
+    let dir = tempfile::tempdir().unwrap();
+    configure_bash_background(&mut aft, &dir, 5_000);
+    let pid_file = dir.path().join("foreground.pid");
+    let command = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+    let session_id = "abort-session";
+
+    aft.send_silent(
+        &json!({
+            "id": "bash-abort-foreground",
+            "session_id": session_id,
+            "method": "bash",
+            "params": {
+                "command": command,
+                "foreground_orchestrate": true,
+                "wait": true,
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+
+    let started = Instant::now();
+    while !pid_file.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "foreground task did not start"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The body deliberately names another session. Raw command callers cannot
+    // retarget this cancellation because the server uses the bound session.
+    aft.send_silent(
+        &json!({
+            "id": "abort-inflight",
+            "session_id": session_id,
+            "command": "bash_abort_inflight",
+            "params": { "session_id": "wrong-session" },
+        })
+        .to_string(),
+    );
+
+    let mut abort_response = None;
+    let mut bash_response = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (abort_response.is_none() || bash_response.is_none()) && Instant::now() < deadline {
+        let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        if frame.get("type").is_some() {
+            continue;
+        }
+        match frame["id"].as_str() {
+            Some("abort-inflight") => abort_response = Some(frame),
+            Some("bash-abort-foreground") => bash_response = Some(frame),
+            _ => {}
+        }
+    }
+
+    let abort_response = abort_response.expect("abort response");
+    assert_eq!(
+        abort_response["success"], true,
+        "response: {abort_response:?}"
+    );
+    assert_eq!(abort_response["killed"], 1, "response: {abort_response:?}");
+    let bash_response = bash_response.expect("deferred bash response");
+    assert_eq!(
+        bash_response["success"], true,
+        "response: {bash_response:?}"
+    );
+    assert_eq!(
+        bash_response["status"], "killed",
+        "response: {bash_response:?}"
+    );
+    let task_id = bash_response["task_id"].as_str().expect("task id");
+
+    let status = aft.send(
+        &json!({
+            "id": "abort-status",
+            "session_id": session_id,
+            "command": "bash_status",
+            "params": { "task_id": task_id },
+        })
+        .to_string(),
+    );
+    assert_eq!(status["success"], true, "status: {status:?}");
+    assert_eq!(status["status"], "killed", "status: {status:?}");
+    assert_eq!(
+        status["status_reason"], "call_aborted",
+        "status: {status:?}"
+    );
+
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("foreground pid");
+    let started = Instant::now();
+    loop {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let alive = ps.status.success() && !String::from_utf8_lossy(&ps.stdout).contains('Z');
+        if !alive {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "pid {pid} survived abort"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(aft.shutdown().success());
+}
