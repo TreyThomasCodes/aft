@@ -1040,6 +1040,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         },
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
@@ -2420,6 +2421,17 @@ fn subc_bridge_bash_wait_true_waits_for_terminal() {
 }
 
 #[test]
+fn subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response",
+        Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(5_000)],
+        drive_bash_abort_inflight_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_wait_true_honors_short_timeout() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_wait_true_honors_short_timeout",
@@ -3093,6 +3105,75 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
     );
     assert!(text.contains("wait-late"), "unexpected bash text: {text:?}");
     assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_abort_inflight_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    send_tool_call(
+        &mut stream,
+        1,
+        130,
+        "bash",
+        json!({
+            "command": "sleep 30",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 5_000,
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        131,
+        "bash_abort_inflight",
+        json!({ "session_id": "spoofed-session" }),
+    )
+    .await;
+
+    let first = read_frame_timeout(&mut stream, "subc bash abort response").await;
+    let second = read_frame_timeout(&mut stream, "subc deferred killed response").await;
+    let (abort_frame, bash_frame) = if first.header.corr == 131 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(abort_frame.header.corr, 131);
+    let abort_response = tool_response_json(&abort_frame);
+    assert_eq!(
+        abort_response["success"], true,
+        "abort response: {abort_response}"
+    );
+    assert_eq!(
+        abort_response["killed"], 1,
+        "abort response: {abort_response}"
+    );
+
+    assert_eq!(bash_frame.header.corr, 130);
+    let bash_response = tool_response_json(&bash_frame);
+    assert_eq!(
+        bash_response["status"], "killed",
+        "bash response: {bash_response}"
+    );
+    let task_id = bash_response["task_id"].as_str().expect("killed task id");
+    send_tool_call(
+        &mut stream,
+        1,
+        132,
+        "bash_status",
+        json!({ "task_id": task_id }),
+    )
+    .await;
+    let status_frame = read_frame_timeout(&mut stream, "subc killed status").await;
+    let status_response = tool_response_json(&status_frame);
+    assert_eq!(status_response["status"], "killed");
+    assert_eq!(status_response["status_reason"], "call_aborted");
     send_connection_goodbye(&mut stream).await;
 }
 

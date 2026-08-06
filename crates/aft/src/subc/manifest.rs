@@ -51,6 +51,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// `configure`-bypass hole the gate exists to close. The untrusted-bind bash
 /// denial fires BEFORE this allowlist (`is_bash_family_tool` matches every
 /// `bash_*` name), so untrusted binds still cannot observe bash state:
+/// - `bash_abort_inflight`: abort-only per-session cancellation of foreground
+///   bash calls that are still wait-registered; explicit background and PTY
+///   tasks are not registered and are therefore untouched.
 /// - `bash_status`: read-only per-session task snapshot; required so a
 ///   respawned module can report rehydrated detached tasks by task id.
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
@@ -71,7 +74,8 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
-        "bash_status"
+        "bash_abort_inflight"
+            | "bash_status"
             | "bash_drain_completions"
             | "bash_ack_completions"
             | "undo_preview"
@@ -124,6 +128,7 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => Lane::HeavyInit,
 
         "bash"
+        | "bash_abort_inflight"
         | "bash_ack_completions"
         | "bash_notify"
         | "bash_unnotify"

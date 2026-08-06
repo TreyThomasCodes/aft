@@ -49,6 +49,30 @@ function orchestratedTransportTimeoutMs(
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
 }
 
+function listenForForegroundAbort(
+  ctx: PluginContext,
+  runtime: ToolContext,
+  enabled: boolean,
+): () => void {
+  if (!enabled) return () => {};
+
+  let fired = false;
+  const onAbort = () => {
+    if (fired) return;
+    fired = true;
+    // Match OpenCode's built-in ShellTool abort path: packages/opencode/src/tool/shell.ts:533-550
+    // calls its child handle.kill() when ctx.abort fires. Pi exposes a different abort
+    // surface, so this parity hook is intentionally OpenCode-only for now.
+    void callBashBridge(ctx, runtime, "bash_abort_inflight").catch(() => {
+      // The host may already be tearing down the transport; abort cleanup is best-effort.
+    });
+  };
+
+  runtime.abort.addEventListener("abort", onAbort, { once: true });
+  if (runtime.abort.aborted) onAbort();
+  return () => runtime.abort.removeEventListener("abort", onAbort);
+}
+
 /**
  * Agent-facing tool description, selected from the live configuration so it
  * never advertises behavior this project doesn't have:
@@ -350,41 +374,51 @@ export function createBashTool(
         { env: {} },
       );
 
-      const data = await withPermissionLoop(
+      const removeAbortListener = listenForForegroundAbort(
         ctx,
         context,
-        {
-          command,
-          timeout: effectiveTimeout,
-          workdir: args.workdir,
-          env: shellEnv?.env ?? {},
-          description,
-          background: effectiveBackground,
-          notify_on_completion: effectiveBackground,
-          compressed,
-          pty: requestedPty,
-          pty_rows: ptyRows,
-          pty_cols: ptyCols,
-          permissions_requested: true,
-          foreground_orchestrate: true,
-          block_to_completion: blockToCompletion,
-          wait: requestedWait,
-          sandbox: args.sandbox,
-        },
-        callBashBridge,
-        {
-          transportTimeoutMs: orchestratedTransportTimeoutMs(
-            blockToCompletion,
-            requestedWait,
-            effectiveTimeout,
-            foregroundWaitMs,
-          ),
-          onProgress: ({ text }) => {
-            accumulatedOutput = preview(accumulatedOutput + text);
-            metadata?.({ output: accumulatedOutput, description });
-          },
-        },
+        !effectiveBackground && !requestedPty,
       );
+      let data: Awaited<ReturnType<typeof withPermissionLoop>>;
+      try {
+        data = await withPermissionLoop(
+          ctx,
+          context,
+          {
+            command,
+            timeout: effectiveTimeout,
+            workdir: args.workdir,
+            env: shellEnv?.env ?? {},
+            description,
+            background: effectiveBackground,
+            notify_on_completion: effectiveBackground,
+            compressed,
+            pty: requestedPty,
+            pty_rows: ptyRows,
+            pty_cols: ptyCols,
+            permissions_requested: true,
+            foreground_orchestrate: true,
+            block_to_completion: blockToCompletion,
+            wait: requestedWait,
+            sandbox: args.sandbox,
+          },
+          callBashBridge,
+          {
+            transportTimeoutMs: orchestratedTransportTimeoutMs(
+              blockToCompletion,
+              requestedWait,
+              effectiveTimeout,
+              foregroundWaitMs,
+            ),
+            onProgress: ({ text }) => {
+              accumulatedOutput = preview(accumulatedOutput + text);
+              metadata?.({ output: accumulatedOutput, description });
+            },
+          },
+        );
+      } finally {
+        removeAbortListener();
+      }
 
       if (data.success === false) {
         throw new Error((data.message as string) || "bash failed");

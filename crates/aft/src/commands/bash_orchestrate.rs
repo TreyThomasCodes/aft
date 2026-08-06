@@ -135,8 +135,11 @@ pub fn build_bash_outcome(
     let session_id = req.session().to_string();
     let attach_command = "bash".to_string();
     let detach_on_user_message = params.wait;
+    ctx.bash_background()
+        .register_foreground_task(&session_id, &task_id);
     if detach_on_user_message {
-        ctx.bash_background().begin_wait_mode_session(&session_id);
+        ctx.bash_background()
+            .begin_wait_mode_session(&session_id, &task_id);
     }
     let wait_window_ms = select_foreground_wait_window_ms(
         ctx.config().foreground_wait_window_ms,
@@ -204,9 +207,14 @@ pub fn build_bash_outcome(
             ))
         };
 
-        if response.is_some() && detach_on_user_message {
-            ctx.bash_background()
-                .end_wait_mode_session(&session_id_for_cleanup);
+        if response.is_some() {
+            if detach_on_user_message {
+                ctx.bash_background()
+                    .end_wait_mode_session(&session_id_for_cleanup, &task_id_for_poll);
+            } else {
+                ctx.bash_background()
+                    .unregister_foreground_task(&session_id_for_cleanup, &task_id_for_poll);
+            }
         }
         response
     });

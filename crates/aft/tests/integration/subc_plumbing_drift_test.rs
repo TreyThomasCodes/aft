@@ -15,6 +15,7 @@ use aft::subc::is_tool_call_admitted_for_test;
 /// Sourced from the plugins' `send("...")` call sites (production code only,
 /// not tests). Keep in sync when adding plugin bridge calls.
 const PLUGIN_NATIVE_SENDS: &[&str] = &[
+    "bash_abort_inflight",
     "bash_status",
     "bash_drain_completions",
     "bash_ack_completions",

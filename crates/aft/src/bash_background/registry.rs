@@ -257,6 +257,7 @@ pub(crate) struct RegistryInner {
     pub(crate) watch_registry: Mutex<WatchRegistry>,
     wait_detach_sessions: Mutex<HashSet<String>>,
     active_wait_sessions: Mutex<HashMap<String, usize>>,
+    wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 pub(crate) struct BgTask {
@@ -329,6 +330,7 @@ impl BgTaskRegistry {
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
+                wait_registered_tasks: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -450,17 +452,38 @@ impl BgTaskRegistry {
         Arc::clone(&self.inner.compression_aggregates)
     }
 
-    pub fn begin_wait_mode_session(&self, session_id: &str) {
+    pub fn register_foreground_task(&self, session_id: &str, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.wait_registered_tasks.lock() {
+            tasks
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(task_id.to_string());
+        }
+    }
+
+    pub fn begin_wait_mode_session(&self, session_id: &str, task_id: &str) {
         if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
             *active.entry(session_id.to_string()).or_insert(0) += 1;
         }
+        self.register_foreground_task(session_id, task_id);
         if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
             detach.remove(session_id);
         }
     }
 
-    pub fn end_wait_mode_session(&self, session_id: &str) {
-        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
+    pub fn unregister_foreground_task(&self, session_id: &str, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.wait_registered_tasks.lock() {
+            if let Some(session_tasks) = tasks.get_mut(session_id) {
+                session_tasks.remove(task_id);
+                if session_tasks.is_empty() {
+                    tasks.remove(session_id);
+                }
+            }
+        }
+    }
+
+    pub fn end_wait_mode_session(&self, session_id: &str, task_id: &str) {
+        let no_active_wait = if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
             match active.get_mut(session_id) {
                 Some(count) if *count > 1 => *count -= 1,
                 Some(_) => {
@@ -468,10 +491,61 @@ impl BgTaskRegistry {
                 }
                 None => {}
             }
+            !active.contains_key(session_id)
+        } else {
+            false
+        };
+        self.unregister_foreground_task(session_id, task_id);
+        if no_active_wait {
+            if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
+                detach.remove(session_id);
+            }
+        }
+    }
+
+    /// Kill the foreground bash task(s) still registered for an in-flight
+    /// call. Explicit background and PTY tasks are never registered
+    /// here, so an abort cannot affect those deliberately detached tasks.
+    pub fn abort_inflight(&self, session_id: &str) -> Result<usize, String> {
+        let task_ids = self
+            .inner
+            .wait_registered_tasks
+            .lock()
+            .map(|mut tasks| tasks.remove(session_id).unwrap_or_default())
+            .map_err(|_| "wait registration lock poisoned".to_string())?;
+        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
+            active.remove(session_id);
         }
         if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
             detach.remove(session_id);
         }
+
+        let mut killed = 0;
+        for task_id in task_ids {
+            let Some(task) = self.task_for_session(&task_id, session_id) else {
+                continue;
+            };
+            let is_terminal = task
+                .state
+                .lock()
+                .map(|state| state.metadata.status.is_terminal())
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if is_terminal {
+                continue;
+            }
+            let snapshot = self.kill_with_status_reason(
+                &task_id,
+                session_id,
+                BgTaskStatus::Killed,
+                Some("call_aborted".to_string()),
+            )?;
+            if snapshot.info.status == BgTaskStatus::Killed
+                && snapshot.info.status_reason.as_deref() == Some("call_aborted")
+            {
+                killed += 1;
+            }
+        }
+        Ok(killed)
     }
 
     pub fn signal_wait_mode_detach(&self, session_id: &str) -> bool {

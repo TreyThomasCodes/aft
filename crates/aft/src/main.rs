@@ -674,6 +674,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "echo" => handle_echo(&req),
         "tool_call" => aft::commands::tool_call::handle(&req, ctx),
         "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),

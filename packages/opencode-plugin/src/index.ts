@@ -1089,7 +1089,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       await autoUpdateEventHook(eventInput);
       const eventType = eventInput.event.type;
       const sessionID = extractSessionID(eventInput.event.properties);
-      if ((eventType === "session.deleted" || eventType === "session.shutdown") && sessionID) {
+      // OpenCode's lifecycle vocabulary publishes session.deleted for explicit
+      // remove() cleanup, not session.shutdown. Deletion-only cleanup is enough:
+      // transport idle eviction and connection-exit quiesce handle abandoned
+      // sessions, while in-flight bash aborts now use bash_abort_inflight.
+      if (eventType === "session.deleted" && sessionID) {
         inspectTier2Idle.clear(sessionID);
         clearStatusBarSession(sessionID);
         // Release this session's transport routes (subc: tool + bg_events;

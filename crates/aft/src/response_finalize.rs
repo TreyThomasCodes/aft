@@ -94,6 +94,7 @@ pub fn attach_bg_completions(
     if matches!(
         command,
         "configure"
+            | "bash_abort_inflight"
             | "bash_status"
             | "bash_write"
             | "bash_promote"
@@ -154,6 +155,7 @@ pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &st
             | "ping"
             | "version"
             | "status"
+            | "bash_abort_inflight"
             | "bash_status"
             | "bash_write"
             | "bash_promote"

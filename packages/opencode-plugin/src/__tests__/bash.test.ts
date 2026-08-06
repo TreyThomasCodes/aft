@@ -624,6 +624,51 @@ describe("OpenCode bash adapter", () => {
     });
   });
 
+  test("already-aborted foreground signal best-effort aborts the in-flight call", async () => {
+    const { calls, tool: bash } = createHarness((command) =>
+      command === "bash_abort_inflight"
+        ? { success: true, killed: 1 }
+        : {
+            success: true,
+            status: "completed",
+            task_id: "task-aborted",
+            exit_code: 0,
+            output: "done",
+            truncated: false,
+          },
+    );
+    const controller = new AbortController();
+    controller.abort();
+
+    await bash.execute({ command: "sleep 30" }, createMockSdkContext({ abort: controller.signal }));
+
+    expect(calls.map((call) => call.command)).toContain("bash_abort_inflight");
+    expect(calls.find((call) => call.command === "bash_abort_inflight")?.params).toMatchObject({
+      session_id: "test-session",
+    });
+  });
+
+  test("normal foreground completion does not fire the abort cleanup call", async () => {
+    const { calls, tool: bash } = createHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: "task-completed",
+      exit_code: 0,
+      output: "done",
+      truncated: false,
+    }));
+    const controller = new AbortController();
+
+    await bash.execute(
+      { command: "echo done" },
+      createMockSdkContext({ abort: controller.signal }),
+    );
+    controller.abort();
+    await Promise.resolve();
+
+    expect(calls.map((call) => call.command)).toEqual(["bash"]);
+  });
+
   test("foreground command returns server-orchestrated inline output without client polling", async () => {
     const { calls, tool: bash } = createHarness(() => ({
       success: true,
