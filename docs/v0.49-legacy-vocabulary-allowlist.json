@@ -188,8 +188,8 @@
     },
     {
       "path": "crates/aft/src/compress/mod.rs",
-      "location": "line 1906, column 19",
-      "line": 1906,
+      "location": "line 2026, column 19",
+      "line": 2026,
       "column": 19,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -287,8 +287,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2152, column 23",
-      "line": 2152,
+      "location": "line 2169, column 23",
+      "line": 2169,
       "column": 23,
       "token": "toFile",
       "class": "rust-compatibility",
@@ -296,8 +296,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2154, column 45",
-      "line": 2154,
+      "location": "line 2171, column 45",
+      "line": 2171,
       "column": 45,
       "token": "toFile",
       "class": "rust-compatibility",
