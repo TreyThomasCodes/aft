@@ -192,11 +192,11 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.49.1";
+const ANNOUNCEMENT_VERSION = "0.49.2";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Windows: language servers spawn again under extended-length paths, config edits reach running servers, and dead-code/diagnostics results no longer silently drop — one canonical path form across the LSP and inspect surface.",
-  "Faster answers under load: completed bash commands respond immediately instead of waiting behind background maintenance (thanks @hheei), and chained commands like `cargo test && ...` keep every command's output.",
-  "Permission rules with absolute paths outside the project root now match (thanks @iceteaSA), and slow embedding providers get a clear timeout message naming the setting that raises the budget.",
+  "No more zombie tasks: background commands die with their session — reclaimed worktrees and aborted calls both terminate their process groups, while deliberately backgrounded tasks keep surviving restarts.",
+  "aft_inspect stops crying wolf: diagnostics from a still-warming analyzer no longer count as errors (rust-analyzer's readiness signal is now consumed), so E-counts match what the compiler actually says.",
+  "Piped commands can't hide failures: when an upstream command fails behind a successful pipe tail, the output says so. Plus zoom into nested JSON paths, range hints on large reads, and better edit errors (thanks @iceteaSA).",
 ];
 
 /**
