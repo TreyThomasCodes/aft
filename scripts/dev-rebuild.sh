@@ -85,7 +85,10 @@ chmod +x "$BINARY_PATH"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> ad-hoc signing for macOS"
-  codesign --force --sign - "$BINARY_PATH"
+  # Pin the signing identifier to the deploy name: the default identifier is
+  # content-derived (name + hash), so every rebuild mints a new one and any
+  # macOS grant keyed to the identifier (TCC etc.) silently dies per stage.
+  codesign --force --sign - --identifier "$(basename "$BINARY_PATH")" "$BINARY_PATH"
 fi
 echo
 

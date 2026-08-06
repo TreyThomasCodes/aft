@@ -362,7 +362,9 @@ if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/
   # ad-hoc re-sign it — mirroring dev-rebuild.sh — or the running session's
   # next bridge spawn dies with "Binary killed by SIGKILL".
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    codesign --force --sign - "$CACHE_DIR/$TAG/aft" 2>/dev/null || true
+    # --identifier pins the signing identity to the file name; the default is
+    # content-derived, so identifier-keyed macOS grants die on every release.
+    codesign --force --sign - --identifier aft "$CACHE_DIR/$TAG/aft" 2>/dev/null || true
   fi
   echo "  Updated $CACHE_DIR/$TAG/aft"
 fi
