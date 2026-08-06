@@ -170,6 +170,54 @@ describe("edit boundary preparation", () => {
       },
       error: "exactly one of",
     },
+    {
+      label: "whole-schema sentinel report resolves to appendContent",
+      input: {
+        path: "src/example.ts",
+        symbol: "",
+        content: "",
+        appendContent: "CONTENT IT APPENDS",
+        edits: [
+          {
+            oldString: "",
+            newString: "",
+            replaceAll: false,
+            occurrence: 1,
+            startLine: 1,
+            endLine: 1,
+            content: "",
+          },
+        ],
+      },
+      expected: { path: "src/example.ts", appendContent: "CONTENT IT APPENDS" },
+    },
+    {
+      label: "sentinel item alongside a real item keeps the real item",
+      input: {
+        path: "src/example.ts",
+        edits: [
+          { oldString: "", newString: "", content: "" },
+          { oldString: "before", newString: "after" },
+        ],
+      },
+      expected: { path: "src/example.ts", edits: [{ oldString: "before", newString: "after" }] },
+    },
+    {
+      label: "line-range delete item is never treated as a sentinel",
+      input: {
+        path: "src/example.ts",
+        edits: [{ startLine: 1, endLine: 1, content: "" }],
+      },
+      expected: { path: "src/example.ts", edits: [{ startLine: 1, endLine: 1, content: "" }] },
+    },
+    {
+      label: "empty-old with real replacement is kept for the batch error",
+      input: {
+        path: "src/example.ts",
+        edits: [{ oldString: "", newString: "real" }],
+      },
+      expected: { path: "src/example.ts", edits: [{ oldString: "", newString: "real" }] },
+    },
   ];
 
   for (const { label, input, expected, error } of meaningfulModeCases) {

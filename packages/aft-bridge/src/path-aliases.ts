@@ -305,11 +305,14 @@ export function prepareCanonicalEditArguments(
     );
   }
   if (modes.length > 1) {
-    throw new InvalidRequestError(`edit: conflicting modes: ${modes.join(", ")}`);
+    throw new InvalidRequestError(
+      `edit: conflicting modes: ${modes.join(", ")}. ` + OMIT_OPTIONAL_FIELDS_STEERING,
+    );
   }
   if (modes.length === 0) {
     throw new InvalidRequestError(
-      "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required",
+      "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. " +
+        OMIT_OPTIONAL_FIELDS_STEERING,
     );
   }
 
@@ -394,7 +397,7 @@ function editModesPresent(record: Record<string, unknown>): string[] {
   const hasAppendContent = isNonEmptyString(record.appendContent);
   if (!hasAppendContent) delete record.appendContent;
 
-  const hasEdits = isNonEmptyEditArray(record.edits);
+  const hasEdits = normalizeEditArraySentinels(record);
   if (!hasEdits) delete record.edits;
 
   const hasSymbol = isNonEmptyString(record.symbol);
@@ -426,12 +429,55 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function isNonEmptyEditArray(value: unknown): boolean {
-  if (Array.isArray(value)) return value.length > 0;
+const OMIT_OPTIONAL_FIELDS_STEERING =
+  "Omit unused optional fields entirely; do not send empty strings or empty arrays for them.";
+
+/**
+ * An edits item is a serialization sentinel when the host emitted every
+ * optional field with a type-default value and put the real payload in a
+ * sibling field. Such an item carries no real edit intent and must not claim
+ * the `edits` mode.
+ *
+ * A pure line-range item ({startLine,endLine,content}) has no `oldString` key,
+ * so it is never a sentinel even when `content` is "" (deleting lines is real
+ * intent). A real replacement has a non-empty `oldString`, so it is never a
+ * sentinel. `{oldString:"", newString:"non-empty"}` is deliberately NOT a
+ * sentinel: it is kept so the batch parser reports its specific empty-match
+ * error instead of silently discarding a broken but intentional edit.
+ */
+function isEditSentinelItem(item: unknown): boolean {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+  const record = item as Record<string, unknown>;
+  if (record.oldString !== "") return false;
+  const newStringEmpty =
+    !hasOwn(record, "newString") || record.newString === "" || record.newString === null;
+  if (!newStringEmpty) return false;
+  return !hasOwn(record, "content") || record.content === "" || record.content === null;
+}
+
+/**
+ * Filter serialization-sentinel items out of the edits array (or its
+ * stringified form) and rewrite `record.edits` to the survivors. Returns
+ * whether any real edit items remain, i.e. whether the edits mode is still
+ * claimed. A non-empty malformed string (or a non-array root) stays an edits
+ * claim so the existing parser can report its specific validation error.
+ */
+function normalizeEditArraySentinels(record: Record<string, unknown>): boolean {
+  const value = record.edits;
+  if (Array.isArray(value)) {
+    const survivors = value.filter((item) => !isEditSentinelItem(item));
+    if (survivors.length === 0) return false;
+    record.edits = survivors;
+    return true;
+  }
   if (typeof value !== "string" || value.length === 0) return false;
   try {
     const parsed: unknown = JSON.parse(value);
-    return !Array.isArray(parsed) || parsed.length > 0;
+    if (!Array.isArray(parsed)) return true;
+    const survivors = parsed.filter((item) => !isEditSentinelItem(item));
+    if (survivors.length === 0) return false;
+    record.edits = survivors;
+    return true;
   } catch {
     // A non-empty malformed string is still an edits claim so the existing
     // parser can report its specific validation error instead of no-mode.

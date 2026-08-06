@@ -191,7 +191,7 @@ fn edit_contract_translation_preserves_exact_code_then_message() {
         (
             "no-mode",
             json!({"path": "src/main.ts"}),
-            "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required",
+            "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
         ),
         (
             "top-level-start-line",
