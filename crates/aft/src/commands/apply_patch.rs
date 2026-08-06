@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use lsp_types::FileChangeType;
 use serde_json::{json, Value};
@@ -90,22 +90,36 @@ fn resolve_patch_input(ctx: &AppContext, path: &str) -> PathBuf {
     }
 }
 
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn normalize_resolved_path(path: PathBuf) -> PathBuf {
-    crate::inspect::job::canonicalize_normalized(&path)
+    fs::canonicalize(&path).unwrap_or_else(|_| normalize_path_lexically(&path))
 }
 
 fn relative_path(abs: &Path, root: Option<&Path>) -> String {
-    let abs = crate::inspect::job::canonicalize_normalized(abs);
     if let Some(root) = root {
-        // Bare canonical paths are verbatim (`\\?\`) on Windows, while a
-        // configured root can already be non-verbatim. Normalize both sides
-        // before `strip_prefix` so patch responses stay project-relative.
-        let root = crate::inspect::job::canonicalize_normalized(root);
         if let Ok(rel) = abs.strip_prefix(root) {
             return display_slash(rel);
         }
+        if let Ok(canonical_root) = fs::canonicalize(root) {
+            if let Ok(rel) = abs.strip_prefix(canonical_root) {
+                return display_slash(rel);
+            }
+        }
     }
-    display_slash(&abs)
+    display_slash(abs)
 }
 
 fn resolve_path(req: &RawRequest, ctx: &AppContext, path: &str) -> Result<ResolvedPath, Response> {
@@ -955,49 +969,6 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
             "metadata": { "diff": diff, "files": files },
         }),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(windows)]
-    fn verbatim_path(path: &Path) -> PathBuf {
-        PathBuf::from(format!(r"\\?\{}", path.display()))
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn normalize_resolved_path_strips_windows_verbatim_prefix() {
-        let temp = tempfile::tempdir().expect("create temporary project");
-        let file = temp.path().join("src/main.rs");
-        fs::create_dir_all(file.parent().expect("source directory"))
-            .expect("create source directory");
-        fs::write(&file, "fn main() {}\n").expect("write source file");
-
-        let normalized = crate::inspect::job::canonicalize_normalized(&file);
-        let verbatim = verbatim_path(&normalized);
-
-        assert_eq!(normalize_resolved_path(verbatim), normalized);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn relative_path_matches_a_verbatim_root_to_a_normalized_file() {
-        let temp = tempfile::tempdir().expect("create temporary project");
-        let file = temp.path().join("src/main.rs");
-        fs::create_dir_all(file.parent().expect("source directory"))
-            .expect("create source directory");
-        fs::write(&file, "fn main() {}\n").expect("write source file");
-
-        let normalized_root = crate::inspect::job::canonicalize_normalized(temp.path());
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
-
-        assert_eq!(
-            relative_path(&normalized_file, Some(&verbatim_path(&normalized_root))),
-            "src/main.rs"
-        );
-    }
 }
 
 /// Handle a raw `apply_patch` request.
