@@ -243,7 +243,9 @@ maybeDescribe("e2e read command", () => {
     const result = await executeReadTool(h, { filePath: "large-hoisted.txt" });
 
     expect(result.output).toContain("output truncated at 50KB");
-    expect(result.output).toContain("Use startLine/endLine or offset/limit to read other sections.");
+    expect(result.output).toContain(
+      "Use startLine/endLine or offset/limit to read other sections.",
+    );
   });
 
   test("hoisted read tool preserves image and PDF attachments while using server text", async () => {

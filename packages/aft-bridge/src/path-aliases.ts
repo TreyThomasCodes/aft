@@ -306,7 +306,7 @@ export function prepareCanonicalEditArguments(
   }
   if (modes.length > 1) {
     throw new InvalidRequestError(
-      `edit: conflicting modes: ${modes.join(", ")}. ` + OMIT_OPTIONAL_FIELDS_STEERING,
+      `edit: conflicting modes: ${modes.join(", ")}. ${OMIT_OPTIONAL_FIELDS_STEERING}`,
     );
   }
   if (modes.length === 0) {
