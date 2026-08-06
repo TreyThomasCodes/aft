@@ -119,18 +119,31 @@ function diagnosticsSummaryPart(summary: Record<string, unknown> | undefined): s
   const hasCounts = [errors, warnings, info, hints].some((value) => value !== undefined);
   const counts = `${errors ?? 0} errors/${warnings ?? 0} warnings/${info ?? 0} info/${hints ?? 0} hints`;
   const status = asString(section.status);
+  const provisionalCounts = asRecord(section.provisional_counts);
+  const provisionalValues = provisionalCounts
+    ? [
+        asNumber(provisionalCounts.errors),
+        asNumber(provisionalCounts.warnings),
+        asNumber(provisionalCounts.info),
+        asNumber(provisionalCounts.hints),
+      ]
+    : [];
+  const provisionalText = provisionalCounts
+    ? ` (${provisionalValues[0] ?? 0} errors/${provisionalValues[1] ?? 0} warnings/${provisionalValues[2] ?? 0} info/${provisionalValues[3] ?? 0} hints)`
+    : "";
+  const provisionalFraming = `provisional — analyzer not ready; counts excluded from E/W${provisionalText}`;
 
-  // Partial result: show counts-so-far alongside the pending/incomplete signal
-  // so already-found diagnostics aren't hidden behind a bare sentinel.
+  // Partial result: keep the leads visible, but make it impossible to read
+  // their counts as authoritative compiler health.
   if (status === "pending") {
-    return hasCounts
-      ? `diagnostics ${counts} so far — still pending (servers: ${diagnosticsServerSummary(section)}); wait for the LSP update and use the next normal aft_inspect, not repeated polling`
-      : `diagnostics pending (servers: ${diagnosticsServerSummary(section)}); wait for the LSP update and use the next normal aft_inspect, not repeated polling`;
+    return `diagnostics ${provisionalFraming} — still pending (servers: ${diagnosticsServerSummary(section)}); wait for the LSP update and use the next normal aft_inspect, not repeated polling`;
   }
   if (status === "incomplete") {
-    return hasCounts
-      ? `diagnostics ${counts} (incomplete — servers: ${diagnosticsServerSummary(section)})`
-      : `diagnostics unavailable (status incomplete; servers: ${diagnosticsServerSummary(section)})`;
+    return `diagnostics ${provisionalFraming} (incomplete — servers: ${diagnosticsServerSummary(section)})`;
+  }
+
+  if (provisionalCounts) {
+    return `diagnostics ${provisionalFraming}`;
   }
 
   if (hasCounts) {
@@ -151,11 +164,21 @@ function diagnosticLocation(diagnostic: Record<string, unknown>): string {
 
 function diagnosticsDetailSection(
   details: Record<string, unknown> | undefined,
+  summary: Record<string, unknown> | undefined,
 ): string | undefined {
   const diagnostics = asRecords(details?.diagnostics);
   if (diagnostics.length === 0) return undefined;
 
-  const lines = ["diagnostics"];
+  const diagnosticsSummary = asRecord(summary?.diagnostics);
+  const provisional =
+    asString(diagnosticsSummary?.status) === "pending" ||
+    asString(diagnosticsSummary?.status) === "incomplete" ||
+    asRecord(diagnosticsSummary?.provisional_counts) !== undefined;
+  const lines = [
+    provisional
+      ? "diagnostics (provisional — analyzer not ready; counts excluded from E/W)"
+      : "diagnostics",
+  ];
   for (const diagnostic of diagnostics) {
     const severity = asString(diagnostic.severity) ?? "information";
     const message = asString(diagnostic.message) ?? "(no message)";
@@ -338,7 +361,7 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
         ? `details: ${names.join(", ")}`
         : theme.fg("muted", "No drill-down details returned."),
     );
-    const diagnosticsDetails = diagnosticsDetailSection(details);
+    const diagnosticsDetails = diagnosticsDetailSection(details, summary);
     if (diagnosticsDetails) sections.push(diagnosticsDetails);
   }
 

@@ -37,9 +37,15 @@ use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 const INSPECT_DIAGNOSTICS_DEADLINE: Duration = Duration::from_secs(8);
 const SCOPED_FILE_CAP: usize = 200;
 
+#[derive(Debug, Clone)]
+struct CollectedDiagnostic {
+    diagnostic: StoredDiagnostic,
+    provisional: bool,
+}
+
 #[derive(Default)]
 struct DiagnosticsCollection {
-    diagnostics: Vec<StoredDiagnostic>,
+    diagnostics: Vec<CollectedDiagnostic>,
     server_ran: bool,
     servers_pending: BTreeSet<String>,
     servers_not_installed: BTreeSet<String>,
@@ -126,12 +132,27 @@ fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> Dia
                     .map(|key| server_id(&key)),
             );
         }
-        collection.diagnostics = lsp.get_all_diagnostics().into_iter().cloned().collect();
+        collection.servers_pending.extend(
+            lsp.provisional_server_keys()
+                .into_iter()
+                .map(|key| server_id(&key)),
+        );
+        collection.diagnostics = lsp
+            .get_all_diagnostics_with_provisional()
+            .into_iter()
+            .map(|(diagnostic, provisional)| CollectedDiagnostic {
+                diagnostic: diagnostic.clone(),
+                provisional,
+            })
+            .collect();
     }
 
     collection.diagnostics.retain(|diagnostic| {
-        diagnostic.file.starts_with(&snapshot.project_root)
-            && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
+        diagnostic
+            .diagnostic
+            .file
+            .starts_with(&snapshot.project_root)
+            && !tsconfig_membership.should_skip_diagnostics(&diagnostic.diagnostic.file)
     });
     collection.sort_and_dedup();
     collection
@@ -187,6 +208,12 @@ fn collect_scoped_diagnostics_until(
 
     collection.diagnostics =
         scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
+    collection.servers_pending.extend(
+        ctx.lsp()
+            .provisional_server_keys()
+            .into_iter()
+            .map(|key| server_id(&key)),
+    );
     collection.sort_and_dedup();
     drop(opened_documents);
     collection
@@ -361,7 +388,7 @@ fn scoped_warm_diagnostics(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     tsconfig_membership: &mut TsconfigMembershipCache,
-) -> Vec<StoredDiagnostic> {
+) -> Vec<CollectedDiagnostic> {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
     } else {
@@ -372,18 +399,24 @@ fn scoped_warm_diagnostics(
     roots
         .iter()
         .flat_map(|root| {
-            if root.is_file() {
-                lsp.get_diagnostics_for_file(root)
+            let diagnostics = if root.is_file() {
+                lsp.get_diagnostics_for_file_with_provisional(root)
             } else {
-                lsp.get_diagnostics_for_directory(root)
-            }
+                lsp.get_diagnostics_for_directory_with_provisional(root)
+            };
+            diagnostics
+                .into_iter()
+                .filter(|(diagnostic, _)| {
+                    scope.contains(&diagnostic.file)
+                        && diagnostic.file.starts_with(&snapshot.project_root)
+                        && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
+                })
+                .map(|(diagnostic, provisional)| CollectedDiagnostic {
+                    diagnostic: diagnostic.clone(),
+                    provisional,
+                })
+                .collect::<Vec<_>>()
         })
-        .filter(|diagnostic| {
-            scope.contains(&diagnostic.file)
-                && diagnostic.file.starts_with(&snapshot.project_root)
-                && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
-        })
-        .cloned()
         .collect()
 }
 
@@ -477,7 +510,9 @@ fn scoped_lsp_files(
 impl DiagnosticsCollection {
     fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
         self.sort_and_dedup();
-        let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
+        let authoritative = severity_counts(&self.diagnostics);
+        let all = severity_counts_including_provisional(&self.diagnostics);
+        let provisional_only = severity_counts_provisional_only(&self.diagnostics);
         let complete = self.server_ran
             && self.servers_pending.is_empty()
             && self.servers_not_installed.is_empty()
@@ -489,13 +524,26 @@ impl DiagnosticsCollection {
             &self.servers_pending,
             self.files_without_server,
         );
+        let counts_are_provisional = matches!(status, Some("incomplete" | "pending"));
+        let (errors, warnings, info, hints) = if counts_are_provisional {
+            (0, 0, 0, 0)
+        } else {
+            authoritative
+        };
+        let provisional_counts = if counts_are_provisional {
+            Some(all)
+        } else if provisional_only != (0, 0, 0, 0) {
+            Some(provisional_only)
+        } else {
+            None
+        };
         let items = self
             .diagnostics
             .iter()
             .map(|diagnostic| diagnostic_item(snapshot, diagnostic))
             .collect::<Vec<_>>();
 
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "errors": errors,
             "warnings": warnings,
             "info": info,
@@ -507,30 +555,43 @@ impl DiagnosticsCollection {
             "servers_not_installed": self.servers_not_installed.into_iter().collect::<Vec<_>>(),
             "files_without_server": self.files_without_server,
             "items": items,
-        })
+        });
+        if let Some((errors, warnings, info, hints)) = provisional_counts {
+            payload["provisional_counts"] = serde_json::json!({
+                "errors": errors,
+                "warnings": warnings,
+                "info": info,
+                "hints": hints,
+            });
+        }
+        payload
     }
 
     fn sort_and_dedup(&mut self) {
         self.diagnostics.sort_by(|left, right| {
-            left.file
-                .cmp(&right.file)
-                .then(left.line.cmp(&right.line))
-                .then(left.column.cmp(&right.column))
-                .then(left.end_line.cmp(&right.end_line))
-                .then(left.end_column.cmp(&right.end_column))
-                .then(left.severity.as_str().cmp(right.severity.as_str()))
-                .then(left.message.cmp(&right.message))
-                .then(left.source.cmp(&right.source))
+            left.diagnostic
+                .file
+                .cmp(&right.diagnostic.file)
+                .then(left.diagnostic.line.cmp(&right.diagnostic.line))
+                .then(left.diagnostic.column.cmp(&right.diagnostic.column))
+                .then(left.diagnostic.end_line.cmp(&right.diagnostic.end_line))
+                .then(left.diagnostic.end_column.cmp(&right.diagnostic.end_column))
+                .then(left.diagnostic.severity.as_str().cmp(right.diagnostic.severity.as_str()))
+                .then(left.diagnostic.message.cmp(&right.diagnostic.message))
+                .then(left.diagnostic.source.cmp(&right.diagnostic.source))
+                // Prefer an authoritative copy when multiple servers report the
+                // same diagnostic, so detail rows do not retain a warming tag.
+                .then(left.provisional.cmp(&right.provisional))
         });
         self.diagnostics.dedup_by(|left, right| {
-            left.file == right.file
-                && left.line == right.line
-                && left.column == right.column
-                && left.end_line == right.end_line
-                && left.end_column == right.end_column
-                && left.severity == right.severity
-                && left.message == right.message
-                && left.source == right.source
+            left.diagnostic.file == right.diagnostic.file
+                && left.diagnostic.line == right.diagnostic.line
+                && left.diagnostic.column == right.diagnostic.column
+                && left.diagnostic.end_line == right.diagnostic.end_line
+                && left.diagnostic.end_column == right.diagnostic.end_column
+                && left.diagnostic.severity == right.diagnostic.severity
+                && left.diagnostic.message == right.diagnostic.message
+                && left.diagnostic.source == right.diagnostic.source
         });
     }
 }
@@ -562,17 +623,38 @@ fn diagnostics_status(
     }
 }
 
-fn severity_counts(diagnostics: &[StoredDiagnostic]) -> (usize, usize, usize, usize) {
+fn severity_counts(diagnostics: &[CollectedDiagnostic]) -> (usize, usize, usize, usize) {
+    severity_counts_filtered(diagnostics, |diagnostic| !diagnostic.provisional)
+}
+
+fn severity_counts_including_provisional(
+    diagnostics: &[CollectedDiagnostic],
+) -> (usize, usize, usize, usize) {
+    severity_counts_filtered(diagnostics, |_| true)
+}
+
+fn severity_counts_provisional_only(
+    diagnostics: &[CollectedDiagnostic],
+) -> (usize, usize, usize, usize) {
+    severity_counts_filtered(diagnostics, |diagnostic| diagnostic.provisional)
+}
+
+fn severity_counts_filtered(
+    diagnostics: &[CollectedDiagnostic],
+    include: impl Fn(&CollectedDiagnostic) -> bool,
+) -> (usize, usize, usize, usize) {
     let mut errors = 0;
     let mut warnings = 0;
     let mut info = 0;
     let mut hints = 0;
 
     for diagnostic in diagnostics {
-        if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+        if !include(diagnostic)
+            || crate::lsp::environmental::is_environmental_diagnostic(&diagnostic.diagnostic)
+        {
             continue;
         }
-        match diagnostic.severity {
+        match diagnostic.diagnostic.severity {
             DiagnosticSeverity::Error => errors += 1,
             DiagnosticSeverity::Warning => warnings += 1,
             DiagnosticSeverity::Information => info += 1,
@@ -584,23 +666,27 @@ fn severity_counts(diagnostics: &[StoredDiagnostic]) -> (usize, usize, usize, us
 }
 
 /// Detail-row message for `aft_inspect` items (file:line:col severity message).
-/// Environmental diagnostics are tagged so summary counts and listed rows agree.
-fn diagnostic_detail_message(diagnostic: &StoredDiagnostic) -> String {
-    let mut message = diagnostic.message.clone();
-    if crate::lsp::environmental::is_environmental_diagnostic(diagnostic) {
+/// Environmental and warming diagnostics are tagged so summary counts and
+/// listed rows explain why a row is excluded from authoritative totals.
+fn diagnostic_detail_message(diagnostic: &CollectedDiagnostic) -> String {
+    let mut message = diagnostic.diagnostic.message.clone();
+    if crate::lsp::environmental::is_environmental_diagnostic(&diagnostic.diagnostic) {
         message.push_str(" [environmental]");
+    }
+    if diagnostic.provisional {
+        message.push_str(" (analyzer warming)");
     }
     message
 }
 
-fn diagnostic_item(snapshot: &InspectSnapshot, diagnostic: &StoredDiagnostic) -> Value {
+fn diagnostic_item(snapshot: &InspectSnapshot, diagnostic: &CollectedDiagnostic) -> Value {
     serde_json::json!({
-        "file": display_path(snapshot, &diagnostic.file),
-        "line": diagnostic.line,
-        "column": diagnostic.column,
-        "severity": diagnostic.severity.as_str(),
+        "file": display_path(snapshot, &diagnostic.diagnostic.file),
+        "line": diagnostic.diagnostic.line,
+        "column": diagnostic.diagnostic.column,
+        "severity": diagnostic.diagnostic.severity.as_str(),
         "message": diagnostic_detail_message(diagnostic),
-        "source": diagnostic.source.as_deref().unwrap_or("lsp"),
+        "source": diagnostic.diagnostic.source.as_deref().unwrap_or("lsp"),
     })
 }
 
@@ -616,10 +702,93 @@ fn server_id(key: &ServerKey) -> String {
 }
 
 #[cfg(test)]
+mod payload_count_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    use super::{CollectedDiagnostic, DiagnosticsCollection};
+    use crate::config::Config;
+    use crate::inspect::job::InspectSnapshot;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::parser::SymbolCache;
+
+    fn snapshot() -> InspectSnapshot {
+        InspectSnapshot::new(
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/.aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        )
+    }
+
+    fn collection() -> DiagnosticsCollection {
+        DiagnosticsCollection {
+            diagnostics: vec![CollectedDiagnostic {
+                diagnostic: StoredDiagnostic {
+                    file: PathBuf::from("/repo/src/main.rs"),
+                    line: 1,
+                    column: 1,
+                    end_line: 1,
+                    end_column: 2,
+                    severity: DiagnosticSeverity::Error,
+                    message: "warming result".into(),
+                    code: None,
+                    source: None,
+                },
+                provisional: false,
+            }],
+            server_ran: true,
+            ..DiagnosticsCollection::default()
+        }
+    }
+
+    #[test]
+    fn pending_counts_are_provisional_and_authoritative_counts_are_zero() {
+        let mut collection = collection();
+        collection.servers_pending.insert("rust-analyzer".into());
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["errors"], 0);
+        assert_eq!(payload["warnings"], 0);
+        assert_eq!(payload["provisional_counts"]["errors"], 1);
+        assert_eq!(payload["provisional_counts"]["warnings"], 0);
+    }
+
+    #[test]
+    fn incomplete_counts_are_provisional_and_authoritative_counts_are_zero() {
+        let mut collection = collection();
+        collection.scope_truncated = true;
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["status"], "incomplete");
+        assert_eq!(payload["errors"], 0);
+        assert_eq!(payload["provisional_counts"]["errors"], 1);
+    }
+
+    #[test]
+    fn complete_counts_stay_at_the_authoritative_top_level() {
+        let payload = collection().into_payload(&snapshot());
+        assert_eq!(payload["complete"], true);
+        assert_eq!(payload["errors"], 1);
+        assert!(payload.get("provisional_counts").is_none());
+    }
+
+    #[test]
+    fn no_server_counts_stay_at_the_authoritative_top_level() {
+        let mut collection = collection();
+        collection.server_ran = false;
+        collection.files_without_server = 1;
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["status"], "no_server");
+        assert_eq!(payload["errors"], 1);
+        assert!(payload.get("provisional_counts").is_none());
+    }
+}
+
+#[cfg(test)]
 mod environmental_count_tests {
     use std::path::PathBuf;
 
-    use super::severity_counts;
+    use super::{severity_counts, CollectedDiagnostic};
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 
     fn diag(line: u32, message: &str) -> StoredDiagnostic {
@@ -639,11 +808,17 @@ mod environmental_count_tests {
     #[test]
     fn severity_counts_exclude_environmental_on_same_file() {
         let diagnostics = vec![
-            diag(1, "Cannot find name 'x'."),
-            diag(
-                2,
-                "Failed to load schema from https://example.com/schema.json",
-            ),
+            CollectedDiagnostic {
+                diagnostic: diag(1, "Cannot find name 'x'."),
+                provisional: false,
+            },
+            CollectedDiagnostic {
+                diagnostic: diag(
+                    2,
+                    "Failed to load schema from https://example.com/schema.json",
+                ),
+                provisional: false,
+            },
         ];
         let (errors, warnings, _, _) = severity_counts(&diagnostics);
         assert_eq!(
@@ -692,7 +867,10 @@ mod environmental_render_tests {
     fn detail_row_tags_environmental_message() {
         let item = diagnostic_item(
             &snapshot(),
-            &stored("Failed to load schema from https://example.com/schema.json"),
+            &super::CollectedDiagnostic {
+                diagnostic: stored("Failed to load schema from https://example.com/schema.json"),
+                provisional: false,
+            },
         );
         assert_eq!(
             item["message"].as_str(),
@@ -702,7 +880,28 @@ mod environmental_render_tests {
 
     #[test]
     fn detail_row_leaves_real_errors_untagged() {
-        let item = diagnostic_item(&snapshot(), &stored("Cannot find name 'typo'."));
+        let item = diagnostic_item(
+            &snapshot(),
+            &super::CollectedDiagnostic {
+                diagnostic: stored("Cannot find name 'typo'."),
+                provisional: false,
+            },
+        );
         assert_eq!(item["message"].as_str(), Some("Cannot find name 'typo'."));
+    }
+
+    #[test]
+    fn detail_row_tags_warming_diagnostics() {
+        let item = diagnostic_item(
+            &snapshot(),
+            &super::CollectedDiagnostic {
+                diagnostic: stored("temporary analyzer result"),
+                provisional: true,
+            },
+        );
+        assert_eq!(
+            item["message"].as_str(),
+            Some("temporary analyzer result (analyzer warming)")
+        );
     }
 }

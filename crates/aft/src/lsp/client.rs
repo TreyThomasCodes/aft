@@ -118,6 +118,10 @@ pub struct LspClient {
     /// `None` until `initialize()` succeeds; conservative defaults thereafter
     /// when the server doesn't advertise diagnosticProvider.
     diagnostic_caps: Option<ServerDiagnosticCapabilities>,
+    /// Rust-analyzer's workspace analysis has reached quiescence. Other server
+    /// kinds do not use the experimental server-status signal and start
+    /// authoritative by default.
+    rust_analyzer_quiescent: bool,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -313,6 +317,7 @@ impl LspClient {
             }
         });
 
+        let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         Ok(Self {
             kind,
             root,
@@ -323,6 +328,7 @@ impl LspClient {
             pending,
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
+            rust_analyzer_quiescent,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
@@ -351,6 +357,9 @@ impl LspClient {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                "experimental": {
+                    "serverStatusNotification": true
+                },
                 "workspace": {
                     "workspaceFolders": true,
                     "configuration": true,
@@ -451,6 +460,23 @@ impl LspClient {
     /// (all `false`) when the server didn't advertise diagnosticProvider.
     pub fn diagnostic_capabilities(&self) -> Option<&ServerDiagnosticCapabilities> {
         self.diagnostic_caps.as_ref()
+    }
+
+    /// Whether diagnostics from this server instance should be treated as
+    /// provisional because rust-analyzer has not reached quiescence.
+    pub fn diagnostics_are_provisional(&self) -> bool {
+        matches!(&self.kind, ServerKind::Rust) && !self.rust_analyzer_quiescent
+    }
+
+    /// Record a rust-analyzer server-status transition. Returns true only for
+    /// the first transition to quiescent, which is when cached warming reports
+    /// must be invalidated before later publishes become authoritative.
+    pub fn set_rust_analyzer_quiescent(&mut self, quiescent: bool) -> bool {
+        if !matches!(&self.kind, ServerKind::Rust) || !quiescent || self.rust_analyzer_quiescent {
+            return false;
+        }
+        self.rust_analyzer_quiescent = true;
+        true
     }
 
     /// Whether the server advertised initialize-time

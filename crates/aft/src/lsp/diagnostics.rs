@@ -65,6 +65,10 @@ pub struct DiagnosticEntry {
     /// in the store so resultIds and server coverage are not lost, but warm
     /// readers must not count or display them as current diagnostics.
     pub stale: bool,
+    /// True while rust-analyzer has not reported that its workspace analysis is
+    /// quiescent. These diagnostics are useful leads, but are not authoritative
+    /// enough to contribute to counts until the server has settled.
+    pub provisional: bool,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -286,6 +290,20 @@ impl DiagnosticsStore {
         result_id: Option<String>,
         version: Option<i32>,
     ) {
+        self.publish_full_with_provisional(server, file, diagnostics, result_id, version, false);
+    }
+
+    /// Replace diagnostics while recording whether the server was still warming
+    /// when it produced them.
+    pub fn publish_full_with_provisional(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        result_id: Option<String>,
+        version: Option<i32>,
+        provisional: bool,
+    ) {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.generation = self.generation.wrapping_add(1);
@@ -295,6 +313,7 @@ impl DiagnosticsStore {
             result_id,
             version,
             stale: false,
+            provisional,
         };
 
         self.last_publish_at_for_file
@@ -346,6 +365,30 @@ impl DiagnosticsStore {
             if let Some(entry) = self.entries.get(&(server.clone(), file.clone())) {
                 if !entry.stale {
                     diagnostics.extend(&entry.diagnostics);
+                }
+            }
+        }
+        diagnostics
+    }
+
+    /// Current diagnostics for a file with the entry-level readiness marker.
+    /// The marker is kept separate from [`StoredDiagnostic`] because readiness
+    /// describes the server report, not an individual diagnostic.
+    pub fn for_file_with_provisional(&self, file: &Path) -> Vec<(&StoredDiagnostic, bool)> {
+        let Some(servers) = self.by_file.get(file) else {
+            return Vec::new();
+        };
+        let file = file.to_path_buf();
+        let mut diagnostics = Vec::new();
+        for server in servers {
+            if let Some(entry) = self.entries.get(&(server.clone(), file.clone())) {
+                if !entry.stale {
+                    diagnostics.extend(
+                        entry
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| (diagnostic, entry.provisional)),
+                    );
                 }
             }
         }
@@ -427,6 +470,21 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// Current diagnostics under a directory with the entry-level readiness
+    /// marker preserved for inspect's provisional framing.
+    pub fn for_directory_with_provisional(&self, dir: &Path) -> Vec<(&StoredDiagnostic, bool)> {
+        self.entries
+            .iter()
+            .filter(|((_, stored_file), entry)| stored_file.starts_with(dir) && !entry.stale)
+            .flat_map(|(_, entry)| {
+                entry
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (diagnostic, entry.provisional))
+            })
+            .collect()
+    }
+
     /// All current diagnostics, flattened. Watcher-stale entries are hidden.
     pub fn all(&self) -> Vec<&StoredDiagnostic> {
         self.entries
@@ -436,16 +494,39 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// All current diagnostics with the entry-level readiness marker.
+    pub fn all_with_provisional(&self) -> Vec<(&StoredDiagnostic, bool)> {
+        self.entries
+            .values()
+            .filter(|entry| !entry.stale)
+            .flat_map(|entry| {
+                entry
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| (diagnostic, entry.provisional))
+            })
+            .collect()
+    }
+
     /// Count of errors and warnings across the entire warm set (every file any
     /// server has published for). Allocation-free — the raw, unfiltered union.
     /// Callers that want the agent-status-bar semantics (project-root scoped,
     /// tsconfig-membership filtered, cross-server deduped) should use
     /// [`filtered_error_warning_counts`](Self::filtered_error_warning_counts).
     pub fn error_warning_counts(&self) -> (usize, usize) {
+        self.error_warning_counts_with_provisional().0
+    }
+
+    /// Raw warm-set counts plus whether any current entry is provisional.
+    pub fn error_warning_counts_with_provisional(&self) -> ((usize, usize), bool) {
         let mut errors = 0usize;
         let mut warnings = 0usize;
+        let mut has_provisional = false;
         for entry in self.entries.values() {
-            if entry.stale {
+            if entry.provisional {
+                has_provisional = true;
+            }
+            if entry.stale || entry.provisional {
                 continue;
             }
             for diagnostic in &entry.diagnostics {
@@ -456,7 +537,7 @@ impl DiagnosticsStore {
                 }
             }
         }
-        (errors, warnings)
+        ((errors, warnings), has_provisional)
     }
 
     /// Error/warning counts after applying a per-file `keep` predicate,
@@ -471,10 +552,17 @@ impl DiagnosticsStore {
     /// The store itself holds no tsconfig/project policy — the caller encodes
     /// it in `keep` (see `LspManager::filtered_error_warning_counts`). `keep`
     /// is `FnMut` because the membership cache resolves lazily.
-    pub fn filtered_error_warning_counts(
+    pub fn filtered_error_warning_counts(&self, keep: impl FnMut(&Path) -> bool) -> (usize, usize) {
+        self.filtered_error_warning_counts_with_provisional(keep).0
+    }
+
+    /// Return status-bar counts plus whether a kept entry is still provisional.
+    /// The boolean lets the context retain the previous authoritative E/W values
+    /// instead of replacing them with zero while an analyzer warms up.
+    pub fn filtered_error_warning_counts_with_provisional(
         &self,
         mut keep: impl FnMut(&Path) -> bool,
-    ) -> (usize, usize) {
+    ) -> ((usize, usize), bool) {
         // Dedup key mirrors `sort_and_dedup` in inspect/diagnostics_category.rs
         // exactly (file, range, severity, message, source) so the bar and
         // inspect collapse the same multi-server overlaps.
@@ -490,8 +578,12 @@ impl DiagnosticsStore {
         )> = std::collections::HashSet::new();
         let mut errors = 0usize;
         let mut warnings = 0usize;
+        let mut has_provisional = false;
         for ((_, file), entry) in &self.entries {
-            if entry.stale {
+            if entry.provisional && keep(file) {
+                has_provisional = true;
+            }
+            if entry.stale || entry.provisional {
                 continue;
             }
             // All diagnostics in an entry share the entry's file, so the keep
@@ -524,7 +616,7 @@ impl DiagnosticsStore {
                 }
             }
         }
-        (errors, warnings)
+        ((errors, warnings), has_provisional)
     }
 
     /// Drop all entries for a server kind (e.g., on server crash/restart).
@@ -629,6 +721,40 @@ impl DiagnosticsStore {
         }
         self.touch_existing(&cache_key);
         changed
+    }
+
+    /// Mark all provisional reports from one server stale when it first becomes
+    /// quiescent. The server will publish fresh reports after this transition;
+    /// keeping the old reports stale avoids treating them as revalidated.
+    pub fn mark_provisional_for_server_stale(&mut self, key: &ServerKey) -> bool {
+        let mut changed = false;
+        for ((stored_key, _), entry) in &mut self.entries {
+            if stored_key == key && entry.provisional && !entry.stale {
+                entry.stale = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.debug_assert_index_consistent();
+        changed
+    }
+
+    /// Clear the readiness marker after a pull response is received from a
+    /// quiescent server. This is separate from `mark_fresh` because a pull
+    /// response received while warming must remain provisional.
+    pub fn clear_provisional_for_server_file(&mut self, key: &ServerKey, file: &Path) -> bool {
+        let cache_key = (key.clone(), file.to_path_buf());
+        let Some(entry) = self.entries.get_mut(&cache_key) else {
+            return false;
+        };
+        if !entry.provisional {
+            return false;
+        }
+        entry.provisional = false;
+        self.generation = self.generation.wrapping_add(1);
+        true
     }
 
     /// Drop all entries for a specific server instance.

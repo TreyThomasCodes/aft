@@ -1406,29 +1406,26 @@ fn diagnostics_summary_for(payload: Option<&Value>) -> Value {
         .get("server_ran")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let provisional_counts = payload.get("provisional_counts").cloned();
 
     if complete && server_ran {
-        return serde_json::json!({
+        let mut summary = serde_json::json!({
             "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
             "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
             "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
             "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
         });
+        if let Some(provisional_counts) = provisional_counts {
+            summary["provisional_counts"] = provisional_counts;
+        }
+        return summary;
     }
 
-    // Public diagnostics summary contract for the plugin layer:
-    //   complete: { errors, warnings, info, hints }
-    //   partial:  { errors, warnings, info, hints,
-    //               status: "pending"|"incomplete", servers_pending, servers_not_installed }
-    //
-    // The partial shape ALWAYS carries the counts found SO FAR alongside the
-    // status/gap fields. Hiding already-collected diagnostics behind a bare
-    // "pending" sentinel was dishonest the other direction: a scoped pull could
-    // have real errors from one server while another server is still pending,
-    // and an agent reading only the summary would miss them. The presence of
-    // `status` tells the agent the counts are not yet the full picture, so a
-    // `0` count here is never misread as "clean".
-    serde_json::json!({
+    // Incomplete and pending diagnostics have useful detail rows, but their
+    // severity counts are provisional and must never be mistaken for the
+    // authoritative E/W totals. Keep the count shape visible under
+    // `provisional_counts` while the top-level counts remain zero.
+    let mut summary = serde_json::json!({
         "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
         "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
         "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
@@ -1449,7 +1446,11 @@ fn diagnostics_summary_for(payload: Option<&Value>) -> Value {
             .get("files_without_server")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-    })
+    });
+    if let Some(provisional_counts) = provisional_counts {
+        summary["provisional_counts"] = provisional_counts;
+    }
+    summary
 }
 
 fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize) -> Value {

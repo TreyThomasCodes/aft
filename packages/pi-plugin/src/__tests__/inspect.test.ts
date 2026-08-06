@@ -120,9 +120,44 @@ describe("Pi aft_inspect adapter", () => {
       },
       { fg: (_name: string, text: string) => text } as never,
     ).join("\n");
-    expect(pending).toContain("diagnostics pending");
+    expect(pending).toContain(
+      "diagnostics provisional — analyzer not ready; counts excluded from E/W",
+    );
+    expect(pending).toContain("still pending");
     expect(pending).toContain("tsserver");
-    expect(pending).not.toContain("0 errors");
+    expect(pending).not.toContain("2 errors");
+
+    const provisional = buildInspectSections(
+      {
+        summary: {
+          diagnostics: {
+            status: "incomplete",
+            errors: 0,
+            warnings: 0,
+            info: 0,
+            hints: 0,
+            provisional_counts: { errors: 2, warnings: 1, info: 0, hints: 0 },
+          },
+        },
+        details: {
+          diagnostics: [
+            {
+              file: "src/lib.rs",
+              line: 3,
+              severity: "error",
+              message: "temporary result (analyzer warming)",
+            },
+          ],
+        },
+      },
+      { fg: (_name: string, text: string) => text } as never,
+    ).join("\n");
+    expect(provisional).toContain(
+      "diagnostics provisional — analyzer not ready; counts excluded from E/W (2 errors/1 warnings/0 info/0 hints)",
+    );
+    expect(provisional).toContain(
+      "diagnostics (provisional — analyzer not ready; counts excluded from E/W)",
+    );
   });
 
   test("sends corrected inspect field names to the bridge", async () => {

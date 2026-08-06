@@ -1886,6 +1886,7 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
         result_id: None,
         version: Some(4),
         stale: false,
+        provisional: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -1921,6 +1922,7 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         result_id: None,
         version: None,
         stale: false,
+        provisional: false,
     };
 
     let pre_edit = PreEditSnapshot {
@@ -2122,3 +2124,90 @@ fn did_change_watched_files_skipped_when_unsupported() {
 // equivalent path IS covered by
 // `post_edit_outcome_reports_complete_when_no_server_registered`, which
 // uses a .txt file (no registered server in the registry).
+
+#[test]
+fn rust_analyzer_warming_diagnostics_are_provisional_until_quiescent() {
+    let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = &files[0];
+    let stored_file = crate::helpers::canonicalize_like_product(file);
+    let mut manager = manager_with_fake_server();
+    manager.set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+    let config = Config::default();
+
+    manager
+        .notify_file_changed_versioned(file, "fn main() {}\n", &config)
+        .expect("start fake rust-analyzer");
+    let initialized = collect_event(&mut manager, |event| {
+        matches!(
+            event,
+            LspEvent::Notification { method, .. } if method == "custom/initialized"
+        )
+    })
+    .expect("fake server initialization event");
+    let initialized_params = match initialized {
+        LspEvent::Notification { params, .. } => params.expect("initialized params"),
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert_eq!(initialized_params["serverStatusNotification"], true);
+    wait_for_publish(&mut manager);
+
+    let entries = manager
+        .diagnostics_store_for_test()
+        .entries_for_file(&stored_file);
+    assert_eq!(entries.len(), 1);
+    assert!(
+        entries[0].1.provisional,
+        "warming publish must be provisional"
+    );
+    assert_eq!(
+        manager.diagnostics_store_for_test().error_warning_counts(),
+        (0, 0),
+        "warming diagnostics must not contribute to severity counts"
+    );
+
+    manager
+        .notify_file_changed_versioned(file, "fn main() { let ready = true; }\n", &config)
+        .expect("send post-quiescence document change");
+    wait_for_publish(&mut manager);
+
+    let entries = manager
+        .diagnostics_store_for_test()
+        .entries_for_file(&stored_file);
+    assert_eq!(entries.len(), 1);
+    assert!(
+        !entries[0].1.provisional,
+        "post-quiescence publish is authoritative"
+    );
+    assert!(!entries[0].1.stale);
+    assert_eq!(
+        manager.diagnostics_store_for_test().error_warning_counts(),
+        (1, 0),
+        "authoritative diagnostics must contribute after quiescence"
+    );
+}
+
+#[test]
+fn server_without_server_status_keeps_authoritative_behavior() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
+    let file = &files[0];
+    let stored_file = crate::helpers::canonicalize_like_product(file);
+    let mut manager = manager_with_fake_typescript_server();
+    manager.set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "disabled");
+    let config = Config::default();
+
+    manager
+        .notify_file_changed_versioned(file, "fn main() {}\n", &config)
+        .expect("start fake rust-analyzer");
+    wait_for_publish(&mut manager);
+
+    let entries = manager
+        .diagnostics_store_for_test()
+        .entries_for_file(&stored_file);
+    assert_eq!(entries.len(), 1);
+    assert!(!entries[0].1.provisional);
+    assert_eq!(
+        manager.diagnostics_store_for_test().error_warning_counts(),
+        (1, 1),
+        "servers without the readiness signal retain existing behavior"
+    );
+}

@@ -170,6 +170,12 @@ fn write_publish_diagnostics_versioned(
 }
 
 fn opened_diagnostics() -> Value {
+    let warming = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1");
+    let error_message = if warming {
+        "warming garbage diagnostic"
+    } else {
+        "test diagnostic error"
+    };
     json!([
         {
             "range": {
@@ -179,7 +185,7 @@ fn opened_diagnostics() -> Value {
             "severity": 1,
             "code": "E0001",
             "source": "fake-lsp",
-            "message": "test diagnostic error"
+            "message": error_message
         },
         {
             "range": {
@@ -311,6 +317,11 @@ fn main() -> io::Result<()> {
                                     .and_then(|value| value.get("initializationOptions"))
                                     .cloned()
                                     .unwrap_or(Value::Null),
+                                "serverStatusNotification": params
+                                    .as_ref()
+                                    .and_then(|value| value.pointer("/capabilities/experimental/serverStatusNotification"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
                                 "env": {
                                     "AFT_TEST_LSP_ENV": std::env::var("AFT_TEST_LSP_ENV").ok()
                                 }
@@ -601,6 +612,25 @@ fn main() -> io::Result<()> {
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
                 "initialized" => {
+                    let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
+                    if server_status_mode.as_deref() != Some("disabled") {
+                        let warming = server_status_mode.as_deref() == Some("1");
+                        write_notification(
+                            &mut writer,
+                            &Notification::new(
+                                "experimental/serverStatus",
+                                Some(json!({
+                                    "health": if warming { "warning" } else { "ok" },
+                                    "quiescent": !warming,
+                                    "message": if warming {
+                                        "workspace analysis is warming"
+                                    } else {
+                                        "workspace analysis is ready"
+                                    },
+                                })),
+                            ),
+                        )?;
+                    }
                     if should_register_watched_files {
                         write_request(
                             &mut writer,
@@ -649,6 +679,19 @@ fn main() -> io::Result<()> {
                 "textDocument/didChange" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1") {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new(
+                                "experimental/serverStatus",
+                                Some(json!({
+                                    "health": "ok",
+                                    "quiescent": true,
+                                    "message": "workspace analysis is ready",
+                                })),
+                            ),
+                        )?;
+                    }
                     write_custom_notification(
                         &mut writer,
                         "custom/documentChanged",

@@ -985,6 +985,10 @@ impl LspManager {
         self.diagnostics.error_warning_counts()
     }
 
+    pub fn warm_error_warning_counts_with_provisional(&self) -> ((usize, usize), bool) {
+        self.diagnostics.error_warning_counts_with_provisional()
+    }
+
     pub fn diagnostics_generation(&self) -> u64 {
         self.diagnostics.generation()
     }
@@ -998,6 +1002,28 @@ impl LspManager {
         keep: impl FnMut(&std::path::Path) -> bool,
     ) -> (usize, usize) {
         self.diagnostics.filtered_error_warning_counts(keep)
+    }
+
+    /// Status-bar counts plus whether any kept diagnostics came from a server
+    /// that is still warming. The readiness flag is needed to retain the last
+    /// authoritative E/W values while provisional reports replace old entries.
+    pub fn filtered_error_warning_counts_with_provisional(
+        &self,
+        keep: impl FnMut(&std::path::Path) -> bool,
+    ) -> ((usize, usize), bool) {
+        self.diagnostics
+            .filtered_error_warning_counts_with_provisional(keep)
+    }
+
+    /// Active rust-analyzer instances that have not yet reported quiescence.
+    /// Other server kinds are intentionally absent because they do not use the
+    /// rust-analyzer readiness extension.
+    pub fn provisional_server_keys(&self) -> Vec<ServerKey> {
+        self.clients
+            .iter()
+            .filter(|(_, client)| client.diagnostics_are_provisional())
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Snapshot the current per-server epoch for every entry that exists
@@ -1582,11 +1608,17 @@ impl LspManager {
                     full.full_document_diagnostic_report.items.clone(),
                 );
                 let count = stored.len();
-                self.diagnostics.publish_with_result_id(
+                let provisional = self
+                    .clients
+                    .get(key)
+                    .is_some_and(|client| client.diagnostics_are_provisional());
+                self.diagnostics.publish_full_with_provisional(
                     key.clone(),
                     canonical_path.to_path_buf(),
                     stored,
                     result_id,
+                    None,
+                    provisional,
                 );
                 PullFileOutcome::Full {
                     diagnostic_count: count,
@@ -1605,6 +1637,14 @@ impl LspManager {
                 {
                     self.diagnostics
                         .mark_fresh_for_server_file(key, canonical_path);
+                    let authoritative = self
+                        .clients
+                        .get(key)
+                        .map_or(true, |client| !client.diagnostics_are_provisional());
+                    if authoritative {
+                        self.diagnostics
+                            .clear_provisional_for_server_file(key, canonical_path);
+                    }
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -1643,6 +1683,14 @@ impl LspManager {
     pub fn get_diagnostics_for_file(&self, file: &Path) -> Vec<&StoredDiagnostic> {
         let normalized = normalize_lookup_path(file);
         self.diagnostics.for_file(&normalized)
+    }
+
+    pub fn get_diagnostics_for_file_with_provisional(
+        &self,
+        file: &Path,
+    ) -> Vec<(&StoredDiagnostic, bool)> {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics.for_file_with_provisional(&normalized)
     }
 
     /// Drop all cached diagnostics for a file across every server. Called when a
@@ -1744,8 +1792,20 @@ impl LspManager {
         self.diagnostics.for_directory(&normalized)
     }
 
+    pub fn get_diagnostics_for_directory_with_provisional(
+        &self,
+        dir: &Path,
+    ) -> Vec<(&StoredDiagnostic, bool)> {
+        let normalized = normalize_lookup_path(dir);
+        self.diagnostics.for_directory_with_provisional(&normalized)
+    }
+
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
         self.diagnostics.all()
+    }
+
+    pub fn get_all_diagnostics_with_provisional(&self) -> Vec<(&StoredDiagnostic, bool)> {
+        self.diagnostics.all_with_provisional()
     }
 
     /// True if any LSP server has a current diagnostic report, including an
@@ -1796,6 +1856,15 @@ impl LspManager {
             } if method == "textDocument/publishDiagnostics" => {
                 self.handle_publish_diagnostics(server_kind.clone(), root.clone(), params)
             }
+            LspEvent::Notification {
+                server_kind,
+                root,
+                method,
+                params: Some(params),
+            } if method == "experimental/serverStatus" => {
+                self.handle_server_status(server_kind.clone(), root.clone(), params);
+                None
+            }
             LspEvent::ServerExited { server_kind, root } => {
                 let key = ServerKey {
                     kind: server_kind.clone(),
@@ -1828,11 +1897,43 @@ impl LspManager {
             // via version-match (preferred) or epoch-delta (fallback). The
             // earlier `publish_with_kind` path silently dropped both.
             let key = ServerKey { kind: server, root };
-            self.diagnostics
-                .publish_full(key, file.clone(), stored, None, publish_params.version);
+            let provisional = self
+                .clients
+                .get(&key)
+                .is_some_and(|client| client.diagnostics_are_provisional());
+            self.diagnostics.publish_full_with_provisional(
+                key,
+                file.clone(),
+                stored,
+                None,
+                publish_params.version,
+                provisional,
+            );
             return Some(file);
         }
         None
+    }
+
+    fn handle_server_status(
+        &mut self,
+        server: ServerKind,
+        root: PathBuf,
+        params: &serde_json::Value,
+    ) {
+        if !matches!(&server, ServerKind::Rust)
+            || params.get("quiescent").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            return;
+        }
+
+        let key = ServerKey { kind: server, root };
+        let became_quiescent = self
+            .clients
+            .get_mut(&key)
+            .is_some_and(|client| client.set_rust_analyzer_quiescent(true));
+        if became_quiescent {
+            self.diagnostics.mark_provisional_for_server_stale(&key);
+        }
     }
 
     fn spawn_server(

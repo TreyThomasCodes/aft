@@ -1876,21 +1876,37 @@ impl AppContext {
             }
         }
 
+        let previous_authoritative = self
+            .status_bar_cached
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counts
+            .as_ref()
+            .map(|counts| (counts.errors, counts.warnings));
         let counts = match (tier2.dead_code, tier2.unused_exports, tier2.duplicates) {
             (Some(dead_code), Some(unused_exports), Some(duplicates)) => {
-                let (errors, warnings) = match self.canonical_cache_root_opt() {
-                    Some(root) => {
-                        // The cache root is identity-domain (bare-canonical,
-                        // verbatim on Windows) while diagnostics store keys are
-                        // normalized; normalize a comparison-local copy or the
-                        // starts_with filter drops every diagnostic.
-                        let root = crate::inspect::job::normalize_path(&root);
-                        let mut membership = self.tsconfig_membership.lock();
-                        lsp.filtered_error_warning_counts(|file| {
-                            file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-                        })
-                    }
-                    None => lsp.warm_error_warning_counts(),
+                let ((current_errors, current_warnings), provisional) =
+                    match self.canonical_cache_root_opt() {
+                        Some(root) => {
+                            // The cache root is identity-domain (bare-canonical,
+                            // verbatim on Windows) while diagnostics store keys are
+                            // normalized; normalize a comparison-local copy or the
+                            // starts_with filter drops every diagnostic.
+                            let root = crate::inspect::job::normalize_path(&root);
+                            let mut membership = self.tsconfig_membership.lock();
+                            lsp.filtered_error_warning_counts_with_provisional(|file| {
+                                file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+                            })
+                        }
+                        None => lsp.warm_error_warning_counts_with_provisional(),
+                    };
+                // A warming report can replace an older authoritative entry. Do
+                // not turn that transient gap into E/W=0; keep the last values
+                // until the server publishes after quiescence.
+                let (errors, warnings) = if provisional {
+                    previous_authoritative.unwrap_or((current_errors, current_warnings))
+                } else {
+                    (current_errors, current_warnings)
                 };
                 Some(StatusBarCounts {
                     errors,
@@ -8068,6 +8084,80 @@ mod status_bar_tests {
         let removed = ctx.lsp_clear_diagnostics_for_file(&file);
         assert!(removed);
         assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+    }
+
+    #[test]
+    fn status_bar_preserves_authoritative_counts_during_provisional_publish() {
+        use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+        let root = std::path::PathBuf::from("/proj");
+        let file = root.join("src/main.rs");
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root,
+        };
+        let diagnostic = || StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "analyzer result".into(),
+            code: None,
+            source: None,
+        };
+
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test().publish(
+                key.clone(),
+                file.clone(),
+                vec![diagnostic()],
+            );
+        }
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish_full_with_provisional(
+                    key.clone(),
+                    file.clone(),
+                    vec![diagnostic()],
+                    None,
+                    None,
+                    true,
+                );
+        }
+        assert_eq!(
+            ctx.status_bar_counts().expect("populated").errors,
+            1,
+            "warming diagnostics must not replace the last authoritative E count"
+        );
+
+        {
+            let mut lsp = ctx.lsp();
+            assert!(lsp
+                .diagnostics_store_mut_for_test()
+                .mark_provisional_for_server_stale(&key));
+        }
+        assert_eq!(
+            ctx.status_bar_counts().expect("populated").errors,
+            1,
+            "invalidating warming entries must retain the last authoritative E count"
+        );
+
+        {
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, file.clone(), vec![diagnostic()]);
+        }
+        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
     }
 
     #[test]

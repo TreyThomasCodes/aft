@@ -1972,7 +1972,20 @@ fn render_inspect_diagnostics(data: &Value) -> String {
 
     let detail_lines = format_diagnostics_details(data.get("details"));
     if !detail_lines.is_empty() {
-        lines.push("diagnostics details:".to_string());
+        let provisional = data
+            .get("summary")
+            .and_then(|summary| summary.get("diagnostics"))
+            .is_some_and(|section| {
+                section.get("status").and_then(Value::as_str) == Some("pending")
+                    || section.get("status").and_then(Value::as_str) == Some("incomplete")
+                    || section.get("provisional_counts").is_some()
+            });
+        lines.push(if provisional {
+            "diagnostics details (provisional — analyzer not ready; counts excluded from E/W):"
+                .to_string()
+        } else {
+            "diagnostics details:".to_string()
+        });
         for line in detail_lines {
             lines.push(format!("- {line}"));
         }
@@ -1996,34 +2009,38 @@ fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
         hints.unwrap_or(0)
     );
     let status = section.get("status").and_then(Value::as_str);
+    let provisional_counts = section.get("provisional_counts").and_then(Value::as_object);
+    let provisional_text = provisional_counts.map(|counts| {
+        format!(
+            " ({} errors, {} warnings, {} info, {} hints)",
+            counts.get("errors").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("warnings").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("info").and_then(Value::as_u64).unwrap_or(0),
+            counts.get("hints").and_then(Value::as_u64).unwrap_or(0),
+        )
+    });
+    let provisional_framing = || {
+        format!(
+            "provisional — analyzer not ready; counts excluded from E/W{}",
+            provisional_text.as_deref().unwrap_or("")
+        )
+    };
 
     match status {
-        Some("pending") => {
-            if has_counts {
-                Some(format!(
-                    "diagnostics: {counts} so far — still pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
-                    diagnostics_server_summary(section)
-                ))
-            } else {
-                Some(format!(
-                    "diagnostics: pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
-                    diagnostics_server_summary(section)
-                ))
-            }
-        }
-        Some("incomplete") => {
-            if has_counts {
-                Some(format!(
-                    "diagnostics: {counts} (incomplete — servers: {})",
-                    diagnostics_server_summary(section)
-                ))
-            } else {
-                Some(format!(
-                    "diagnostics: unavailable (status incomplete; servers: {})",
-                    diagnostics_server_summary(section)
-                ))
-            }
-        }
+        Some("pending") => Some(format!(
+            "diagnostics: {} — still pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
+            provisional_framing(),
+            diagnostics_server_summary(section)
+        )),
+        Some("incomplete") => Some(format!(
+            "diagnostics: {} (incomplete — servers: {})",
+            provisional_framing(),
+            diagnostics_server_summary(section)
+        )),
+        _ if provisional_counts.is_some() => Some(format!(
+            "diagnostics: {}",
+            provisional_framing()
+        )),
         _ => {
             if has_counts {
                 Some(format!("diagnostics: {counts}"))
