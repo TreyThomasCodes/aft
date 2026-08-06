@@ -3,8 +3,10 @@ mod test_helpers;
 
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{
-    live_callgraph_edge_snapshot, project_dead_code_snapshot, CallGraphRead, CallGraphStore,
-    StoredEdge,
+    callgraph_refresh_worker_test_counts, clear_callgraph_refresh_worker_test_seam,
+    install_callgraph_refresh_worker_test_gate, live_callgraph_edge_snapshot,
+    project_dead_code_snapshot, set_callgraph_refresh_worker_test_open_failure,
+    set_callgraph_refresh_worker_test_seam, CallGraphRead, CallGraphStore, StoredEdge,
 };
 use aft::commands::callgraph_store_adapter;
 use aft::config::Config;
@@ -970,36 +972,108 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
     // (e.g. migration candidate readiness probes) rewrites them by design, and
     // the preservation invariant is about the data files.
     let legacy_before = without_wal_sidecars(directory_file_snapshot(&legacy_dir));
+    let key = artifact_cache_key_for_test(&root);
+    let pointer = ctx.callgraph_store_dir().join(format!("{key}.current"));
+    let migration_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if pointer.exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < migration_deadline,
+            "legacy migration did not hold the writer lease"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The migration has published the generation captured by its snapshot but
+    // still holds the writer lease. Modify the source, then pause the refresh
+    // worker after `open_ready` returns `None` and drain the migration event.
+    // This orders the deferred batch after the install site's pending-sink take,
+    // testing that the batch is not lost.
     write_file(
         &source,
         "export function entry() { migratedLeaf(); }\nfunction migratedLeaf() {}\n",
     );
+    set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+    set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+    let (refresh_held_rx, refresh_release_tx) =
+        install_callgraph_refresh_worker_test_gate(root.clone());
     aft::runtime_drain::refresh_callgraph_store_for_watcher(&ctx, &HashSet::from([source.clone()]));
-    wait_for_root_keyed_callgraph(&ctx, Duration::from_secs(20));
+    refresh_held_rx
+        .recv_timeout(Duration::from_secs(12))
+        .expect("refresh worker must hold after migration open failure");
+
+    let install_deadline = Instant::now() + Duration::from_secs(20);
+    let migrated = loop {
+        aft::runtime_drain::drain_callgraph_store_events(&ctx);
+        let installed = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone);
+        if installed
+            .as_ref()
+            .is_some_and(|store| !store.is_legacy_fallback())
+        {
+            break installed.expect("non-legacy store was just checked");
+        }
+        assert!(
+            Instant::now() < install_deadline,
+            "migration Ready event did not install a root-keyed reader"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert!(
         !fallback.is_current(),
         "published root-keyed pointer must supersede an open legacy fallback"
     );
-
-    let migrated = match ctx.callgraph_store_for_ops() {
-        CallgraphStoreAccess::Ready(store) => store,
-        _ => panic!("completed migration should install a root-keyed reader"),
-    };
     assert!(!migrated.is_legacy_fallback());
-    assert!(migrated
-        .sqlite_path()
-        .starts_with(ctx.callgraph_store_dir()));
+    assert_eq!(
+        entry_leaf_from_store(migrated.as_ref()),
+        "oldLeaf",
+        "migration generation must predate the edit held for refresh"
+    );
+    assert_eq!(
+        callgraph_refresh_worker_test_counts(&root).0,
+        1,
+        "the one watcher edit must have exactly one failed open before defer"
+    );
+    set_callgraph_refresh_worker_test_open_failure(root.clone(), false);
+    refresh_release_tx
+        .send(())
+        .expect("release deferred refresh worker");
+
     let refresh_deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if entry_leaf_from_store(migrated.as_ref()) == "migratedLeaf" {
+        if callgraph_refresh_worker_test_counts(&root).0 >= 2
+            && entry_leaf_from_store(migrated.as_ref()) == "migratedLeaf"
+        {
             break;
         }
         assert!(
             Instant::now() < refresh_deadline,
-            "background watcher refresh did not converge the migrated generation"
+            "background watcher refresh did not converge the migrated generation (calls={}, leaf={}, pending={:?})",
+            callgraph_refresh_worker_test_counts(&root).0,
+            entry_leaf_from_store(migrated.as_ref()),
+            ctx.take_pending_callgraph_store_paths(),
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        callgraph_refresh_worker_test_counts(&root).0,
+        2,
+        "post-defer self-replay must be the only additional refresh enqueue"
+    );
+    assert!(ctx.take_pending_callgraph_store_paths().is_empty());
+    assert!(
+        aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(5))
+    );
+    clear_callgraph_refresh_worker_test_seam(&root);
+    assert!(migrated
+        .sqlite_path()
+        .starts_with(ctx.callgraph_store_dir()));
     assert_eq!(
         without_wal_sidecars(directory_file_snapshot(&legacy_dir)),
         legacy_before,

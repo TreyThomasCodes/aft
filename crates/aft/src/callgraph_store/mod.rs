@@ -284,6 +284,35 @@ pub struct CallGraphStoreOptions {
 
 pub type PendingCallGraphStorePaths = Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>;
 
+/// Shared context state that lets the refresh worker observe a store installed
+/// after its batch was opened. The worker clones the installed store Arc before
+/// checking it, so no context lock guard crosses the check or enqueue call.
+#[derive(Clone)]
+pub(crate) struct CallgraphRefreshState {
+    store: Arc<std::sync::RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
+    heavy_root_work_allowed: Arc<AtomicBool>,
+}
+
+impl CallgraphRefreshState {
+    pub(crate) fn new(
+        store: Arc<std::sync::RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
+        heavy_root_work_allowed: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            store,
+            heavy_root_work_allowed,
+        }
+    }
+
+    fn installed_store_snapshot(&self) -> Option<Arc<ReadonlyCallGraphStore>> {
+        self.store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)
+    }
+}
+
 type WorkspaceCratePrefixes = HashMap<String, String>;
 
 #[derive(Clone, Debug, Default)]
@@ -339,6 +368,7 @@ struct RefreshBatch {
     root: RefreshRoot,
     paths: BTreeSet<PathBuf>,
     pending_sinks: Vec<PendingCallGraphStorePaths>,
+    refresh_states: Vec<CallgraphRefreshState>,
     ticket: Option<CallgraphRefreshTicket>,
 }
 
@@ -349,10 +379,63 @@ impl RefreshBatch {
         }
     }
 
+    fn defer_after_open_failure(&self) {
+        self.defer();
+        if self
+            .ticket
+            .as_ref()
+            .is_some_and(|ticket| !ticket.is_current())
+            || !self
+                .refresh_states
+                .iter()
+                .any(|state| state.heavy_root_work_allowed.load(AtomicOrdering::SeqCst))
+        {
+            return;
+        }
+
+        let ready_store_installed = self.refresh_states.iter().any(|state| {
+            let store = state.installed_store_snapshot();
+            store.is_some_and(|store| {
+                store.project_root() == self.root.project_root
+                    && !store.is_legacy_fallback()
+                    && store.is_current()
+            })
+        });
+        if !ready_store_installed {
+            return;
+        }
+
+        // This re-check and the ready-store install's pending-sink take form a
+        // check-then-act handoff: after this defer, exactly one site observes
+        // the parked paths with a ready current store, so no polling is needed.
+        for sink in &self.pending_sinks {
+            let paths = {
+                let mut pending = sink.lock();
+                self.paths
+                    .iter()
+                    .filter(|path| pending.remove(*path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if paths.is_empty() {
+                continue;
+            }
+            let _ = enqueue_callgraph_store_refresh_inner(
+                self.root.callgraph_dir.clone(),
+                self.root.project_root.clone(),
+                paths,
+                Arc::clone(sink),
+                self.refresh_states.clone(),
+                self.ticket.clone(),
+            );
+        }
+    }
+
     fn merge(
         &mut self,
         paths: impl IntoIterator<Item = PathBuf>,
         sink: PendingCallGraphStorePaths,
+        refresh_states: Vec<CallgraphRefreshState>,
         ticket: Option<CallgraphRefreshTicket>,
     ) {
         self.paths.extend(paths);
@@ -365,6 +448,17 @@ impl RefreshBatch {
             .any(|existing| Arc::ptr_eq(existing, &sink))
         {
             self.pending_sinks.push(sink);
+        }
+        for refresh_state in refresh_states {
+            if !self.refresh_states.iter().any(|existing| {
+                Arc::ptr_eq(&existing.store, &refresh_state.store)
+                    && Arc::ptr_eq(
+                        &existing.heavy_root_work_allowed,
+                        &refresh_state.heavy_root_work_allowed,
+                    )
+            }) {
+                self.refresh_states.push(refresh_state);
+            }
         }
     }
 }
@@ -458,6 +552,7 @@ impl RefreshWorker {
         root: RefreshRoot,
         paths: Vec<PathBuf>,
         pending_sink: PendingCallGraphStorePaths,
+        refresh_states: Vec<CallgraphRefreshState>,
         ticket: Option<CallgraphRefreshTicket>,
     ) -> bool {
         let mut queue = self
@@ -470,7 +565,7 @@ impl RefreshWorker {
             return false;
         }
         if let Some(batch) = queue.queued.get_mut(&root) {
-            batch.merge(paths, pending_sink, ticket);
+            batch.merge(paths, pending_sink, refresh_states, ticket);
         } else {
             queue.order.push_back(root.clone());
             queue.queued.insert(
@@ -479,6 +574,7 @@ impl RefreshWorker {
                     root,
                     paths: paths.into_iter().collect(),
                     pending_sinks: vec![pending_sink],
+                    refresh_states,
                     ticket,
                 },
             );
@@ -540,9 +636,17 @@ pub fn enqueue_callgraph_store_refresh(
     paths: Vec<PathBuf>,
     pending_sink: PendingCallGraphStorePaths,
 ) -> bool {
-    enqueue_callgraph_store_refresh_inner(callgraph_dir, project_root, paths, pending_sink, None)
+    enqueue_callgraph_store_refresh_inner(
+        callgraph_dir,
+        project_root,
+        paths,
+        pending_sink,
+        Vec::new(),
+        None,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn enqueue_callgraph_store_refresh_fenced(
     callgraph_dir: PathBuf,
     project_root: PathBuf,
@@ -555,6 +659,25 @@ pub(crate) fn enqueue_callgraph_store_refresh_fenced(
         project_root,
         paths,
         pending_sink,
+        Vec::new(),
+        Some(ticket),
+    )
+}
+
+pub(crate) fn enqueue_callgraph_store_refresh_fenced_with_state(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    paths: Vec<PathBuf>,
+    pending_sink: PendingCallGraphStorePaths,
+    refresh_state: CallgraphRefreshState,
+    ticket: CallgraphRefreshTicket,
+) -> bool {
+    enqueue_callgraph_store_refresh_inner(
+        callgraph_dir,
+        project_root,
+        paths,
+        pending_sink,
+        vec![refresh_state],
         Some(ticket),
     )
 }
@@ -564,6 +687,7 @@ fn enqueue_callgraph_store_refresh_inner(
     project_root: PathBuf,
     paths: Vec<PathBuf>,
     pending_sink: PendingCallGraphStorePaths,
+    refresh_states: Vec<CallgraphRefreshState>,
     ticket: Option<CallgraphRefreshTicket>,
 ) -> bool {
     if paths.is_empty() {
@@ -583,6 +707,7 @@ fn enqueue_callgraph_store_refresh_inner(
         },
         paths,
         pending_sink,
+        refresh_states,
         ticket,
     )
 }
@@ -693,17 +818,30 @@ fn process_callgraph_refresh_batch(
     let workspace_crate_prefix_cache =
         workspace_crate_prefix_cache_for_root(workspace_crate_prefixes, &batch.root);
     let _watchdog = RefreshWorkerWatchdog::start(&paths);
-    let store = match CallGraphStore::open_ready(
-        batch.root.callgraph_dir.clone(),
-        batch.root.project_root.clone(),
-    ) {
+    let test_seam = refresh_worker_test_seam(&batch.root.project_root);
+    note_refresh_worker_call_for_test(&batch.root.project_root);
+    let opened = if test_seam.fail_open {
+        Ok(None)
+    } else {
+        CallGraphStore::open_ready(
+            batch.root.callgraph_dir.clone(),
+            batch.root.project_root.clone(),
+        )
+    };
+    if let Some(gate) = take_refresh_worker_test_gate(&batch.root.project_root) {
+        // The gate is deliberately after open_ready so tests can hold a failed
+        // open between its result and the defer that parks the batch.
+        let _ = gate.held_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+    let store = match opened {
         Ok(Some(store)) => store,
         Ok(None) => {
-            batch.defer();
+            batch.defer_after_open_failure();
             return;
         }
         Err(error) => {
-            batch.defer();
+            batch.defer_after_open_failure();
             crate::slog_warn!(
                 "callgraph store writer open failed during refresh; deferred paths: {}",
                 error
@@ -711,14 +849,6 @@ fn process_callgraph_refresh_batch(
             return;
         }
     };
-
-    let test_seam = refresh_worker_test_seam(&batch.root.project_root);
-    note_refresh_worker_call_for_test(&batch.root.project_root);
-    #[cfg(test)]
-    if let Some(gate) = take_refresh_worker_test_gate(&batch.root.project_root) {
-        let _ = gate.held_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
-    }
     if !test_seam.delay.is_zero() {
         std::thread::sleep(test_seam.delay);
     }
@@ -727,6 +857,8 @@ fn process_callgraph_refresh_batch(
         .as_ref()
         .is_some_and(|ticket| !ticket.is_current())
     {
+        // This is a superseded-ticket defer, not an open-failure defer: leave
+        // the paths for the replacement configure instead of self-replaying.
         batch.defer();
         return;
     }
@@ -806,6 +938,7 @@ fn workspace_crate_prefix_cache_for_root(
 struct RefreshWorkerTestSeam {
     delay: Duration,
     fail_refresh: bool,
+    fail_open: bool,
     refresh_calls: usize,
     stale_marks: usize,
 }
@@ -813,18 +946,16 @@ struct RefreshWorkerTestSeam {
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
     OnceLock::new();
 
-#[cfg(test)]
 struct RefreshWorkerTestGate {
     held_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(test)]
 static REFRESH_WORKER_TEST_GATES: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestGate>>> =
     OnceLock::new();
 
-#[cfg(test)]
-fn install_refresh_worker_test_gate(
+#[doc(hidden)]
+pub fn install_callgraph_refresh_worker_test_gate(
     project_root: PathBuf,
 ) -> (
     crossbeam_channel::Receiver<()>,
@@ -846,7 +977,6 @@ fn install_refresh_worker_test_gate(
     (held_rx, release_tx)
 }
 
-#[cfg(test)]
 fn take_refresh_worker_test_gate(project_root: &Path) -> Option<RefreshWorkerTestGate> {
     REFRESH_WORKER_TEST_GATES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -909,6 +1039,19 @@ pub fn set_callgraph_refresh_worker_test_seam(
                 ..RefreshWorkerTestSeam::default()
             },
         );
+}
+
+#[doc(hidden)]
+pub fn set_callgraph_refresh_worker_test_open_failure(project_root: PathBuf, enabled: bool) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        if let Some(seam) = seams
+            .lock()
+            .expect("callgraph refresh test seam mutex poisoned")
+            .get_mut(&project_root)
+        {
+            seam.fail_open = enabled;
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -10765,12 +10908,20 @@ mod refresh_worker_tests {
         );
         // Supersede before the worker runs: the batch must defer, not commit.
         generation.store(8, std::sync::atomic::Ordering::SeqCst);
+        let installed = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone())
+            .unwrap()
+            .expect("ready store snapshot");
+        let refresh_state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(Arc::new(installed)))),
+            Arc::new(AtomicBool::new(true)),
+        );
 
-        enqueue_callgraph_store_refresh_fenced(
+        enqueue_callgraph_store_refresh_fenced_with_state(
             callgraph_dir,
             root.clone(),
             vec![source.clone()],
             Arc::clone(&pending),
+            refresh_state,
             ticket,
         );
         assert!(flush_callgraph_store_refreshes_with_budget(
@@ -10779,7 +10930,7 @@ mod refresh_worker_tests {
         assert_eq!(
             callgraph_refresh_worker_test_counts(&root).0,
             0,
-            "superseded batch must not reach refresh_files"
+            "superseded batch must not reach refresh_files or self-replay"
         );
         assert!(
             pending.lock().contains(&source),
@@ -10940,7 +11091,7 @@ mod refresh_worker_tests {
         let (_target_temp, target_root, target_dir, target_source) = ready_store_fixture();
         set_callgraph_refresh_worker_test_seam(active_root.clone(), Duration::ZERO, false);
         let (active_held_rx, active_release_tx) =
-            install_refresh_worker_test_gate(active_root.clone());
+            install_callgraph_refresh_worker_test_gate(active_root.clone());
         set_callgraph_refresh_worker_test_seam(target_root.clone(), Duration::ZERO, false);
         enqueue_callgraph_store_refresh(
             active_dir,

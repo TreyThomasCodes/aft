@@ -1389,7 +1389,7 @@ pub struct AppContext {
     /// closes it for degraded home roots and every heavy-work entry point reads
     /// the same atomic so the decision cannot drift after configure returns.
     heavy_root_work_allowed: Arc<AtomicBool>,
-    callgraph_store: RwLock<Option<Arc<ReadonlyCallGraphStore>>>,
+    callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_store_force_requested: AtomicU64,
     callgraph_store_force_fulfilled: AtomicU64,
     callgraph_store_rx:
@@ -1751,7 +1751,7 @@ impl AppContext {
             artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
-            callgraph_store: RwLock::new(None),
+            callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_store_force_requested: AtomicU64::new(0),
             callgraph_store_force_fulfilled: AtomicU64::new(0),
             callgraph_store_rx: parking_lot::Mutex::new(None),
@@ -3285,7 +3285,7 @@ impl AppContext {
 
     /// Access the persisted call graph store.
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
-        &self.callgraph_store
+        self.callgraph_store.as_ref()
     }
 
     pub fn mark_callgraph_store_force_rebuild(&self) -> u64 {
@@ -3627,12 +3627,16 @@ impl AppContext {
                             match reopened {
                                 Ok(Some(store)) => {
                                     let ready = Arc::new(store);
-                                    pending = self.take_pending_callgraph_store_paths();
                                     *self
                                         .callgraph_store
                                         .write()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                         Some(Arc::clone(&ready));
+                                    // This take and the refresh worker's post-defer re-check form a
+                                    // check-then-act handoff: the store is installed before the
+                                    // take, so one site sees parked paths with a ready store and
+                                    // neither site needs to poll alone.
+                                    pending = self.take_pending_callgraph_store_paths();
                                     if let Some(force_token) = fulfilled_force_token {
                                         self.fulfill_callgraph_store_force_token(force_token);
                                     }
@@ -3994,11 +3998,15 @@ impl AppContext {
                 self.callgraph_persist_epoch_flag(),
                 self.callgraph_persist_epoch_flag().current(),
             );
-            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced(
+            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced_with_state(
                 self.callgraph_store_dir(),
                 project_root,
                 paths,
                 Arc::clone(&self.pending_callgraph_store_paths),
+                crate::callgraph_store::CallgraphRefreshState::new(
+                    Arc::clone(&self.callgraph_store),
+                    Arc::clone(&self.heavy_root_work_allowed),
+                ),
                 ticket,
             )
         })

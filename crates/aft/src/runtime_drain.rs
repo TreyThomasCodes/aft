@@ -598,6 +598,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                 *ctx.callgraph_store()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
+                // This take and the refresh worker's post-defer re-check form a
+                // check-then-act handoff: one site sees parked paths with a
+                // ready current store, so neither site needs to poll alone.
                 pending = ctx
                     .take_pending_callgraph_store_paths()
                     .into_iter()
