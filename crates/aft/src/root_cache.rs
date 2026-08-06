@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::fs_lock;
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
+static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), usize>>> = OnceLock::new();
 
 /// Read-marker heartbeats refresh no more often than the filesystem lock
 /// heartbeat. Active readers piggyback this on normal read paths instead of
@@ -205,6 +206,52 @@ impl ArtifactAccess {
 
 fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAccess>> {
     CONFIGURED_ARTIFACT_ACCESS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Track scope keys belonging to roots currently bound in this process. The
+/// inspect sweep snapshots this registry at publication time so a live actor's
+/// cache cannot be mistaken for a reclaimed worktree cache.
+fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
+    LIVE_SCOPE_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_live_scope(storage_root: &Path, project_root: &Path) {
+    let storage_root = canonical_root(storage_root);
+    let scope_key = crate::path_identity::project_scope_key(project_root);
+    let mut scopes = match live_scope_keys().lock() {
+        Ok(scopes) => scopes,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *scopes.entry((storage_root, scope_key)).or_default() += 1;
+}
+
+pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
+    let storage_root = canonical_root(storage_root);
+    let scope_key = crate::path_identity::project_scope_key(project_root);
+    let mut scopes = match live_scope_keys().lock() {
+        Ok(scopes) => scopes,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let key = (storage_root, scope_key);
+    if let Some(count) = scopes.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            scopes.remove(&key);
+        }
+    }
+}
+
+pub(crate) fn live_scope_keys_for_storage(storage_root: &Path) -> HashSet<String> {
+    let storage_root = canonical_root(storage_root);
+    let scopes = match live_scope_keys().lock() {
+        Ok(scopes) => scopes,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    scopes
+        .iter()
+        .filter(|((root, _), count)| root == &storage_root && **count > 0)
+        .map(|((_, key), _)| key.clone())
+        .collect()
 }
 
 /// Register the worktree topology already detected by configure so artifact
@@ -548,6 +595,49 @@ impl Drop for ReadMarker {
 
 pub fn read_marker_dir(cache_dir: &Path, generation_label: &str) -> PathBuf {
     cache_dir.join("readers").join(generation_label)
+}
+
+/// Sweep every generation marker below a cache directory, reusing the same
+/// PID-authoritative and cross-host-TTL liveness rules as generation GC.
+pub(crate) fn sweep_all_read_markers(cache_dir: &Path) -> ReadMarkerSweep {
+    let readers = cache_dir.join("readers");
+    let entries = match fs::read_dir(&readers) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return ReadMarkerSweep::default(),
+        Err(_) => {
+            return ReadMarkerSweep {
+                protected: true,
+                removed_stale: 0,
+            }
+        }
+    };
+
+    let mut sweep = ReadMarkerSweep::default();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            sweep.protected = true;
+            continue;
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                sweep.protected = true;
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(label) = path.file_name().and_then(|name| name.to_str()) else {
+            sweep.protected = true;
+            continue;
+        };
+        let generation = sweep_read_markers(cache_dir, label);
+        sweep.protected |= generation.protected;
+        sweep.removed_stale += generation.removed_stale;
+    }
+    sweep
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

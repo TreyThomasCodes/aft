@@ -2,10 +2,27 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+// Field data (2026-08-06): ~/.local/share/cortexkit/aft/inspect held 1,945
+// scope-key directories for about 30 repositories; 1,849 directories (21.5 GB)
+// had no file newer than seven days. Scope keys hash canonical checkout paths,
+// so reclaimed worktrees cannot ever reach their old directories again. This is
+// a structural fix for that permanent accumulation, not a user-facing knob.
+const INSPECT_SCOPE_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// Bound one process-wide pass so a slow filesystem cannot stall publication;
+/// the first-level cursor resumes the remaining scope directories next time.
+const INSPECT_SCOPE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct InspectScopeSweepCursor {
+    last_name: Option<String>,
+}
+
+static INSPECT_SCOPE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, InspectScopeSweepCursor>>> =
+    OnceLock::new();
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
@@ -1595,6 +1612,249 @@ fn gc_old_inspect_generations(inspect_dir: &Path, project_key: &str, current: &s
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InspectScopeSweepSummary {
+    removed: usize,
+    bytes: u64,
+    skipped_live: usize,
+    skipped_marker: usize,
+    scanned: usize,
+    budget_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InspectScopeFileStats {
+    newest_file: Option<SystemTime>,
+    bytes: u64,
+}
+
+enum InspectScopeWalk {
+    Complete(InspectScopeFileStats),
+    BudgetExceeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum InspectScopeCandidateResult {
+    #[default]
+    Processed,
+    Removed {
+        bytes: u64,
+    },
+    SkippedLive,
+    SkippedMarker,
+    BudgetExceeded,
+}
+
+/// Process-wide inspect-scope GC. The caller supplies the scope keys currently
+/// bound in this process; the cursor lets the same publication cadence resume
+/// after a large or slow first-level directory exceeds its wall-clock budget.
+pub(crate) fn sweep_inspect_scope_dirs(
+    inspect_root: &Path,
+    live_scope_keys: &HashSet<String>,
+) -> InspectScopeSweepSummary {
+    sweep_inspect_scope_dirs_with_limits(
+        inspect_root,
+        live_scope_keys,
+        INSPECT_SCOPE_SWEEP_BUDGET,
+        usize::MAX,
+    )
+}
+
+fn sweep_inspect_scope_dirs_with_limits(
+    inspect_root: &Path,
+    live_scope_keys: &HashSet<String>,
+    wall_clock_budget: Duration,
+    entry_limit: usize,
+) -> InspectScopeSweepSummary {
+    let started = Instant::now();
+    let deadline = started + wall_clock_budget;
+    let mut summary = InspectScopeSweepSummary::default();
+    let mut entries = match fs::read_dir(inspect_root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                file_type.is_dir().then(|| {
+                    (
+                        entry.file_name().to_string_lossy().to_string(),
+                        entry.path(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let cursor_store = INSPECT_SCOPE_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let last_name = cursor_store.lock().ok().and_then(|cursors| {
+        cursors
+            .get(inspect_root)
+            .and_then(|cursor| cursor.last_name.clone())
+    });
+    let start_index = last_name
+        .as_deref()
+        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
+        .unwrap_or(0);
+    if start_index > 0 {
+        entries.rotate_left(start_index);
+    }
+
+    let mut cursor_name = last_name;
+    for (processed, (name, path)) in entries.into_iter().enumerate() {
+        if processed >= entry_limit || started.elapsed() >= wall_clock_budget {
+            summary.budget_exhausted = true;
+            break;
+        }
+        match inspect_scope_candidate(&path, &name, live_scope_keys, deadline) {
+            InspectScopeCandidateResult::BudgetExceeded => {
+                summary.budget_exhausted = true;
+                break;
+            }
+            InspectScopeCandidateResult::Processed => {}
+            InspectScopeCandidateResult::Removed { bytes } => {
+                summary.removed += 1;
+                summary.bytes = summary.bytes.saturating_add(bytes);
+            }
+            InspectScopeCandidateResult::SkippedLive => summary.skipped_live += 1,
+            InspectScopeCandidateResult::SkippedMarker => summary.skipped_marker += 1,
+        }
+        summary.scanned += 1;
+        cursor_name = Some(name);
+    }
+
+    if let Ok(mut cursors) = cursor_store.lock() {
+        let cursor = cursors.entry(inspect_root.to_path_buf()).or_default();
+        cursor.last_name = summary.budget_exhausted.then_some(cursor_name).flatten();
+        if !summary.budget_exhausted {
+            cursor.last_name = None;
+        }
+    }
+
+    if summary.removed > 0 {
+        crate::fs_lock::sync_parent(inspect_root);
+    }
+    crate::slog_info!(
+        "inspect scope cache sweep root={} removed={} bytes={} skipped_live={} skipped_marker={} scanned={} budget_exhausted={}",
+        inspect_root.display(),
+        summary.removed,
+        summary.bytes,
+        summary.skipped_live,
+        summary.skipped_marker,
+        summary.scanned,
+        summary.budget_exhausted
+    );
+    summary
+}
+
+fn inspect_scope_candidate(
+    scope_dir: &Path,
+    scope_name: &str,
+    live_scope_keys: &HashSet<String>,
+    deadline: Instant,
+) -> InspectScopeCandidateResult {
+    if live_scope_keys.contains(scope_name) {
+        return InspectScopeCandidateResult::SkippedLive;
+    }
+
+    let stats = match inspect_scope_file_stats(scope_dir, deadline) {
+        InspectScopeWalk::Complete(stats) => stats,
+        InspectScopeWalk::BudgetExceeded => return InspectScopeCandidateResult::BudgetExceeded,
+        InspectScopeWalk::Failed => return InspectScopeCandidateResult::Processed,
+    };
+    let Some(newest_file) = stats.newest_file else {
+        return InspectScopeCandidateResult::Processed;
+    };
+    let now = SystemTime::now();
+    if now.duration_since(newest_file).unwrap_or(Duration::ZERO) < INSPECT_SCOPE_MIN_AGE {
+        return InspectScopeCandidateResult::Processed;
+    }
+
+    if crate::root_cache::sweep_all_read_markers(scope_dir).protected {
+        return InspectScopeCandidateResult::SkippedMarker;
+    }
+
+    match fs::remove_dir_all(scope_dir) {
+        Ok(()) => InspectScopeCandidateResult::Removed { bytes: stats.bytes },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !scope_dir.exists() => {
+            InspectScopeCandidateResult::Removed { bytes: stats.bytes }
+        }
+        // A pinned directory (notably ERROR_SHARING_VIOLATION on Windows) is
+        // left for the next cursor pass; all deletion errors are best effort.
+        Err(_) => InspectScopeCandidateResult::Processed,
+    }
+}
+
+fn inspect_scope_file_stats(scope_dir: &Path, deadline: Instant) -> InspectScopeWalk {
+    if Instant::now() >= deadline {
+        return InspectScopeWalk::BudgetExceeded;
+    }
+    let entries = match fs::read_dir(scope_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return InspectScopeWalk::Complete(InspectScopeFileStats::default())
+        }
+        Err(_) => return InspectScopeWalk::Failed,
+    };
+    let mut stats = InspectScopeFileStats::default();
+    for entry in entries {
+        if Instant::now() >= deadline {
+            return InspectScopeWalk::BudgetExceeded;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return InspectScopeWalk::Failed,
+        };
+        let name = entry.file_name();
+        if name == "readers" {
+            // Marker heartbeats describe readers, not cache freshness. Marker
+            // liveness is checked separately after the age predicate.
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => return InspectScopeWalk::Failed,
+        };
+        if file_type.is_dir() {
+            match inspect_scope_file_stats(&entry.path(), deadline) {
+                InspectScopeWalk::Complete(child) => merge_scope_file_stats(&mut stats, child),
+                other => return other,
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return InspectScopeWalk::Failed,
+        };
+        stats.bytes = stats.bytes.saturating_add(metadata.len());
+        let Some(modified) = metadata.modified().ok() else {
+            return InspectScopeWalk::Failed;
+        };
+        if stats.newest_file.is_none_or(|newest| modified > newest) {
+            stats.newest_file = Some(modified);
+        }
+    }
+    InspectScopeWalk::Complete(stats)
+}
+
+fn merge_scope_file_stats(stats: &mut InspectScopeFileStats, child: InspectScopeFileStats) {
+    stats.bytes = stats.bytes.saturating_add(child.bytes);
+    if child.newest_file > stats.newest_file {
+        stats.newest_file = child.newest_file;
+    }
+}
+
+#[cfg(test)]
+fn reset_inspect_scope_sweep_cursor_for_test() {
+    if let Some(cursors) = INSPECT_SCOPE_SWEEP_CURSORS.get() {
+        cursors.lock().unwrap().clear();
+    }
+}
+
 fn acquire_writer_lease(
     inspect_dir: &Path,
     project_key: &str,
@@ -2124,6 +2384,7 @@ fn now_nanos() -> u128 {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -2188,6 +2449,134 @@ mod tests {
             .unwrap()
             .expect("pointer-published inspect cache should reopen read-only");
         assert_eq!(readonly.inner.sqlite_path(), reopened.sqlite_path());
+    }
+
+    fn write_aged_scope_file(scope_dir: &Path, name: &str) {
+        fs::create_dir_all(scope_dir.join("nested")).unwrap();
+        let path = scope_dir.join("nested").join(name);
+        fs::write(&path, b"old inspect payload").unwrap();
+        let old = SystemTime::now()
+            .checked_sub(INSPECT_SCOPE_MIN_AGE + Duration::from_secs(60))
+            .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+    }
+
+    #[test]
+    fn inspect_scope_sweep_reaps_aged_and_keeps_fresh_scope() {
+        reset_inspect_scope_sweep_cursor_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let inspect_root = temp.path().join("inspect");
+        let aged = inspect_root.join("aged-scope");
+        let fresh = inspect_root.join("fresh-scope");
+        write_aged_scope_file(&aged, "facts.sqlite");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("facts.sqlite"), b"fresh inspect payload").unwrap();
+
+        let summary = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+
+        assert_eq!(summary.removed, 1);
+        assert!(summary.bytes > 0, "reaped cache bytes must be reported");
+        assert!(!aged.exists(), "an aged scope directory must be reaped");
+        assert!(fresh.is_dir(), "a fresh scope directory must survive");
+        // This assertion is intentionally a negative check: if the age
+        // predicate is accidentally inverted, the fresh directory must still
+        // be kept and this assertion will fail.
+    }
+
+    #[test]
+    fn inspect_scope_sweep_keeps_aged_live_scope_key() {
+        reset_inspect_scope_sweep_cursor_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let inspect_root = temp.path().join("inspect");
+        let project_root = temp.path().join("checkout");
+        fs::create_dir_all(&project_root).unwrap();
+        let scope_key = crate::path_identity::project_scope_key(&project_root);
+        let live = inspect_root.join(&scope_key);
+        write_aged_scope_file(&live, "facts.sqlite");
+        crate::root_cache::register_live_scope(temp.path(), &project_root);
+        let live_keys = crate::root_cache::live_scope_keys_for_storage(temp.path());
+
+        let summary = sweep_inspect_scope_dirs(&inspect_root, &live_keys);
+
+        crate::root_cache::unregister_live_scope(temp.path(), &project_root);
+        assert_eq!(summary.skipped_live, 1);
+        assert!(live.is_dir(), "a bound root's scope directory must survive");
+        // This assertion is intentionally a negative check: if the live-key
+        // exemption is removed, the bound root could be deleted and this
+        // assertion will fail.
+    }
+
+    #[test]
+    fn inspect_scope_sweep_keeps_live_marker_then_reaps_stale_marker_scope() {
+        reset_inspect_scope_sweep_cursor_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let inspect_root = temp.path().join("inspect");
+        let scope = inspect_root.join("marked-scope");
+        write_aged_scope_file(&scope, "facts.sqlite");
+        let marker = crate::root_cache::ReadMarker::create(&scope, "generation").unwrap();
+        let mut stale_metadata = marker.metadata().clone();
+        stale_metadata.pid = 0;
+        fs::write(
+            marker.path(),
+            serde_json::to_vec(&stale_metadata).expect("marker metadata serializes"),
+        )
+        .unwrap();
+
+        // Recreate a live marker after planting the stale fixture so the first
+        // pass exercises the existing marker liveness rules, not scope age.
+        let live_marker = crate::root_cache::ReadMarker::create(&scope, "live-generation").unwrap();
+        let first = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+        assert_eq!(first.skipped_marker, 1);
+        assert!(scope.is_dir(), "a live read marker protects an aged scope");
+        drop(live_marker);
+
+        let second = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+        assert_eq!(second.removed, 1);
+        assert!(
+            !scope.exists(),
+            "the scope is reapable after markers become stale"
+        );
+    }
+
+    #[test]
+    fn inspect_scope_sweep_cursor_resumes_after_tiny_budget() {
+        reset_inspect_scope_sweep_cursor_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let inspect_root = temp.path().join("inspect");
+        for name in ["scope-a", "scope-b", "scope-c"] {
+            write_aged_scope_file(&inspect_root.join(name), "facts.sqlite");
+        }
+
+        let first = sweep_inspect_scope_dirs_with_limits(
+            &inspect_root,
+            &HashSet::new(),
+            INSPECT_SCOPE_SWEEP_BUDGET,
+            1,
+        );
+        assert!(first.budget_exhausted);
+        assert!(!inspect_root.join("scope-a").exists());
+        assert!(inspect_root.join("scope-b").exists());
+        assert!(inspect_root.join("scope-c").exists());
+
+        let second = sweep_inspect_scope_dirs_with_limits(
+            &inspect_root,
+            &HashSet::new(),
+            INSPECT_SCOPE_SWEEP_BUDGET,
+            1,
+        );
+        assert!(second.budget_exhausted);
+        assert!(!inspect_root.join("scope-b").exists());
+        assert!(inspect_root.join("scope-c").exists());
+
+        let third = sweep_inspect_scope_dirs_with_limits(
+            &inspect_root,
+            &HashSet::new(),
+            INSPECT_SCOPE_SWEEP_BUDGET,
+            1,
+        );
+        assert!(!third.budget_exhausted);
+        assert!(!inspect_root.join("scope-c").exists());
+        reset_inspect_scope_sweep_cursor_for_test();
     }
 
     #[test]

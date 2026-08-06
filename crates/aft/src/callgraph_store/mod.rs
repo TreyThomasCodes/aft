@@ -2051,6 +2051,12 @@ impl CallGraphStore {
             // temps for roots that no longer build here, which the per-root GC
             // above never reaches.
             sweep_orphaned_build_temps_store_wide(callgraph_dir);
+            if let Some(storage_root) = root_storage_dir(callgraph_dir) {
+                let inspect_root =
+                    storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
+                let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(&storage_root);
+                crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
+            }
             Ok(())
         });
         if matches!(publication, Err(CallGraphStoreError::Superseded)) {
