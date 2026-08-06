@@ -9,6 +9,17 @@ use serde_json::Value;
 
 const MAX_UNCHECKED_FILES_IN_FOOTER: usize = 10;
 
+/// Soft threshold for a whole-file read that was NOT truncated: when the
+/// returned text exceeds this many bytes, append a gentle note that range
+/// parameters exist, so the agent knows it can narrow a large read without
+/// being told it lost content (it did not).
+const READ_SOFT_NOTE_BYTES: usize = 20 * 1024;
+
+/// One-line, non-scolding note appended when a whole file read is large but
+/// complete. Names both parameter shapes the agent can use to narrow it.
+const READ_SOFT_NOTE: &str =
+    "\n(File is large; use startLine/endLine or offset/limit to read a section.)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutlineMode {
     Text,
@@ -1232,6 +1243,17 @@ fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
+        // Not truncated. If the caller read the file whole and it came back
+        // large, offer a soft note that ranges exist — but only when the
+        // caller did not already pick a range (checked above).
+        let content_len = data
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        if content_len > READ_SOFT_NOTE_BYTES {
+            return READ_SOFT_NOTE.to_string();
+        }
         return String::new();
     }
     let start = data.get("start_line").and_then(Value::as_u64);
@@ -1239,7 +1261,7 @@ fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
     let total = data.get("total_lines").and_then(Value::as_u64);
     match (start, end, total) {
         (Some(start), Some(end), Some(total)) => format!(
-            "\n(Showing lines {start}-{end} of {total}. Use startLine/endLine to read other sections.)"
+            "\n(Showing lines {start}-{end} of {total}. Use startLine/endLine or offset/limit to read other sections.)"
         ),
         _ => String::new(),
     }

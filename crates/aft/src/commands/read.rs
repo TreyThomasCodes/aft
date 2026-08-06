@@ -1460,4 +1460,133 @@ mod tests {
             .unwrap()
             .contains("too large to inline"));
     }
+
+    /// Render a read response through the agent-facing text formatter, the same
+    /// path the plugins use. `agent_specified_range` mirrors whether the caller
+    /// passed a range parameter (startLine/endLine or offset/limit).
+    fn render_read(response: &Response, agent_specified_range: bool) -> String {
+        crate::subc_format::format_response("read", response, agent_specified_range)
+    }
+
+    /// Build a text fixture whose rendered line-numbered output exceeds
+    /// `MAX_BYTES` (50KB) so a whole-file read truncates.
+    fn oversized_text_fixture(root: &Path, name: &str) -> PathBuf {
+        let line = "x".repeat(80);
+        let mut content = String::new();
+        // ~2000 lines * ~85 bytes/line ≈ 170KB, well past the 50KB cap.
+        for i in 1..=2000 {
+            content.push_str(&format!("line-{i}-{line}\n"));
+        }
+        write_fixture(root, name, content.as_bytes())
+    }
+
+    #[test]
+    fn truncated_read_carries_footer_and_structured_truncation_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = oversized_text_fixture(temp.path(), "big.txt");
+
+        let response = read_response(temp.path(), &path, json!({}));
+
+        assert!(response.success);
+        // Expose truncation in the structured response fields so callers can
+        // tell when content was omitted, not just from the rendered footer.
+        assert_eq!(response.data["truncated"], json!(true));
+        assert!(response.data["total_lines"].as_u64().unwrap() >= 2000);
+        assert!(response.data["lines_read"].as_u64().unwrap() < 2000);
+
+        let text = render_read(&response, false);
+        assert!(
+            text.contains("Use startLine/endLine or offset/limit to read other sections."),
+            "truncated read should carry the narrowing footer, got: {text}"
+        );
+        assert!(
+            text.contains("Showing lines"),
+            "footer should state the range: {text}"
+        );
+    }
+
+    #[test]
+    fn whole_large_read_carries_soft_note_but_ranged_read_of_same_file_does_not() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Build a file that is large (>20KB soft threshold) yet still fits
+        // under the 50KB truncation cap when read whole.
+        let line = "y".repeat(40);
+        let mut content = String::new();
+        // ~600 lines * ~45 bytes ≈ 27KB: over the 20KB soft threshold, under
+        // the 50KB truncation cap.
+        for i in 1..=600 {
+            content.push_str(&format!("line-{i}-{line}\n"));
+        }
+        let path = write_fixture(temp.path(), "medium.txt", content.as_bytes());
+
+        // Whole read: not truncated, but large enough for the soft note.
+        let whole = read_response(temp.path(), &path, json!({}));
+        assert!(whole.success);
+        assert_eq!(whole.data["truncated"], json!(false));
+        let whole_text = render_read(&whole, false);
+        assert!(
+            whole_text.contains(
+                "File is large; use startLine/endLine or offset/limit to read a section."
+            ),
+            "whole large read should carry the soft note, got: {whole_text}"
+        );
+
+        // Ranged read of the same file: no soft note, no truncation footer.
+        let ranged = read_response(
+            temp.path(),
+            &path,
+            json!({ "start_line": 1, "end_line": 10 }),
+        );
+        assert!(ranged.success);
+        let ranged_text = render_read(&ranged, true);
+        assert!(
+            !ranged_text.contains("File is large"),
+            "ranged read must not carry the soft note, got: {ranged_text}"
+        );
+        assert!(
+            !ranged_text.contains("Use startLine/endLine"),
+            "ranged read must not carry the truncation footer, got: {ranged_text}"
+        );
+    }
+
+    #[test]
+    fn small_read_carries_no_footer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = write_fixture(temp.path(), "small.txt", b"hello\nworld\n");
+
+        let response = read_response(temp.path(), &path, json!({}));
+        assert!(response.success);
+        assert_eq!(response.data["truncated"], json!(false));
+
+        let text = render_read(&response, false);
+        assert!(
+            !text.contains("File is large") && !text.contains("Use startLine/endLine"),
+            "small read should carry no footer, got: {text}"
+        );
+    }
+
+    #[test]
+    fn ranged_read_of_oversized_fixture_carries_no_footer() {
+        // Negative control: the truncation footer must NOT appear when the
+        // caller already picked a range on the same oversized fixture.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = oversized_text_fixture(temp.path(), "big.txt");
+
+        let response = read_response(
+            temp.path(),
+            &path,
+            json!({ "start_line": 1, "end_line": 5 }),
+        );
+        assert!(response.success);
+
+        let text = render_read(&response, true);
+        assert!(
+            !text.contains("Use startLine/endLine"),
+            "ranged read of oversized fixture must not carry the footer, got: {text}"
+        );
+        assert!(
+            !text.contains("File is large"),
+            "ranged read must not carry the soft note, got: {text}"
+        );
+    }
 }
