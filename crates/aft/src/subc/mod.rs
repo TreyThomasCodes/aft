@@ -5464,8 +5464,14 @@ mod tests {
         storage: &tempfile::TempDir,
         session_id: &str,
     ) -> (String, u32) {
+        // Windows refuses to delete a directory that is a running process's
+        // cwd (ERROR_SHARING_VIOLATION), so the task must not live inside the
+        // project root these tests delete. The kill path matches on the task's
+        // registered project_root, not its cwd, so pointing the cwd at task
+        // storage keeps the association under test intact.
         let command = if cfg!(windows) {
-            "cmd /c timeout /t 30 /nobreak > nul"
+            // timeout.exe requires a console; ping is the standard sleep shim.
+            "ping -n 31 127.0.0.1 > nul"
         } else {
             "sleep 30"
         };
@@ -5475,7 +5481,7 @@ mod tests {
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 command,
                 session_id.to_string(),
-                root.as_path().to_path_buf(),
+                storage.path().to_path_buf(),
                 HashMap::new(),
                 Some(Duration::from_secs(60)),
                 storage.path().to_path_buf(),
