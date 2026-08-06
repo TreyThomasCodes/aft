@@ -796,6 +796,16 @@ fn process_callgraph_refresh_batch(
         workspace_crate_prefixes.remove(&batch.root);
     }
 
+    let paths = batch
+        .paths
+        .iter()
+        .filter(|path| crate::parser::detect_language(path).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return;
+    }
+    note_refresh_worker_batch_for_test(&batch.root.project_root);
     if batch
         .ticket
         .as_ref()
@@ -804,15 +814,6 @@ fn process_callgraph_refresh_batch(
         // Superseded before starting: park the paths so the next configure's
         // pending replay (or unbind cleanup) decides their fate.
         batch.defer();
-        return;
-    }
-    let paths = batch
-        .paths
-        .iter()
-        .filter(|path| crate::parser::detect_language(path).is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
         return;
     }
     let workspace_crate_prefix_cache =
@@ -940,6 +941,7 @@ struct RefreshWorkerTestSeam {
     fail_refresh: bool,
     fail_open: bool,
     refresh_calls: usize,
+    worker_calls: usize,
     stale_marks: usize,
 }
 
@@ -995,6 +997,18 @@ fn refresh_worker_test_seam(project_root: &Path) -> RefreshWorkerTestSeam {
         .get(project_root)
         .copied()
         .unwrap_or_default()
+}
+
+fn note_refresh_worker_batch_for_test(project_root: &Path) {
+    if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
+        if let Some(seam) = seams
+            .lock()
+            .expect("callgraph refresh test seam mutex poisoned")
+            .get_mut(project_root)
+        {
+            seam.worker_calls += 1;
+        }
+    }
 }
 
 fn note_refresh_worker_call_for_test(project_root: &Path) {
@@ -1058,6 +1072,11 @@ pub fn set_callgraph_refresh_worker_test_open_failure(project_root: PathBuf, ena
 pub fn callgraph_refresh_worker_test_counts(project_root: &Path) -> (usize, usize) {
     let seam = refresh_worker_test_seam(project_root);
     (seam.refresh_calls, seam.stale_marks)
+}
+
+#[doc(hidden)]
+pub fn callgraph_refresh_worker_test_worker_calls(project_root: &Path) -> usize {
+    refresh_worker_test_seam(project_root).worker_calls
 }
 
 #[doc(hidden)]
@@ -10935,6 +10954,85 @@ mod refresh_worker_tests {
         assert!(
             pending.lock().contains(&source),
             "superseded batch must defer its paths to the pending sink"
+        );
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn superseded_open_failure_defers_without_self_replay() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        let installed = Arc::new(
+            CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone())
+                .unwrap()
+                .expect("ready store snapshot"),
+        );
+        let refresh_state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(Arc::clone(&installed)))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(!installed.is_legacy_fallback());
+        assert!(installed.is_current());
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+        let (held_rx, release_tx) = install_callgraph_refresh_worker_test_gate(root.clone());
+
+        let lifecycle = SubcLifecycleAdmission::default();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let publish_epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            lifecycle,
+            Arc::clone(&generation),
+            7,
+            publish_epoch.clone(),
+            publish_epoch.current(),
+        );
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            callgraph_dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            refresh_state,
+            ticket,
+        );
+        held_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("refresh worker must hold after injected open failure");
+
+        // Mark the refresh request obsolete after the injected open failure,
+        // then unblock the worker before its deferred retry can run.
+        generation.store(8, std::sync::atomic::Ordering::SeqCst);
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), false);
+        release_tx
+            .send(())
+            .expect("release superseded refresh worker");
+        wait_for_refresh_worker_idle();
+
+        assert_eq!(
+            callgraph_refresh_worker_test_counts(&root).0,
+            1,
+            "superseded open-failure batch must not self-replay"
+        );
+        assert_eq!(
+            callgraph_refresh_worker_test_worker_calls(&root),
+            1,
+            "superseded open-failure batch must not create another worker call"
+        );
+        assert!(
+            pending.lock().contains(&source),
+            "superseded open-failure paths must remain in the pending sink"
+        );
+        let tree = installed
+            .call_tree(Path::new("main.rs"), "entry", 1)
+            .unwrap();
+        assert_eq!(
+            tree.children[0].name, "old_leaf",
+            "superseded open-failure batch must not converge the store"
         );
         clear_callgraph_refresh_worker_test_seam(&root);
     }
