@@ -154,6 +154,10 @@ impl WindowsShell {
     /// `FILE_SHARE_DELETE`) and atomically swaps in a fully-written file, so the
     /// daemon's fresh open in `read_exit_marker` never observes a partial value.
     /// (Verified empirically on native Windows.)
+    ///
+    /// PowerShell and cmd do not expose a portable per-segment pipeline status
+    /// array, so Windows wrappers intentionally record only the overall exit
+    /// code. Unix bash/zsh pipeline diagnostics live in the Unix payload wrapper.
     pub(crate) fn wrapper_script(&self, command: &str, exit_path: &Path) -> String {
         match self {
             WindowsShell::Pwsh | WindowsShell::Powershell => {

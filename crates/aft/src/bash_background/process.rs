@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::path::Path;
 /// Shared process-termination helpers for both foreground bash and background
 /// bash tasks. Extracted to avoid duplication between `commands/bash.rs` and
 /// `bash_background/registry.rs`.
@@ -14,6 +16,53 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+
+/// The Unix payload wrapper runs the user's command in the same shell that
+/// owns the pipeline. Bash exposes per-segment statuses as `PIPESTATUS`, while
+/// zsh exposes them as `pipestatus`; plain POSIX sh has neither and therefore
+/// receives the original command without a capture suffix. The status stream
+/// uses fd 5, which the parent opens only for a clean pipeline and places beside
+/// the ordinary exit marker. Windows shells use their existing wrapper and do
+/// not have a portable per-segment status equivalent.
+#[cfg(unix)]
+pub(crate) const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
+shell=$1
+command=$2
+exit_fd=$3
+pipeline_status_fd=$4
+pipeline_shell=$5
+case "$pipeline_status_fd:$pipeline_shell" in
+  5:bash)
+    "$shell" -c "$command
+__aft_code=\$? __aft_ps=(\"\${PIPESTATUS[@]}\")
+printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
+exit \"\$__aft_code\""
+    ;;
+  5:zsh)
+    "$shell" -c "$command
+__aft_code=\$? __aft_ps=(\"\${pipestatus[@]}\")
+printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
+exit \"\$__aft_code\""
+    ;;
+  *)
+    # POSIX sh has no per-segment pipeline status array; preserve the original
+    # invocation instead of changing its semantics with a best-effort guess.
+    "$shell" -c "$command"
+    ;;
+esac
+code=$?
+printf "%s" "$code" >&"$exit_fd"
+exit "$code"
+"#;
+
+#[cfg(unix)]
+pub(crate) fn pipeline_shell_kind(shell: &Path) -> Option<&'static str> {
+    match shell.file_name().and_then(|name| name.to_str()) {
+        Some("bash") => Some("bash"),
+        Some("zsh") => Some("zsh"),
+        _ => None,
+    }
+}
 
 #[cfg(unix)]
 pub fn terminate_process(child: &mut Child) {
@@ -111,6 +160,54 @@ mod tests {
     #[test]
     fn is_process_alive_returns_true_for_self() {
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_wrapper_captures_bash_and_zsh_pipeline_statuses() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut shells = vec![("/bin/bash", "bash")];
+        if Path::new("/bin/zsh").is_file() {
+            shells.push(("/bin/zsh", "zsh"));
+        }
+
+        for (shell, kind) in shells {
+            let temp = tempfile::tempdir().expect("create wrapper test directory");
+            let exit_path = temp.path().join("exit");
+            let status_path = temp.path().join("pipeline-status");
+            let exit_file = std::fs::File::create(&exit_path).expect("create exit marker");
+            let status_file = std::fs::File::create(&status_path).expect("create status file");
+            let exit_fd = exit_file.as_raw_fd();
+            let status_fd = status_file.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command.args([
+                "-c",
+                std::str::from_utf8(PAYLOAD_WRAPPER).expect("wrapper is UTF-8"),
+                "aft-payload-wrapper",
+                shell,
+                "false | true",
+                "3",
+                "5",
+                kind,
+            ]);
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(exit_fd, 3) < 0 || libc::dup2(status_fd, 5) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let result = command.status().expect("run payload wrapper");
+            drop(exit_file);
+            drop(status_file);
+            assert!(result.success(), "wrapper failed for {kind}");
+            assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "1\n0\n");
+            assert_eq!(std::fs::read_to_string(&exit_path).unwrap(), "0");
+        }
     }
 
     #[test]

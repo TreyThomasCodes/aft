@@ -99,16 +99,6 @@ const ESCALATION_GRANT_TTL: Duration = Duration::from_secs(120);
 #[cfg(unix)]
 const ESCALATION_DIGEST_TAG: &[u8] = b"aft-escalation-payload-v3";
 #[cfg(unix)]
-const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
-shell=$1
-command=$2
-exit_fd=$3
-"$shell" -c "$command"
-code=$?
-printf "%s" "$code" >&"$exit_fd"
-exit "$code"
-"#;
-#[cfg(unix)]
 const ENVIRONMENT_TAG: &[u8] = b"AFTENV1\0";
 #[cfg(unix)]
 const ESCALATION_TIER: &[u8] = b"host";
@@ -651,7 +641,7 @@ fn materialize_payload(
     let digest = payload_digest(
         &task.paths.task_id,
         command_bytes,
-        PAYLOAD_WRAPPER,
+        crate::bash_background::process::PAYLOAD_WRAPPER,
         &environment_bytes,
         root,
         cwd,
@@ -668,7 +658,7 @@ fn materialize_payload(
     crate::bash_background::persistence::create_control_file(
         &task.dirs,
         crate::bash_background::persistence::WRAPPER_FILE,
-        PAYLOAD_WRAPPER,
+        crate::bash_background::process::PAYLOAD_WRAPPER,
     )
     .map_err(|error| format!("failed to materialize wrapper payload: {error}"))?;
     crate::bash_background::persistence::create_control_file(
@@ -2394,12 +2384,15 @@ pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() ->
 pub(crate) const CHILD_EXIT_FD: RawFd = 3;
 #[cfg(unix)]
 pub(crate) const CHILD_FAILURE_FD: RawFd = 4;
+#[cfg(unix)]
+pub(crate) const CHILD_PIPE_STATUS_FD: RawFd = 5;
 
 #[cfg(unix)]
 pub(crate) fn apply_marker_fd_allowlist(
     command: &mut Command,
     exit_fd: RawFd,
     failure_fd: RawFd,
+    pipeline_status_fd: Option<RawFd>,
 ) -> Result<(RawFd, RawFd), String> {
     use std::os::unix::process::CommandExt;
 
@@ -2411,27 +2404,48 @@ pub(crate) fn apply_marker_fd_allowlist(
     };
     unsafe {
         command.pre_exec(move || {
-            let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 5);
+            let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 6);
             if exit_copy < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let failure_copy = libc::fcntl(failure_fd, libc::F_DUPFD_CLOEXEC, 5);
+            let failure_copy = libc::fcntl(failure_fd, libc::F_DUPFD_CLOEXEC, 6);
             if failure_copy < 0 {
                 let error = std::io::Error::last_os_error();
                 libc::close(exit_copy);
                 return Err(error);
             }
-            if libc::dup2(exit_copy, CHILD_EXIT_FD) < 0
-                || libc::dup2(failure_copy, CHILD_FAILURE_FD) < 0
-            {
+            let status_copy =
+                pipeline_status_fd.map(|fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 6));
+            if status_copy.is_some_and(|fd| fd < 0) {
                 let error = std::io::Error::last_os_error();
                 libc::close(exit_copy);
                 libc::close(failure_copy);
                 return Err(error);
             }
+            let status_copy = status_copy.unwrap_or(-1);
+            if libc::dup2(exit_copy, CHILD_EXIT_FD) < 0
+                || libc::dup2(failure_copy, CHILD_FAILURE_FD) < 0
+                || (status_copy >= 0 && libc::dup2(status_copy, CHILD_PIPE_STATUS_FD) < 0)
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(exit_copy);
+                libc::close(failure_copy);
+                if status_copy >= 0 {
+                    libc::close(status_copy);
+                }
+                return Err(error);
+            }
             libc::close(exit_copy);
             libc::close(failure_copy);
-            for fd in 5..fd_limit {
+            if status_copy >= 0 {
+                libc::close(status_copy);
+            }
+            let first_dynamic_fd = if pipeline_status_fd.is_some() {
+                CHILD_PIPE_STATUS_FD + 1
+            } else {
+                CHILD_PIPE_STATUS_FD
+            };
+            for fd in first_dynamic_fd..fd_limit {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
                     libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);

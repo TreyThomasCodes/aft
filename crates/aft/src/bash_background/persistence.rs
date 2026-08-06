@@ -55,6 +55,7 @@ pub struct TaskPaths {
     pub stdout: PathBuf,
     pub stderr: PathBuf,
     pub exit: PathBuf,
+    pub pipeline_status: PathBuf,
     pub pty: PathBuf,
     pub sandbox_unavailable: PathBuf,
     pub command: PathBuf,
@@ -78,6 +79,7 @@ impl TaskPaths {
             stdout: io_dir.join(TaskArtifact::Stdout.file_name()),
             stderr: io_dir.join(TaskArtifact::Stderr.file_name()),
             exit: io_dir.join(TaskArtifact::Exit.file_name()),
+            pipeline_status: io_dir.join(TaskArtifact::PipelineStatus.file_name()),
             pty: io_dir.join(TaskArtifact::Pty.file_name()),
             sandbox_unavailable: io_dir.join(TaskArtifact::SandboxUnavailable.file_name()),
             command: control_dir.join(COMMAND_FILE),
@@ -102,6 +104,7 @@ impl TaskPaths {
             stdout: prefix("stdout"),
             stderr: prefix("stderr"),
             exit: prefix("exit"),
+            pipeline_status: prefix("pipeline-status"),
             pty: prefix("pty"),
             sandbox_unavailable: prefix("sandbox-unavailable"),
             command: prefix("sh"),
@@ -118,6 +121,7 @@ impl TaskPaths {
             TaskArtifact::Stdout => &self.stdout,
             TaskArtifact::Stderr => &self.stderr,
             TaskArtifact::Exit => &self.exit,
+            TaskArtifact::PipelineStatus => &self.pipeline_status,
             TaskArtifact::Pty => &self.pty,
             TaskArtifact::SandboxUnavailable => &self.sandbox_unavailable,
         }
@@ -138,15 +142,17 @@ pub enum TaskArtifact {
     Stdout,
     Stderr,
     Exit,
+    PipelineStatus,
     Pty,
     SandboxUnavailable,
 }
 
 impl TaskArtifact {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Stdout,
         Self::Stderr,
         Self::Exit,
+        Self::PipelineStatus,
         Self::Pty,
         Self::SandboxUnavailable,
     ];
@@ -156,6 +162,7 @@ impl TaskArtifact {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
             Self::Exit => "exit",
+            Self::PipelineStatus => "pipeline-status",
             Self::Pty => "pty",
             Self::SandboxUnavailable => "sandbox-unavailable",
         }
@@ -166,6 +173,7 @@ impl TaskArtifact {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
             Self::Exit => "exit",
+            Self::PipelineStatus => "pipeline-status",
             Self::Pty => "pty",
             Self::SandboxUnavailable => "sandbox-unavailable",
         }
@@ -478,6 +486,10 @@ pub struct PersistedTask {
     pub task_id: String,
     pub session_id: String,
     pub command: String,
+    /// Scanner-derived segment labels retained so completion rendering does not
+    /// need to parse the command again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline_segments: Vec<String>,
     #[serde(default)]
     pub mode: BgMode,
     pub workdir: PathBuf,
@@ -540,6 +552,7 @@ impl PersistedTask {
             task_id,
             session_id,
             command,
+            pipeline_segments: Vec::new(),
             mode: BgMode::Pipes,
             workdir,
             project_root,
@@ -652,6 +665,7 @@ impl From<BashTaskRow> for PersistedTask {
             task_id: row.task_id,
             session_id: row.session_id,
             command: row.command,
+            pipeline_segments: Vec::new(),
             mode: BgMode::Pipes,
             workdir: PathBuf::from(row.cwd),
             project_root: None,
@@ -1271,6 +1285,7 @@ pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
         paths.stdout.clone(),
         paths.stderr.clone(),
         paths.exit.clone(),
+        paths.pipeline_status.clone(),
         paths.pty.clone(),
         paths.sandbox_unavailable.clone(),
         paths.command.clone(),
@@ -1489,11 +1504,16 @@ pub struct TaskIoHandles {
     stderr: Option<File>,
     exit: File,
     pty: Option<File>,
+    pipeline_status: Option<File>,
     sandbox_unavailable: File,
 }
 
 impl TaskIoHandles {
-    pub fn create(task: &ResolvedTask, mode: BgMode) -> io::Result<Self> {
+    pub fn create(
+        task: &ResolvedTask,
+        mode: BgMode,
+        capture_pipeline_status: bool,
+    ) -> io::Result<Self> {
         if task.paths.layout != TaskLayout::Directory {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1532,6 +1552,13 @@ impl TaskIoHandles {
                 .dirs
                 .io
                 .open_new_file(OsStr::new(TaskArtifact::Exit.file_name()))?,
+            pipeline_status: capture_pipeline_status
+                .then(|| {
+                    task.dirs
+                        .io
+                        .open_new_file(OsStr::new(TaskArtifact::PipelineStatus.file_name()))
+                })
+                .transpose()?,
             pty,
             sandbox_unavailable: task
                 .dirs
@@ -1545,6 +1572,7 @@ impl TaskIoHandles {
             TaskArtifact::Stdout => self.stdout.as_ref(),
             TaskArtifact::Stderr => self.stderr.as_ref(),
             TaskArtifact::Exit => Some(&self.exit),
+            TaskArtifact::PipelineStatus => self.pipeline_status.as_ref(),
             TaskArtifact::Pty => self.pty.as_ref(),
             TaskArtifact::SandboxUnavailable => Some(&self.sandbox_unavailable),
         }
@@ -1567,6 +1595,7 @@ impl TaskIoHandles {
             TaskArtifact::Stdout => self.stdout.as_mut(),
             TaskArtifact::Stderr => self.stderr.as_mut(),
             TaskArtifact::Exit => Some(&mut self.exit),
+            TaskArtifact::PipelineStatus => self.pipeline_status.as_mut(),
             TaskArtifact::Pty => self.pty.as_mut(),
             TaskArtifact::SandboxUnavailable => Some(&mut self.sandbox_unavailable),
         }
@@ -1585,6 +1614,7 @@ impl TaskIoHandles {
             TaskArtifact::Stdout => self.stdout.as_ref(),
             TaskArtifact::Stderr => self.stderr.as_ref(),
             TaskArtifact::Exit => Some(&self.exit),
+            TaskArtifact::PipelineStatus => self.pipeline_status.as_ref(),
             TaskArtifact::Pty => self.pty.as_ref(),
             TaskArtifact::SandboxUnavailable => Some(&self.sandbox_unavailable),
         }
@@ -2053,11 +2083,11 @@ mod tests {
         fs::write(&victim, b"victim-bytes").unwrap();
 
         symlink(&victim, &task.paths.stdout).unwrap();
-        assert!(TaskIoHandles::create(&task, BgMode::Pipes).is_err());
+        assert!(TaskIoHandles::create(&task, BgMode::Pipes, false).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
         fs::remove_file(&task.paths.stdout).unwrap();
 
-        let mut handles = TaskIoHandles::create(&task, BgMode::Pipes).unwrap();
+        let mut handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
         fs::hard_link(&task.paths.stdout, task.paths.io_dir.join("linked-stdout")).unwrap();
         assert!(handles
             .write(TaskArtifact::Stdout, b"daemon-write")

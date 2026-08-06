@@ -18,6 +18,8 @@ use serde::Serialize;
 
 use crate::bash_permissions::PermissionAsk;
 use crate::compress::caps::DropClass;
+#[cfg(unix)]
+use crate::compress::single_top_level_pipeline;
 use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
 use crate::db::compression_events::CompressionAggregateCache;
@@ -557,7 +559,8 @@ impl BgTaskRegistry {
 
         let mut cap_buffer = buffer.clone();
         let disk_truncation = cap_buffer.enforce_terminal_cap();
-        let cache = self.render_terminal_output(&metadata, &cap_buffer, disk_truncation);
+        let cache =
+            self.render_terminal_output(&metadata, &cap_buffer, disk_truncation, Some(&task.paths));
         let mut state = task.state.lock().ok()?;
         if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
             return None;
@@ -574,6 +577,7 @@ impl BgTaskRegistry {
         metadata: &PersistedTask,
         buffer: &BgBuffer,
         disk_truncation: DiskTruncation,
+        paths: Option<&TaskPaths>,
     ) -> TerminalOutputCache {
         let output_readable = buffer
             .output_path()
@@ -599,17 +603,20 @@ impl BgTaskRegistry {
             };
         }
 
-        if let Some(structured) = render_structured_output(
+        if let Some(mut structured) = render_structured_output(
             &metadata.command,
             buffer,
             disk_truncation,
             artifact_access.clone(),
         ) {
+            append_pipeline_warning(&mut structured, metadata, paths);
             return structured;
         }
 
         if !metadata.compressed {
-            return render_raw_passthrough(buffer, disk_truncation, artifact_access);
+            let mut raw = render_raw_passthrough(buffer, disk_truncation, artifact_access);
+            append_pipeline_warning(&mut raw, metadata, paths);
+            return raw;
         }
 
         let raw = buffer.read_combined_head_tail(
@@ -618,13 +625,15 @@ impl BgTaskRegistry {
             COMPRESS_INPUT_TAIL_BYTES,
         );
         let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-        render_compressed_with_recovery(
+        let mut rendered = render_compressed_with_recovery(
             buffer,
             compressed,
             raw.truncated,
             disk_truncation,
             artifact_access,
-        )
+        );
+        append_pipeline_warning(&mut rendered, metadata, paths);
+        rendered
     }
 
     fn snapshot_with_terminal_cache(
@@ -1106,6 +1115,25 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        let shell = spawn_plan
+            .host_shell_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(resolve_posix_shell);
+        let pipeline = single_top_level_pipeline(command);
+        let capture_pipeline_status =
+            pipeline.is_some() && super::process::pipeline_shell_kind(&shell).is_some();
+        if capture_pipeline_status {
+            metadata.pipeline_segments = pipeline
+                .as_ref()
+                .map(|pipeline| {
+                    pipeline
+                        .segments
+                        .iter()
+                        .map(|segment| segment.label.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -1115,8 +1143,9 @@ impl BgTaskRegistry {
         }
         self.dual_write_task(&paths, &metadata);
 
-        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes)
-            .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        let mut io_handles =
+            TaskIoHandles::create(&task_layout, BgMode::Pipes, capture_pipeline_status)
+                .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
@@ -1124,6 +1153,7 @@ impl BgTaskRegistry {
             &workdir,
             &env,
             &mut io_handles,
+            capture_pipeline_status,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -1254,7 +1284,7 @@ impl BgTaskRegistry {
             ));
         }
         self.dual_write_task(&paths, &metadata);
-        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty)
+        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
 
         let runtime = match spawn_pty_for_command(
@@ -1372,7 +1402,7 @@ impl BgTaskRegistry {
             ));
         }
         self.dual_write_task(&paths, &metadata);
-        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes)
+        let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
 
         let child = match spawn_detached_child(
@@ -1382,6 +1412,7 @@ impl BgTaskRegistry {
             &workdir,
             &env,
             &mut io_handles,
+            false,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -3357,7 +3388,7 @@ impl BgTaskRegistry {
         }
         let mut buffer = BgBuffer::registered(paths, BgMode::Pipes);
         let disk_truncation = buffer.enforce_terminal_cap();
-        Some(self.render_terminal_output(metadata, &buffer, disk_truncation))
+        Some(self.render_terminal_output(metadata, &buffer, disk_truncation, Some(paths)))
     }
 
     fn enqueue_completion_from_parts(
@@ -3392,7 +3423,7 @@ impl BgTaskRegistry {
             render_buffer.map(|buffer| {
                 let mut capped_buffer = buffer.clone();
                 let disk_truncation = capped_buffer.enforce_terminal_cap();
-                self.render_terminal_output(metadata, &capped_buffer, disk_truncation)
+                self.render_terminal_output(metadata, &capped_buffer, disk_truncation, paths)
             })
         } else {
             None
@@ -3898,6 +3929,68 @@ impl BgTaskRegistry {
 
 fn canonical_artifact_root(paths: &TaskPaths) -> PathBuf {
     fs::canonicalize(&paths.io_dir).unwrap_or_else(|_| paths.io_dir.clone())
+}
+
+/// Append the pipeline-failure note after compression and output capping. The
+/// note is intentionally derived from the same scanner used before spawning;
+/// the status file only supplies numeric results for those already-known
+/// segments.
+fn append_pipeline_warning(
+    cache: &mut TerminalOutputCache,
+    metadata: &PersistedTask,
+    paths: Option<&TaskPaths>,
+) {
+    if metadata.exit_code != Some(0) {
+        return;
+    }
+    let Some(paths) = paths else {
+        return;
+    };
+    if metadata.pipeline_segments.len() < 2 {
+        return;
+    }
+    let Ok(mut status_file) = open_task_artifact(paths, TaskArtifact::PipelineStatus) else {
+        return;
+    };
+    let Ok(status_bytes) = status_file.read_all() else {
+        return;
+    };
+    let Some(statuses) = String::from_utf8_lossy(&status_bytes)
+        .lines()
+        .map(|line| line.trim().parse::<i32>().ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    if statuses.len() != metadata.pipeline_segments.len() {
+        return;
+    }
+    let Some((failing_index, failing_code)) = statuses
+        .iter()
+        .enumerate()
+        .take(statuses.len().saturating_sub(1))
+        .find(|(_, code)| **code != 0)
+        .map(|(index, code)| (index, *code))
+    else {
+        return;
+    };
+    let Some(final_segment) = metadata.pipeline_segments.last() else {
+        return;
+    };
+    let failing_segment = &metadata.pipeline_segments[failing_index];
+    let footer = format!(
+        "note: `{}` (segment {} of {}) exited {}; the pipeline's exit code is `{}`'s.",
+        failing_segment,
+        failing_index + 1,
+        metadata.pipeline_segments.len(),
+        failing_code,
+        final_segment,
+    );
+    if cache.output_preview.trim().is_empty() {
+        cache.output_preview = footer;
+    } else {
+        cache.output_preview = format!("{}\n{}", cache.output_preview.trim_end(), footer,);
+    }
 }
 
 fn render_compressed_with_recovery(
@@ -4889,7 +4982,10 @@ fn spawn_detached_child(
     workdir: &Path,
     env: &HashMap<String, String>,
     io_handles: &mut TaskIoHandles,
+    capture_pipeline_status: bool,
 ) -> Result<std::process::Child, String> {
+    #[cfg(windows)]
+    let _ = capture_pipeline_status;
     #[cfg(not(windows))]
     let _ = command;
     #[cfg(not(windows))]
@@ -4912,10 +5008,20 @@ fn spawn_detached_child(
         let failure = io_handles
             .inheritable_file(TaskArtifact::SandboxUnavailable)
             .map_err(|e| format!("failed to inherit sandbox failure marker handle: {e}"))?;
+        let pipeline_status = capture_pipeline_status
+            .then(|| io_handles.inheritable_file(TaskArtifact::PipelineStatus))
+            .transpose()
+            .map_err(|e| format!("failed to inherit pipeline status handle: {e}"))?;
         let shell = spawn_plan
             .host_shell_path()
             .map(Path::to_path_buf)
             .unwrap_or_else(resolve_posix_shell);
+        let pipeline_shell = super::process::pipeline_shell_kind(&shell).unwrap_or("");
+        let pipeline_status_fd = if capture_pipeline_status {
+            crate::sandbox_spawn::CHILD_PIPE_STATUS_FD.to_string()
+        } else {
+            String::new()
+        };
         let args = vec![
             OsString::from("-c"),
             payload.wrapper_text.clone(),
@@ -4923,6 +5029,8 @@ fn spawn_detached_child(
             shell.as_os_str().to_os_string(),
             payload.command_text.clone(),
             OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
+            OsString::from(pipeline_status_fd),
+            OsString::from(pipeline_shell),
         ];
         let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
             spawn_plan,
@@ -4936,6 +5044,7 @@ fn spawn_detached_child(
             &mut child_command,
             exit.as_raw_fd(),
             failure.as_raw_fd(),
+            pipeline_status.as_ref().map(|file| file.as_raw_fd()),
         )?;
         child_command
             .current_dir(workdir)
@@ -4947,7 +5056,7 @@ fn spawn_detached_child(
         let child = child_command
             .spawn()
             .map_err(|e| format!("failed to spawn background bash command: {e}"));
-        drop((payload, exit, failure, profile_handle));
+        drop((payload, exit, failure, pipeline_status, profile_handle));
         child
     }
     #[cfg(windows)]

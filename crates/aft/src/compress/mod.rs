@@ -974,172 +974,258 @@ enum PipeSplit {
     Unsafe,
 }
 
+/// A clean, single top-level pipeline as seen by the shell scanner. The segment
+/// labels are derived while scanning so completion warnings do not need to
+/// perform a second, less-capable parse of the user's command.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PipelineInfo {
+    pub(crate) segments: Vec<PipelineSegment>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PipelineSegment {
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Default)]
+struct PipelineScan {
+    stages: Vec<String>,
+    saw_top_pipe: bool,
+    saw_top_separator: bool,
+    saw_unmatched_close: bool,
+    in_single: bool,
+    in_double: bool,
+    in_backtick: bool,
+    paren_depth: u32,
+    escaped: bool,
+}
+
+/// Return the scanner's segment list only for a single, clean top-level
+/// pipeline. Instrumentation deliberately rejects comments here: appending a
+/// capture program to a command that ends in a comment is otherwise easy for
+/// the comment to swallow. Heredocs and other multi-statement forms are already
+/// rejected by the scanner's top-level newline/separator handling.
+#[cfg(unix)]
+pub(crate) fn single_top_level_pipeline(command: &str) -> Option<PipelineInfo> {
+    if strip_top_level_comment(command) != command {
+        return None;
+    }
+
+    let scan = scan_top_level_pipe(command);
+    let stages = clean_pipeline_stages(scan)?;
+    if stages.len() < 2 {
+        return None;
+    }
+
+    Some(PipelineInfo {
+        segments: stages
+            .iter()
+            .map(|stage| PipelineSegment {
+                label: pipeline_segment_label(stage),
+            })
+            .collect(),
+    })
+}
+
+#[cfg(unix)]
+fn pipeline_segment_label(stage: &str) -> String {
+    let stage = strip_leading_assignment_prefix(stage).unwrap_or_else(|| stage.trim().to_string());
+    let start = skip_whitespace(&stage, 0);
+    let Some(first_end) = shell_word_end(&stage, start) else {
+        return stage;
+    };
+    if first_end == stage.len() {
+        return stage[start..first_end].to_string();
+    }
+
+    let first_word = &stage[start..first_end];
+    if first_word != "git" {
+        return first_word.to_string();
+    }
+
+    // Git's subcommand is part of the user-facing command name (`git rebase`)
+    // and makes the warning substantially more useful than a bare `git` label.
+    let second_start = skip_whitespace(&stage, first_end);
+    let second_end = shell_word_end(&stage, second_start).unwrap_or(second_start);
+    if second_end > second_start {
+        format!("{} {}", first_word, &stage[second_start..second_end])
+    } else {
+        first_word.to_string()
+    }
+}
+
 /// Depth-aware pipeline scanner that FAILS CLOSED. Tracks single/double quotes,
 /// backslash escapes, backtick substitution, and `(`/`$(`/`<(`/`>(` nesting so a
 /// `|` inside any of them is not treated as a stage boundary. Splits on a
-/// top-level `|`/`|&` (never `||`) and returns the LAST stage — but ONLY when
-/// the command is a clean single pipeline. The caller captured the WHOLE
-/// command's stdout, so "last stage == captured output" holds only when no other
-/// top-level structure exists; otherwise a head-token compressor could claim the
-/// command and drop output (issue #137). Therefore, whenever a top-level pipe
+/// top-level `|`/`|&` (never `||`) and returns the LAST stage — but ONLY when the
+/// command is a clean single pipeline. The caller captured the WHOLE command's
+/// stdout, so "last stage == captured output" holds only when no other top-level
+/// structure exists; otherwise a head-token compressor could claim the command
+/// and drop the output (issue #137). Therefore, whenever a top-level pipe
 /// coexists with ANY of {a top-level separator `;`/`&&`/`||`/bare `&`/newline,
 /// an unbalanced quote/paren/backtick/escape, an unmatched `)`, or an empty
 /// trailing stage}, we return `Unsafe` so the caller forces generic compression.
 /// The same `Unsafe` result applies when there is NO pipe but a top-level
 /// separator IS present: the captured transcript interleaves multiple commands'
 /// output, so per-head specialized compression would delete the other commands'
-/// output.
-/// Top-level comments must already be removed by `strip_top_level_comment`.
-/// Redirects (`>`, `2>&1`, `&>`, …) are NOT separators.
+/// output. Top-level comments must already be removed by
+/// `strip_top_level_comment`. Redirects (`>`, `2>&1`, `&>`, …) are NOT separators.
 fn split_top_level_pipe(command: &str) -> PipeSplit {
-    let bytes = command.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut paren_depth: u32 = 0;
-    let mut escaped = false;
-    let mut saw_unmatched_close = false;
-    let mut saw_top_pipe = false;
-    let mut saw_top_separator = false;
-    let mut last_pipe_end: Option<usize> = None;
+    let scan = scan_top_level_pipe(command);
+    if scan.saw_top_pipe {
+        if let Some(stages) = clean_pipeline_stages(scan) {
+            return PipeSplit::LastStage(stages.last().cloned().unwrap_or_default());
+        }
+        return PipeSplit::Unsafe;
+    }
 
+    if (scan.imbalance() && command.contains('|')) || scan.saw_top_separator {
+        PipeSplit::Unsafe
+    } else {
+        PipeSplit::None
+    }
+}
+
+fn clean_pipeline_stages(scan: PipelineScan) -> Option<Vec<String>> {
+    if !scan.saw_top_pipe || scan.imbalance() || scan.saw_top_separator {
+        return None;
+    }
+    if scan.stages.iter().any(|stage| stage.trim().is_empty()) {
+        return None;
+    }
+    Some(scan.stages)
+}
+
+impl PipelineScan {
+    fn imbalance(&self) -> bool {
+        self.in_single
+            || self.in_double
+            || self.in_backtick
+            || self.escaped
+            || self.paren_depth != 0
+            || self.saw_unmatched_close
+    }
+}
+
+fn scan_top_level_pipe(command: &str) -> PipelineScan {
+    let bytes = command.as_bytes();
+    let mut scan = PipelineScan::default();
+    let mut stage_start = 0usize;
     let mut i = 0;
+
     while i < bytes.len() {
         let ch = bytes[i];
 
-        if escaped {
-            escaped = false;
+        if scan.escaped {
+            scan.escaped = false;
             i += 1;
             continue;
         }
-        if in_single {
+        if scan.in_single {
             if ch == b'\'' {
-                in_single = false;
+                scan.in_single = false;
             }
             i += 1;
             continue;
         }
-        if in_backtick {
+        if scan.in_backtick {
             // Backtick substitution is opaque for splitting. A backslash still
-            // escapes the next byte so an escaped backtick doesn't close it.
+            // escapes the next byte so an escaped backtick does not close it.
             if ch == b'\\' {
-                escaped = true;
+                scan.escaped = true;
             } else if ch == b'`' {
-                in_backtick = false;
+                scan.in_backtick = false;
             }
             i += 1;
             continue;
         }
         if ch == b'\\' {
-            escaped = true;
+            scan.escaped = true;
             i += 1;
             continue;
         }
         if ch == b'`' {
-            in_backtick = true;
+            scan.in_backtick = true;
             i += 1;
             continue;
         }
         // `$(` opens command substitution even inside double quotes.
         if ch == b'$' && bytes.get(i + 1) == Some(&b'(') {
-            paren_depth += 1;
+            scan.paren_depth += 1;
             i += 2;
             continue;
         }
-        if in_double {
+        if scan.in_double {
             if ch == b'"' {
-                in_double = false;
+                scan.in_double = false;
             }
             i += 1;
             continue;
         }
 
         // Below here: outside single/double quotes and backticks. Top-level
-        // comments are already removed by `strip_top_level_comment` before this
-        // scanner runs, so no `#` handling is needed here.
+        // comments are already removed by `strip_top_level_comment` before the
+        // compression scanner runs, so no `#` handling is needed here.
         let prev_raw = if i > 0 { bytes[i - 1] } else { b' ' };
 
         match ch {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
+            b'\'' => scan.in_single = true,
+            b'"' => scan.in_double = true,
             // process substitution `<(` / `>(`
             b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
-                paren_depth += 1;
+                scan.paren_depth += 1;
                 i += 2;
                 continue;
             }
-            b'(' => paren_depth += 1,
+            b'(' => scan.paren_depth += 1,
             b')' => {
-                if paren_depth == 0 {
-                    saw_unmatched_close = true;
+                if scan.paren_depth == 0 {
+                    scan.saw_unmatched_close = true;
                 } else {
-                    paren_depth -= 1;
+                    scan.paren_depth -= 1;
                 }
             }
-            b'|' if paren_depth == 0 => {
+            b'|' if scan.paren_depth == 0 => {
                 if bytes.get(i + 1) == Some(&b'|') {
-                    saw_top_separator = true; // `||` logical OR
+                    scan.saw_top_separator = true; // `||` logical OR
                     i += 2;
                     continue;
                 }
-                saw_top_pipe = true;
-                if bytes.get(i + 1) == Some(&b'&') {
-                    last_pipe_end = Some(i + 2); // `|&` (stdout+stderr)
-                    i += 2;
-                    continue;
-                }
-                last_pipe_end = Some(i + 1);
+                scan.saw_top_pipe = true;
+                scan.stages.push(command[stage_start..i].trim().to_string());
+                let delimiter_len = if bytes.get(i + 1) == Some(&b'&') {
+                    2 // `|&` (stdout+stderr)
+                } else {
+                    1
+                };
+                stage_start = i + delimiter_len;
+                i += delimiter_len;
+                continue;
             }
-            b'&' if paren_depth == 0 => {
+            b'&' if scan.paren_depth == 0 => {
                 if bytes.get(i + 1) == Some(&b'&') {
-                    saw_top_separator = true; // `&&`
+                    scan.saw_top_separator = true; // `&&`
                     i += 2;
                     continue;
                 }
                 // `&>`/`&>>` redirect, or `>&`/`2>&1` fd-dup: NOT a separator.
                 // A bare `&` is the background control operator.
                 if bytes.get(i + 1) != Some(&b'>') && prev_raw != b'>' {
-                    saw_top_separator = true;
+                    scan.saw_top_separator = true;
                 }
             }
-            b';' if paren_depth == 0 => saw_top_separator = true,
-            b'\n' if paren_depth == 0 => saw_top_separator = true,
+            b';' | b'\n' if scan.paren_depth == 0 => scan.saw_top_separator = true,
             _ => {}
         }
         i += 1;
     }
 
-    let imbalance =
-        in_single || in_double || in_backtick || escaped || paren_depth != 0 || saw_unmatched_close;
-
-    if saw_top_pipe {
-        // Only a clean single pipeline is safe to last-stage dispatch.
-        if imbalance || saw_top_separator {
-            return PipeSplit::Unsafe;
-        }
-        match last_pipe_end {
-            Some(end) => {
-                let last_stage = command[end..].trim();
-                if last_stage.is_empty() {
-                    PipeSplit::Unsafe // trailing empty stage, e.g. `cargo test |`
-                } else {
-                    PipeSplit::LastStage(last_stage.to_string())
-                }
-            }
-            None => PipeSplit::Unsafe,
-        }
-    } else if imbalance && command.contains('|') {
-        // No resolvable top-level pipe, but a `|` hides in an unbalanced region.
-        PipeSplit::Unsafe
-    } else if saw_top_separator {
-        // A top-level separator (`;`, `&&`, `||`, bare `&`, newline) without a
-        // pipe means multiple commands' output is interleaved in the captured
-        // transcript. Per-head specialized compression would delete the other
-        // commands' output — same rationale as the pipe Unsafe rule.
-        PipeSplit::Unsafe
-    } else {
-        PipeSplit::None
+    if scan.saw_top_pipe {
+        scan.stages.push(command[stage_start..].trim().to_string());
     }
+    scan
 }
 
 fn strip_cd_prefix(command: &str) -> Option<String> {
@@ -1379,6 +1465,40 @@ pub fn project_filter_dir(project_root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_pipeline_scanner_returns_segment_labels() {
+        let pipeline = single_top_level_pipeline("git rebase upstream/main | tail -3").unwrap();
+        assert_eq!(
+            pipeline
+                .segments
+                .iter()
+                .map(|segment| segment.label.as_str())
+                .collect::<Vec<_>>(),
+            ["git rebase", "tail"]
+        );
+    }
+
+    #[test]
+    fn single_pipeline_scanner_rejects_unsafe_shapes() {
+        for command in [
+            "false | tail -1; true | cat",
+            "false | tail -1 &",
+            "false | tail -1 # trailing comment",
+            "cat <<EOF | tail -1\nbody\nEOF",
+        ] {
+            assert!(
+                single_top_level_pipeline(command).is_none(),
+                "scanner should reject {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_pipeline_scanner_accepts_pipe_without_top_level_newline() {
+        let pipeline = single_top_level_pipeline("false | tail -1").unwrap();
+        assert_eq!(pipeline.segments.len(), 2);
+    }
 
     #[test]
     fn user_and_project_filter_dir_helpers() {

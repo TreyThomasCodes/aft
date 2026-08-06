@@ -237,6 +237,91 @@ fn hold_until_release_command(marker: &Path, release: &Path) -> String {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn pipeline_warning_reports_upstream_failure_in_status_and_completion_frame() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg(&mut aft, "pipeline-upstream-failure", "false | tail -1");
+    let completed = wait_for_status(&mut aft, &task_id, "completed");
+    let output = completed["output_preview"].as_str().unwrap_or_default();
+    assert_eq!(completed["exit_code"], 0);
+    let status_path =
+        Path::new(completed["output_path"].as_str().unwrap()).with_file_name("pipeline-status");
+    assert!(
+        status_path.exists(),
+        "expected pipeline status capture alongside stdout: {}",
+        status_path.display()
+    );
+    assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "1\n0\n");
+    assert!(
+        output.contains("note: `false` (segment 1 of 2) exited 1"),
+        "expected upstream pipeline warning in status output: {completed:?}"
+    );
+    assert!(
+        output.contains("the pipeline's exit code is `tail`'s."),
+        "expected final-stage name in status output: {completed:?}"
+    );
+
+    let frame = wait_for_bash_completed_frame(&mut aft, &task_id);
+    assert!(
+        frame["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("note: `false` (segment 1 of 2) exited 1"),
+        "expected upstream pipeline warning in completion frame: {frame:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_warning_is_silent_for_healthy_final_failure_and_multi_statement_commands() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    for (id, command, expected_exit) in [
+        ("pipeline-healthy", "true | tail -1", 0),
+        ("pipeline-final-failure", "true | false", 1),
+        (
+            "pipeline-multi-statement",
+            "false | tail -1; true | tail -1",
+            0,
+        ),
+    ] {
+        let task_id = spawn_bg(&mut aft, id, command);
+        let completed = wait_for_status(
+            &mut aft,
+            &task_id,
+            if expected_exit == 0 {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        assert_eq!(completed["exit_code"], expected_exit);
+        if id == "pipeline-multi-statement" {
+            let status_path = Path::new(completed["output_path"].as_str().unwrap())
+                .with_file_name("pipeline-status");
+            assert!(
+                !status_path.exists(),
+                "multi-statement command must not create a pipeline capture: {}",
+                status_path.display()
+            );
+        }
+        assert!(
+            !completed["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the pipeline's exit code is"),
+            "unexpected pipeline warning for {command:?}: {completed:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn background_bash_spawns_and_completes_cross_platform() {
     let mut aft = AftProcess::spawn();
