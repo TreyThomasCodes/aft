@@ -39,5 +39,13 @@ echo "gated-push: gate green — running governed-surface preflight"
 bun scripts/audit-v049-agent-surface.ts
 node scripts/release-gate-v049.mjs
 
+# Biome runs in CI's unit suites; a style-only miss costs a full CI roundtrip
+# (a template-vs-concat nit killed a push after every Rust gate was green).
+for pkg in packages/aft-bridge packages/opencode-plugin packages/pi-plugin packages/aft-cli; do
+  if [[ -d "$pkg/src" ]]; then
+    (cd "$pkg" && bunx biome check src)
+  fi
+done
+
 echo "gated-push: preflight green — pushing to $remote $branch"
 git push "$remote" "$branch"
