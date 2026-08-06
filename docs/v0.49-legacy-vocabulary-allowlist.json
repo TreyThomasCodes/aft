@@ -188,8 +188,8 @@
     },
     {
       "path": "crates/aft/src/compress/mod.rs",
-      "location": "line 2026, column 19",
-      "line": 2026,
+      "location": "line 2029, column 19",
+      "line": 2029,
       "column": 19,
       "token": "filePath",
       "class": "rust-compatibility",
