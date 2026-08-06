@@ -64,6 +64,7 @@ const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
+pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
@@ -99,6 +100,8 @@ pub struct BgCompletion {
     /// True when a stream exceeded the tokenization cap and counts are absent.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tokens_skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -2467,6 +2470,63 @@ impl BgTaskRegistry {
         self.kill_with_status(task_id, session_id, BgTaskStatus::Killed)
     }
 
+    /// Terminate live tasks whose project root has been confirmed absent by
+    /// subc's consecutive directory-absence scans, so tasks cannot keep using
+    /// a root that has been verified for reclamation.
+    ///
+    /// The absence signal intentionally cannot distinguish deletion from
+    /// renaming: a task's cwd handle can follow a moved directory even while
+    /// the registered path is absent. A renamed root is nevertheless a retired
+    /// registry identity, so killing those tasks is accepted; operational
+    /// guidance is to rename a project only after its live tasks have ended.
+    pub fn kill_running_tasks_for_root(&self, project_root: &Path) -> usize {
+        let canonical_root = canonicalized_path(project_root);
+        let targets = self
+            .inner
+            .tasks
+            .lock()
+            .map(|tasks| {
+                tasks
+                    .values()
+                    .filter_map(|task| {
+                        let state = task.state.lock().ok()?;
+                        let status = &state.metadata.status;
+                        let running = matches!(status, BgTaskStatus::Running)
+                            || (state.metadata.mode == BgMode::Pty
+                                && matches!(status, BgTaskStatus::Killing));
+                        if !running {
+                            return None;
+                        }
+                        let task_root = state
+                            .metadata
+                            .project_root
+                            .as_deref()
+                            .unwrap_or(&state.metadata.workdir);
+                        (canonicalized_path(task_root) == canonical_root)
+                            .then(|| (task.task_id.clone(), task.session_id.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut killed = 0;
+        for (task_id, session_id) in targets {
+            match self.kill_with_status_reason(
+                &task_id,
+                &session_id,
+                BgTaskStatus::Killed,
+                Some(ROOT_RECLAIMED_REASON.to_string()),
+            ) {
+                Ok(_) => killed += 1,
+                Err(error) => crate::slog_warn!(
+                    "failed to terminate background task {task_id} for reclaimed root {}: {error}",
+                    project_root.display()
+                ),
+            }
+        }
+        killed
+    }
+
     pub fn promote(&self, task_id: &str, session_id: &str) -> Result<bool, String> {
         let task = self
             .task_for_session(task_id, session_id)
@@ -2711,6 +2771,7 @@ impl BgTaskRegistry {
             original_tokens: None,
             compressed_tokens: None,
             tokens_skipped: false,
+            status_reason: snapshot.info.status_reason,
         })
     }
 
@@ -3144,6 +3205,16 @@ impl BgTaskRegistry {
         session_id: &str,
         terminal_status: BgTaskStatus,
     ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(task_id, session_id, terminal_status, None)
+    }
+
+    fn kill_with_status_reason(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        terminal_status: BgTaskStatus,
+        reason: Option<String>,
+    ) -> Result<BgTaskSnapshot, String> {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
@@ -3158,7 +3229,7 @@ impl BgTaskRegistry {
                 state.pending_terminal_override = None;
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
-                    terminal_metadata_from_marker(state.metadata.clone(), marker, None);
+                    terminal_metadata_from_marker(state.metadata.clone(), marker, reason.clone());
                 if self.task_has_watch_control(&task.task_id) {
                     state.metadata.completion_delivered = true;
                 }
@@ -3182,6 +3253,11 @@ impl BgTaskRegistry {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
                 if !was_already_killing {
                     state.metadata.status = BgTaskStatus::Killing;
+                }
+                if reason.is_some() {
+                    state.metadata.status_reason = reason.clone();
+                }
+                if !was_already_killing || reason.is_some() {
                     self.persist_task(&task.paths, &state.metadata)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
@@ -3230,7 +3306,7 @@ impl BgTaskRegistry {
                         let exit_code = terminal_exit_code_for_status(&terminal_status);
                         state
                             .metadata
-                            .mark_terminal(terminal_status, exit_code, None);
+                            .mark_terminal(terminal_status, exit_code, reason.clone());
                         if self.task_has_watch_control(&task.task_id) {
                             state.metadata.completion_delivered = true;
                         }
@@ -3281,7 +3357,9 @@ impl BgTaskRegistry {
                     }
 
                     let exit_code = terminal_exit_code_for_status(&target_status);
-                    state.metadata.mark_terminal(target_status, exit_code, None);
+                    state
+                        .metadata
+                        .mark_terminal(target_status, exit_code, reason.clone());
                     if self.task_has_watch_control(&task.task_id) {
                         state.metadata.completion_delivered = true;
                     }
@@ -3324,16 +3402,17 @@ impl BgTaskRegistry {
 
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
+            let reason = reason.or_else(|| state.metadata.status_reason.clone());
             let updated = self
                 .update_task_metadata(&task.paths, |metadata| {
                     let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
                         let mut metadata = metadata.clone();
                         let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
                         let exit_code = terminal_exit_code_for_status(&target_status);
-                        metadata.mark_terminal(target_status, exit_code, reason);
+                        metadata.mark_terminal(target_status, exit_code, reason.clone());
                         metadata
                     } else {
-                        terminal_metadata_from_marker(metadata.clone(), marker, reason)
+                        terminal_metadata_from_marker(metadata.clone(), marker, reason.clone())
                     };
                     if watch_controlled {
                         new_metadata.completion_delivered = true;
@@ -3462,6 +3541,7 @@ impl BgTaskRegistry {
             original_tokens: token_counts.original_tokens,
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
+            status_reason: metadata.status_reason.clone(),
         };
 
         // Record the compression event BEFORE the push-frame dedupe. Event
@@ -3731,7 +3811,7 @@ impl BgTaskRegistry {
         // sender is shared behind a Mutex. It still uses the same stdout writer
         // closure as foreground progress frames, preserving the existing lock/
         // flush behavior in main.rs.
-        sender(PushFrame::BashCompleted(BashCompletedFrame::new(
+        let mut frame = BashCompletedFrame::new(
             completion.task_id,
             completion.session_id,
             completion.status,
@@ -3742,7 +3822,9 @@ impl BgTaskRegistry {
             completion.original_tokens,
             completion.compressed_tokens,
             completion.tokens_skipped,
-        )));
+        );
+        frame.status_reason = completion.status_reason;
+        sender(PushFrame::BashCompleted(frame));
     }
 
     fn completion_token_counts(
@@ -4738,6 +4820,7 @@ impl BgTask {
                 mode: metadata.mode.clone(),
                 started_at: metadata.started_at,
                 duration_ms,
+                status_reason: metadata.status_reason.clone(),
             },
             exit_code: metadata.exit_code,
             child_pid: metadata.child_pid,
@@ -5293,6 +5376,7 @@ mod tests {
                 original_tokens: None,
                 compressed_tokens: None,
                 tokens_skipped: false,
+                status_reason: None,
             });
         let estimate = registry.estimated_memory();
         assert!(estimate.estimated_bytes.unwrap() > 0);
@@ -6305,6 +6389,162 @@ mod tests {
         assert!(replayed
             .drain_completions_for_session(Some("session"))
             .is_empty());
+    }
+
+    #[test]
+    fn reclaimed_root_kills_running_task_and_persists_reason() {
+        let registry = BgTaskRegistry::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                root.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(root.path().to_path_buf()),
+            )
+            .unwrap();
+        let pid = registry
+            .status(
+                &task_id,
+                "session",
+                Some(root.path()),
+                Some(storage.path()),
+                0,
+            )
+            .unwrap()
+            .child_pid
+            .unwrap();
+        assert!(is_process_alive(pid));
+
+        assert_eq!(registry.kill_running_tasks_for_root(root.path()), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "reclaimed task process survived kill"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                Some(root.path()),
+                Some(storage.path()),
+                0,
+            )
+            .unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(
+            snapshot.info.status_reason.as_deref(),
+            Some(ROOT_RECLAIMED_REASON)
+        );
+        let persisted = read_task(
+            &registry
+                .task_json_path(&task_id, "session")
+                .expect("reclaimed task metadata path"),
+        )
+        .expect("persisted reclaimed task");
+        assert_eq!(
+            persisted.status_reason.as_deref(),
+            Some(ROOT_RECLAIMED_REASON)
+        );
+        let completion = registry
+            .drain_completions_for_session(Some("session"))
+            .pop()
+            .expect("reclaimed task completion");
+        assert_eq!(
+            completion.status_reason.as_deref(),
+            Some(ROOT_RECLAIMED_REASON)
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn reclaimed_root_kills_pty_task_and_preserves_reason() {
+        let registry = BgTaskRegistry::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                command,
+                "session".to_string(),
+                root.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(60)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(root.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let pid = registry
+            .status(
+                &task_id,
+                "session",
+                Some(root.path()),
+                Some(storage.path()),
+                0,
+            )
+            .unwrap()
+            .child_pid
+            .unwrap();
+        assert!(is_process_alive(pid));
+
+        assert_eq!(registry.kill_running_tasks_for_root(root.path()), 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = registry
+                .status(
+                    &task_id,
+                    "session",
+                    Some(root.path()),
+                    Some(storage.path()),
+                    0,
+                )
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+                assert_eq!(
+                    snapshot.info.status_reason.as_deref(),
+                    Some(ROOT_RECLAIMED_REASON)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reclaimed PTY task did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_process_alive(pid));
+        let completion = registry
+            .drain_completions_for_session(Some("session"))
+            .pop()
+            .expect("reclaimed PTY completion");
+        assert_eq!(
+            completion.status_reason.as_deref(),
+            Some(ROOT_RECLAIMED_REASON)
+        );
+        registry.detach();
     }
 
     #[test]

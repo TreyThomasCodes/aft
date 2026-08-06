@@ -71,6 +71,8 @@ pub struct BashCompletedFrame {
     /// True when output exceeded the tokenization cap and was not measured.
     #[serde(default)]
     pub tokens_skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,6 +332,7 @@ impl BashCompletedFrame {
             original_tokens,
             compressed_tokens,
             tokens_skipped,
+            status_reason: None,
         }
     }
 }

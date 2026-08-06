@@ -47,6 +47,8 @@ pub struct BgTaskInfo {
     pub mode: BgMode,
     pub started_at: u64,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

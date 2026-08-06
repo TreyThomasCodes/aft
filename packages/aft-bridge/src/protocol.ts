@@ -83,6 +83,7 @@ export interface BashCompletedFrame {
   original_tokens?: number;
   compressed_tokens?: number;
   tokens_skipped?: boolean;
+  status_reason?: string;
   session_id?: string;
 }
 
@@ -146,4 +147,5 @@ export interface BgCompletion {
   original_tokens?: number;
   compressed_tokens?: number;
   tokens_skipped?: boolean;
+  status_reason?: string;
 }

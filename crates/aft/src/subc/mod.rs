@@ -823,6 +823,11 @@ fn reap_idle_roots(
             // lookup is not enough evidence to tear down a client-visible actor.
             // Requiring two maintenance sweeps protects atomic replacement and
             // transient filesystem failures; observing the path resets the proof.
+            // Absence also covers renames: a task's cwd handle can follow the
+            // moved directory while the registered path disappears. The old
+            // path is deliberately treated as a retired root identity, so the
+            // reaper accepts killing such tasks; rename a project only with no
+            // live tasks rather than relying on cwd-resolution heuristics.
             meta.consecutive_missing_sweeps = meta.consecutive_missing_sweeps.saturating_add(1);
         } else {
             meta.consecutive_missing_sweeps = 0;
@@ -907,6 +912,16 @@ fn reap_idle_roots(
         // across the transient-unbind window. Strict gap invalidation subsumes
         // them, but every abort path must restore them because a rebind can
         // still happen until eviction commits.
+        //
+        // After two consecutive directory-absence scans confirm that the
+        // root is gone, terminate its background task before checking the
+        // artifact-eviction gate. The task can otherwise keep the root's
+        // artifacts in use; cleanup first lets confirmed reclamation finish
+        // without weakening the gate for unrelated active work.
+        if deleted {
+            ctx.bash_background()
+                .kill_running_tasks_for_root(root_id.as_path());
+        }
         let taken_pending = Some(ctx.take_pending_reconciliation_state());
         if ctx.artifact_eviction_blocked() {
             if let Some(pending) = taken_pending {
@@ -4599,6 +4614,7 @@ pub(crate) mod test_support {
             original_tokens: None,
             compressed_tokens: None,
             tokens_skipped: false,
+            status_reason: None,
         })
     }
 
@@ -4707,6 +4723,7 @@ mod tests {
         wait_for_actor_root_count, wait_for_watcher_count,
     };
     use super::*;
+    use crate::bash_background::BgTaskStatus;
 
     fn attach_error(kind: io::ErrorKind) -> SubcError {
         SubcError::Connect {
@@ -5439,6 +5456,214 @@ mod tests {
         assert!(outcome.forgotten_deleted_roots.is_empty());
         assert!(live_roots.contains_key(&root));
         assert!(executor.actor_registered(&root));
+    }
+
+    fn spawn_background_for_root(
+        ctx: &AppContext,
+        root: &ProjectRootId,
+        storage: &tempfile::TempDir,
+        session_id: &str,
+    ) -> (String, u32) {
+        let command = if cfg!(windows) {
+            "cmd /c timeout /t 30 /nobreak > nul"
+        } else {
+            "sleep 30"
+        };
+        let task_id = ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                command,
+                session_id.to_string(),
+                root.as_path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(60)),
+                storage.path().to_path_buf(),
+                8,
+                true,
+                false,
+                Some(root.as_path().to_path_buf()),
+            )
+            .expect("spawn background task");
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                &task_id,
+                session_id,
+                Some(root.as_path()),
+                Some(storage.path()),
+                0,
+            )
+            .expect("background task status");
+        (task_id, snapshot.child_pid.expect("background child pid"))
+    }
+
+    fn wait_for_background_exit(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::bash_background::process::is_process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "background task process survived kill"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn deleted_root_reclaims_background_task_after_two_absence_sweeps() {
+        let (root_dir, root) = test_root("deleted-root-background-task");
+        let storage = tempfile::tempdir().expect("task storage");
+        let ctx = test_ctx();
+        let (task_id, pid) = spawn_background_for_root(&ctx, &root, &storage, "reclaim-session");
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        assert!(executor.actor_is_idle(&root));
+        root_dir.close().expect("delete project root");
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let pending_binds = HashMap::new();
+        let root_channels = HashMap::new();
+        let metrics = DispatchPathMetrics::new();
+
+        let first = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &pending_binds,
+            &root_channels,
+            &executor,
+            &metrics,
+        );
+        assert!(first.forgotten_deleted_roots.is_empty());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        let outcome = reap_until_forgotten(
+            &root,
+            &mut live_roots,
+            &pending_binds,
+            &root_channels,
+            &executor,
+            &metrics,
+        );
+        assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
+        wait_for_background_exit(pid);
+
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                &task_id,
+                "reclaim-session",
+                Some(root.as_path()),
+                Some(storage.path()),
+                0,
+            )
+            .expect("reclaimed task status");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(
+            snapshot.info.status_reason.as_deref(),
+            Some(crate::bash_background::registry::ROOT_RECLAIMED_REASON)
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot).expect("serialize bash status")["status_reason"],
+            crate::bash_background::registry::ROOT_RECLAIMED_REASON
+        );
+        let completion = ctx
+            .bash_background()
+            .drain_completions_for_session(Some("reclaim-session"))
+            .pop()
+            .expect("reclaimed task completion");
+        assert_eq!(
+            completion.status_reason.as_deref(),
+            Some(crate::bash_background::registry::ROOT_RECLAIMED_REASON)
+        );
+    }
+
+    #[test]
+    fn existing_unbound_root_keeps_background_task_alive_across_sweeps() {
+        let (root_dir, root) = test_root("existing-root-background-task");
+        let storage = tempfile::tempdir().expect("task storage");
+        let ctx = test_ctx();
+        ctx.mark_subc_unbound();
+        let (task_id, pid) = spawn_background_for_root(&ctx, &root, &storage, "existing-session");
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut meta = RootMeta::new(
+            Instant::now()
+                .checked_sub(IDLE_ROOT_TTL + Duration::from_secs(1))
+                .expect("old root timestamp"),
+        );
+        meta.unbound_quiesced = true;
+        let mut live_roots = HashMap::from([(root.clone(), meta)]);
+        let pending_binds = HashMap::new();
+        let root_channels = HashMap::new();
+        let metrics = DispatchPathMetrics::new();
+
+        for _ in 0..8 {
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &pending_binds,
+                &root_channels,
+                &executor,
+                &metrics,
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(root_dir.path().exists());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                &task_id,
+                "existing-session",
+                Some(root.as_path()),
+                Some(storage.path()),
+                0,
+            )
+            .expect("existing task status");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+        let _ = ctx.bash_background().kill(&task_id, "existing-session");
+        wait_for_background_exit(pid);
+    }
+
+    #[test]
+    fn restored_root_between_absence_sweeps_keeps_background_task_alive() {
+        let (root_dir, root) = test_root("restored-root-background-task");
+        let storage = tempfile::tempdir().expect("task storage");
+        let ctx = test_ctx();
+        let (task_id, pid) = spawn_background_for_root(&ctx, &root, &storage, "restored-session");
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        root_dir.close().expect("delete project root");
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let pending_binds = HashMap::new();
+        let root_channels = HashMap::new();
+        let metrics = DispatchPathMetrics::new();
+
+        let first = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &pending_binds,
+            &root_channels,
+            &executor,
+            &metrics,
+        );
+        assert!(first.forgotten_deleted_roots.is_empty());
+        std::fs::create_dir_all(root.as_path()).expect("restore project root");
+        let second = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &pending_binds,
+            &root_channels,
+            &executor,
+            &metrics,
+        );
+        assert!(second.forgotten_deleted_roots.is_empty());
+        assert!(crate::bash_background::process::is_process_alive(pid));
+        let _ = ctx.bash_background().kill(&task_id, "restored-session");
+        wait_for_background_exit(pid);
     }
 
     #[test]

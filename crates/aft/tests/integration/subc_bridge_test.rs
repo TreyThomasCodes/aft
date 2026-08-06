@@ -722,6 +722,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         original_tokens: None,
         compressed_tokens: None,
         tokens_skipped: false,
+        status_reason: None,
     })
 }
 

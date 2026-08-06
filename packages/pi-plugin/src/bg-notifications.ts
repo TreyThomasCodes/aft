@@ -22,6 +22,7 @@ export interface BgCompletion {
   original_tokens?: number;
   compressed_tokens?: number;
   tokens_skipped?: boolean;
+  status_reason?: string;
   mode?: "pipes" | "pty" | string;
   output_path?: string;
 }

@@ -427,6 +427,7 @@ mod tests {
                 mode: BgMode::Pipes,
                 started_at: 0,
                 duration_ms: Some(1),
+                status_reason: None,
             },
             exit_code,
             child_pid: None,
