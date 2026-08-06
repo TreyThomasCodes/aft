@@ -15,6 +15,8 @@ use aft::subc_translate::{subc_translate_with_context, TranslateContext};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use super::helpers::AftProcess;
+
 static PROJECT_FIXTURE: Once = Once::new();
 const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
 
@@ -352,4 +354,152 @@ fn file_urls_decode_to_local_paths_in_translate() {
         let drive = resolve_path_from_project_root(root, "file:///C:/temp/x.txt");
         assert_eq!(drive, std::path::PathBuf::from("C:\\temp\\x.txt"));
     }
+}
+
+// The GPT 5.6 Terra report shape (GitHub #171): every optional edit field
+// carries a type-default sentinel and the real payload lives in one field.
+// The all-empty `edits` array must not claim the edits mode, so the request
+// resolves to a successful appendContent write on disk.
+#[test]
+fn edit_all_empty_sentinel_edits_resolves_to_append_write() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    let target = root.join("sentinel.txt");
+    fs::write(&target, "before\n").expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "edit-sentinel-append",
+            "command": "tool_call",
+            "session_id": "subc-translate-sentinel",
+            "name": "edit",
+            "arguments": {
+                "path": "sentinel.txt",
+                "symbol": "",
+                "content": "",
+                "appendContent": "CONTENT IT APPENDS",
+                "edits": [
+                    { "oldString": "", "newString": "", "replaceAll": false,
+                      "occurrence": 1, "startLine": 1, "endLine": 1, "content": "" }
+                ]
+            }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "sentinel edits must resolve to an append write: {response:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("read target"),
+        "before\nCONTENT IT APPENDS",
+        "appendContent must be written to disk"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// {oldString:"", newString:"x"} is NOT a sentinel: it is kept as an edits
+// claim so the batch parser reports its specific empty-match error instead of
+// a conflicting-modes error. The error must mention the match problem, not
+// the mode conflict.
+#[test]
+fn edit_empty_old_string_surfaces_batch_match_error() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    let target = root.join("empty-match.txt");
+    fs::write(&target, "some content\n").expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "edit-empty-match",
+            "command": "tool_call",
+            "session_id": "subc-translate-sentinel",
+            "name": "edit",
+            "arguments": {
+                "path": "empty-match.txt",
+                "edits": [{ "oldString": "", "newString": "x" }]
+            }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        response["success"], false,
+        "empty oldString must fail at the batch leaf: {response:#}"
+    );
+    let message = response["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("match") || message.contains("oldString"),
+        "expected a match/oldString problem, got: {message}"
+    );
+    assert!(
+        !message.contains("conflicting modes"),
+        "must not be a conflicting-modes error: {message}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_sentinel_item_alongside_real_match_applies_batch() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    let target = root.join("mixed.txt");
+    fs::write(&target, "one two\n").expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "edit-sentinel-mixed",
+            "command": "tool_call",
+            "session_id": "subc-translate-sentinel",
+            "name": "edit",
+            "arguments": {
+                "path": "mixed.txt",
+                "edits": [
+                    { "oldString": "", "newString": "", "replaceAll": false,
+                      "occurrence": 1, "startLine": 1, "endLine": 1, "content": "" },
+                    { "oldString": "one", "newString": "ONE" }
+                ]
+            }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "real item must survive sentinel stripping: {response:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("read target"),
+        "ONE two\n",
+        "the real match item must be applied to disk"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
 }

@@ -195,13 +195,13 @@ fn normalize_edit_arguments(map: &mut Map<String, Value>) -> Result<(), Translat
     }
     if modes.len() > 1 {
         return Err(invalid_request(format!(
-            "edit: conflicting modes: {}",
+            "edit: conflicting modes: {}. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
             modes.join(", ")
         )));
     }
     let Some(mode) = modes.first().copied() else {
         return Err(invalid_request(
-            "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required",
+            "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
         ));
     };
 
@@ -277,7 +277,7 @@ fn edit_modes_present(map: &mut Map<String, Value>) -> Vec<&'static str> {
         map.remove("appendContent");
     }
 
-    let has_edits = is_non_empty_edit_array(map.get("edits"));
+    let has_edits = normalize_edit_array_sentinels(map);
     if !has_edits {
         map.remove("edits");
     }
@@ -327,16 +327,84 @@ fn is_non_empty_string(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::String(value)) if !value.is_empty())
 }
 
-fn is_non_empty_edit_array(value: Option<&Value>) -> bool {
+/// An edits item is a serialization sentinel when the host emitted every
+/// optional field with a type-default value and put the real payload in a
+/// sibling field. Such an item carries no real edit intent and must not claim
+/// the `edits` mode.
+///
+/// A pure line-range item ({startLine,endLine,content}) has no `oldString`
+/// key, so it is never a sentinel even when `content` is "" (deleting lines is
+/// real intent). A real replacement has a non-empty `oldString`, so it is
+/// never a sentinel. `{oldString:"", newString:"non-empty"}` is deliberately
+/// NOT a sentinel: it is kept so the batch parser reports its specific
+/// empty-match error instead of us silently discarding a broken but
+/// intentional edit.
+fn is_edit_sentinel_item(item: &Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    // `oldString` must be present with an empty-string value.
+    let old_string_empty = matches!(obj.get("oldString"), Some(Value::String(s)) if s.is_empty());
+    if !old_string_empty {
+        return false;
+    }
+    // `newString` must be empty or absent.
+    let new_string_empty = match obj.get("newString") {
+        None => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    };
+    if !new_string_empty {
+        return false;
+    }
+    // `content` must be empty or absent.
+    match obj.get("content") {
+        None => true,
+        Some(Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// Filter serialization-sentinel items out of the `edits` array (or its
+/// stringified form) and rewrite `map["edits"]` to the survivors. Returns
+/// whether any real edit items remain, i.e. whether the `edits` mode is still
+/// claimed. A non-empty malformed string (or a non-array root) stays an edits
+/// claim so the existing parser can report its specific validation error.
+fn normalize_edit_array_sentinels(map: &mut Map<String, Value>) -> bool {
+    let Some(value) = map.get("edits") else {
+        return false;
+    };
     match value {
-        Some(Value::Array(items)) => !items.is_empty(),
-        Some(Value::String(raw)) if raw.is_empty() => false,
-        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
-            .ok()
-            .map(|value| !matches!(value, Value::Array(items) if items.is_empty()))
-            // A non-empty malformed string is still an edits claim so the
-            // existing parser can report its specific validation error.
-            .unwrap_or(true),
+        Value::Array(items) => {
+            let survivors: Vec<Value> = items
+                .iter()
+                .filter(|item| !is_edit_sentinel_item(item))
+                .cloned()
+                .collect();
+            if survivors.is_empty() {
+                false
+            } else {
+                map.insert("edits".to_string(), Value::Array(survivors));
+                true
+            }
+        }
+        Value::String(raw) if raw.is_empty() => false,
+        Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Array(items)) => {
+                let survivors: Vec<Value> = items
+                    .iter()
+                    .filter(|item| !is_edit_sentinel_item(item))
+                    .cloned()
+                    .collect();
+                if survivors.is_empty() {
+                    false
+                } else {
+                    map.insert("edits".to_string(), Value::Array(survivors));
+                    true
+                }
+            }
+            _ => true,
+        },
         _ => false,
     }
 }
@@ -2556,6 +2624,151 @@ mod tests {
             .expect_err("invalid occurrence spelling");
             assert!(error.message.contains("occurrence"));
         }
+    }
+
+    #[test]
+    fn edit_strips_all_empty_sentinel_edit_items() {
+        let project = Path::new("/project");
+
+        // The exact GPT 5.6 Terra report shape: every optional field carries a
+        // type-default sentinel and the real payload lives in appendContent.
+        // The all-empty edits array must not claim the edits mode.
+        let report = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "symbol": "",
+                "content": "",
+                "appendContent": "CONTENT IT APPENDS",
+                "edits": [
+                    { "oldString": "", "newString": "", "replaceAll": false,
+                      "occurrence": 1, "startLine": 1, "endLine": 1, "content": "" }
+                ]
+            }),
+            project,
+        )
+        .expect("all-empty sentinel edits must not claim the edits mode");
+        assert_eq!(report.command, "edit_match");
+        assert_eq!(
+            report.args.get("append_content").and_then(Value::as_str),
+            Some("CONTENT IT APPENDS")
+        );
+
+        // A sentinel item alongside one real match item: the real item
+        // survives and the batch path is taken.
+        let mixed = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "edits": [
+                    { "oldString": "", "newString": "", "replaceAll": false,
+                      "occurrence": 1, "startLine": 1, "endLine": 1, "content": "" },
+                    { "oldString": "old", "newString": "new" }
+                ]
+            }),
+            project,
+        )
+        .expect("real item must survive sentinel stripping");
+        assert_eq!(mixed.command, "batch");
+        let items = mixed.args.get("edits").and_then(Value::as_array).unwrap();
+        assert_eq!(items.len(), 1, "only the real item survives");
+        assert_eq!(items[0].get("match").and_then(Value::as_str), Some("old"));
+        assert_eq!(
+            items[0].get("replacement").and_then(Value::as_str),
+            Some("new")
+        );
+
+        // A pure line-range delete item has no oldString key, so it is never a
+        // sentinel even with empty content (deleting lines is real intent).
+        let line_delete = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "edits": [{ "startLine": 1, "endLine": 1, "content": "" }]
+            }),
+            project,
+        )
+        .expect("pure line-range delete must stay an edits claim");
+        assert_eq!(line_delete.command, "batch");
+
+        // {oldString:"", newString:"x"} is NOT a sentinel: it is kept as an
+        // edits claim so the batch parser reports its specific empty-match
+        // error instead of us silently discarding a broken but intentional
+        // edit. Translation succeeds (the batch command is produced); the
+        // empty-match error surfaces at the batch leaf handler.
+        let empty_match = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "edits": [{ "oldString": "", "newString": "x" }]
+            }),
+            project,
+        )
+        .expect("empty oldString must stay an edits claim");
+        assert_eq!(empty_match.command, "batch");
+        let kept = empty_match
+            .args
+            .get("edits")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(kept.len(), 1, "the empty-match item must be kept");
+        assert_eq!(kept[0].get("match").and_then(Value::as_str), Some(""));
+
+        // Stringified kitchen-sink edits + appendContent: appendContent wins.
+        let stringified = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "appendContent": "APPEND",
+                "edits": "[{\"oldString\":\"\",\"newString\":\"\",\"replaceAll\":false,\"occurrence\":1,\"startLine\":1,\"endLine\":1,\"content\":\"\"}]"
+            }),
+            project,
+        )
+        .expect("stringified all-empty sentinel edits must not claim edits mode");
+        assert_eq!(stringified.command, "edit_match");
+        assert_eq!(
+            stringified
+                .args
+                .get("append_content")
+                .and_then(Value::as_str),
+            Some("APPEND")
+        );
+    }
+
+    #[test]
+    fn edit_mode_errors_steer_away_from_empty_sentinels() {
+        let project = Path::new("/project");
+        let steering = "Omit unused optional fields entirely; do not send empty strings or empty arrays for them.";
+
+        let conflict = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "appendContent": "x",
+                "edits": [{ "oldString": "old", "newString": "new" }]
+            }),
+            project,
+        )
+        .expect_err("conflicting modes");
+        assert!(conflict.message.contains("conflicting modes"));
+        assert!(
+            conflict.message.contains(steering),
+            "conflicting-modes error must steer: {}",
+            conflict.message
+        );
+
+        let no_mode = subc_translate_owned(
+            "edit",
+            serde_json::json!({ "path": "src/main.ts" }),
+            project,
+        )
+        .expect_err("no mode");
+        assert!(no_mode.message.contains("exactly one of"));
+        assert!(
+            no_mode.message.contains(steering),
+            "no-mode error must steer: {}",
+            no_mode.message
+        );
     }
 
     #[test]
