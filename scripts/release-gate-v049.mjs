@@ -25,8 +25,21 @@ const RELEASE_MANIFEST_PATH = "docs/v0.49-release-manifest.json";
 const SURFACE_MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SOURCE_INVENTORY_PATH = "docs/v0.49-unified-tool-surface-inventory.json";
 const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
+// The surface GENERATION label: manifests describe the v0.49.0 activation
+// surface and keep that identity for the whole 0.49 line.
 const TARGET_VERSION = "0.49.0";
 const PREVIOUS_VERSION = "0.48.1";
+// The version actually being released (patch releases move this while the
+// surface generation stays 0.49.0). Version-consistency checks compare
+// against this; surface-identity checks keep TARGET_VERSION.
+const RELEASE_VERSION = (() => {
+  const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
+  const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
+  if (!version) fail("could not read the workspace version from crates/aft/Cargo.toml");
+  if (!version.startsWith("0.49."))
+    fail(`workspace version ${version} is outside the v0.49 line this gate governs`);
+  return version;
+})();
 const BUN = process.env.BUN_BIN || "bun";
 
 function fail(message) {
@@ -221,24 +234,24 @@ function checkCandidateVersions(release, candidate) {
   for (const artifact of packageArtifacts) {
     const packagePath = join(artifact.source, "package.json");
     const pkg = packageJson(packagePath);
-    if (candidate && pkg.version !== TARGET_VERSION)
-      failures.push(`${packagePath}: ${pkg.version} != ${TARGET_VERSION}`);
-    if (!candidate && pkg.version !== TARGET_VERSION && pkg.version !== PREVIOUS_VERSION)
+    if (candidate && pkg.version !== RELEASE_VERSION)
+      failures.push(`${packagePath}: ${pkg.version} != ${RELEASE_VERSION}`);
+    if (!candidate && pkg.version !== RELEASE_VERSION && pkg.version !== PREVIOUS_VERSION)
       failures.push(`${packagePath}: unsupported version ${pkg.version}`);
   }
 
   const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
   const cargoVersion = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
-  if (candidate && cargoVersion !== TARGET_VERSION)
-    failures.push(`crates/aft/Cargo.toml: ${cargoVersion} != ${TARGET_VERSION}`);
-  if (!candidate && cargoVersion !== TARGET_VERSION && cargoVersion !== PREVIOUS_VERSION)
+  if (candidate && cargoVersion !== RELEASE_VERSION)
+    failures.push(`crates/aft/Cargo.toml: ${cargoVersion} != ${RELEASE_VERSION}`);
+  if (!candidate && cargoVersion !== RELEASE_VERSION && cargoVersion !== PREVIOUS_VERSION)
     failures.push(`crates/aft/Cargo.toml: unsupported version ${cargoVersion}`);
 
   const tokenizer = readFileSync(join(ROOT, "crates/aft-tokenizer/Cargo.toml"), "utf8");
   const tokenizerVersion = /^version\s*=\s*"([^"]+)"/m.exec(tokenizer)?.[1];
-  if (candidate && tokenizerVersion !== TARGET_VERSION)
-    failures.push(`crates/aft-tokenizer/Cargo.toml: ${tokenizerVersion} != ${TARGET_VERSION}`);
-  if (!candidate && tokenizerVersion !== TARGET_VERSION && tokenizerVersion !== PREVIOUS_VERSION)
+  if (candidate && tokenizerVersion !== RELEASE_VERSION)
+    failures.push(`crates/aft-tokenizer/Cargo.toml: ${tokenizerVersion} != ${RELEASE_VERSION}`);
+  if (!candidate && tokenizerVersion !== RELEASE_VERSION && tokenizerVersion !== PREVIOUS_VERSION)
     failures.push(`crates/aft-tokenizer/Cargo.toml: unsupported version ${tokenizerVersion}`);
   if (failures.length > 0) fail(`candidate version gate failed:\n${failures.join("\n")}`);
 }
@@ -264,8 +277,8 @@ function checkPlatformArtifacts(release, assetsDir) {
   for (const artifact of release.platform_binary_artifacts) {
     const pkgPath = join(ROOT, "packages/npm", artifact.directory, "package.json");
     const pkg = packageJson(relative(ROOT, pkgPath));
-    if (pkg.version !== TARGET_VERSION)
-      failures.push(`${artifact.id}: ${pkgPath} is ${pkg.version}, not ${TARGET_VERSION}`);
+    if (pkg.version !== RELEASE_VERSION)
+      failures.push(`${artifact.id}: ${pkgPath} is ${pkg.version}, not ${RELEASE_VERSION}`);
     const path = assetsDir
       ? join(root, artifact.asset)
       : join(
