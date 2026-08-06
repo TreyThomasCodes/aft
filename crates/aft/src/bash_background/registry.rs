@@ -6536,10 +6536,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!is_process_alive(pid));
-        let completion = registry
-            .drain_completions_for_session(Some("session"))
-            .pop()
-            .expect("reclaimed PTY completion");
+        // The terminal status and the completion frame are written by
+        // different actors (kill finalize vs the watchdog's terminal-transition
+        // scan), so the completion can trail the observed Killed status. Poll
+        // the drain rather than reading it once.
+        let completion = loop {
+            if let Some(completion) = registry
+                .drain_completions_for_session(Some("session"))
+                .pop()
+            {
+                break completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reclaimed PTY completion never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert_eq!(
             completion.status_reason.as_deref(),
             Some(ROOT_RECLAIMED_REASON)
