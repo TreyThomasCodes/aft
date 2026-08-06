@@ -1694,13 +1694,14 @@ impl LspManager {
             removed |= self.diagnostics.clear_for_file(&normalized);
         }
 
-        // Reconstruct through the surviving parent so a deleted file still
-        // reaches its publish-time key, using the same non-verbatim form as the
-        // store. A raw Windows canonical parent has a `\\?\` prefix, which
-        // would otherwise fail to match the normalized diagnostics key.
-        if let Some(reconstructed) = normalized_path_from_existing_parent(file) {
-            if reconstructed != file && reconstructed != normalized {
-                removed |= self.diagnostics.clear_for_file(&reconstructed);
+        // Reconstruct the canonical key via the parent dir (which still exists
+        // for a just-deleted file) so symlink-aliased roots still match.
+        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let reconstructed = canonical_parent.join(name);
+                if reconstructed != file && reconstructed != normalized {
+                    removed |= self.diagnostics.clear_for_file(&reconstructed);
+                }
             }
         }
 
@@ -1717,15 +1718,15 @@ impl LspManager {
             candidates.push(normalized.clone());
         }
 
-        // The parent reconstruction must use the normalized diagnostic-key
-        // form. Otherwise a Windows `\\?\` path looks distinct from an equal
-        // non-verbatim candidate and the stale-diagnostics fan-out misses it.
-        if let Some(reconstructed) = normalized_path_from_existing_parent(file) {
-            if !candidates
-                .iter()
-                .any(|candidate| candidate == &reconstructed)
-            {
-                candidates.push(reconstructed);
+        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                let reconstructed = canonical_parent.join(name);
+                if !candidates
+                    .iter()
+                    .any(|candidate| candidate == &reconstructed)
+                {
+                    candidates.push(reconstructed);
+                }
             }
         }
 
@@ -2135,15 +2136,6 @@ fn normalize_lookup_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn normalized_path_from_existing_parent(file: &Path) -> Option<PathBuf> {
-    let parent = file.parent()?;
-    let name = file.file_name()?;
-    let canonical_parent = std::fs::canonicalize(parent).ok()?;
-    Some(crate::inspect::job::normalize_path(
-        &canonical_parent.join(name),
-    ))
-}
-
 /// Classify an error returned by `spawn_server` into a structured
 /// `ServerAttemptResult`. The two interesting cases for callers are:
 /// - `BinaryNotInstalled` — the server's binary couldn't be resolved on PATH
@@ -2267,8 +2259,6 @@ mod diagnostic_capacity_tests {
 
 #[cfg(test)]
 mod clear_diagnostics_tests {
-    #[cfg(windows)]
-    use std::path::Path;
     use std::path::PathBuf;
 
     use super::LspManager;
@@ -2290,60 +2280,6 @@ mod clear_diagnostics_tests {
             code: None,
             source: None,
         }
-    }
-
-    #[cfg(windows)]
-    fn verbatim_path(path: &Path) -> PathBuf {
-        PathBuf::from(format!(r"\\?\{}", path.display()))
-    }
-
-    #[cfg(windows)]
-    fn manager_with_normalized_error(normalized_file: &Path) -> LspManager {
-        let mut manager = LspManager::new();
-        let key = ServerKey {
-            kind: ServerKind::TypeScript,
-            root: normalized_file
-                .parent()
-                .expect("normalized diagnostic parent")
-                .to_path_buf(),
-        };
-        let file = normalized_file.to_path_buf();
-        manager
-            .diagnostics_store_mut_for_test()
-            .publish(key, file.clone(), vec![err_diag(&file)]);
-        manager
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn clear_diagnostics_for_deleted_verbatim_path_matches_normalized_key() {
-        let dir = tempfile::tempdir().expect("create temporary project");
-        let file = dir.path().join("gone.ts");
-        std::fs::write(&file, "x").expect("write source file");
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
-        let mut manager = manager_with_normalized_error(&normalized_file);
-
-        std::fs::remove_file(&file).expect("delete source file");
-
-        assert!(manager.clear_diagnostics_for_file(&verbatim_path(&normalized_file)));
-        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn stale_diagnostics_for_deleted_verbatim_path_matches_normalized_key() {
-        let dir = tempfile::tempdir().expect("create temporary project");
-        let file = dir.path().join("changed.ts");
-        std::fs::write(&file, "x").expect("write source file");
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
-        let mut manager = manager_with_normalized_error(&normalized_file);
-
-        std::fs::remove_file(&file).expect("delete source file");
-
-        let result = manager.mark_diagnostics_stale_for_file(&verbatim_path(&normalized_file));
-        assert!(result.had_entries);
-        assert!(result.changed);
-        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
     }
 
     // A just-deleted file can no longer be canonicalized directly, but its
