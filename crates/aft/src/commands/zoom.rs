@@ -13,7 +13,7 @@ use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::language::{HeadingAnchor, LanguageProvider};
 use crate::lsp_hints;
-use crate::parser::{detect_language, FileParser, LangId};
+use crate::parser::{detect_language, node_text, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
@@ -589,7 +589,24 @@ fn zoom_one_symbol(
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
     // Code symbols continue through the provider's exact resolver.
-    let is_heading = is_heading_zoom_language(detect_language(path));
+    let lang = detect_language(path);
+    let is_heading = is_heading_zoom_language(lang);
+
+    // JSON files resolve dotted paths (`a.b.c`, `servers[0]`) against the parsed
+    // document in addition to literal top-level keys. See `resolve_json_zoom`.
+    if lang == Some(LangId::Json) {
+        return resolve_json_zoom(
+            req,
+            ctx,
+            path,
+            source,
+            lines,
+            symbol_name,
+            context_lines,
+            include_callgraph,
+        );
+    }
+
     let matches = match resolve_zoom_symbol(ctx.provider(), path, symbol_name, is_heading) {
         Ok(matches) => matches,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -961,6 +978,461 @@ fn resolve_zoom_symbol(
     match provider.resolve_symbol(path, query) {
         Err(crate::error::AftError::SymbolNotFound { .. }) => Ok(Vec::new()),
         result => result,
+    }
+}
+
+/// A resolved JSON node: the tree-sitter node plus the human-readable path
+/// segments used to reach it (for error messages and candidate labels).
+struct JsonNode<'a> {
+    node: tree_sitter::Node<'a>,
+    path: String,
+}
+
+/// Resolve a zoom request against a JSON document.
+///
+/// The query is resolved in two independent ways and the results compared:
+///
+/// 1. **Literal first**: the query is matched as an exact top-level key name
+///    using the provider's normal symbol resolution. JSON keys may legitimately
+///    contain dots, so a literal match always wins outright.
+/// 2. **Path walk**: if there is no literal match, the query is split on `.`
+///    and walked through the document — object steps by key, array steps by
+///    `name[index]` (0-based) or bare `[index]`.
+///
+/// If both a literal key and a successful path walk resolve to DIFFERENT nodes,
+/// the query is ambiguous and both candidates are reported. If they resolve to
+/// the same node, the literal match is returned (not an error).
+fn resolve_json_zoom(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    source: &str,
+    lines: &[String],
+    symbol_name: &str,
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
+    let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
+    let (tree, _) = match parser.parse(path) {
+        Ok(parsed) => parsed,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
+    let root = tree.root_node();
+
+    // Literal resolution: exact top-level key via the provider.
+    let literal = match ctx.provider().resolve_symbol(path, symbol_name) {
+        Ok(matches) => matches,
+        Err(crate::error::AftError::SymbolNotFound { .. }) => Vec::new(),
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
+
+    // Path resolution: walk the document by segments.
+    let path_result = json_path_resolve(source, &root, symbol_name);
+
+    // Both a literal key and a path walk resolved. Compare the literal key's
+    // VALUE node against the path-walked node. A plain top-level key like
+    // `servers` resolves to the same value node both ways, so it is not
+    // ambiguous. A dotted query where a literal key AND a nested path both
+    // exist (e.g. `literal.dotted.key`) resolves to different nodes → ambiguous.
+    if !literal.is_empty() {
+        if let Some(path_node) = path_result.as_ref() {
+            let literal_value_node = root
+                .named_child(0)
+                .and_then(|object| json_object_value(source, object, symbol_name));
+            let same_node = literal_value_node
+                .map(|node| {
+                    node.start_position().row == path_node.node.start_position().row
+                        && node.start_position().column == path_node.node.start_position().column
+                        && node.end_position().row == path_node.node.end_position().row
+                        && node.end_position().column == path_node.node.end_position().column
+                })
+                .unwrap_or(false);
+            if !same_node {
+                let literal_node = &literal[0].symbol;
+                let candidates = vec![
+                    serde_json::json!({
+                        "name": symbol_name,
+                        "kind": symbol_kind_string(&literal_node.kind),
+                        "range": literal_node.range.clone(),
+                        "signature": literal_node.signature.clone(),
+                    }),
+                    serde_json::json!({
+                        "name": path_node.path.clone(),
+                        "kind": "json_path",
+                        "range": node_range(&path_node.node),
+                        "signature": serde_json::Value::Null,
+                    }),
+                ];
+                return Response::error_with_data(
+                    &req.id,
+                    "ambiguous_match",
+                    format!(
+                        "symbol '{}' is ambiguous: a literal key and a JSON path both resolve to different nodes",
+                        symbol_name
+                    ),
+                    serde_json::json!({ "candidates": candidates }),
+                );
+            }
+        }
+    }
+
+    // Prefer the literal match when present (literal-first).
+    if !literal.is_empty() {
+        return render_json_zoom(
+            req,
+            ctx,
+            path,
+            source,
+            lines,
+            symbol_name,
+            &literal[0].symbol,
+            context_lines,
+            include_callgraph,
+        );
+    }
+
+    // Otherwise use the path walk result.
+    if let Some(resolved) = path_result {
+        return render_json_zoom(
+            req,
+            ctx,
+            path,
+            source,
+            lines,
+            &resolved.path,
+            &json_node_to_symbol(&resolved.node, &resolved.path),
+            context_lines,
+            include_callgraph,
+        );
+    }
+
+    // Miss: report the deepest resolved prefix and the failing segment, and
+    // suggest sibling keys within the deepest resolved object.
+    let (prefix, failing) = json_miss_details(symbol_name);
+    let mut msg = if prefix.is_empty() {
+        format!("symbol '{}' not found: no key `{}`", symbol_name, failing)
+    } else {
+        format!(
+            "symbol '{}' not found: resolved `{}`, no key `{}`",
+            symbol_name, prefix, failing
+        )
+    };
+    let sibling_keys = json_sibling_keys(source, &root, &prefix);
+    if !sibling_keys.is_empty() {
+        let suggestions = suggest_close_symbols(&failing, &sibling_keys, 5);
+        if !suggestions.is_empty() {
+            msg.push_str(&format!(" — nearest: [{}]", suggestions.join(", ")));
+        }
+    }
+    Response::error(&req.id, "symbol_not_found", msg)
+}
+
+/// Walk a JSON document by a dotted path, returning the deepest resolved node.
+///
+/// Object steps match keys literally; array steps use `name[index]` (0-based)
+/// or bare `[index]`. A segment containing brackets tries the bracket parse
+/// only if no literal key of that exact spelling exists.
+fn json_path_resolve<'a>(
+    source: &str,
+    root: &tree_sitter::Node<'a>,
+    query: &str,
+) -> Option<JsonNode<'a>> {
+    let segments = split_json_path(query);
+    if segments.is_empty() {
+        return None;
+    }
+
+    // The document root must be an object for keyed access.
+    let mut current = root.named_child(0)?;
+    if current.kind() != "object" {
+        return None;
+    }
+
+    let mut resolved_path = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        let (key, array_index) = parse_json_segment(segment);
+        let next = if let Some(array_index) = array_index {
+            // A segment like `servers[0]` first resolves the key to the array
+            // node, then indexes into it. A bare `[0]` indexes the current node.
+            let array = match key {
+                Some(key) => json_object_value(source, current, key)?,
+                None => current,
+            };
+            json_array_element(array, array_index)?
+        } else {
+            json_object_value(source, current, key?)?
+        };
+        if index == 0 {
+            resolved_path = segment.clone();
+        } else {
+            resolved_path.push('.');
+            resolved_path.push_str(segment);
+        }
+        current = next;
+    }
+
+    Some(JsonNode {
+        node: current,
+        path: resolved_path,
+    })
+}
+
+/// Split a JSON path query into segments on `.`, preserving bracket groups.
+fn split_json_path(query: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for character in query.chars() {
+        match character {
+            '[' => {
+                depth += 1;
+                current.push(character);
+            }
+            ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            '.' if depth == 0 => {
+                if !current.is_empty() {
+                    segments.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Parse a single path segment into an optional object key and optional array index.
+///
+/// A segment like `servers[0]` yields key `servers` and index `0`; a bare `[0]`
+/// yields no key and index `0`; a plain `host` yields key `host` and no index.
+fn parse_json_segment(segment: &str) -> (Option<&str>, Option<usize>) {
+    if let Some(open) = segment.find('[') {
+        if segment.ends_with(']') {
+            let key = if open == 0 {
+                None
+            } else {
+                Some(&segment[..open])
+            };
+            let index_text = &segment[open + 1..segment.len() - 1];
+            if let Ok(index) = index_text.parse::<usize>() {
+                return (key, Some(index));
+            }
+        }
+    }
+    (Some(segment), None)
+}
+
+/// Return the value node for a key in a JSON object, or `None` if absent.
+fn json_object_value<'a>(
+    source: &str,
+    object: tree_sitter::Node<'a>,
+    key: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut cursor = object.walk();
+    for pair in object.named_children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        if node_text(source, &key_node).trim_matches('"') == key {
+            return pair.child_by_field_name("value");
+        }
+    }
+    None
+}
+
+/// Return the element at a 0-based index in a JSON array, or `None` if out of range.
+fn json_array_element<'a>(
+    array: tree_sitter::Node<'a>,
+    index: usize,
+) -> Option<tree_sitter::Node<'a>> {
+    if array.kind() != "array" {
+        return None;
+    }
+    let mut cursor = array.walk();
+    for (seen, element) in array.named_children(&mut cursor).enumerate() {
+        if seen == index {
+            return Some(element);
+        }
+    }
+    None
+}
+
+/// Build a `Symbol` from a resolved JSON node for rendering.
+fn json_node_to_symbol(node: &tree_sitter::Node, path: &str) -> Symbol {
+    Symbol {
+        name: path.to_string(),
+        kind: SymbolKind::Variable,
+        range: node_range(node),
+        signature: None,
+        scope_chain: vec![],
+        exported: false,
+        parent: None,
+    }
+}
+
+/// Render a resolved JSON node as a zoom response, mirroring a top-level zoom.
+fn render_json_zoom(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    source: &str,
+    lines: &[String],
+    name: &str,
+    target: &Symbol,
+    context_lines: usize,
+    include_callgraph: bool,
+) -> Response {
+    let start = target.range.start_line as usize;
+    let end = target.range.end_line as usize;
+
+    let content = if end < lines.len() {
+        lines[start..=end].join("\n")
+    } else {
+        lines[start..].join("\n")
+    };
+
+    let ctx_start = start.saturating_sub(context_lines);
+    let context_before: Vec<String> = if ctx_start < start {
+        lines[ctx_start..start].to_vec()
+    } else {
+        vec![]
+    };
+    let ctx_end = (end + 1 + context_lines).min(lines.len());
+    let context_after: Vec<String> = if end + 1 < lines.len() {
+        lines[(end + 1)..ctx_end].to_vec()
+    } else {
+        vec![]
+    };
+
+    let (calls_out, called_by) = if include_callgraph {
+        let all_symbols = match ctx.provider().list_symbols(path) {
+            Ok(s) => s,
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        };
+        let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
+        let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
+        let (tree, lang) = match parser.parse(path) {
+            Ok(r) => r,
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        };
+        let all_file_calls = extract_calls_with_ranges(source, tree.root_node(), lang);
+        let signature_byte_start =
+            line_col_to_byte(source, target.range.start_line, target.range.start_col);
+        let signature_byte_end =
+            line_col_to_byte(source, target.range.end_line, target.range.end_col);
+        let (target_byte_start, target_byte_end) =
+            symbol_body_byte_range(tree.root_node(), signature_byte_start, signature_byte_end)
+                .unwrap_or((signature_byte_start, signature_byte_end));
+        let calls_out = dedupe_call_refs_by_name(
+            all_file_calls
+                .iter()
+                .filter(|call| {
+                    call.start_byte >= target_byte_start
+                        && call.end_byte <= target_byte_end
+                        && known_names.contains(&call.name.as_str())
+                        && call.name != target.name
+                })
+                .map(|call| CallRef {
+                    name: call.name.clone(),
+                    line: call.line,
+                    extra_count: 0,
+                })
+                .collect(),
+        );
+        (calls_out, Vec::new())
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let resp = ZoomResponse {
+        name: name.to_string(),
+        kind: symbol_kind_string(&target.kind),
+        range: target.range.clone(),
+        content,
+        context_before,
+        context_after,
+        annotations: Annotations {
+            calls_out,
+            called_by,
+        },
+    };
+
+    match serde_json::to_value(&resp) {
+        Ok(resp_json) => Response::success(&req.id, resp_json),
+        Err(err) => Response::error(
+            &req.id,
+            "internal_error",
+            format!("zoom: failed to serialize response: {err}"),
+        ),
+    }
+}
+
+/// Compute the deepest resolved prefix and the failing segment for a miss message.
+///
+/// For a single-segment query the prefix is empty (the document root) and the
+/// failing segment is the whole query.
+fn json_miss_details(query: &str) -> (String, String) {
+    let segments = split_json_path(query);
+    if segments.len() <= 1 {
+        return (String::new(), query.to_string());
+    }
+    let prefix = segments[..segments.len() - 1].join(".");
+    let failing = segments[segments.len() - 1].clone();
+    (prefix, failing)
+}
+
+/// Return the sibling keys of the deepest resolved object for a miss message.
+///
+/// For a single-segment query the "deepest resolved object" is the document
+/// root; for a multi-segment query it is the object reached by the prefix.
+fn json_sibling_keys(source: &str, root: &tree_sitter::Node, prefix: &str) -> Vec<String> {
+    let object = if prefix.is_empty() {
+        root.named_child(0)
+    } else {
+        json_path_resolve(source, root, prefix).map(|resolved| resolved.node)
+    };
+    let Some(object) = object else {
+        return Vec::new();
+    };
+    if object.kind() != "object" {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    let mut cursor = object.walk();
+    for pair in object.named_children(&mut cursor) {
+        if pair.kind() != "pair" {
+            continue;
+        }
+        if let Some(key_node) = pair.child_by_field_name("key") {
+            let key = node_text(source, &key_node).trim_matches('"').to_string();
+            if !key.is_empty() {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Build a `Range` from a tree-sitter node (0-indexed, matching `Symbol::range`).
+fn node_range(node: &tree_sitter::Node) -> Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    Range {
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: end.row as u32,
+        end_col: end.column as u32,
     }
 }
 
@@ -2023,5 +2495,108 @@ function helper(value: number): number {
 
     fn make_raw_request(_id: &str, json_str: &str) -> RawRequest {
         serde_json::from_str(json_str).unwrap()
+    }
+
+    // --- JSON path resolution tests ---
+
+    fn json_fixture_tree() -> (String, tree_sitter::Tree) {
+        let source = std::fs::read_to_string(fixture_path("nested.json")).unwrap();
+        let mut parser = FileParser::new();
+        let path = fixture_path("nested.json");
+        let (tree, _) = parser.parse(&path).unwrap();
+        (source, tree.clone())
+    }
+
+    #[test]
+    fn json_path_resolves_nested_object() {
+        let (source, tree) = json_fixture_tree();
+        let resolved = json_path_resolve(
+            &source,
+            &tree.root_node(),
+            "registration_profile_manifest.nested.deep",
+        )
+        .expect("path should resolve");
+        assert_eq!(resolved.path, "registration_profile_manifest.nested.deep");
+        assert_eq!(node_text(&source, &resolved.node).trim(), "\"value\"");
+    }
+
+    #[test]
+    fn json_path_resolves_array_index() {
+        let (source, tree) = json_fixture_tree();
+        let resolved = json_path_resolve(&source, &tree.root_node(), "servers[0]")
+            .expect("path should resolve");
+        assert_eq!(resolved.path, "servers[0]");
+        assert!(node_text(&source, &resolved.node).contains("primary"));
+    }
+
+    #[test]
+    fn json_path_resolves_chained_array_index() {
+        let (source, tree) = json_fixture_tree();
+        let resolved =
+            json_path_resolve(&source, &tree.root_node(), "a.b[1].c").expect("path should resolve");
+        assert_eq!(resolved.path, "a.b[1].c");
+        assert_eq!(node_text(&source, &resolved.node).trim(), "\"second\"");
+    }
+
+    #[test]
+    fn json_path_resolves_bare_array_index() {
+        let (source, tree) = json_fixture_tree();
+        let resolved = json_path_resolve(&source, &tree.root_node(), "servers[1].name")
+            .expect("path should resolve");
+        assert_eq!(resolved.path, "servers[1].name");
+        assert_eq!(node_text(&source, &resolved.node).trim(), "\"backup\"");
+    }
+
+    #[test]
+    fn json_path_miss_returns_none() {
+        let (source, tree) = json_fixture_tree();
+        assert!(json_path_resolve(
+            &source,
+            &tree.root_node(),
+            "registration_profile_manifest.host_only_allowlis"
+        )
+        .is_none());
+        assert!(json_path_resolve(&source, &tree.root_node(), "servers[9]").is_none());
+        assert!(json_path_resolve(&source, &tree.root_node(), "missing").is_none());
+    }
+
+    #[test]
+    fn json_path_resolves_dotted_query_as_path() {
+        // The fixture has BOTH a literal key "literal.dotted.key" and a nested
+        // path literal.dotted.key. This unit test exercises the path-walk
+        // function directly, which resolves to the nested path-value node.
+        let (source, tree) = json_fixture_tree();
+        let resolved = json_path_resolve(&source, &tree.root_node(), "literal.dotted.key")
+            .expect("path should resolve");
+        assert_eq!(node_text(&source, &resolved.node).trim(), "\"path-value\"");
+    }
+
+    #[test]
+    fn json_miss_details_reports_deepest_prefix() {
+        let (prefix, failing) =
+            json_miss_details("registration_profile_manifest.host_only_allowlis");
+        assert_eq!(prefix, "registration_profile_manifest");
+        assert_eq!(failing, "host_only_allowlis");
+    }
+
+    #[test]
+    fn json_miss_details_single_segment() {
+        let (prefix, failing) = json_miss_details("missing");
+        assert_eq!(prefix, "");
+        assert_eq!(failing, "missing");
+    }
+
+    #[test]
+    fn split_json_path_keeps_bracket_groups() {
+        assert_eq!(split_json_path("a.b[0].c"), vec!["a", "b[0]", "c"]);
+        assert_eq!(split_json_path("servers[0]"), vec!["servers[0]"]);
+        assert_eq!(split_json_path("a.b.c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_json_segment_handles_key_and_index() {
+        assert_eq!(parse_json_segment("servers[0]"), (Some("servers"), Some(0)));
+        assert_eq!(parse_json_segment("[0]"), (None, Some(0)));
+        assert_eq!(parse_json_segment("host"), (Some("host"), None));
     }
 }

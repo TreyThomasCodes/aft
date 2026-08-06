@@ -1029,3 +1029,361 @@ function unrelated_symbol() {}
 
     assert!(aft.shutdown().success());
 }
+
+const NESTED_JSON: &str = r#"{
+  "registration_profile_manifest": {
+    "host_only_allowlist": ["alpha", "beta"],
+    "nested": {
+      "deep": "value"
+    }
+  },
+  "servers": [
+    { "name": "primary", "port": 8080 },
+    { "name": "backup", "port": 9090 }
+  ],
+  "a": {
+    "b": [
+      { "c": "first" },
+      { "c": "second" }
+    ]
+  },
+  "literal.dotted.key": "literal-value",
+  "literal": {
+    "dotted": {
+      "key": "path-value"
+    }
+  },
+  "plain.dotted": "plain-value"
+}
+"#;
+
+#[test]
+fn zoom_json_nested_object_path() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-nested",
+            "command": "zoom",
+            "file": file,
+            "symbol": "registration_profile_manifest.nested.deep",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "nested path zoom: {resp:?}");
+    assert_eq!(resp["name"], "registration_profile_manifest.nested.deep");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("\"value\""),
+        "nested path should render the resolved value: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_array_index() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-array",
+            "command": "zoom",
+            "file": file,
+            "symbol": "servers[0]",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "array index zoom: {resp:?}");
+    assert_eq!(resp["name"], "servers[0]");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("primary"),
+        "array index should render the element: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_chained_array_index() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-chained",
+            "command": "zoom",
+            "file": file,
+            "symbol": "a.b[1].c",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "chained array zoom: {resp:?}");
+    assert_eq!(resp["name"], "a.b[1].c");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("\"second\""),
+        "chained array should render the element value: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_literal_dotted_key_wins_over_path() {
+    // The fixture has a literal key "plain.dotted" with no corresponding
+    // nested path. Literal-first means the literal key wins outright.
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-literal-dotted",
+            "command": "zoom",
+            "file": file,
+            "symbol": "plain.dotted",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "literal dotted key zoom: {resp:?}");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("plain-value"),
+        "literal dotted key should win over the path interpretation: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_equal_node_literal_and_path_is_not_ambiguous() {
+    // A query that resolves to the same node both as a literal key and as a
+    // path must not be reported as ambiguous.
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-equal-node",
+            "command": "zoom",
+            "file": file,
+            "symbol": "servers",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "equal-node zoom: {resp:?}");
+    assert_eq!(resp["kind"], "variable");
+    assert!(resp["content"].as_str().unwrap().contains("primary"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_different_node_literal_and_path_is_ambiguous() {
+    // A query that resolves to DIFFERENT nodes as a literal key and as a path
+    // must return ambiguous_match with both candidates.
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-ambiguous",
+            "command": "zoom",
+            "file": file,
+            "symbol": "literal.dotted.key",
+        }),
+    );
+
+    // The literal key "literal.dotted.key" and the path literal.dotted.key
+    // resolve to different nodes → ambiguous_match.
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "ambiguous_match");
+    let candidates = resp["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 2, "both candidates: {candidates:?}");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_miss_reports_deepest_prefix_and_failing_segment() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-miss",
+            "command": "zoom",
+            "file": file,
+            "symbol": "registration_profile_manifest.host_only_allowlis",
+        }),
+    );
+
+    assert_eq!(resp["success"], false);
+    assert_eq!(resp["code"], "symbol_not_found");
+    let msg = resp["message"].as_str().unwrap();
+    assert!(
+        msg.contains("registration_profile_manifest"),
+        "miss should report deepest resolved prefix: {msg}"
+    );
+    assert!(
+        msg.contains("host_only_allowlis"),
+        "miss should report the failing segment: {msg}"
+    );
+    assert!(
+        msg.contains("host_only_allowlist"),
+        "miss should suggest the nearest key: {msg}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_multi_symbol_paths_work() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-multi",
+            "command": "zoom",
+            "file": file,
+            "symbols": ["servers[0]", "a.b[0].c"],
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "multi-symbol zoom: {resp:?}");
+    assert_eq!(resp["complete"], true);
+    let entries = resp["symbols"].as_array().expect("symbols batch");
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(
+            entry["response"]["success"], true,
+            "path entry should succeed: {entry:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_json_targets_form_works_with_paths() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "nested.json", NESTED_JSON);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-json-targets",
+            "command": "zoom",
+            "targets": [
+                { "file": file, "symbol": "servers[1].name" },
+                { "file": file, "symbol": "registration_profile_manifest.host_only_allowlist" }
+            ],
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "targets zoom: {resp:?}");
+    let targets = resp["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 2);
+    for target in targets {
+        assert_eq!(
+            target["response"]["success"], true,
+            "target should succeed: {target:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_non_json_dotted_query_keeps_existing_behavior() {
+    // Negative control: a dotted query on a .ts file must still resolve via the
+    // existing symbol logic (qualified name), and its miss message is unchanged.
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "search.ts",
+        r#"class First {
+  execute(): string {
+    const firstBodyLine = "first";
+    return firstBodyLine;
+  }
+}
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = send(
+        &mut aft,
+        json!({
+            "id": "zoom-ts-dotted",
+            "command": "zoom",
+            "file": file,
+            "symbol": "First.execute",
+        }),
+    );
+
+    assert_eq!(resp["success"], true, "ts dotted zoom: {resp:?}");
+    assert_eq!(resp["name"], "execute");
+    assert!(resp["content"].as_str().unwrap().contains("firstBodyLine"));
+
+    // Miss message unchanged for non-JSON files.
+    let miss = send(
+        &mut aft,
+        json!({
+            "id": "zoom-ts-dotted-miss",
+            "command": "zoom",
+            "file": file,
+            "symbol": "First.missing",
+        }),
+    );
+    assert_eq!(miss["success"], false);
+    assert_eq!(miss["code"], "symbol_not_found");
+    let msg = miss["message"].as_str().unwrap();
+    assert!(
+        msg.contains("symbol 'First.missing' not found"),
+        "non-JSON miss message should be unchanged: {msg}"
+    );
+
+    assert!(aft.shutdown().success());
+}
