@@ -507,6 +507,11 @@ function resolveCachedOnnxRuntimeDir(ortVersionDir: string, libName: string): st
   // AFT's own installer flattens the runtime libraries into the version root.
   // Microsoft's archives keep them under lib/. Prefer the root when both exist
   // because downloads and metadata are anchored there.
+  //
+  // MIRROR: the Rust standalone binary resolves the same layout in
+  // `crates/aft/src/semantic_index.rs::find_managed_onnx_runtime` /
+  // `managed_ort_lib_in_version_dir` (version root, then `lib/` subdir). A
+  // layout change here must update that resolver too, and vice versa.
   if (existsSync(join(ortVersionDir, libName))) return ortVersionDir;
   const libSubdir = join(ortVersionDir, "lib");
   if (existsSync(join(libSubdir, libName))) return libSubdir;

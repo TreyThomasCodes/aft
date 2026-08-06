@@ -67,6 +67,12 @@ const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Test-only probe counter for the managed-ONNX resolver (see
+/// `find_managed_onnx_runtime`). Counts storage-tree reads so a negative-control
+/// test can assert a pre-set ORT_DYLIB_PATH short-circuits the resolver.
+#[cfg(test)]
+static MANAGED_ORT_PROBE_READS: AtomicUsize = AtomicUsize::new(0);
+
 /// Per-query request policy kept separate from the background build timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryBudget {
@@ -1165,6 +1171,137 @@ impl SemanticEmbeddingModel {
             }
         }
     }
+}
+
+/// Platform library filename for the plugin-managed ONNX Runtime.
+///
+/// Mirrors `ORT_PLATFORM_MAP` in packages/aft-bridge/src/onnx-runtime.ts. A
+/// layout change on either side must update both — the plugin downloads the
+/// runtime into `<storage_dir>/onnxruntime/<version>/` and this resolver must
+/// find it at the same path.
+#[cfg(target_os = "linux")]
+const MANAGED_ORT_LIB_NAME: &str = "libonnxruntime.so";
+#[cfg(target_os = "macos")]
+const MANAGED_ORT_LIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(target_os = "windows")]
+const MANAGED_ORT_LIB_NAME: &str = "onnxruntime.dll";
+
+/// Minimum managed ONNX Runtime minor version this resolver will accept.
+///
+/// Mirrors the `REQUIRED_ORT_MIN_MINOR` floor in onnx-runtime.ts and the 1.20
+/// floor `pre_validate_onnx_runtime` enforces. A managed install below this
+/// would be handed to ort and rejected there, so the resolver must skip it.
+const MANAGED_ORT_MIN_MINOR: u32 = 20;
+
+/// Resolve the plugin-managed ONNX Runtime under the ACTIVE storage dir and
+/// export it as `ORT_DYLIB_PATH` for the process.
+///
+/// The plugin (packages/aft-bridge/src/onnx-runtime.ts) downloads the runtime
+/// to `<storage_dir>/onnxruntime/<version>/<libname>` and exports ORT_DYLIB_PATH
+/// into the child env. A bare `aft` binary has no such step: without this
+/// resolver, `pre_validate_onnx_runtime` dlopens the bare soname, which only
+/// works with a system-installed runtime. This makes the standalone binary pick
+/// up the runtime the plugin already downloaded.
+///
+/// Resolution order:
+///   1. If `ORT_DYLIB_PATH` is already set (an explicit user override, or the
+///      plugin already exported it), do nothing — the caller's choice wins and
+///      the resolver must not run at all.
+///   2. Enumerate `<storage_dir>/onnxruntime/` version directories, keep only
+///      parseable `1.x.y` with x >= 20, pick the highest, and if its library
+///      file exists set `ORT_DYLIB_PATH` to it.
+///   3. Otherwise leave the env untouched; `pre_validate_onnx_runtime` falls
+///      back to the bare soname + doctor hint as before.
+///
+/// # Process-global env mutation
+/// This sets a process-wide env var and must run ONCE at startup, before any
+/// worker threads spawn (the warmup CLI main and the standalone main's semantic
+/// init path). Setting it lazily from a worker thread would race ort's own
+/// dlopen and other threads reading the env. The function is idempotent: once
+/// `ORT_DYLIB_PATH` is set, subsequent calls short-circuit.
+pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+    let Some(lib_path) = find_managed_onnx_runtime(storage_dir) else {
+        return;
+    };
+    std::env::set_var("ORT_DYLIB_PATH", &lib_path);
+    slog_info!(
+        "using plugin-managed ONNX Runtime at {}",
+        lib_path.display()
+    );
+}
+
+/// Find the highest compatible managed ONNX Runtime library under
+/// `<storage_dir>/onnxruntime/`, or None when absent/incompatible.
+///
+/// Mirrors the plugin's `resolveCachedOnnxRuntimeDir`: the library may live at
+/// the version root (the plugin's own flattened install) or under a `lib/`
+/// subdir (manual Microsoft-archive installs, issue #71).
+fn find_managed_onnx_runtime(storage_dir: &Path) -> Option<PathBuf> {
+    let base = storage_dir.join("onnxruntime");
+    let entries = std::fs::read_dir(&base).ok()?;
+    #[cfg(test)]
+    {
+        // Test-only probe: counts how many times the resolver actually reads
+        // the storage tree. Lets a negative-control test assert that a pre-set
+        // ORT_DYLIB_PATH short-circuits the resolver without touching the tree.
+        MANAGED_ORT_PROBE_READS.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut best: Option<(u32, u32, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some((major, minor)) = parse_managed_ort_version(&entry.file_name().to_string_lossy())
+        else {
+            continue;
+        };
+        if major != 1 || minor < MANAGED_ORT_MIN_MINOR {
+            continue;
+        }
+        let Some(lib_path) = managed_ort_lib_in_version_dir(&path) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_major, best_minor, _)| (major, minor) > (*best_major, *best_minor))
+        {
+            best = Some((major, minor, lib_path));
+        }
+    }
+    best.map(|(_, _, path)| path)
+}
+
+/// Locate the library file inside one `<version>` directory, preferring the
+/// version root over a `lib/` subdir (mirrors `resolveCachedOnnxRuntimeDir`).
+fn managed_ort_lib_in_version_dir(version_dir: &Path) -> Option<PathBuf> {
+    let root = version_dir.join(MANAGED_ORT_LIB_NAME);
+    if root.is_file() {
+        return Some(root);
+    }
+    let lib_subdir = version_dir.join("lib").join(MANAGED_ORT_LIB_NAME);
+    if lib_subdir.is_file() {
+        return Some(lib_subdir);
+    }
+    None
+}
+
+/// Parse a `major.minor.patch` triple from a version directory name. Returns
+/// None for anything that is not exactly a three-part numeric version (so
+/// non-version dirs and malformed names are ignored).
+fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
+    let mut parts = name.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let _patch = parts.next()?.parse::<u32>().ok()?;
+    // Reject trailing junk like "1.24.4.tmp" or "1.24.4.5".
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
 }
 
 /// Pre-validate ONNX Runtime by attempting a raw dlopen before ort touches it.
@@ -7628,5 +7765,145 @@ public class Greeter {
             msg.contains("'/opt/homebrew/lib/libonnxruntime.dylib'"),
             "system path should be quoted in the auto-fix sentence: {msg}"
         );
+    }
+
+    // ── managed ONNX Runtime resolver tests ──────────────────────────────────
+
+    /// Build a fake `<storage>/onnxruntime/<version>/<libname>` tree. Returns
+    /// the storage root. `lib_name` is the platform library filename the
+    /// resolver looks for.
+    fn fake_managed_ort_tree(storage: &std::path::Path, lib_name: &str, versions: &[(&str, bool)]) {
+        for (version, has_lib) in versions {
+            let dir = storage.join("onnxruntime").join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            if *has_lib {
+                std::fs::write(dir.join(lib_name), b"fake-ort").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn managed_ort_resolver_picks_highest_compatible_version() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        fake_managed_ort_tree(
+            storage.path(),
+            MANAGED_ORT_LIB_NAME,
+            &[
+                ("1.19.0", true), // below the 1.20 floor — must be ignored
+                ("1.20.1", true),
+                ("1.24.4", true), // highest compatible — must win
+                ("1.23.0", true),
+            ],
+        );
+        let found = find_managed_onnx_runtime(storage.path()).expect("resolver finds a runtime");
+        assert_eq!(
+            found,
+            storage
+                .path()
+                .join("onnxruntime")
+                .join("1.24.4")
+                .join(MANAGED_ORT_LIB_NAME)
+        );
+    }
+
+    #[test]
+    fn managed_ort_resolver_ignores_non_version_and_pre_120_dirs() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        fake_managed_ort_tree(
+            storage.path(),
+            MANAGED_ORT_LIB_NAME,
+            &[
+                ("1.19.0", true),     // pre-1.20 — ignored
+                ("1.24.4.tmp", true), // not a parseable version — ignored
+                ("latest", true),     // not a version — ignored
+                ("1.24.4", false),    // compatible but no library file — ignored
+            ],
+        );
+        assert_eq!(
+            find_managed_onnx_runtime(storage.path()),
+            None,
+            "no compatible version with a library file should resolve"
+        );
+    }
+
+    #[test]
+    fn managed_ort_resolver_absent_tree_falls_through() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        // No onnxruntime/ dir at all.
+        assert_eq!(find_managed_onnx_runtime(storage.path()), None);
+        // Empty onnxruntime/ dir.
+        std::fs::create_dir_all(storage.path().join("onnxruntime")).unwrap();
+        assert_eq!(find_managed_onnx_runtime(storage.path()), None);
+    }
+
+    #[test]
+    fn managed_ort_resolver_prefers_version_root_over_lib_subdir() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        let version_dir = storage.path().join("onnxruntime").join("1.24.4");
+        std::fs::create_dir_all(version_dir.join("lib")).unwrap();
+        // Both the version root and the lib/ subdir hold the library; the root
+        // must win (mirrors resolveCachedOnnxRuntimeDir).
+        std::fs::write(version_dir.join(MANAGED_ORT_LIB_NAME), b"root").unwrap();
+        std::fs::write(version_dir.join("lib").join(MANAGED_ORT_LIB_NAME), b"lib").unwrap();
+        let found = find_managed_onnx_runtime(storage.path()).expect("resolver finds a runtime");
+        assert_eq!(found, version_dir.join(MANAGED_ORT_LIB_NAME));
+    }
+
+    #[test]
+    fn managed_ort_resolver_accepts_lib_subdir_only() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        let version_dir = storage.path().join("onnxruntime").join("1.24.4");
+        std::fs::create_dir_all(version_dir.join("lib")).unwrap();
+        // Library only under lib/ (manual Microsoft-archive install, #71).
+        std::fs::write(version_dir.join("lib").join(MANAGED_ORT_LIB_NAME), b"lib").unwrap();
+        let found = find_managed_onnx_runtime(storage.path()).expect("resolver finds a runtime");
+        assert_eq!(found, version_dir.join("lib").join(MANAGED_ORT_LIB_NAME));
+    }
+
+    #[test]
+    fn managed_ort_resolver_pre_set_env_short_circuits_without_reading_tree() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        // Plant a poison dir that would panic the resolver if it were read:
+        // a version dir whose name is a valid version but whose library file is
+        // a directory (so `is_file()` would be false) — harmless, but the point
+        // is the resolver must never even look.
+        let poison = storage.path().join("onnxruntime").join("1.24.4");
+        std::fs::create_dir_all(poison.join(MANAGED_ORT_LIB_NAME)).unwrap();
+
+        let before = MANAGED_ORT_PROBE_READS.load(Ordering::Relaxed);
+        // Pre-set ORT_DYLIB_PATH — the resolver must not run at all.
+        std::env::set_var("ORT_DYLIB_PATH", "/explicit/override/libonnxruntime.so");
+        resolve_managed_onnx_runtime(storage.path());
+        std::env::remove_var("ORT_DYLIB_PATH");
+        assert_eq!(
+            MANAGED_ORT_PROBE_READS.load(Ordering::Relaxed),
+            before,
+            "resolver must not read the storage tree when ORT_DYLIB_PATH is pre-set"
+        );
+    }
+
+    #[test]
+    fn managed_ort_resolver_sets_env_when_found() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let storage = tempfile::tempdir().unwrap();
+        fake_managed_ort_tree(storage.path(), MANAGED_ORT_LIB_NAME, &[("1.24.4", true)]);
+        std::env::remove_var("ORT_DYLIB_PATH");
+        resolve_managed_onnx_runtime(storage.path());
+        let set = std::env::var_os("ORT_DYLIB_PATH").expect("resolver sets ORT_DYLIB_PATH");
+        assert_eq!(
+            PathBuf::from(set),
+            storage
+                .path()
+                .join("onnxruntime")
+                .join("1.24.4")
+                .join(MANAGED_ORT_LIB_NAME)
+        );
+        std::env::remove_var("ORT_DYLIB_PATH");
     }
 }

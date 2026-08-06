@@ -46,6 +46,12 @@ pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
             storage_dir.display()
         )));
     }
+    // Resolve the plugin-managed ONNX Runtime before any worker threads spawn.
+    // This sets the process-global ORT_DYLIB_PATH once at startup so the
+    // semantic build's pre_validate_onnx_runtime finds the runtime the plugin
+    // already downloaded (issue #128). Must run here, not lazily from a worker
+    // thread, because env mutation races ort's own dlopen.
+    aft::semantic_index::resolve_managed_onnx_runtime(&storage_dir);
     if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
         std::env::set_var(
             "FASTEMBED_CACHE_DIR",

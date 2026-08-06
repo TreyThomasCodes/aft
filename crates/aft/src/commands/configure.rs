@@ -1905,6 +1905,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // splitting the storage universe by transport.
         next_config.storage_dir = Some(crate::bash_background::storage_dir(None));
     }
+    // Resolve the plugin-managed ONNX Runtime before the semantic build worker
+    // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
+    // startup so pre_validate_onnx_runtime finds the runtime the plugin already
+    // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
+    // by an explicit user override) it short-circuits. Must run here, not lazily
+    // from the worker thread, because env mutation races ort's own dlopen.
+    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
+        crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
+    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
