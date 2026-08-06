@@ -2337,8 +2337,8 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 351, column 37",
-      "line": 351,
+      "location": "line 354, column 37",
+      "line": 354,
       "column": 37,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -2346,8 +2346,8 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 359, column 35",
-      "line": 359,
+      "location": "line 362, column 35",
+      "line": 362,
       "column": 35,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -2355,8 +2355,8 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 362, column 39",
-      "line": 362,
+      "location": "line 365, column 39",
+      "line": 365,
       "column": 39,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -2364,17 +2364,17 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 367, column 39",
-      "line": 367,
-      "column": 39,
-      "token": "filePath",
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 370, column 19",
+      "location": "line 370, column 39",
       "line": 370,
+      "column": 39,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "packages/aft-bridge/src/path-aliases.ts",
+      "location": "line 373, column 19",
+      "line": 373,
       "column": 19,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -2382,8 +2382,8 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 375, column 38",
-      "line": 375,
+      "location": "line 378, column 38",
+      "line": 378,
       "column": 38,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -2391,8 +2391,8 @@
     },
     {
       "path": "packages/aft-bridge/src/path-aliases.ts",
-      "location": "line 376, column 19",
-      "line": 376,
+      "location": "line 379, column 19",
+      "line": 379,
       "column": 19,
       "token": "filePath",
       "class": "internal-compatibility",
