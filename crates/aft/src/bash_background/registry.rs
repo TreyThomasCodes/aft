@@ -1115,25 +1115,33 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
-        let shell = spawn_plan
-            .host_shell_path()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(resolve_posix_shell);
-        let pipeline = single_top_level_pipeline(command);
-        let capture_pipeline_status =
-            should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell);
-        if capture_pipeline_status {
-            metadata.pipeline_segments = pipeline
-                .as_ref()
-                .map(|pipeline| {
-                    pipeline
-                        .segments
-                        .iter()
-                        .map(|segment| segment.label.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
+        // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
+        // bash/zsh PIPESTATUS and a dedicated inherited fd, neither of which
+        // exists on the Windows spawn path.
+        #[cfg(unix)]
+        let capture_pipeline_status = {
+            let shell = spawn_plan
+                .host_shell_path()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(resolve_posix_shell);
+            let pipeline = single_top_level_pipeline(command);
+            let capture = should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell);
+            if capture {
+                metadata.pipeline_segments = pipeline
+                    .as_ref()
+                    .map(|pipeline| {
+                        pipeline
+                            .segments
+                            .iter()
+                            .map(|segment| segment.label.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+            capture
+        };
+        #[cfg(windows)]
+        let capture_pipeline_status = false;
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);

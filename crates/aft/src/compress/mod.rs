@@ -1466,6 +1466,7 @@ pub fn project_filter_dir(project_root: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn single_pipeline_scanner_returns_segment_labels() {
         let pipeline = single_top_level_pipeline("git rebase upstream/main | tail -3").unwrap();
@@ -1479,6 +1480,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn single_pipeline_scanner_rejects_unsafe_shapes() {
         for command in [
@@ -1494,6 +1496,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn single_pipeline_scanner_accepts_pipe_without_top_level_newline() {
         let pipeline = single_top_level_pipeline("false | tail -1").unwrap();
