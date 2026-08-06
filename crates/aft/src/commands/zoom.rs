@@ -13,7 +13,7 @@ use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::language::{HeadingAnchor, LanguageProvider};
 use crate::lsp_hints;
-use crate::parser::{detect_language, node_text, FileParser, LangId};
+use crate::parser::{detect_language, json_document_value, node_text, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
@@ -988,6 +988,11 @@ struct JsonNode<'a> {
     path: String,
 }
 
+struct JsonPathMiss {
+    prefix: String,
+    failing: String,
+}
+
 /// Resolve a zoom request against a JSON document.
 ///
 /// The query is resolved in two independent ways and the results compared:
@@ -1036,8 +1041,7 @@ fn resolve_json_zoom(
     // exist (e.g. `literal.dotted.key`) resolves to different nodes → ambiguous.
     if !literal.is_empty() {
         if let Some(path_node) = path_result.as_ref() {
-            let literal_value_node = root
-                .named_child(0)
+            let literal_value_node = json_document_value(&root)
                 .and_then(|object| json_object_value(source, object, symbol_name));
             let same_node = literal_value_node
                 .map(|node| {
@@ -1108,7 +1112,7 @@ fn resolve_json_zoom(
 
     // Miss: report the deepest resolved prefix and the failing segment, and
     // suggest sibling keys within the deepest resolved object.
-    let (prefix, failing) = json_miss_details(symbol_name);
+    let (prefix, failing) = json_miss_details(source, &root, symbol_name);
     let mut msg = if prefix.is_empty() {
         format!("symbol '{}' not found: no key `{}`", symbol_name, failing)
     } else {
@@ -1137,32 +1141,64 @@ fn json_path_resolve<'a>(
     root: &tree_sitter::Node<'a>,
     query: &str,
 ) -> Option<JsonNode<'a>> {
-    let segments = split_json_path(query);
-    if segments.is_empty() {
-        return None;
-    }
+    json_path_lookup(source, root, query).ok()
+}
 
-    // The document root must be an object for keyed access.
-    let mut current = root.named_child(0)?;
+/// Walk a JSON path while preserving the exact segment at which resolution fails.
+///
+/// Keeping the miss at the point of failure lets the caller report the actual
+/// deepest object rather than guessing that only the final query segment failed.
+fn json_path_lookup<'a>(
+    source: &str,
+    root: &tree_sitter::Node<'a>,
+    query: &str,
+) -> Result<JsonNode<'a>, JsonPathMiss> {
+    let segments = split_json_path(query);
+    let Some(first_segment) = segments.first() else {
+        return Err(JsonPathMiss {
+            prefix: String::new(),
+            failing: query.to_string(),
+        });
+    };
+
+    // The document root must be an object for keyed access. JSONC comments can
+    // precede this value, so select the first non-comment child rather than the
+    // first named child unconditionally.
+    let Some(mut current) = json_document_value(root) else {
+        return Err(JsonPathMiss {
+            prefix: String::new(),
+            failing: first_segment.clone(),
+        });
+    };
     if current.kind() != "object" {
-        return None;
+        return Err(JsonPathMiss {
+            prefix: String::new(),
+            failing: first_segment.clone(),
+        });
     }
 
     let mut resolved_path = String::new();
-    for (index, segment) in segments.iter().enumerate() {
+    for segment in &segments {
         let (key, array_index) = parse_json_segment(segment);
         let next = if let Some(array_index) = array_index {
             // A segment like `servers[0]` first resolves the key to the array
             // node, then indexes into it. A bare `[0]` indexes the current node.
             let array = match key {
-                Some(key) => json_object_value(source, current, key)?,
-                None => current,
+                Some(key) => json_object_value(source, current, key),
+                None => Some(current),
             };
-            json_array_element(array, array_index)?
+            array.and_then(|array| json_array_element(array, array_index))
         } else {
-            json_object_value(source, current, key?)?
+            key.and_then(|key| json_object_value(source, current, key))
         };
-        if index == 0 {
+        let Some(next) = next else {
+            return Err(JsonPathMiss {
+                prefix: resolved_path,
+                failing: segment.clone(),
+            });
+        };
+
+        if resolved_path.is_empty() {
             resolved_path = segment.clone();
         } else {
             resolved_path.push('.');
@@ -1171,7 +1207,7 @@ fn json_path_resolve<'a>(
         current = next;
     }
 
-    Some(JsonNode {
+    Ok(JsonNode {
         node: current,
         path: resolved_path,
     })
@@ -1380,16 +1416,14 @@ fn render_json_zoom(
 
 /// Compute the deepest resolved prefix and the failing segment for a miss message.
 ///
-/// For a single-segment query the prefix is empty (the document root) and the
-/// failing segment is the whole query.
-fn json_miss_details(query: &str) -> (String, String) {
-    let segments = split_json_path(query);
-    if segments.len() <= 1 {
-        return (String::new(), query.to_string());
+/// The path walker records the first segment that cannot be resolved, so a
+/// multi-segment miss names the real failing segment and its nearest resolved
+/// object.
+fn json_miss_details(source: &str, root: &tree_sitter::Node, query: &str) -> (String, String) {
+    match json_path_lookup(source, root, query) {
+        Err(miss) => (miss.prefix, miss.failing),
+        Ok(_) => (String::new(), String::new()),
     }
-    let prefix = segments[..segments.len() - 1].join(".");
-    let failing = segments[segments.len() - 1].clone();
-    (prefix, failing)
 }
 
 /// Return the sibling keys of the deepest resolved object for a miss message.
@@ -1398,7 +1432,7 @@ fn json_miss_details(query: &str) -> (String, String) {
 /// root; for a multi-segment query it is the object reached by the prefix.
 fn json_sibling_keys(source: &str, root: &tree_sitter::Node, prefix: &str) -> Vec<String> {
     let object = if prefix.is_empty() {
-        root.named_child(0)
+        json_document_value(root)
     } else {
         json_path_resolve(source, root, prefix).map(|resolved| resolved.node)
     };
@@ -2500,11 +2534,31 @@ function helper(value: number): number {
     // --- JSON path resolution tests ---
 
     fn json_fixture_tree() -> (String, tree_sitter::Tree) {
-        let source = std::fs::read_to_string(fixture_path("nested.json")).unwrap();
+        json_fixture_tree_named("nested.json")
+    }
+
+    fn json_fixture_tree_named(name: &str) -> (String, tree_sitter::Tree) {
+        let source = std::fs::read_to_string(fixture_path(name)).unwrap();
         let mut parser = FileParser::new();
-        let path = fixture_path("nested.json");
+        let path = fixture_path(name);
         let (tree, _) = parser.parse(&path).unwrap();
         (source, tree.clone())
+    }
+
+    fn assert_json_zoom_resolves(fixture: &str, query: &str, expected_fragment: &str) {
+        let ctx = make_ctx();
+        let path = fixture_path(fixture);
+        let req = make_zoom_request("json-regression", path.to_str().unwrap(), query, None);
+        let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        assert_eq!(json["success"], true, "JSON zoom should succeed: {json}");
+        assert_eq!(json["name"], query);
+        assert!(
+            json["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_fragment),
+            "JSON zoom content should contain {expected_fragment:?}: {json}"
+        );
     }
 
     #[test]
@@ -2518,6 +2572,58 @@ function helper(value: number): number {
         .expect("path should resolve");
         assert_eq!(resolved.path, "registration_profile_manifest.nested.deep");
         assert_eq!(node_text(&source, &resolved.node).trim(), "\"value\"");
+    }
+
+    #[test]
+    fn json_zoom_resolves_leading_line_comments() {
+        assert_json_zoom_resolves(
+            "zoom_jsonc_leading_line_comments.jsonc",
+            "chains",
+            "\"executor\"",
+        );
+    }
+
+    #[test]
+    fn json_zoom_resolves_leading_block_comment() {
+        assert_json_zoom_resolves(
+            "zoom_jsonc_leading_block_comment.jsonc",
+            "chains",
+            "\"executor\"",
+        );
+    }
+
+    #[test]
+    fn json_zoom_resolves_blank_lines_before_document() {
+        assert_json_zoom_resolves("zoom_json_blank_lines.json", "chains", "\"executor\"");
+    }
+
+    #[test]
+    fn json_zoom_resolves_comments_inside_object() {
+        assert_json_zoom_resolves("zoom_json_comments_inside.jsonc", "chains", "\"executor\"");
+    }
+
+    #[test]
+    fn json_zoom_leading_multibyte_comment_keeps_path_and_value_offsets() {
+        assert_json_zoom_resolves(
+            "zoom_jsonc_leading_line_comments.jsonc",
+            "chains.executor.entries[1].model",
+            "\"large\"",
+        );
+    }
+
+    #[test]
+    fn json_zoom_miss_reports_actual_deepest_prefix_and_segment() {
+        let ctx = make_ctx();
+        let path = fixture_path("zoom_json_miss_locus.json");
+        let query = "agent.general.model";
+        let req = make_zoom_request("json-miss", path.to_str().unwrap(), query, None);
+        let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+
+        assert_eq!(json["success"], false);
+        assert_eq!(
+            json["message"],
+            "symbol 'agent.general.model' not found: resolved `agent`, no key `general` — nearest: [general_settings]"
+        );
     }
 
     #[test]
@@ -2573,15 +2679,20 @@ function helper(value: number): number {
 
     #[test]
     fn json_miss_details_reports_deepest_prefix() {
-        let (prefix, failing) =
-            json_miss_details("registration_profile_manifest.host_only_allowlis");
+        let (source, tree) = json_fixture_tree();
+        let (prefix, failing) = json_miss_details(
+            &source,
+            &tree.root_node(),
+            "registration_profile_manifest.host_only_allowlis",
+        );
         assert_eq!(prefix, "registration_profile_manifest");
         assert_eq!(failing, "host_only_allowlis");
     }
 
     #[test]
     fn json_miss_details_single_segment() {
-        let (prefix, failing) = json_miss_details("missing");
+        let (source, tree) = json_fixture_tree();
+        let (prefix, failing) = json_miss_details(&source, &tree.root_node(), "missing");
         assert_eq!(prefix, "");
         assert_eq!(failing, "missing");
     }

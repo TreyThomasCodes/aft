@@ -5161,8 +5161,21 @@ fn objc_declarator_name(source: &str, node: &Node) -> Option<String> {
     })
 }
 
+/// Return the first non-comment value in a JSON document.
+///
+/// JSONC permits comments before the document value. Tree-sitter exposes those
+/// comments as named children, so callers must not assume `named_child(0)` is the
+/// object or array that contains the document's data.
+pub(crate) fn json_document_value<'a>(root: &Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = root.walk();
+    let value = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment");
+    value
+}
+
 fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
-    let Some(value) = root.named_child(0) else {
+    let Some(value) = json_document_value(root) else {
         return Ok(Vec::new());
     };
 
