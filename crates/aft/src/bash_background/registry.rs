@@ -3228,21 +3228,8 @@ impl BgTaskRegistry {
         } else {
             gap_matches
         };
-        let emitted_once_ids: Vec<String> = to_emit
-            .iter()
-            .filter(|m| m.once)
-            .map(|m| m.watch_id.clone())
-            .collect();
         for pattern_match in to_emit {
             self.emit_bash_pattern_match(&task.session_id, pattern_match);
-        }
-        // After recovering a pending once-match, drop the durable row so a later
-        // restart without an ack cannot loop the same notification forever.
-        // Fresh gap once-matches stay until ack (same as the live match path).
-        if emitted_pending {
-            for watch_id in emitted_once_ids {
-                self.delete_persisted_watch(&task.session_id, &task.task_id, &watch_id);
-            }
         }
 
         if !terminal {

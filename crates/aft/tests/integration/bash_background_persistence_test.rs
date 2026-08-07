@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,100 @@ fn ack(aft: &mut AftProcess, session: &str, task_id: &str) -> Value {
         })
         .to_string(),
     )
+}
+
+fn notify_once(aft: &mut AftProcess, session: &str, task_id: &str, pattern: &str) -> Value {
+    aft.send(
+        &json!({
+            "id": "notify-persist-bg",
+            "session_id": session,
+            "command": "bash_notify",
+            "params": { "task_id": task_id, "pattern": pattern, "once": true }
+        })
+        .to_string(),
+    )
+}
+
+fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["type"] == "bash_pattern_match" && frame["task_id"] == task_id {
+                return frame;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "timed out waiting for pattern frame for {task_id}"
+        );
+    }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn sigkill_aft(aft: AftProcess) {
+    let pid = aft.pid();
+    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    assert_eq!(result, 0, "failed to SIGKILL aft process {pid}");
+    assert!(
+        !aft.shutdown().success(),
+        "SIGKILLed aft exited successfully"
+    );
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("query child process state");
+    output.status.success() && !String::from_utf8_lossy(&output.stdout).contains('Z')
+}
+
+fn persisted_watch_rows(
+    storage: &Path,
+    session: &str,
+    task_id: &str,
+) -> Vec<aft::db::bash_watches::BashPatternWatchRow> {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open watch database");
+    aft::db::bash_watches::list_bash_pattern_watches_for_task(&conn, "opencode", session, task_id)
+        .expect("read persisted watch rows")
+}
+
+struct StopTaskOnDrop(PathBuf);
+
+impl Drop for StopTaskOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"stop");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedOnceMatch {
+    watch_id: String,
+    match_text: String,
+    match_offset: i64,
+}
+
+fn persisted_once_match(storage: &Path, session: &str, task_id: &str) -> PersistedOnceMatch {
+    let rows = persisted_watch_rows(storage, session, task_id);
+    assert_eq!(rows.len(), 1, "expected one durable watch row: {rows:?}");
+    let row = &rows[0];
+    assert!(row.once, "expected a once-watch row: {row:?}");
+    assert!(
+        !row.scanning,
+        "matched once-watch must stop scanning: {row:?}"
+    );
+    assert!(
+        row.pending_match,
+        "matched watch must remain pending: {row:?}"
+    );
+    PersistedOnceMatch {
+        watch_id: row.watch_id.clone(),
+        match_text: row.match_text.clone().expect("persisted match text"),
+        match_offset: row.match_offset.expect("persisted match offset"),
+    }
 }
 
 fn wait_for_status(aft: &mut AftProcess, session: &str, task_id: &str, expected: &str) -> Value {
@@ -1162,6 +1257,198 @@ fn completion_durability_replays_undelivered_terminal_task() {
         true
     );
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
+    const MATCH_TEXT: &str = "PENDING-ONCE-MATCH";
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-once-watch");
+    let stop = project.path().join("stop-once-watch");
+    let _stop_guard = StopTaskOnDrop(stop.clone());
+    let command = format!(
+        "until [ -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; until [ -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release),
+        MATCH_TEXT,
+        shell_quote_path(&stop),
+    );
+
+    let (task_id, child_pid, persisted_match) = {
+        let mut aft = AftProcess::spawn();
+        configure_background(&mut aft, project.path(), storage.path(), SESSION);
+        let task_id = spawn_bg(&mut aft, SESSION, &command, Some(120_000));
+        let registered = notify_once(&mut aft, SESSION, &task_id, MATCH_TEXT);
+        assert_eq!(
+            registered["success"], true,
+            "watch registration failed: {registered:?}"
+        );
+
+        fs::write(&release, b"release").unwrap();
+        let frame = wait_for_pattern_frame(&mut aft, &task_id);
+        assert_eq!(frame["match_text"], MATCH_TEXT);
+        assert_eq!(frame["once"], true);
+
+        let running = status(&mut aft, SESSION, &task_id);
+        assert_eq!(
+            running["status"], "running",
+            "task exited early: {running:?}"
+        );
+        let child_pid = running["child_pid"].as_u64().expect("running child PID") as u32;
+        assert!(process_is_alive(child_pid), "background child is not alive");
+
+        let persisted_match = persisted_once_match(storage.path(), SESSION, &task_id);
+        assert_eq!(persisted_match.match_text, MATCH_TEXT);
+        assert_eq!(
+            frame["match_offset"].as_u64(),
+            Some(persisted_match.match_offset as u64)
+        );
+
+        sigkill_aft(aft);
+        (task_id, child_pid, persisted_match)
+    };
+
+    let phase_two_cache = tempfile::tempdir().unwrap();
+    let phase_two_ready = project.path().join("phase-two-configured");
+    let mut phase_two = Command::new(env!("CARGO_BIN_EXE_aft"))
+        .env("AFT_CACHE_DIR", phase_two_cache.path())
+        .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
+        .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+        .env("AFT_TEST_RAW_PATH", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn unread re-arm process");
+    {
+        let stdin = phase_two.stdin.as_mut().expect("phase-two stdin");
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "cfg-unread-rearm",
+                "session_id": SESSION,
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": project.path(),
+                "storage_dir": storage.path(),
+                "config": user_config(serde_json::json!({
+                    "experimental": { "bash": { "background": true } }
+                })),
+                "max_background_bash_tasks": 32,
+            })
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "id": "phase-two-probe",
+                "session_id": SESSION,
+                "command": "bash",
+                "params": {
+                    "command": format!(
+                        "printf ready > {}",
+                        shell_quote_path(&phase_two_ready)
+                    )
+                }
+            })
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    wait_for_path(&phase_two_ready);
+    phase_two.kill().expect("SIGKILL unread re-arm process");
+    let phase_two_status = phase_two.wait().expect("reap unread re-arm process");
+    assert!(!phase_two_status.success());
+    let mut phase_two_output = String::new();
+    phase_two
+        .stdout
+        .take()
+        .expect("phase-two stdout")
+        .read_to_string(&mut phase_two_output)
+        .expect("read post-crash phase-two output");
+    let phase_two_frame = phase_two_output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|frame| frame["type"] == "bash_pattern_match" && frame["task_id"] == task_id)
+        .unwrap_or_else(|| panic!("phase two did not emit the pending match: {phase_two_output}"));
+    assert_eq!(phase_two_frame["match_text"], persisted_match.match_text);
+    assert_eq!(
+        phase_two_frame["match_offset"].as_u64(),
+        Some(persisted_match.match_offset as u64)
+    );
+
+    let mut phase_three = AftProcess::spawn();
+    configure_background(&mut phase_three, project.path(), storage.path(), SESSION);
+    let phase_three_frame = wait_for_pattern_frame(&mut phase_three, &task_id);
+    assert_eq!(phase_three_frame["match_text"], persisted_match.match_text);
+    assert_eq!(
+        phase_three_frame["match_offset"].as_u64(),
+        Some(persisted_match.match_offset as u64)
+    );
+    let running = status(&mut phase_three, SESSION, &task_id);
+    assert_eq!(
+        running["status"], "running",
+        "task exited early: {running:?}"
+    );
+    assert_eq!(running["child_pid"].as_u64(), Some(child_pid as u64));
+    assert!(
+        process_is_alive(child_pid),
+        "background child died across re-arm"
+    );
+    assert_eq!(
+        persisted_once_match(storage.path(), SESSION, &task_id),
+        persisted_match,
+        "restarts must preserve the one durable match row"
+    );
+
+    let acked = ack(&mut phase_three, SESSION, &task_id);
+    assert_eq!(acked["success"], true, "ack failed: {acked:?}");
+    assert!(acked["acked_task_ids"]
+        .as_array()
+        .expect("acked task IDs")
+        .iter()
+        .any(|acked_task_id| acked_task_id == &task_id));
+    assert!(
+        persisted_watch_rows(storage.path(), SESSION, &task_id).is_empty(),
+        "ack must delete the re-armed once-watch row"
+    );
+    assert!(phase_three.shutdown().success());
+
+    let mut phase_four = AftProcess::spawn();
+    configure_background(&mut phase_four, project.path(), storage.path(), SESSION);
+    let no_replay_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < no_replay_deadline {
+        if let Some(frame) = phase_four.try_read_next_timeout(Duration::from_millis(100)) {
+            assert!(
+                frame["type"] != "bash_pattern_match" || frame["task_id"] != task_id,
+                "acked watch re-delivered after restart: {frame:?}"
+            );
+        }
+    }
+    let running = status(&mut phase_four, SESSION, &task_id);
+    assert_eq!(
+        running["status"], "running",
+        "task exited early: {running:?}"
+    );
+    assert_eq!(running["child_pid"].as_u64(), Some(child_pid as u64));
+    assert!(
+        process_is_alive(child_pid),
+        "background child died before release"
+    );
+    assert!(persisted_watch_rows(storage.path(), SESSION, &task_id).is_empty());
+
+    fs::write(&stop, b"stop").unwrap();
+    let completed = wait_for_status(&mut phase_four, SESSION, &task_id, "completed");
+    assert_eq!(completed["exit_code"], 0);
+    let final_ack = ack(&mut phase_four, SESSION, &task_id);
+    assert_eq!(
+        final_ack["success"], true,
+        "final ack failed: {final_ack:?}"
+    );
+    assert!(phase_four.shutdown().success());
 }
 
 #[test]
