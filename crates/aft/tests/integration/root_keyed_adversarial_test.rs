@@ -523,6 +523,14 @@ fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());
     ctx.set_cache_role(false, None);
+    // The lease gate is fail-closed for unregistered roots; grant writer
+    // capability the way a real configure does so migrations and cold builds
+    // reach the failure seams these tests exercise.
+    aft::root_cache::configure_artifact_access(
+        root,
+        &aft::search_index::artifact_cache_key(root),
+        false,
+    );
     ctx
 }
 
