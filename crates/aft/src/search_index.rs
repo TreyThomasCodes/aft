@@ -137,7 +137,9 @@ fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Pa
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
     base: Option<Arc<BasePostings>>,
-    delta_postings: HashMap<u32, Vec<Posting>>,
+    delta: Arc<DeltaState>,
+    // This reverse lookup is writer-only. Snapshots never read it, so exclusive
+    // SearchIndex write access keeps it synchronized with the versioned postings.
     delta_file_trigrams: HashMap<u32, Vec<u32>>,
     pub files: Arc<Vec<FileEntry>>,
     pub path_to_id: Arc<HashMap<PathBuf, u32>>,
@@ -154,10 +156,17 @@ pub struct SearchIndex {
     ignore_rules_fingerprint: String,
     pub file_trigram_count: Arc<Vec<u32>>,
     unindexed_files: Arc<HashSet<u32>>,
-    superseded: HashSet<u32>,
     base_file_count: u32,
     delta_packed_bytes: usize,
     compaction_state: Arc<Mutex<CompactionState>>,
+}
+
+// A query must observe postings and superseded base files from one version;
+// mixing versions can hide both an old base posting and its delta replacement.
+#[derive(Clone, Debug, Default)]
+struct DeltaState {
+    postings: HashMap<u32, Vec<Posting>>,
+    superseded: HashSet<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -185,14 +194,13 @@ struct CompactionState {
 #[derive(Clone, Debug)]
 pub struct SearchIndexSnapshot {
     base: Option<Arc<BasePostings>>,
-    delta_postings: Arc<HashMap<u32, Vec<Posting>>>,
+    delta: Arc<DeltaState>,
     files: Arc<Vec<FileEntry>>,
     path_to_id: Arc<HashMap<PathBuf, u32>>,
     ready: bool,
     project_root: PathBuf,
     file_trigram_count: Arc<Vec<u32>>,
     unindexed_files: Arc<HashSet<u32>>,
-    superseded: Arc<HashSet<u32>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -211,11 +219,12 @@ impl SearchIndex {
     pub fn trigram_count(&self) -> usize {
         let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
         let Some(base) = &self.base else {
-            return self.delta_postings.len();
+            return self.delta.postings.len();
         };
         base_count
             + self
-                .delta_postings
+                .delta
+                .postings
                 .keys()
                 .filter(|trigram| base.lookup_entry(**trigram).is_none())
                 .count()
@@ -229,13 +238,13 @@ impl SearchIndex {
             return crate::memory::MemoryEstimate::busy();
         };
         if self.base.is_none()
-            && self.delta_postings.is_empty()
+            && self.delta.postings.is_empty()
             && self.delta_file_trigrams.is_empty()
             && self.files.is_empty()
             && self.path_to_id.is_empty()
             && self.file_trigram_count.is_empty()
             && self.unindexed_files.is_empty()
-            && self.superseded.is_empty()
+            && self.delta.superseded.is_empty()
             && compaction.buffered_paths.is_empty()
         {
             return crate::memory::MemoryEstimate::estimated(0)
@@ -249,14 +258,15 @@ impl SearchIndex {
                 .count_u64("base_postings_resident_bytes", 0);
         }
         let delta_posting_count = self
-            .delta_postings
+            .delta
+            .postings
             .values()
             .map(Vec::len)
             .fold(0usize, usize::saturating_add);
         let delta_postings_bytes = crate::memory::usize_to_u64(delta_posting_count)
             .saturating_mul(std::mem::size_of::<Posting>() as u64)
             .saturating_add(
-                crate::memory::usize_to_u64(self.delta_postings.len())
+                crate::memory::usize_to_u64(self.delta.postings.len())
                     .saturating_mul(std::mem::size_of::<u32>() as u64),
             );
         let delta_file_trigram_count = self
@@ -287,7 +297,8 @@ impl SearchIndex {
         let file_count_table_bytes = crate::memory::usize_to_u64(self.file_trigram_count.len())
             .saturating_mul(std::mem::size_of::<u32>() as u64);
         let masks_bytes = crate::memory::usize_to_u64(
-            self.superseded
+            self.delta
+                .superseded
                 .len()
                 .saturating_add(self.unindexed_files.len()),
         )
@@ -329,9 +340,9 @@ impl SearchIndex {
             .saturating_add(metadata_bytes);
         crate::memory::MemoryEstimate::estimated(estimated_bytes)
             .count("files", self.files.len())
-            .count("delta_trigrams", self.delta_postings.len())
+            .count("delta_trigrams", self.delta.postings.len())
             .count("delta_postings", delta_posting_count)
-            .count("superseded_files", self.superseded.len())
+            .count("superseded_files", self.delta.superseded.len())
             .count("unindexed_files", self.unindexed_files.len())
             .count(
                 "base_lookup_entries",
@@ -348,8 +359,8 @@ impl SearchIndex {
     /// This covers pure deletions and unindexed file additions, which do not
     /// always populate `delta_file_trigrams`.
     pub(crate) fn has_pending_disk_changes(&self) -> bool {
-        !self.delta_postings.is_empty()
-            || !self.superseded.is_empty()
+        !self.delta.postings.is_empty()
+            || !self.delta.superseded.is_empty()
             || self.path_to_id.len() != self.base_file_count as usize
     }
 
@@ -360,14 +371,13 @@ impl SearchIndex {
     pub fn snapshot(&self) -> SearchIndexSnapshot {
         SearchIndexSnapshot {
             base: self.base.clone(),
-            delta_postings: Arc::new(self.delta_postings.clone()),
+            delta: Arc::clone(&self.delta),
             files: Arc::clone(&self.files),
             path_to_id: Arc::clone(&self.path_to_id),
             ready: self.ready,
             project_root: self.project_root.clone(),
             file_trigram_count: Arc::clone(&self.file_trigram_count),
             unindexed_files: Arc::clone(&self.unindexed_files),
-            superseded: Arc::new(self.superseded.clone()),
         }
     }
 
@@ -406,11 +416,12 @@ impl SearchIndexSnapshot {
     pub fn trigram_count(&self) -> usize {
         let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
         let Some(base) = &self.base else {
-            return self.delta_postings.len();
+            return self.delta.postings.len();
         };
         base_count
             + self
-                .delta_postings
+                .delta
+                .postings
                 .keys()
                 .filter(|trigram| base.lookup_entry(**trigram).is_none())
                 .count()
@@ -640,7 +651,7 @@ impl SearchIndex {
     pub fn new() -> Self {
         SearchIndex {
             base: None,
-            delta_postings: HashMap::new(),
+            delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
             files: Arc::new(Vec::new()),
             path_to_id: Arc::new(HashMap::new()),
@@ -652,7 +663,6 @@ impl SearchIndex {
             ignore_rules_fingerprint: String::new(),
             file_trigram_count: Arc::new(Vec::new()),
             unindexed_files: Arc::new(HashSet::new()),
-            superseded: HashSet::new(),
             base_file_count: 0,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -833,8 +843,9 @@ impl SearchIndex {
         }
 
         let mut file_trigrams = Vec::with_capacity(file.trigram_map.len());
+        let delta = Arc::make_mut(&mut self.delta);
         for (trigram, filter) in file.trigram_map {
-            let postings = self.delta_postings.entry(trigram).or_default();
+            let postings = delta.postings.entry(trigram).or_default();
             postings.push(Posting {
                 file_id,
                 next_mask: filter.next_mask,
@@ -879,15 +890,16 @@ impl SearchIndex {
         };
 
         if file_id < self.base_file_count {
-            self.superseded.insert(file_id);
+            Arc::make_mut(&mut self.delta).superseded.insert(file_id);
         }
 
         if let Some(trigrams) = self.delta_file_trigrams.remove(&file_id) {
             self.delta_packed_bytes = self
                 .delta_packed_bytes
                 .saturating_sub(trigrams.len().saturating_mul(POSTING_BYTES));
+            let delta = Arc::make_mut(&mut self.delta);
             for trigram in trigrams {
-                let should_remove = if let Some(postings) = self.delta_postings.get_mut(&trigram) {
+                let should_remove = if let Some(postings) = delta.postings.get_mut(&trigram) {
                     postings.retain(|posting| posting.file_id != file_id);
                     postings.is_empty()
                 } else {
@@ -895,7 +907,7 @@ impl SearchIndex {
                 };
 
                 if should_remove {
-                    self.delta_postings.remove(&trigram);
+                    delta.postings.remove(&trigram);
                 }
             }
         }
@@ -1001,9 +1013,8 @@ impl SearchIndex {
         match write_result {
             Ok(base) => {
                 self.base = Some(Arc::new(base));
-                self.delta_postings.clear();
+                self.delta = Arc::new(DeltaState::default());
                 self.delta_file_trigrams.clear();
-                self.superseded.clear();
                 self.delta_packed_bytes = 0;
                 self.base_file_count = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
                 self.files = Arc::new(plan.files);
@@ -1261,7 +1272,7 @@ impl SearchIndex {
 
         let mut index = SearchIndex {
             base: Some(Arc::new(base)),
-            delta_postings: HashMap::new(),
+            delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
             files: Arc::new(files),
             path_to_id: Arc::new(path_to_id),
@@ -1273,7 +1284,6 @@ impl SearchIndex {
             ignore_rules_fingerprint: current_ignore_rules_fingerprint,
             file_trigram_count: Arc::new(file_trigram_count),
             unindexed_files: Arc::new(unindexed_files),
-            superseded: HashSet::new(),
             base_file_count: u32::try_from(file_count).ok()?,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -1472,12 +1482,12 @@ impl SearchIndex {
             sources.push(Box::new(BaseRecordSource::new(
                 base,
                 Arc::clone(&id_map),
-                Arc::new(self.superseded.clone()),
+                Arc::clone(&self.delta),
             )));
         }
 
         let mut delta_records = Vec::new();
-        for (&trigram, postings) in &self.delta_postings {
+        for (&trigram, postings) in &self.delta.postings {
             for posting in postings {
                 let Some(mapped_file_id) = id_map.get(&posting.file_id).copied() else {
                     continue;
@@ -1948,7 +1958,7 @@ impl SearchIndexSnapshot {
             .as_ref()
             .and_then(|base| base.lookup_entry(trigram))
             .map_or(0usize, |entry| entry.count as usize);
-        base_count.saturating_add(self.delta_postings.get(&trigram).map_or(0usize, Vec::len))
+        base_count.saturating_add(self.delta.postings.get(&trigram).map_or(0usize, Vec::len))
     }
 
     fn active_file_ids(&self) -> Vec<u32> {
@@ -1959,7 +1969,7 @@ impl SearchIndexSnapshot {
     }
 
     fn is_active_file(&self, file_id: u32) -> bool {
-        if self.superseded.contains(&file_id) {
+        if self.delta.superseded.contains(&file_id) {
             return false;
         }
         self.files
@@ -1982,7 +1992,7 @@ impl SearchIndexSnapshot {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
                 let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
-                    if self.superseded.contains(&file_id) {
+                    if self.delta.superseded.contains(&file_id) {
                         return;
                     }
                     let posting = Posting {
@@ -2000,7 +2010,7 @@ impl SearchIndexSnapshot {
             }
         }
 
-        if let Some(postings) = self.delta_postings.get(&trigram) {
+        if let Some(postings) = self.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
             for posting in postings {
                 if !posting_matches_filter(posting, filter) {
@@ -2429,7 +2439,7 @@ impl PostingRecordSource for SpillSegmentSource {
 struct BaseRecordSource {
     base: Arc<BasePostings>,
     id_map: Arc<HashMap<u32, u32>>,
-    superseded: Arc<HashSet<u32>>,
+    delta: Arc<DeltaState>,
     lookup_index: usize,
     current: Vec<SpillRecord>,
     current_index: usize,
@@ -2439,12 +2449,12 @@ impl BaseRecordSource {
     fn new(
         base: Arc<BasePostings>,
         id_map: Arc<HashMap<u32, u32>>,
-        superseded: Arc<HashSet<u32>>,
+        delta: Arc<DeltaState>,
     ) -> Self {
         Self {
             base,
             id_map,
-            superseded,
+            delta,
             lookup_index: 0,
             current: Vec::new(),
             current_index: 0,
@@ -2458,7 +2468,7 @@ impl BaseRecordSource {
             self.current.clear();
             self.current_index = 0;
             for posting in postings {
-                if self.superseded.contains(&posting.file_id) {
+                if self.delta.superseded.contains(&posting.file_id) {
                     continue;
                 }
                 let Some(mapped_file_id) = self.id_map.get(&posting.file_id).copied() else {
@@ -2642,7 +2652,7 @@ fn build_streaming_index(
     let git_head = current_git_head(&project_root);
     let index = SearchIndex {
         base: Some(Arc::new(base)),
-        delta_postings: HashMap::new(),
+        delta: Arc::new(DeltaState::default()),
         delta_file_trigrams: HashMap::new(),
         files: Arc::new(files),
         path_to_id: Arc::new(path_to_id),
@@ -2654,7 +2664,6 @@ fn build_streaming_index(
         ignore_rules_fingerprint: ignore_fingerprint,
         file_trigram_count: Arc::new(file_trigram_count),
         unindexed_files: Arc::new(unindexed_files),
-        superseded: HashSet::new(),
         base_file_count,
         delta_packed_bytes: 0,
         compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -4963,8 +4972,8 @@ mod tests {
         index.index_file(&added, b"abcdefghij sharedalpha added_delta");
 
         assert!(index.base.is_some());
-        assert!(!index.delta_postings.is_empty());
-        assert!(!index.superseded.is_empty());
+        assert!(!index.delta.postings.is_empty());
+        assert!(!index.delta.superseded.is_empty());
         (dir, index)
     }
 
@@ -4983,7 +4992,7 @@ mod tests {
                 if let Ok(postings) = base.read_postings(base_entry) {
                     matches.reserve(postings.len());
                     for posting in postings {
-                        if index.superseded.contains(&posting.file_id) {
+                        if index.delta.superseded.contains(&posting.file_id) {
                             continue;
                         }
                         if !posting_matches_filter(&posting, filter) {
@@ -4996,7 +5005,7 @@ mod tests {
                 }
             }
         }
-        if let Some(postings) = index.delta_postings.get(&trigram) {
+        if let Some(postings) = index.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
             for posting in postings {
                 if !posting_matches_filter(posting, filter) {
@@ -5109,7 +5118,8 @@ mod tests {
         assert_eq!(file_trigrams, &expected.keys().copied().collect::<Vec<_>>());
         for (trigram, filter) in expected {
             let postings = index
-                .delta_postings
+                .delta
+                .postings
                 .get(&trigram)
                 .expect("delta posting list");
             assert_eq!(postings.len(), 1);
@@ -5191,9 +5201,9 @@ mod tests {
         let base_only = pack_trigram(b'm', b'a', b'r');
         let base_and_delta = pack_trigram(b'a', b'b', b'c');
 
-        assert!(snapshot.delta_postings.get(&base_only).is_none());
-        assert!(snapshot.delta_postings.contains_key(&base_and_delta));
-        assert!(!snapshot.superseded.is_empty());
+        assert!(snapshot.delta.postings.get(&base_only).is_none());
+        assert!(snapshot.delta.postings.contains_key(&base_and_delta));
+        assert!(!snapshot.delta.superseded.is_empty());
 
         let filters = [
             None,
@@ -5231,7 +5241,7 @@ mod tests {
                 );
                 assert!(actual
                     .iter()
-                    .all(|file_id| !snapshot.superseded.contains(file_id)));
+                    .all(|file_id| !snapshot.delta.superseded.contains(file_id)));
             }
         }
 
@@ -5276,6 +5286,75 @@ mod tests {
             expected
         });
         assert!(!ids.contains(&old_a_id));
+    }
+
+    #[test]
+    fn snapshot_started_before_edit_keeps_coherent_pre_edit_postings() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let project = fs::canonicalize(project).expect("canonicalize project");
+        let file = project.join("source.txt");
+        fs::write(&file, "old_generation marker").expect("write old source");
+
+        let mut built = SearchIndex::build(&project);
+        let cache_dir = dir.path().join("cache");
+        assert!(built.write_to_disk(&cache_dir, None));
+        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base index");
+        index.ready = true;
+        let old_file_id = *index.path_to_id.get(&file).expect("old file id");
+        let index = std::sync::RwLock::new(index);
+
+        let before_edit = {
+            let guard = index.read().expect("read index");
+            let snapshot = guard.snapshot();
+            assert!(Arc::ptr_eq(&snapshot.delta, &guard.delta));
+            snapshot
+        };
+
+        fs::write(&file, "new_generation marker").expect("write new source");
+        index.write().expect("write index").update_file(&file);
+
+        let after_edit = index.read().expect("read updated index").snapshot();
+        let new_file_id = *after_edit.path_to_id.get(&file).expect("new file id");
+        assert!(!Arc::ptr_eq(&before_edit.delta, &after_edit.delta));
+        assert!(!before_edit.delta.superseded.contains(&old_file_id));
+        assert!(after_edit.delta.superseded.contains(&old_file_id));
+
+        let old_trigram = pack_trigram(b'o', b'l', b'd');
+        let new_trigram = pack_trigram(b'n', b'e', b'w');
+        assert_eq!(
+            before_edit.postings_for_trigram(old_trigram, None),
+            vec![old_file_id]
+        );
+        assert!(before_edit
+            .postings_for_trigram(new_trigram, None)
+            .is_empty());
+        assert!(after_edit
+            .postings_for_trigram(old_trigram, None)
+            .is_empty());
+        assert_eq!(
+            after_edit.postings_for_trigram(new_trigram, None),
+            vec![new_file_id]
+        );
+
+        let dirty_result = index.read().expect("read dirty index").grep(
+            "new_generation",
+            true,
+            &[],
+            &[],
+            &project,
+            100,
+        );
+        let reference_cache = dir.path().join("reference-cache");
+        let reference = SearchIndex::build_with_limit_to_cache_dir(
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            &reference_cache,
+        );
+        let reference_result = reference.grep("new_generation", true, &[], &[], &project, 100);
+        assert_eq!(dirty_result.matches, reference_result.matches);
+        assert_eq!(dirty_result.total_matches, reference_result.total_matches);
     }
 
     #[test]
@@ -5354,10 +5433,10 @@ mod tests {
         index.write_to_disk(&cache_dir, None);
         fs::write(&file, "abcxyz").expect("edit source");
         index.update_file(&file);
-        assert!(!index.delta_postings.is_empty());
+        assert!(!index.delta.postings.is_empty());
         index.write_to_disk(&cache_dir, None);
-        assert!(index.delta_postings.is_empty());
-        assert!(index.superseded.is_empty());
+        assert!(index.delta.postings.is_empty());
+        assert!(index.delta.superseded.is_empty());
         assert_eq!(
             index.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
             vec![0]
@@ -5382,7 +5461,7 @@ mod tests {
 
         let loaded = SearchIndex::read_from_disk(&cache_dir, &project).expect("load legacy cache");
         assert_eq!(loaded.file_trigram_count.as_ref(), &[4]);
-        assert!(loaded.delta_postings.is_empty());
+        assert!(loaded.delta.postings.is_empty());
         assert!(cache_has_file_trigram_count_extension(&cache_path));
     }
 
@@ -5401,7 +5480,7 @@ mod tests {
         }
         index.update_file(&file);
         let state = index.compaction_state.lock().expect("compaction state");
-        assert!(state.requested_again || !index.delta_postings.is_empty());
+        assert!(state.requested_again || !index.delta.postings.is_empty());
         assert!(state.buffered_paths.contains(&file));
     }
 
