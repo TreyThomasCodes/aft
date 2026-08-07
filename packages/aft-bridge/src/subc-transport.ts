@@ -32,6 +32,17 @@ import {
 } from "@cortexkit/subc-client";
 
 import type { StatusSnapshot } from "./bridge.js";
+import {
+  asCanonicalRootPath,
+  asRootGeneration,
+  type CanonicalRootPath,
+  type ConcretePoolId,
+  type LifecycleEvent,
+  type LifecyclePoolRegistration,
+  type LifecyclePoolRegistrationOptions,
+  LifecycleRegistry,
+  type RootGeneration,
+} from "./lifecycle-registry.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 import type {
@@ -142,10 +153,136 @@ export interface SubcTransportPoolOptions {
   onBgEventsNudge?: (projectRoot: string, session: string) => void;
   /** Test seam: backoff sleeper for the bg resubscribe loop (default real timer). */
   bgBackoffSleep?: (ms: number) => Promise<void>;
+  /** Optional lifecycle registry used for root tracking; omit it to retain legacy behavior. */
+  lifecycleRegistry?: LifecycleRegistry;
+  /** Configuration-shaped alias used by construction sites that group lifecycle seams. */
+  lifecycle?: {
+    registry?: LifecycleRegistry;
+    reapingEnabled?: boolean;
+    demandCheck?: (
+      root: CanonicalRootPath,
+      poolId: ConcretePoolId,
+    ) => boolean | { readonly exists?: boolean };
+    evictOuterFacade?: (root: CanonicalRootPath, generation: RootGeneration) => void;
+    onEvent?: (event: LifecycleEvent) => void;
+  };
+  /** Fixed registration switch; it is immutable for the registration lifetime. */
+  reapingEnabled?: boolean;
+  /** Alias for lifecycleDemandCheck matching LifecycleRegistry's seam name. */
+  demandCheck?: (
+    root: CanonicalRootPath,
+    poolId: ConcretePoolId,
+  ) => boolean | { readonly exists?: boolean };
+  /**
+   * Synchronous demand seam for the synchronous AftTransportPool interface. A
+   * false result prevents a facade, session, and lifecycle root from being made.
+   * Async demand callers can use getBridgeForDemand below.
+   */
+  lifecycleDemandCheck?: (
+    root: CanonicalRootPath,
+    poolId: ConcretePoolId,
+  ) => boolean | { readonly exists?: boolean };
+  /**
+   * Optional callback used by direct concrete-pool tests. The wrapper normally
+   * supplies this callback when it binds the returned registration handle.
+   */
+  evictOuterFacade?: (root: CanonicalRootPath, generation: RootGeneration) => void;
+  /** Optional structured event sink for tests and host metrics. */
+  onLifecycleEvent?: (event: LifecycleEvent) => void;
+  /** Nudge rejection events are separate from root lifecycle events. */
+  onBgNudgeRejected?: (event: SubcBgNudgeRejectedEvent) => void;
+  /** Optional nudge callback that receives complete generation provenance. */
+  onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
+  /**
+   * A pre-created registration is useful when a wrapper owns registration order:
+   * bind it only after the wrapper callback has been installed.
+   */
+  lifecycleRegistration?: LifecyclePoolRegistration;
 }
 
-function identityKey(identity: BindIdentity): string {
-  return `${identity.project_root}\u0000${identity.harness}\u0000${identity.session}`;
+/** Complete provenance captured when a bg_events subscription is installed. */
+export interface BgNudgeRef {
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly session: string;
+  readonly concretePoolId: ConcretePoolId;
+  readonly generation: RootGeneration;
+}
+
+export interface SubcBgNudgeRejectedEvent {
+  readonly type: "subc_bg_nudge_rejected";
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly session: string;
+  readonly expectedGeneration: RootGeneration;
+  readonly currentGeneration?: RootGeneration;
+  readonly expectedConcretePoolId: ConcretePoolId;
+  readonly currentConcretePoolId?: ConcretePoolId;
+}
+
+interface RootGenerationErrorFields {
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly expectedGeneration: RootGeneration;
+  readonly currentGeneration?: RootGeneration;
+  readonly concretePoolId?: ConcretePoolId;
+  readonly currentConcretePoolId?: ConcretePoolId;
+}
+
+/** Stable classification for a request that loses its root to coordinated reap. */
+export class SubcRootReapedError extends Error implements RootGenerationErrorFields {
+  readonly code = "root_reaped" as const;
+  readonly name = "SubcRootReapedError";
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly expectedGeneration: RootGeneration;
+  readonly currentGeneration?: RootGeneration;
+  readonly concretePoolId?: ConcretePoolId;
+  readonly currentConcretePoolId?: ConcretePoolId;
+
+  constructor(fields: RootGenerationErrorFields) {
+    super(`subc root was reaped: ${fields.canonicalRoot}`);
+    this.canonicalRoot = fields.canonicalRoot;
+    this.expectedGeneration = fields.expectedGeneration;
+    this.currentGeneration = fields.currentGeneration;
+    this.concretePoolId = fields.concretePoolId;
+    this.currentConcretePoolId = fields.currentConcretePoolId;
+  }
+}
+
+/** Stable classification for an operation holding an older root generation. */
+export class SubcRootGenerationExpiredError extends Error implements RootGenerationErrorFields {
+  readonly code = "root_generation_expired" as const;
+  readonly name = "SubcRootGenerationExpiredError";
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly expectedGeneration: RootGeneration;
+  readonly currentGeneration?: RootGeneration;
+  readonly concretePoolId?: ConcretePoolId;
+  readonly currentConcretePoolId?: ConcretePoolId;
+
+  constructor(fields: RootGenerationErrorFields) {
+    super(`subc root generation expired: ${fields.canonicalRoot}`);
+    this.canonicalRoot = fields.canonicalRoot;
+    this.expectedGeneration = fields.expectedGeneration;
+    this.currentGeneration = fields.currentGeneration;
+    this.concretePoolId = fields.concretePoolId;
+    this.currentConcretePoolId = fields.currentConcretePoolId;
+  }
+}
+
+/** A synchronous lifecycle demand check could not establish that the root exists. */
+export class SubcRootDemandRequiredError extends Error {
+  readonly code = "root_demand_required" as const;
+  readonly canonicalRoot: CanonicalRootPath;
+
+  constructor(root: CanonicalRootPath) {
+    super(`positive live demand is required before creating subc root state: ${root}`);
+    this.name = "SubcRootDemandRequiredError";
+    this.canonicalRoot = root;
+  }
+}
+
+declare const identityKeyBrand: unique symbol;
+export type IdentityKey = string & { readonly [identityKeyBrand]: "IdentityKey" };
+
+function identityKey(identity: BindIdentity): IdentityKey {
+  return `${identity.project_root}\u0000${identity.harness}\u0000${identity.session}` as IdentityKey;
 }
 
 /**
@@ -160,8 +297,8 @@ function identityKey(identity: BindIdentity): string {
  * it until acked; resubscribe + the immediate forced-drain replay it).
  *
  * The loop is a single sequential async task (only one attempt in flight at a
- * time), so no numeric generation guard is needed — `stopped` plus one-instance-
- * per-identity (the pool's bgSubs map) prevents duplicate or stale subscribes.
+ * time). `stopped`, the captured root-generation check, and one instance per
+ * identity prevent duplicate or stale subscriptions.
  */
 class BgSubscription {
   private stopped = false;
@@ -176,6 +313,8 @@ class BgSubscription {
     private readonly consumerIdentity: ConsumerIdentity | null | undefined,
     private readonly onNudge: () => void,
     private readonly sleep: (ms: number) => Promise<void>,
+    readonly nudgeRef?: BgNudgeRef,
+    private readonly isCurrent: () => boolean = () => true,
   ) {
     this.loop = this.run();
   }
@@ -201,6 +340,7 @@ class BgSubscription {
   private async run(): Promise<void> {
     let attempt = 0;
     while (!this.stopped) {
+      if (!this.isCurrent()) return;
       let client: SubcClientLike;
       try {
         client = await this.acquireClient();
@@ -208,7 +348,7 @@ class BgSubscription {
         await this.backoff(attempt++);
         continue;
       }
-      if (this.stopped) return;
+      if (this.stopped || !this.isCurrent()) return;
 
       let route: RouteHandle;
       try {
@@ -228,7 +368,7 @@ class BgSubscription {
         await this.backoff(attempt++);
         continue;
       }
-      if (this.stopped) {
+      if (this.stopped || !this.isCurrent()) {
         safeCloseRoute(client, route);
         return;
       }
@@ -239,7 +379,7 @@ class BgSubscription {
       const subscribedAt = Date.now();
       try {
         const sub = client.subscribe(route, { op: "bg_events" }, () => {
-          if (!this.stopped) this.onNudge();
+          if (!this.stopped && this.isCurrent()) this.onNudge();
         });
         this.current = sub;
         // stop() may have fired between the pre-subscribe check and here; self-
@@ -249,7 +389,7 @@ class BgSubscription {
 
         // Immediate forced-drain replay: a completion that landed while we were
         // disconnected is recovered now (resubscribe == the outbox replay trigger).
-        if (!this.stopped) this.onNudge();
+        if (!this.stopped && this.isCurrent()) this.onNudge();
 
         await sub.closed;
         // StreamEnd = an intentional close (our unsubscribe or module teardown).
@@ -306,14 +446,27 @@ function safeCloseRoute(client: SubcClientLike, route: RouteHandle): void {
 
 /** Per-identity session lifecycle state, independent from transient route churn. */
 interface SessionRecord {
+  /** Complete identity is retained; the opaque map key is never parsed. */
+  readonly identity: BindIdentity;
+  readonly identityKey: IdentityKey;
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly generation?: RootGeneration;
   /** Current tool route for this session incarnation; replaced after route failures. */
   routeEntry: RouteEntry | null;
   /** Dedicated bg_events subscription, present only when background events are enabled. */
   bgSub: BgSubscription | null;
   /** Closed marker set synchronously so in-flight requests can see the close. */
   closed: boolean;
+  /** Root close marks this before any asynchronous cleanup starts. */
+  teardownReason: "root_reaped" | "session_closed" | "shutdown" | null;
   /** Count of in-flight requests on this session's route; used for safe cleanup. */
   inflight: number;
+}
+
+interface DetachedSession {
+  readonly record: SessionRecord;
+  readonly bgSub: BgSubscription | null;
+  readonly routeEntry: RouteEntry | null;
 }
 
 /**
@@ -325,6 +478,9 @@ interface SessionRecord {
  * channel instead of caching a stale route.
  */
 interface RouteEntry {
+  /** Route provenance prevents late work from touching a successor generation. */
+  readonly canonicalRoot: CanonicalRootPath;
+  readonly generation?: RootGeneration;
   /** Client that minted this route; closeSession must close channels on this owner. */
   client: SubcClientLike;
   /** In-flight routeOpen; non-null until it settles. Concurrent callers await it. */
@@ -400,11 +556,21 @@ class SubcTransport implements AftProjectTransport {
 
   constructor(
     private readonly pool: SubcTransportPool,
-    private readonly projectRoot: string,
+    private readonly projectRoot: CanonicalRootPath,
+    private readonly generation?: RootGeneration,
   ) {}
 
   getCwd(): string {
     return this.projectRoot;
+  }
+
+  /** Generation provenance is intentionally observable for lifecycle tests and nudge wiring. */
+  getGeneration(): RootGeneration | undefined {
+    return this.generation;
+  }
+
+  getConcretePoolId(): ConcretePoolId | undefined {
+    return this.pool.getConcretePoolId();
   }
 
   getStatusBar(): StatusBarCounts | undefined {
@@ -432,12 +598,17 @@ class SubcTransport implements AftProjectTransport {
     };
   }
 
+  private assertCurrent(): void {
+    this.pool.assertFacadeCurrent(this.projectRoot, this.generation, "facade_use");
+  }
+
   async toolCall(
     sessionId: string | undefined,
     name: string,
     rawArgs: ToolCallArguments = {},
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
+    this.assertCurrent();
     const { preview, timeoutMs, onProgress } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
     if (preview === true) body.preview = true;
@@ -446,6 +617,7 @@ class SubcTransport implements AftProjectTransport {
       body,
       timeoutMs,
       onProgress,
+      this.generation,
     );
     const result = reliftReply(reply) as ToolCallResult;
     this.captureStatusBar(result);
@@ -467,6 +639,7 @@ class SubcTransport implements AftProjectTransport {
     params: Record<string, unknown> = {},
     options?: AftTransportOptions,
   ): Promise<Record<string, unknown>> {
+    this.assertCurrent();
     if (LOCALLY_SATISFIED_COMMANDS.has(command)) {
       return { success: true, command, subc_local: true };
     }
@@ -477,6 +650,7 @@ class SubcTransport implements AftProjectTransport {
       { name: command, arguments: params },
       timeoutMs,
       onProgress,
+      this.generation,
     );
     const response = reliftReply(reply);
     this.captureStatusBar(response);
@@ -501,9 +675,9 @@ class SubcTransport implements AftProjectTransport {
 }
 
 /**
- * Route cache over one authenticated subc client. Implements {@link AftTransportPool}
- * so it drops into the plugin in place of {@link BridgePool} behind the shared
- * interface. One client per process; routes keyed by `(root, harness, session)`.
+ * Route cache over one authenticated subc client. In lifecycle mode this class
+ * also owns the concrete pool's root index; the registry owns timer and root
+ * transition state, while this class owns sessions, routes, and subscriptions.
  */
 export class SubcTransportPool implements AftTransportPool {
   readonly harness: string;
@@ -516,22 +690,36 @@ export class SubcTransportPool implements AftTransportPool {
   }) => Promise<SubcClientLike>;
 
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
+  private readonly onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
   private readonly bgBackoffSleep: (ms: number) => Promise<void>;
+  private readonly lifecycleDemandCheck?: (
+    root: CanonicalRootPath,
+    poolId: ConcretePoolId,
+  ) => boolean | { readonly exists?: boolean };
+  private readonly onLifecycleEvent?: (event: LifecycleEvent) => void;
+  private readonly onBgNudgeRejected?: (event: SubcBgNudgeRejectedEvent) => void;
+
+  private lifecycleRegistry?: LifecycleRegistry;
+  private registryUsesPoolEventSink = false;
+  private lifecycleRegistration: LifecyclePoolRegistration | null = null;
+  private outerFacadeEvictor: (root: CanonicalRootPath, generation: RootGeneration) => void;
 
   private client: SubcClientLike | null = null;
   /** Single-flight guard so concurrent first calls share one connect. */
   private connecting: Promise<SubcClientLike> | null = null;
-  /** Per-session lifecycle records keyed by a string built from root, harness, and session. */
-  private readonly sessions = new Map<string, SessionRecord>();
+  /** Per-session records keyed by the opaque identity key. */
+  private readonly sessions = new Map<IdentityKey, SessionRecord>();
   /**
-   * Consecutive NON-transient transport throws on the current client with no
-   * success in between. Resets to 0 on any successful request. Trips a client drop
-   * at {@link MAX_CONSECUTIVE_TRANSPORT_FAILURES} to recover a half-open socket
-   * whose timeouts never classify transient (B-#4).
+   * The sole root-scoped session enumeration authority. Keys are opaque and are
+   * removed by the same detacher that removes the corresponding session record.
    */
+  private readonly rootIndex = new Map<CanonicalRootPath, Set<IdentityKey>>();
+  /** Consecutive non-transient failures on the current pool-local client. */
   private transportFailures = 0;
-  /** Per-root transport facades returned by getBridge/getActiveBridgeForRoot. */
-  private readonly transports = new Map<string, SubcTransport>();
+  /** Concrete per-root facades, including their captured root generation. */
+  private readonly transports = new Map<CanonicalRootPath, SubcTransport>();
+  private readonly generationRejections = new Set<string>();
+  private readonly pendingRootCleanups = new Set<Promise<unknown>>();
   private shuttingDown = false;
 
   constructor(options: SubcTransportPoolOptions) {
@@ -541,40 +729,340 @@ export class SubcTransportPool implements AftTransportPool {
     this.consumerIdentity = options.consumerIdentity;
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
+    this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
     this.bgBackoffSleep =
       options.bgBackoffSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const lifecycle = options.lifecycle;
+    const demandCheck =
+      options.lifecycleDemandCheck ?? options.demandCheck ?? lifecycle?.demandCheck;
+    this.lifecycleDemandCheck = demandCheck;
+    this.onLifecycleEvent = options.onLifecycleEvent ?? lifecycle?.onEvent;
+    this.onBgNudgeRejected = options.onBgNudgeRejected;
+    this.outerFacadeEvictor =
+      options.evictOuterFacade ?? lifecycle?.evictOuterFacade ?? (() => undefined);
+
+    const lifecycleRegistry = options.lifecycleRegistry ?? lifecycle?.registry;
+    if (lifecycleRegistry || demandCheck || options.lifecycleRegistration) {
+      this.registryUsesPoolEventSink =
+        lifecycleRegistry === undefined && this.onLifecycleEvent !== undefined;
+      this.lifecycleRegistry =
+        lifecycleRegistry ??
+        new LifecycleRegistry({
+          demandCheck: demandCheck ? (root, poolId) => demandCheck(root, poolId) : undefined,
+          onEvent: this.registryUsesPoolEventSink ? this.onLifecycleEvent : undefined,
+        });
+      if (options.lifecycleRegistration) {
+        this.bindLifecycleRegistration(options.lifecycleRegistration);
+      } else {
+        this.bindLifecycleRegistration(
+          this.lifecycleRegistry.registerLifecyclePool(this, {
+            reapingEnabled: options.reapingEnabled ?? lifecycle?.reapingEnabled ?? false,
+            evictOuterFacade: (root, generation) => this.outerFacadeEvictor(root, generation),
+          }),
+        );
+      }
+    }
   }
 
   /**
-   * Fail-loud presence check (memory: present-but-unconnectable must never silently
-   * downgrade to standalone). Returns false only when the file is genuinely absent.
+   * Bind a wrapper-owned registration after its generation-matched eviction
+   * callback has been installed. The handle is the only authority that may
+   * deregister this concrete pool.
    */
+  bindLifecycleRegistration(registration: LifecyclePoolRegistration): void {
+    if (this.lifecycleRegistration && this.lifecycleRegistration !== registration) {
+      this.lifecycleRegistration.deregister();
+    }
+    this.lifecycleRegistration = registration;
+  }
+
+  /** Construction helper for wrappers that own the registration sequence. */
+  registerLifecyclePool(
+    registry: LifecycleRegistry,
+    options: LifecyclePoolRegistrationOptions,
+  ): LifecyclePoolRegistration {
+    this.lifecycleRegistry = registry;
+    this.outerFacadeEvictor = options.evictOuterFacade;
+    const registration = registry.registerLifecyclePool(this, options);
+    this.bindLifecycleRegistration(registration);
+    return registration;
+  }
+
+  /** Replace only the callback; registration identity and switch stay immutable. */
+  setOuterFacadeEvictor(
+    evictOuterFacade: (root: CanonicalRootPath, generation: RootGeneration) => void,
+  ): void {
+    this.outerFacadeEvictor = evictOuterFacade;
+  }
+
+  getConcretePoolId(): ConcretePoolId | undefined {
+    return this.lifecycleRegistration?.concretePoolId;
+  }
+
+  getCurrentRootGeneration(root: CanonicalRootPath): RootGeneration | undefined {
+    return this.currentGeneration(root);
+  }
+
+  recordBgNudgeRejection(ref: BgNudgeRef): void {
+    const event: SubcBgNudgeRejectedEvent = {
+      type: "subc_bg_nudge_rejected",
+      canonicalRoot: ref.canonicalRoot,
+      session: ref.session,
+      expectedGeneration: ref.generation,
+      currentGeneration: this.currentGeneration(ref.canonicalRoot),
+      expectedConcretePoolId: ref.concretePoolId,
+      currentConcretePoolId: this.currentPoolId(),
+    };
+    this.onBgNudgeRejected?.(event);
+  }
+
+  getLifecycleRegistration(): LifecyclePoolRegistration | null {
+    return this.lifecycleRegistration;
+  }
+
+  getLifecycleRegistry(): LifecycleRegistry | undefined {
+    return this.lifecycleRegistry;
+  }
+
   static async connectionAvailable(connectionFile: string): Promise<boolean> {
     return connectionFileExists(connectionFile);
   }
 
-  getBridge(projectRoot: string): SubcTransport {
-    const key = canonicalizeProjectRoot(projectRoot);
-    let transport = this.transports.get(key);
-    if (!transport) {
-      transport = new SubcTransport(this, key);
-      this.transports.set(key, transport);
+  private canonicalRoot(projectRoot: string): CanonicalRootPath {
+    return asCanonicalRootPath(canonicalizeProjectRoot(projectRoot));
+  }
+
+  private lifecycleEnabled(): boolean {
+    // A disabled registration deliberately behaves like the pre-reaper pool:
+    // synthetic roots may be used, no demand check is required, and no sweep can
+    // acquire a tombstone for the pool.
+    return Boolean(this.lifecycleRegistry && this.lifecycleRegistration?.reapingEnabled);
+  }
+
+  private currentGeneration(root: CanonicalRootPath): RootGeneration | undefined {
+    const registration = this.lifecycleRegistration;
+    return registration && this.lifecycleRegistry
+      ? this.lifecycleRegistry.currentGeneration(registration.concretePoolId, root)
+      : undefined;
+  }
+
+  private currentPoolId(): ConcretePoolId | undefined {
+    return this.lifecycleRegistration?.concretePoolId;
+  }
+
+  private isCurrentLiveGeneration(
+    root: CanonicalRootPath,
+    generation: RootGeneration | undefined,
+  ): boolean {
+    if (!this.lifecycleEnabled()) return true;
+    const registry = this.lifecycleRegistry;
+    const poolId = this.currentPoolId();
+    return (
+      registry !== undefined &&
+      poolId !== undefined &&
+      generation !== undefined &&
+      registry.isCurrentLiveGeneration(poolId, root, generation)
+    );
+  }
+
+  private isRootTombstoned(root: CanonicalRootPath, generation: RootGeneration): boolean {
+    const registry = this.lifecycleRegistry;
+    const poolId = this.currentPoolId();
+    return (
+      registry !== undefined &&
+      poolId !== undefined &&
+      registry.isTombstoned(poolId, root, generation)
+    );
+  }
+
+  private recordGenerationRejection(
+    root: CanonicalRootPath,
+    expectedGeneration: RootGeneration,
+    boundary: string,
+  ): void {
+    if (!this.lifecycleEnabled()) return;
+    const poolId = this.currentPoolId();
+    const registry = this.lifecycleRegistry;
+    if (!poolId || !registry) return;
+    const key = `${poolId}\u0000${root}\u0000${expectedGeneration}\u0000${boundary}`;
+    if (this.generationRejections.has(key)) return;
+    this.generationRejections.add(key);
+    registry.recordGenerationRejection(poolId, root, expectedGeneration, boundary);
+    if (this.registryUsesPoolEventSink) return;
+    this.onLifecycleEvent?.({
+      type: "subc_root_generation_rejected",
+      realm: registry.realm,
+      concretePoolId: poolId,
+      canonicalRoot: root,
+      expectedGeneration,
+      currentGeneration: registry.currentGeneration(poolId, root),
+      boundary,
+    });
+  }
+
+  private generationExpiredError(
+    root: CanonicalRootPath,
+    expectedGeneration: RootGeneration,
+  ): SubcRootGenerationExpiredError {
+    const currentGeneration = this.currentGeneration(root);
+    this.recordGenerationRejection(root, expectedGeneration, "stale_generation");
+    return new SubcRootGenerationExpiredError({
+      canonicalRoot: root,
+      expectedGeneration,
+      currentGeneration,
+      concretePoolId: this.currentPoolId(),
+      currentConcretePoolId: this.currentPoolId(),
+    });
+  }
+
+  private rootReapedError(record: SessionRecord): SubcRootReapedError {
+    return new SubcRootReapedError({
+      canonicalRoot: record.canonicalRoot,
+      expectedGeneration: record.generation ?? asRootGeneration(1),
+      currentGeneration: record.generation
+        ? this.currentGeneration(record.canonicalRoot)
+        : undefined,
+      concretePoolId: this.currentPoolId(),
+      currentConcretePoolId: this.currentPoolId(),
+    });
+  }
+
+  assertFacadeCurrent(
+    root: CanonicalRootPath,
+    expectedGeneration: RootGeneration | undefined,
+    boundary: string,
+  ): void {
+    this.assertGeneration(root, expectedGeneration, boundary);
+  }
+
+  private assertGeneration(
+    root: CanonicalRootPath,
+    expectedGeneration: RootGeneration | undefined,
+    boundary: string,
+  ): void {
+    if (!this.lifecycleEnabled() || expectedGeneration === undefined) return;
+    if (this.isCurrentLiveGeneration(root, expectedGeneration)) return;
+    if (this.isRootTombstoned(root, expectedGeneration)) {
+      throw new SubcRootReapedError({
+        canonicalRoot: root,
+        expectedGeneration,
+        currentGeneration: this.currentGeneration(root),
+        concretePoolId: this.currentPoolId(),
+        currentConcretePoolId: this.currentPoolId(),
+      });
     }
+    this.recordGenerationRejection(root, expectedGeneration, boundary);
+    throw this.generationExpiredError(root, expectedGeneration);
+  }
+
+  private assertRecordLive(record: SessionRecord): void {
+    if (!this.isCurrentSession(record.identityKey, record)) {
+      if (record.teardownReason === "root_reaped") throw this.rootReapedError(record);
+      throw new RouteTornDownError("subc session closed");
+    }
+    this.assertGeneration(record.canonicalRoot, record.generation, "route_request");
+  }
+
+  private synchronousDemand(root: CanonicalRootPath): boolean {
+    const poolId = this.currentPoolId();
+    if (!this.lifecycleEnabled() || poolId === undefined) return true;
+    if (!this.lifecycleDemandCheck) throw new SubcRootDemandRequiredError(root);
+    const result = this.lifecycleDemandCheck(root, poolId);
+    if (typeof result === "boolean") return result;
+    return result.exists !== false;
+  }
+
+  private makeFacade(root: CanonicalRootPath, generation?: RootGeneration): SubcTransport {
+    const existing = this.transports.get(root);
+    if (existing && (!this.lifecycleEnabled() || existing.getGeneration() === generation)) {
+      return existing;
+    }
+    const transport = new SubcTransport(this, root, generation);
+    this.transports.set(root, transport);
     return transport;
   }
 
-  getActiveBridgeForRoot(projectRoot: string): SubcTransport | null {
-    const key = canonicalizeProjectRoot(projectRoot);
-    if (!this.client) return null;
-    return this.transports.get(key) ?? null;
+  /**
+   * Return a live facade. Legacy construction remains synchronous. Lifecycle
+   * construction uses the injected synchronous demand seam so a returned facade
+   * always has a registered root and captured generation.
+   */
+  getBridge(projectRoot: string): SubcTransport {
+    const root = this.canonicalRoot(projectRoot);
+    if (this.shuttingDown && this.lifecycleEnabled()) {
+      throw new SubcCallError("terminal", "subc transport is shutting down");
+    }
+
+    if (!this.lifecycleEnabled()) return this.makeFacade(root);
+
+    const current = this.currentGeneration(root);
+    const existing = this.transports.get(root);
+    if (
+      current !== undefined &&
+      this.isCurrentLiveGeneration(root, current) &&
+      existing?.getGeneration() === current
+    ) {
+      return existing;
+    }
+
+    if (!this.synchronousDemand(root)) throw new SubcRootDemandRequiredError(root);
+    const registration = this.lifecycleRegistration;
+    const registry = this.lifecycleRegistry;
+    if (!registration || !registry) throw new SubcRootDemandRequiredError(root);
+    const generation = registry.registerRoot(registration.concretePoolId, root);
+    return this.makeFacade(root, generation);
   }
 
-  /** All live per-root facades, for session-scoped signals that must not
-   * depend on exact root-key resolution (the command carries the session ID
-   * and the module scopes by session, so fan-out is safe). */
+  /** Async demand entry point for registries whose existence seam is asynchronous. */
+  async getBridgeForDemand(projectRoot: string): Promise<SubcTransport | null> {
+    const root = this.canonicalRoot(projectRoot);
+    if (this.shuttingDown || !this.lifecycleEnabled()) return null;
+    const registration = this.lifecycleRegistration;
+    const registry = this.lifecycleRegistry;
+    if (!registration || !registry) return null;
+    const generation = await registry.ensureRootForDemand(registration.concretePoolId, root);
+    if (
+      generation === undefined ||
+      !registry.isCurrentLiveGeneration(registration.concretePoolId, root, generation)
+    ) {
+      return null;
+    }
+    return this.makeFacade(root, generation);
+  }
+
+  /** Alias used by host construction code that calls the seam a demand operation. */
+  demandBridge(projectRoot: string): Promise<SubcTransport | null> {
+    return this.getBridgeForDemand(projectRoot);
+  }
+
+  getActiveBridgeForRoot(projectRoot: string): SubcTransport | null {
+    const root = this.canonicalRoot(projectRoot);
+    const transport = this.transports.get(root);
+    if (!transport) return null;
+    if (this.lifecycleEnabled()) {
+      return this.isCurrentLiveGeneration(root, transport.getGeneration()) ? transport : null;
+    }
+    if (!this.client || this.shuttingDown) return null;
+    return transport;
+  }
+
+  /** Non-creating lookup requiring the complete pool/root/generation provenance. */
+  getActiveBridgeForRootGeneration(ref: BgNudgeRef): SubcTransport | null {
+    const poolId = this.currentPoolId();
+    if (!this.lifecycleEnabled() || poolId === undefined || ref.concretePoolId !== poolId)
+      return null;
+    if (!this.isCurrentLiveGeneration(ref.canonicalRoot, ref.generation)) return null;
+    const transport = this.transports.get(ref.canonicalRoot);
+    return transport?.getGeneration() === ref.generation ? transport : null;
+  }
+
   activeBridges(): SubcTransport[] {
-    if (!this.client || this.shuttingDown) return [];
-    return [...this.transports.values()];
+    if (this.shuttingDown) return [];
+    return [...this.transports.entries()].flatMap(([root, transport]) =>
+      !this.lifecycleEnabled() || this.isCurrentLiveGeneration(root, transport.getGeneration())
+        ? [transport]
+        : [],
+    );
   }
 
   async toolCall(
@@ -587,176 +1075,243 @@ export class SubcTransportPool implements AftTransportPool {
     return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
   }
 
-  private getOrCreateSession(key: string): SessionRecord {
+  private getOrCreateSession(identity: BindIdentity, generation?: RootGeneration): SessionRecord {
+    const key = identityKey(identity);
+    const root = asCanonicalRootPath(identity.project_root);
     let record = this.sessions.get(key);
-    if (!record || record.closed) {
-      record = { routeEntry: null, bgSub: null, closed: false, inflight: 0 };
-      this.sessions.set(key, record);
+    if (record && !record.closed) {
+      if (this.lifecycleEnabled() && record.generation !== generation) {
+        throw this.generationExpiredError(root, generation ?? asRootGeneration(1));
+      }
+      return record;
     }
+    record = {
+      identity,
+      identityKey: key,
+      canonicalRoot: root,
+      generation,
+      routeEntry: null,
+      bgSub: null,
+      closed: false,
+      teardownReason: null,
+      inflight: 0,
+    };
+    this.sessions.set(key, record);
+    let keys = this.rootIndex.get(root);
+    if (!keys) {
+      keys = new Set<IdentityKey>();
+      this.rootIndex.set(root, keys);
+    }
+    keys.add(key);
     return record;
   }
 
-  private isCurrentSession(key: string, record: SessionRecord): boolean {
+  private isCurrentSession(key: IdentityKey, record: SessionRecord): boolean {
     return this.sessions.get(key) === record && !record.closed;
   }
 
-  private deleteSessionIfEmpty(key: string, record: SessionRecord): void {
+  private removeIndexMembership(record: SessionRecord): void {
+    const keys = this.rootIndex.get(record.canonicalRoot);
+    if (!keys) return;
+    keys.delete(record.identityKey);
+    if (keys.size === 0) this.rootIndex.delete(record.canonicalRoot);
+  }
+
+  private deleteSessionIfEmpty(_key: IdentityKey, record: SessionRecord): void {
     if (
-      this.sessions.get(key) === record &&
+      this.sessions.get(record.identityKey) === record &&
       !record.closed &&
       record.inflight === 0 &&
       record.routeEntry === null &&
       record.bgSub === null
     ) {
-      this.sessions.delete(key);
+      this.sessions.delete(record.identityKey);
+      this.removeIndexMembership(record);
     }
   }
 
   /**
-   * Open-or-reuse a route for `identity` and send `body` as a data-plane Request.
-   * Rd reconnect is mutation-safe by construction: transport failures surface to
-   * the caller after clearing stale route/client state so the NEXT call
-   * re-establishes. The only in-place retries are route-absence proofs: either the
-   * daemon returns `unknown_channel`, or the client rejects a stale handle before
-   * writing. In both cases, the request was not delivered to the module.
-   * Tool-level errors come back as normal replies with `success:false` and are
-   * returned, not thrown.
+   * Atomically detaches one opaque identity. Nothing in this method awaits: it
+   * is the sole owner transfer used by session close, root reap, and shutdown.
    */
+  private detachSession(
+    key: IdentityKey,
+    reason: "root_reaped" | "session_closed" | "shutdown",
+  ): DetachedSession | null {
+    const record = this.sessions.get(key);
+    if (!record || record.closed) return null;
+    record.closed = true;
+    record.teardownReason = reason;
+    this.sessions.delete(key);
+    this.removeIndexMembership(record);
+
+    const bgSub = record.bgSub;
+    record.bgSub = null;
+    const routeEntry = record.routeEntry;
+    record.routeEntry = null;
+    if (routeEntry) routeEntry.closed = true;
+    return { record, bgSub, routeEntry };
+  }
+
+  private async cleanupDetached(detached: DetachedSession): Promise<void> {
+    const cleanup: Promise<unknown>[] = [];
+    if (detached.bgSub) cleanup.push(detached.bgSub.stop());
+    const routeEntry = detached.routeEntry;
+    const route = routeEntry?.handle;
+    if (routeEntry && route !== null && route !== undefined) {
+      try {
+        cleanup.push(
+          Promise.resolve(routeEntry.client.closeRouteChannel(route)).catch(() => undefined),
+        );
+      } catch {
+        // A client may throw synchronously when its socket is already closed.
+      }
+    }
+    await Promise.allSettled(cleanup);
+  }
+
+  private isReapInduced(record: SessionRecord): boolean {
+    return record.teardownReason === "root_reaped";
+  }
+
+  private annotateReapError(error: unknown, record: SessionRecord): unknown {
+    if (!this.isReapInduced(record)) return error;
+    if (error instanceof SubcRootReapedError) return error;
+    if (error instanceof Error) {
+      try {
+        Object.defineProperty(error, "subcTeardownReason", {
+          configurable: true,
+          enumerable: true,
+          value: "root_reaped",
+          writable: false,
+        });
+      } catch {
+        // A frozen transport error cannot be annotated; use the stable wrapper.
+        return this.rootReapedError(record);
+      }
+      return error;
+    }
+    return this.rootReapedError(record);
+  }
+
+  /** Open or reuse a route while guarding every lifecycle boundary. */
   async routeRequest(
     identity: BindIdentity,
     body: Record<string, unknown>,
     timeoutMs?: number,
     onProgress?: RequestOptions["onProgress"],
+    expectedGeneration?: RootGeneration,
   ): Promise<unknown> {
+    const root = asCanonicalRootPath(identity.project_root);
+    let generation = expectedGeneration;
+    if (this.lifecycleEnabled()) {
+      generation ??= this.currentGeneration(root);
+      if (generation === undefined) throw new SubcRootDemandRequiredError(root);
+      this.assertGeneration(root, generation, "route_request");
+    }
     const key = identityKey(identity);
-    const record = this.getOrCreateSession(key);
+    const record = this.getOrCreateSession(identity, generation);
     record.inflight += 1;
 
     try {
-      const client = await this.ensureClient();
-      const openRoute = async (): Promise<{ route: RouteHandle; entry: RouteEntry }> => {
-        // closeSession/shutdown marks and deletes the record synchronously. A request
-        // that was waiting for connect must not open a route for a session that no
-        // longer exists.
-        if (!this.isCurrentSession(key, record)) {
-          throw new RouteTornDownError("subc session closed");
-        }
+      let client: SubcClientLike;
+      try {
+        client = await this.ensureClient();
+        this.assertRecordLive(record);
+      } catch (error) {
+        throw this.annotateReapError(error, record);
+      }
 
+      const openRoute = async (): Promise<{ route: RouteHandle; entry: RouteEntry }> => {
         try {
+          this.assertRecordLive(record);
           const opened = await this.routeHandle(client, identity, record);
-          // routeOpen may have awaited. Do not send a request after a close, even
-          // if a stale route entry just resolved.
-          if (!this.isCurrentSession(key, record)) {
-            throw new RouteTornDownError("subc session closed");
-          }
+          this.assertRecordLive(record);
           return opened;
-        } catch (err) {
-          // A teardown that raced the open is not a transport fault — surface it
-          // without dropping the client or charging the failure budget.
-          if (err instanceof RouteTornDownError) throw err;
-          // routeOpen itself failed. Classify the error like other request failures
-          // for transient connection death, but only while this request's session
-          // and client are still current. A close-induced failure must not drop a
-          // healthy client shared by other sessions.
+        } catch (error) {
+          if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
+          if (error instanceof RouteTornDownError) throw error;
           if (
-            isConsumerReconnectTransient(err) &&
+            isConsumerReconnectTransient(error) &&
             this.isCurrentSession(key, record) &&
             this.client === client
           ) {
             this.dropClient(client);
           }
-          throw err;
+          throw error;
         }
       };
 
       const clearRouteEntry = (entry: RouteEntry): void => {
-        if (record.routeEntry === entry) {
-          entry.closed = true;
-          record.routeEntry = null;
-          if (entry.handle != null) {
-            // Forgetting only the local handle leaves the module's route bound
-            // when a request times out but the shared connection remains alive.
-            safeCloseRoute(entry.client, entry.handle);
-          }
-        }
+        if (record.routeEntry !== entry) return;
+        entry.closed = true;
+        record.routeEntry = null;
+        if (entry.handle != null) safeCloseRoute(entry.client, entry.handle);
       };
 
-      const handleRequestFailure = (err: unknown, entry: RouteEntry): void => {
-        // The raw `request()` path does not turn failures into SubcCallError; it
-        // rejects with a base SubcError for route-level failures or a raw socket
-        // error for connection failures. Use `isConsumerReconnectTransient`, not
-        // `instanceof SubcCallError`, to distinguish a dead connection from a dead
-        // route.
-        //
-        // A failed request makes its own route suspect, so drop it and let the next
-        // call re-open. Check only the current entry; a stale failure must not
-        // delete a successor route in the same still-open session.
+      const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
         clearRouteEntry(entry);
-        // Only a failure from the current session on the current client can charge
-        // or drop that client. A failure caused by closeSession sees
-        // !isCurrentSession because close marked/deleted the record before awaiting
-        // transport cleanup.
-        if (this.isCurrentSession(key, record) && this.client === client) {
-          if (isConsumerReconnectTransient(err)) {
-            this.transportFailures = 0;
-            this.dropClient(client);
-          } else if (
-            !isRouteProvenAbsentError(err) &&
-            ++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES
-          ) {
-            // A run of non-transient throws (timeouts / route GOODBYEs) with no
-            // success between them is a half-open socket: local writes succeed but
-            // no response ever returns, so isConsumerReconnectTransient never fires
-            // and the client would otherwise be kept forever. Force reconnect.
-            this.transportFailures = 0;
-            this.dropClient(client);
-          }
+        if (
+          !this.isCurrentSession(key, record) ||
+          this.client !== client ||
+          this.isReapInduced(record)
+        )
+          return;
+        if (isConsumerReconnectTransient(error)) {
+          this.transportFailures = 0;
+          this.dropClient(client);
+          return;
+        }
+        if (
+          !isRouteProvenAbsentError(error) &&
+          ++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES
+        ) {
+          this.transportFailures = 0;
+          this.dropClient(client);
         }
       };
 
       const requestOnRoute = async (route: RouteHandle): Promise<unknown> => {
-        // Forward the caller's progress callback to the subc client. Current
-        // foreground calls return one final reply, so production does not rely on
-        // live progress events here.
+        this.assertRecordLive(record);
         const reply = await client.request(route, body, { timeoutMs, onProgress });
-        // The half-open failure budget belongs to the current live session on the
-        // current client. A late success after close or client replacement must
-        // not mutate the current client's counter.
-        if (this.isCurrentSession(key, record) && this.client === client) {
-          this.transportFailures = 0;
+        // A legacy closeSession may intentionally let an already-delivered reply
+        // settle. It must not mutate shared state or recreate a subscription.
+        if (!this.isCurrentSession(key, record)) {
+          if (this.isReapInduced(record)) throw this.rootReapedError(record);
+          return reply;
         }
-        // bg_events is a session resource, not a route-entry resource. A
-        // successful request on an older route should still ensure the subscription
-        // while the session remains open, and a late success after close must not
-        // resurrect one.
+        this.assertGeneration(record.canonicalRoot, record.generation, "request_completion");
+        if (this.client === client) this.transportFailures = 0;
         this.ensureBgSubscription(identity, record);
         return reply;
       };
 
-      let { route, entry } = await openRoute();
+      let routeAndEntry = await openRoute();
       try {
-        return await requestOnRoute(route);
-      } catch (err) {
+        return await requestOnRoute(routeAndEntry.route);
+      } catch (error) {
+        if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
         if (
-          isRouteProvenAbsentError(err) &&
+          isRouteProvenAbsentError(error) &&
           this.isCurrentSession(key, record) &&
           this.client === client
         ) {
-          // Either the daemon says the channel does not exist, or the client
-          // rejected the stale handle before writing. Reopen and resend once; all
-          // other failures keep the no-auto-retry mutation-safety rule.
-          clearRouteEntry(entry);
-          ({ route, entry } = await openRoute());
+          clearRouteEntry(routeAndEntry.entry);
+          routeAndEntry = await openRoute();
           try {
-            return await requestOnRoute(route);
-          } catch (retryErr) {
-            handleRequestFailure(retryErr, entry);
-            throw retryErr;
+            return await requestOnRoute(routeAndEntry.route);
+          } catch (retryError) {
+            if (this.isReapInduced(record)) throw this.annotateReapError(retryError, record);
+            handleRequestFailure(retryError, routeAndEntry.entry);
+            throw retryError;
           }
         }
-        handleRequestFailure(err, entry);
-        throw err;
+        handleRequestFailure(error, routeAndEntry.entry);
+        throw error;
       }
+    } catch (error) {
+      if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
+      throw error;
     } finally {
       record.inflight -= 1;
       this.deleteSessionIfEmpty(key, record);
@@ -764,9 +1319,7 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private async ensureClient(): Promise<SubcClientLike> {
-    if (this.shuttingDown) {
-      throw new SubcCallError("terminal", "subc transport is shutting down");
-    }
+    if (this.shuttingDown) throw new SubcCallError("terminal", "subc transport is shutting down");
     if (this.client) return this.client;
     if (this.connecting) return this.connecting;
     this.connecting = this.connectFn({
@@ -775,61 +1328,56 @@ export class SubcTransportPool implements AftTransportPool {
     })
       .then((client) => {
         this.connecting = null;
-        // shutdown() may have fired while this connect was in flight. Don't
-        // install a live client after teardown — close it and fail the call
-        // (B-#5: otherwise a socket leaks open past shutdown()).
         if (this.shuttingDown) {
           try {
             client.close();
           } catch {
-            // best-effort
+            // A late connection is owned by the failed connect and is closed here.
           }
           throw new SubcCallError("terminal", "subc transport is shutting down");
         }
         this.client = client;
-        // Fresh client generation starts with a clean failure budget (R2-T2).
         this.transportFailures = 0;
         return client;
       })
-      .catch((err) => {
+      .catch((error) => {
         this.connecting = null;
-        throw err;
+        throw error;
       });
     return this.connecting;
   }
 
-  /**
-   * Resolve the route channel for `identity`, returning BOTH the channel and the
-   * `RouteEntry` token that owns it. The route-entry token is the route-cache
-   * ownership guard: stale request failures can clear only the route they used,
-   * never a successor route in the same still-open session.
-   */
   private async routeHandle(
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
   ): Promise<{ route: RouteHandle; entry: RouteEntry }> {
-    const key = identityKey(identity);
     const existing = record.routeEntry;
-    if (existing?.handle != null) return { route: existing.handle, entry: existing };
-    if (existing?.opening) return { route: await existing.opening, entry: existing };
+    if (existing?.handle != null && existing.client === client)
+      return { route: existing.handle, entry: existing };
+    if (existing?.opening && existing.client === client)
+      return { route: await existing.opening, entry: existing };
 
-    // Singleflight: install the entry BEFORE awaiting so a concurrent caller for
-    // the same identity awaits this same open instead of minting a second channel.
-    const entry: RouteEntry = { client, opening: null, handle: null, closed: false };
+    const entry: RouteEntry = {
+      canonicalRoot: record.canonicalRoot,
+      generation: record.generation,
+      client,
+      opening: null,
+      handle: null,
+      closed: false,
+    };
     const opening = client
       .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
         consumerIdentity: this.consumerIdentity,
       })
       .then((route) => {
-        // A close/shutdown may have raced this open, or this entry may have been
-        // replaced by a transient drop/reopen. In both cases, release the freshly
-        // minted channel and clear only this entry if it still owns the cache slot.
         if (
-          !this.isCurrentSession(key, record) ||
+          !this.isCurrentSession(record.identityKey, record) ||
           record.routeEntry !== entry ||
           entry.closed ||
-          this.client !== client
+          this.client !== client ||
+          (this.lifecycleEnabled() &&
+            !this.isCurrentLiveGeneration(record.canonicalRoot, record.generation))
         ) {
           safeCloseRoute(client, route);
           if (record.routeEntry === entry) record.routeEntry = null;
@@ -839,36 +1387,45 @@ export class SubcTransportPool implements AftTransportPool {
         entry.opening = null;
         return route;
       })
-      .catch((err) => {
-        const current = this.isCurrentSession(key, record);
-        // Failed open: drop this entry so the next call retries cleanly, but never
-        // delete a successor entry that replaced it while this open was in flight.
+      .catch((error) => {
         if (record.routeEntry === entry) {
           entry.closed = true;
           record.routeEntry = null;
         }
-        if (!current && !(err instanceof RouteTornDownError)) {
+        if (
+          !this.isCurrentSession(record.identityKey, record) &&
+          !(error instanceof RouteTornDownError)
+        ) {
           throw new RouteTornDownError("subc route opened after session closed");
         }
-        throw err;
+        throw error;
       });
     entry.opening = opening;
     record.routeEntry = entry;
     return { route: await opening, entry };
   }
 
-  /**
-   * Open the dedicated bg_events subscription for `identity` once. Idempotent —
-   * a second call for the same identity is a no-op (one sub per session, the
-   * duplicate-sub guard from Oracle #2). No-op when no nudge handler is wired,
-   * during shutdown, or after the session has been closed.
-   */
   private ensureBgSubscription(identity: BindIdentity, record: SessionRecord): void {
-    if (this.shuttingDown || !this.onBgEventsNudge) return;
-    const key = identityKey(identity);
-    if (!this.isCurrentSession(key, record)) return;
+    if (this.shuttingDown || (!this.onBgEventsNudge && !this.onBgEventsNudgeRef)) return;
+    if (!this.isCurrentSession(record.identityKey, record)) return;
     if (record.bgSub) return;
-    const onNudge = (): void => this.onBgEventsNudge?.(identity.project_root, identity.session);
+
+    const poolId = this.currentPoolId();
+    const generation = record.generation;
+    const nudgeRef =
+      poolId !== undefined && generation !== undefined
+        ? ({
+            canonicalRoot: record.canonicalRoot,
+            session: identity.session,
+            concretePoolId: poolId,
+            generation,
+          } satisfies BgNudgeRef)
+        : undefined;
+    const onNudge = (): void => {
+      if (!this.isCurrentSession(record.identityKey, record)) return;
+      this.onBgEventsNudge?.(identity.project_root, identity.session);
+      if (nudgeRef) this.onBgEventsNudgeRef?.(nudgeRef);
+    };
     const sub = new BgSubscription(
       identity,
       () => this.ensureClient(),
@@ -876,34 +1433,89 @@ export class SubcTransportPool implements AftTransportPool {
       this.consumerIdentity,
       onNudge,
       this.bgBackoffSleep,
+      nudgeRef,
+      () =>
+        this.isCurrentSession(record.identityKey, record) &&
+        this.isCurrentLiveGeneration(record.canonicalRoot, record.generation),
     );
     record.bgSub = sub;
   }
 
-  /** Drop a dead client so the next call reconnects; preserves session records. */
+  /**
+   * Invalidate only routes owned by a dead client. Sessions remain indexed so a
+   * replacement client can reconnect the same identity and its bg subscription.
+   */
   private dropClient(client: SubcClientLike): void {
-    if (this.client === client) {
-      this.client = null;
-      for (const [key, record] of this.sessions) {
-        const entry = record.routeEntry;
-        if (entry?.client === client) {
-          entry.closed = true;
-          record.routeEntry = null;
-          this.deleteSessionIfEmpty(key, record);
-        }
-      }
-      // The half-open failure counter is per-client-generation: a dropped client
-      // resets it so the NEXT client starts fresh (R2-T2). Without this, failures
-      // accrued on a client dropped via another path (e.g. a bg-subscription
-      // transient drop) would carry over and trip the backstop on a healthy new
-      // client after a single failure.
-      this.transportFailures = 0;
-      try {
-        client.close();
-      } catch {
-        // best-effort; the socket is already gone
+    if (this.client !== client) return;
+    this.client = null;
+    for (const record of this.sessions.values()) {
+      const entry = record.routeEntry;
+      if (entry?.client !== client) continue;
+      entry.closed = true;
+      record.routeEntry = null;
+      this.deleteSessionIfEmpty(record.identityKey, record);
+    }
+    this.transportFailures = 0;
+    try {
+      client.close();
+    } catch {
+      // A dead socket is already released by the peer.
+    }
+  }
+
+  /** Synchronous concrete-facade eviction used by the registry coordinator. */
+  evictConcreteFacade(root: CanonicalRootPath, generation: RootGeneration): void {
+    const facade = this.transports.get(root);
+    if (facade?.getGeneration() === generation) this.transports.delete(root);
+  }
+
+  /**
+   * Registry-owned coordinated close. All record/index/facade mutations happen
+   * before cleanup promises are created; the registry has already tombstoned the
+   * matching generation and evicted the wrapper facade before this is called.
+   */
+  async closeProjectRoot(
+    root: CanonicalRootPath,
+    generation: RootGeneration,
+  ): Promise<{ tornDownSessionCount: number; tornDownFacadeCount: number }> {
+    if (!this.lifecycleEnabled()) return { tornDownSessionCount: 0, tornDownFacadeCount: 0 };
+    if (!this.isRootTombstoned(root, generation))
+      return { tornDownSessionCount: 0, tornDownFacadeCount: 0 };
+
+    const keys = [...(this.rootIndex.get(root) ?? new Set<IdentityKey>())];
+    const detached: DetachedSession[] = [];
+    for (const key of keys) {
+      const record = this.sessions.get(key);
+      if (record?.canonicalRoot === root && record.generation === generation) {
+        const owner = this.detachSession(key, "root_reaped");
+        if (owner) detached.push(owner);
       }
     }
+    this.rootIndex.delete(root);
+    const hadFacade = this.transports.get(root)?.getGeneration() === generation;
+    this.evictConcreteFacade(root, generation);
+
+    const cleanup = Promise.allSettled(detached.map((owner) => this.cleanupDetached(owner))).then(
+      () => ({
+        tornDownSessionCount: detached.length,
+        tornDownFacadeCount: hadFacade ? 1 : 0,
+      }),
+    );
+    this.pendingRootCleanups.add(cleanup);
+    void cleanup.finally(() => this.pendingRootCleanups.delete(cleanup));
+    return cleanup;
+  }
+
+  /** Forward explicit lifecycle close requests to the registry-owned coordinator. */
+  requestProjectRootClose(
+    root: CanonicalRootPath,
+    generation: RootGeneration,
+    cause: "sweep" | "explicit" = "explicit",
+  ): Promise<void> {
+    const registry = this.lifecycleRegistry;
+    const registration = this.lifecycleRegistration;
+    if (!registry || !registration || !registration.reapingEnabled) return Promise.resolve();
+    return registry.requestProjectRootClose(registration.concretePoolId, root, generation, cause);
   }
 
   /** No-op over subc: config is read locally by AFT (wire tiers are ignored). */
@@ -917,85 +1529,76 @@ export class SubcTransportPool implements AftTransportPool {
     return path;
   }
 
-  /** A subc pool instance is terminal after shutdown; ownership revives it outside this class. */
   isShutdown(): boolean {
     return this.shuttingDown;
   }
 
   async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
     this.shuttingDown = true;
-    const subs: BgSubscription[] = [];
-    const entries: RouteEntry[] = [];
-    for (const record of this.sessions.values()) {
-      record.closed = true;
-      const sub = record.bgSub;
-      record.bgSub = null;
-      if (sub) subs.push(sub);
-      const entry = record.routeEntry;
-      record.routeEntry = null;
-      if (entry) {
-        entry.closed = true;
-        entries.push(entry);
-      }
+
+    // Deregistration synchronously tombstones all registered roots and invokes
+    // closeProjectRoot before this method reaches its first await.
+    const registration = this.lifecycleRegistration;
+    registration?.deregister();
+    this.lifecycleRegistration = null;
+
+    const detached: DetachedSession[] = [];
+    for (const key of [...this.sessions.keys()]) {
+      const owner = this.detachSession(key, "shutdown");
+      if (owner) detached.push(owner);
     }
-    this.sessions.clear();
-    const client = this.client;
-    this.client = null;
+    this.rootIndex.clear();
     this.transports.clear();
 
-    await Promise.allSettled(subs.map((sub) => sub.stop()));
-    await Promise.allSettled(
-      entries.map(async (entry) => {
-        if (entry.handle == null) return;
-        try {
-          await entry.client.closeRouteChannel(entry.handle);
-        } catch {
-          // best-effort; a dropped connection releases the route on the other side
-        }
-      }),
-    );
+    const client = this.client;
+    this.client = null;
+    const pending = [...this.pendingRootCleanups];
+    await Promise.allSettled([...detached.map((owner) => this.cleanupDetached(owner)), ...pending]);
     if (client) {
       try {
         client.close();
       } catch {
-        // best-effort
+        // Best effort; route cleanup has already been attempted.
       }
     }
   }
 
-  /**
-   * Tear down a single session's bg subscription (and tool route) — the
-   * per-session close hook (Oracle #5). Idempotent. Wired to OpenCode session-end
-   * / Pi equivalent in S4; until then, shutdown() covers teardown.
-   */
   async closeSession(projectRoot: string, session: string): Promise<void> {
     const identity: BindIdentity = {
       project_root: canonicalizeProjectRoot(projectRoot),
       harness: this.harness,
       session: session && session.length > 0 ? session : DEFAULT_SESSION_ID,
     };
-    const key = identityKey(identity);
-    const record = this.sessions.get(key);
-    if (!record) return;
-
-    // All lifecycle mutation happens before the first await. In-flight requests
-    // resumed after this point observe !isCurrentSession and skip route opens,
-    // bg-sub resurrection, and client failure-budget mutation.
-    record.closed = true;
-    this.sessions.delete(key);
-    const sub = record.bgSub;
-    record.bgSub = null;
-    const entry = record.routeEntry;
-    record.routeEntry = null;
-    if (entry) entry.closed = true;
-
-    if (sub) await sub.stop();
-    if (entry?.handle != null) {
-      try {
-        await entry.client.closeRouteChannel(entry.handle);
-      } catch {
-        // best-effort; a dropped connection releases the route on the other side
-      }
-    }
+    const owner = this.detachSession(identityKey(identity), "session_closed");
+    if (owner) await this.cleanupDetached(owner);
   }
+}
+
+/**
+ * Resolve a background nudge exactly once by looking up the existing active
+ * bridge without creating one or reviving a shut-down pool; hosts use this
+ * function to acknowledge nudge handling.
+ */
+export function resolveBridgeForNudge(
+  pool: AftTransportPool,
+  ref: BgNudgeRef,
+): AftProjectTransport {
+  const candidate = pool as AftTransportPool & {
+    getActiveBridgeForRootGeneration?: (value: BgNudgeRef) => AftProjectTransport | null;
+    recordBgNudgeRejection?: (value: BgNudgeRef) => void;
+    getCurrentRootGeneration?: (root: CanonicalRootPath) => RootGeneration | undefined;
+    getConcretePoolId?: () => ConcretePoolId | undefined;
+  };
+  const bridge = candidate.getActiveBridgeForRootGeneration?.(ref) ?? null;
+  if (bridge) return bridge;
+
+  candidate.recordBgNudgeRejection?.(ref);
+  throw new SubcRootGenerationExpiredError({
+    canonicalRoot: ref.canonicalRoot,
+    expectedGeneration: ref.generation,
+    currentGeneration: candidate.getCurrentRootGeneration?.(ref.canonicalRoot),
+    concretePoolId: ref.concretePoolId,
+    currentConcretePoolId: candidate.getConcretePoolId?.(),
+  });
 }
