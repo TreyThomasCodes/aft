@@ -217,6 +217,9 @@ fn main() {
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Human-readable reason line; the phase markers below cover the
+                // shutdown sequence itself. protocol_test asserts this banner.
+                aft::slog_info!("stdin closed, shutting down");
                 graceful_stdin_shutdown = true;
                 break;
             }
