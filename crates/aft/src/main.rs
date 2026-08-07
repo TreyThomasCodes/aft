@@ -2097,6 +2097,13 @@ mod watcher_filter_tests {
         ctx.set_harness(Harness::Opencode);
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx.set_cache_role(false, None);
+        // The lease gate is fail-closed for unregistered roots, so grant this
+        // fixture writer capability the same way a real configure does.
+        aft::root_cache::configure_artifact_access(
+            root,
+            &aft::search_index::artifact_cache_key(root),
+            false,
+        );
         ctx.rebuild_gitignore();
         let tx = install_watcher_rx(&ctx);
         {
@@ -2565,6 +2572,11 @@ mod watcher_filter_tests {
             },
         );
         ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
         ctx.rebuild_gitignore();
 
         // Make a callgraph store resident (synchronous build of the 1-file repo).
@@ -2625,6 +2637,11 @@ mod watcher_filter_tests {
             },
         );
         ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
         ctx.rebuild_gitignore();
 
         let resident = ctx
