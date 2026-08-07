@@ -1405,6 +1405,8 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
         },
     ));
     ctx.set_canonical_cache_root(root_dir.path().to_path_buf());
+    let project_key = crate::search_index::artifact_cache_key(root_dir.path());
+    crate::root_cache::configure_artifact_access(root_dir.path(), &project_key, false);
     ctx.set_cache_role(false, None);
     let (store, _) = CallGraphStore::cold_build_with_lease(
         ctx.callgraph_store_dir(),

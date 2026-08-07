@@ -148,9 +148,6 @@ impl AftProcess {
         command
             .envs(hermetic_git_env())
             .env("AFT_CACHE_DIR", cache_dir.path())
-            // Integration tests often run from a linked git worktree, but their
-            // fixture projects need to exercise main-checkout demand builds.
-            .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
             // Callgraph store cold build is pure-async in production (returns
             // `Building`, agent retries). Fixture projects are tiny (build in
             // ~100ms), so default the test harness to a large inline-wait window

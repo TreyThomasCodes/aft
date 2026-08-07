@@ -79,13 +79,26 @@ struct HeartbeatRegistry {
 
 static HEARTBEAT_STATE: OnceLock<Arc<HeartbeatState>> = OnceLock::new();
 
+/// Route linked worktrees to borrowing before any same-family owner claim.
+/// `is_linked_worktree` is the configure-time Git topology result; ownership
+/// code must not probe `.git` again while opening an artifact.
 pub fn claim_or_open_read_only(
     storage_dir: Option<&Path>,
     project_root: &Path,
     project_key: &str,
     project_scope_key: &str,
+    is_linked_worktree: bool,
     git_common_dir: Option<&Path>,
 ) -> io::Result<ArtifactOwnerClaim> {
+    if is_linked_worktree {
+        return Ok(open_read_only_borrow(
+            storage_dir,
+            project_root,
+            project_key,
+            project_scope_key,
+        ));
+    }
+
     let manifest_dir = resolve_manifest_dir(storage_dir, project_root, project_key);
     fs::create_dir_all(&manifest_dir)?;
     let path = manifest_dir.join("owner.json");
@@ -754,7 +767,8 @@ mod tests {
     ) -> (ArtifactOwnerStatus, ArtifactOwnerLease) {
         fs::create_dir_all(root).unwrap();
         let mut claim =
-            claim_or_open_read_only(Some(storage_dir), root, "shared-key", "scope", None).unwrap();
+            claim_or_open_read_only(Some(storage_dir), root, "shared-key", "scope", false, None)
+                .unwrap();
         let lease = claim.lease.as_mut().expect("owner lease");
         lease.manifest.heartbeat_at_ms = 0;
         lease.last_heartbeat_ms = 0;
@@ -815,13 +829,20 @@ mod tests {
         let key = "shared-key";
 
         let first =
-            claim_or_open_read_only(Some(temp.path()), &owner, key, "owner-scope", None).unwrap();
+            claim_or_open_read_only(Some(temp.path()), &owner, key, "owner-scope", false, None)
+                .unwrap();
         assert_eq!(first.status.mode, ArtifactOwnerMode::Owner);
         assert!(first.lease.is_some());
 
-        let second =
-            claim_or_open_read_only(Some(temp.path()), &sibling, key, "sibling-scope", None)
-                .unwrap();
+        let second = claim_or_open_read_only(
+            Some(temp.path()),
+            &sibling,
+            key,
+            "sibling-scope",
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(second.status.mode, ArtifactOwnerMode::ReadOnly);
         assert!(second.status.note.unwrap().contains("read-only"));
         assert!(second.lease.is_none());
@@ -834,8 +855,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let key = "shared-key";
 
-        let first = claim_or_open_read_only(Some(temp.path()), &root, key, "scope", None).unwrap();
-        let second = claim_or_open_read_only(Some(temp.path()), &root, key, "scope", None).unwrap();
+        let first =
+            claim_or_open_read_only(Some(temp.path()), &root, key, "scope", false, None).unwrap();
+        let second =
+            claim_or_open_read_only(Some(temp.path()), &root, key, "scope", false, None).unwrap();
 
         assert_eq!(first.status.mode, ArtifactOwnerMode::Owner);
         assert_eq!(second.status.mode, ArtifactOwnerMode::Owner);
@@ -852,9 +875,15 @@ mod tests {
         let key = "shared-key";
         write_synthetic_manifest_for_test(temp.path(), &owner, key, "owner-scope", 0, 0);
 
-        let claim =
-            claim_or_open_read_only(Some(temp.path()), &sibling, key, "sibling-scope", None)
-                .unwrap();
+        let claim = claim_or_open_read_only(
+            Some(temp.path()),
+            &sibling,
+            key,
+            "sibling-scope",
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(claim.status.mode, ArtifactOwnerMode::Owner);
         assert_eq!(claim.status.owner_project_scope_key, "sibling-scope");
@@ -862,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_common_dir_is_not_forced_read_only_by_manifest() {
+    fn linked_worktree_common_dir_routes_to_read_only_without_replacing_owner() {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("owner");
         let linked = temp.path().join("linked");
@@ -872,18 +901,38 @@ mod tests {
         fs::create_dir_all(&common).unwrap();
         let key = "shared-key";
 
-        claim_or_open_read_only(Some(temp.path()), &owner, key, "owner-scope", Some(&common))
-            .unwrap();
+        claim_or_open_read_only(
+            Some(temp.path()),
+            &owner,
+            key,
+            "owner-scope",
+            false,
+            Some(&common),
+        )
+        .unwrap();
+        let owner_manifest =
+            read_manifest(&temp.path().join("artifact-owners/shared-key/owner.json"))
+                .expect("owner manifest");
         let claim = claim_or_open_read_only(
             Some(temp.path()),
             &linked,
             key,
             "linked-scope",
+            true,
             Some(&common),
         )
         .unwrap();
+        let manifest_after =
+            read_manifest(&temp.path().join("artifact-owners/shared-key/owner.json"))
+                .expect("owner manifest after linked route");
 
-        assert_eq!(claim.status.mode, ArtifactOwnerMode::Owner);
+        assert_eq!(claim.status.mode, ArtifactOwnerMode::ReadOnly);
+        assert!(claim.lease.is_none());
+        assert_eq!(
+            manifest_after.project_scope_key,
+            owner_manifest.project_scope_key
+        );
+        assert_eq!(manifest_after.checkout_path, owner_manifest.checkout_path);
     }
 
     #[test]

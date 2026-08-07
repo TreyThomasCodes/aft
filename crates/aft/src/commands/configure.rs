@@ -735,9 +735,6 @@ fn has_parent_component(path: &Path) -> bool {
 }
 
 fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Option<PathBuf>) {
-    if std::env::var_os("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD").is_some() {
-        return (false, None);
-    }
     if let Some(result) = ctx.cached_worktree_bridge(project_root) {
         return result;
     }
@@ -747,6 +744,16 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
     // stable until the root's `.git` marker changes.
     #[cfg(test)]
     ctx.record_worktree_bridge_probe_spawn_for_test();
+    let fail_closed_topology = || {
+        let git_marker_is_file = project_root.join(".git").is_file();
+        if git_marker_is_file {
+            slog_warn!(
+                "git worktree topology probe failed for {}; treating .git file root as borrow-only",
+                project_root.display()
+            );
+        }
+        (git_marker_is_file, None)
+    };
     let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
@@ -758,18 +765,18 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
         ])
         .output();
     let Ok(output) = output else {
-        return (false, None);
+        return fail_closed_topology();
     };
     if !output.status.success() {
-        return (false, None);
+        return fail_closed_topology();
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
     let Some(git_dir) = lines.next().map(PathBuf::from) else {
-        return (false, None);
+        return fail_closed_topology();
     };
     let Some(common_dir) = lines.next().map(PathBuf::from) else {
-        return (false, None);
+        return fail_closed_topology();
     };
     let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
     let common_dir = std::fs::canonicalize(&common_dir).unwrap_or(common_dir);
@@ -2114,29 +2121,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         return cancelled;
     }
     let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
-        if is_worktree_bridge {
-            Some(crate::artifact_owner::open_read_only_borrow(
-                next_config.storage_dir.as_deref(),
-                &canonical_cache_root,
-                project_key,
-                &project_scope_key,
-            ))
-        } else {
-            match crate::artifact_owner::claim_or_open_read_only(
-                next_config.storage_dir.as_deref(),
-                &canonical_cache_root,
-                project_key,
-                &project_scope_key,
-                git_common_dir.as_deref(),
-            ) {
-                Ok(claim) => Some(claim),
-                Err(error) => {
-                    return Response::error(
-                        &req.id,
-                        "artifact_owner_unavailable",
-                        format!("failed to claim artifact owner manifest: {error}"),
-                    );
-                }
+        match crate::artifact_owner::claim_or_open_read_only(
+            next_config.storage_dir.as_deref(),
+            &canonical_cache_root,
+            project_key,
+            &project_scope_key,
+            is_worktree_bridge,
+            git_common_dir.as_deref(),
+        ) {
+            Ok(claim) => Some(claim),
+            Err(error) => {
+                return Response::error(
+                    &req.id,
+                    "artifact_owner_unavailable",
+                    format!("failed to claim artifact owner manifest: {error}"),
+                );
             }
         }
     } else {
@@ -4070,6 +4069,7 @@ mod tests {
         project_key: &str,
         sources: &[PathBuf],
     ) {
+        crate::root_cache::configure_artifact_access(project, project_key, false);
         let mut parser = FileParser::new();
         for source in sources {
             parser.extract_symbols(source).expect("extract symbols");
@@ -5203,6 +5203,21 @@ mod tests {
     }
 
     #[test]
+    fn broken_git_file_topology_fails_closed_as_linked_worktree() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("broken-worktree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /definitely/missing/worktree\n").unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let ctx = test_context();
+
+        let topology = super::detect_worktree_bridge(&ctx, &canonical_root);
+
+        assert_eq!(topology, (true, None));
+    }
+
+    #[test]
     fn worktree_then_main_claim_sequence_ends_with_main_owner() {
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -5255,6 +5270,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let cache_dir = temp.path().join("search-cache");
+        crate::root_cache::configure_artifact_access(&root, "search-cache", false);
         std::fs::create_dir_all(&cache_dir).unwrap();
         let artifact = cache_dir.join("cache.bin");
         std::fs::write(&artifact, b"generation-a").unwrap();

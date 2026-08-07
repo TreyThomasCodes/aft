@@ -154,11 +154,13 @@ fn artifact_cache_key_for_test(project_root: &Path) -> String {
 }
 
 fn rebuild_dead_code_callgraph_store(project_root: &Path, inspect_dir: &Path) {
+    let project_key = artifact_cache_key_for_test(project_root);
     let store_dir = inspect_dir
         .parent()
         .expect("inspect dir has parent")
         .join("callgraph")
-        .join(artifact_cache_key_for_test(project_root));
+        .join(&project_key);
+    aft::root_cache::configure_artifact_access(project_root, &project_key, false);
     let store = CallGraphStore::open(store_dir, project_root.to_path_buf()).expect("open store");
     let files = project_source_files(project_root);
     store

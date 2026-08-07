@@ -22,7 +22,9 @@ use super::oxc_engine::{
     ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
-use crate::callgraph_store::{project_dead_code_snapshot, CallGraphStore, CallGraphStoreError};
+use crate::callgraph_store::{
+    project_dead_code_snapshot, CallGraphStore, CallGraphStoreError, ReadonlyCallGraphStore,
+};
 use crate::cold_build_limiter;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
@@ -2173,11 +2175,25 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         return None;
     };
 
+    enum ProjectionStore {
+        ReadOnly(ReadonlyCallGraphStore),
+        Writable(CallGraphStore),
+    }
+
+    impl ProjectionStore {
+        fn sqlite_path(&self) -> &Path {
+            match self {
+                Self::ReadOnly(store) => store.sqlite_path(),
+                Self::Writable(store) => store.sqlite_path(),
+            }
+        }
+    }
+
     for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
         // Background refresh may rebuild call graphs for moved project roots.
         // Direct inspect cannot trigger that rebuild, so it opens without repair
         // and reports callgraph_unavailable when a rebuild is needed.
-        let sqlite_path = if refresh_paths.is_empty() || !job.callgraph_writer {
+        let projection_store = if refresh_paths.is_empty() || !job.callgraph_writer {
             let store = match CallGraphStore::open_readonly(
                 callgraph_dir.clone(),
                 job.project_root.clone(),
@@ -2201,7 +2217,7 @@ fn build_tier2_callgraph_snapshot_with_refresh(
                     continue;
                 }
             };
-            store.sqlite_path().to_path_buf()
+            ProjectionStore::ReadOnly(store)
         } else {
             let store = match if allow_cold_build {
                 CallGraphStore::open_ready_repairing(
@@ -2259,10 +2275,10 @@ fn build_tier2_callgraph_snapshot_with_refresh(
                     }
                 }
             }
-            store.sqlite_path().to_path_buf()
+            ProjectionStore::Writable(store)
         };
 
-        let snapshot = match project_dead_code_snapshot(&sqlite_path) {
+        let snapshot = match project_dead_code_snapshot(projection_store.sqlite_path()) {
             Ok(snapshot) => snapshot,
             Err(CallGraphStoreError::Unavailable(message)) => {
                 crate::slog_info!(
@@ -3593,6 +3609,9 @@ mod guard_tests {
             )
             .expect("write fixture");
         }
+        let canonical_root = std::fs::canonicalize(root).expect("canonical fixture root");
+        let project_key = crate::search_index::artifact_cache_key(&canonical_root);
+        crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
         dir
     }
 
@@ -4018,6 +4037,62 @@ export function bannerUnused() {}
     }
 
     #[test]
+    fn readonly_tier2_projection_keeps_generation_pinned_through_concurrent_gc() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
+                .expect("initial generation");
+        let initial_generation = store.sqlite_path().to_path_buf();
+        drop(store);
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+
+        let root_for_observer = root.clone();
+        let dir_for_observer = callgraph_dir.clone();
+        let files_for_observer = files.clone();
+        crate::callgraph_store::set_projection_before_open_observer(Some(Arc::new(
+            move |projected_path| {
+                for _ in 0..3 {
+                    let (published, _) = CallGraphStore::cold_build_with_lease(
+                        dir_for_observer.clone(),
+                        root_for_observer.clone(),
+                        &files_for_observer,
+                    )
+                    .expect("concurrent generation publication");
+                    drop(published);
+                }
+                assert!(
+                    projected_path.is_file(),
+                    "the tier2 reader marker must pin the selected generation through GC"
+                );
+            },
+        )));
+        let mut job = snapshot_job(&root, &inspect_dir, true);
+        job.callgraph_writer = false;
+
+        let snapshot =
+            build_tier2_callgraph_snapshot_with_refresh(&job, false, &[root.join("mod0.ts")]);
+        crate::callgraph_store::set_projection_before_open_observer(None);
+
+        assert!(snapshot.is_some());
+        assert!(initial_generation.is_file());
+        assert_eq!(
+            crate::root_cache::writer_lease_acquisition_count_for_test(
+                crate::root_cache::RootCacheDomain::Callgraph,
+                &project_key,
+                &root,
+            ),
+            3,
+            "only the three observer publications may acquire a writer lease; tier2 must stay read-only"
+        );
+    }
+
+    #[test]
     fn direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
@@ -4129,6 +4204,8 @@ export function bannerUnused() {}
         let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
         let callgraph_dir =
             callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
         store.cold_build(&project_files).expect("cold build store");
@@ -4466,6 +4543,8 @@ mod dead_code_projection_tests {
         let inspect_dir = root.join(".aft-cache").join("inspect");
         let callgraph_dir =
             callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
         let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
         let files = project_files(&root);
         store.cold_build(&files).expect("cold build store");

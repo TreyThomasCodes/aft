@@ -3,6 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(test)]
+pub(crate) type ProjectionBeforeOpenObserver = dyn Fn(&Path) + Send + Sync + 'static;
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_BEFORE_OPEN_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<ProjectionBeforeOpenObserver>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 use crate::inspect::job::{CallgraphExport, CallgraphOutboundCall, CallgraphSnapshot};
 use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::symbols::SymbolKind;
@@ -12,6 +21,24 @@ use super::{
     PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
 };
 
+#[cfg(test)]
+pub(crate) fn set_projection_before_open_observer(
+    observer: Option<std::sync::Arc<ProjectionBeforeOpenObserver>>,
+) {
+    PROJECTION_BEFORE_OPEN_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_projection_before_open_observer(db_path: &Path) {
+    let observer = PROJECTION_BEFORE_OPEN_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(db_path);
+    }
+}
+
+#[cfg(not(test))]
+fn notify_projection_before_open_observer(_db_path: &Path) {}
+
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
@@ -20,6 +47,7 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
         )));
     }
 
+    notify_projection_before_open_observer(db_path);
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(Duration::from_millis(5_000))?;
     if !database_ready(&conn).unwrap_or(false) {

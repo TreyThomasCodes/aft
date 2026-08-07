@@ -705,11 +705,13 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
         "export function unused() { return 1; }\n",
     );
     let inspect_dir = root.join(".aft-cache").join("inspect");
+    let project_key = artifact_cache_key_for_test(&root);
     let callgraph_dir = inspect_dir
         .parent()
         .expect("storage dir")
         .join("callgraph")
-        .join(artifact_cache_key_for_test(&root));
+        .join(&project_key);
+    aft::root_cache::configure_artifact_access(&root, &project_key, false);
     let _not_ready_store =
         CallGraphStore::open(callgraph_dir, root.clone()).expect("open non-ready callgraph store");
 

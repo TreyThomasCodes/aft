@@ -1313,7 +1313,6 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
     let phase_two_ready = project.path().join("phase-two-configured");
     let mut phase_two = Command::new(env!("CARGO_BIN_EXE_aft"))
         .env("AFT_CACHE_DIR", phase_two_cache.path())
-        .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
         .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
         .env("AFT_TEST_RAW_PATH", "1")
         .stdin(Stdio::piped())

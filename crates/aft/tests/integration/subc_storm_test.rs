@@ -1251,11 +1251,18 @@ async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
     );
 
     let callgraph_dir = storage_dir.join("callgraph").join(&shared_key);
-    let _ = aft::callgraph_store::CallGraphStore::open_ready_no_rebuild(
-        callgraph_dir,
+    let writer_shaped = aft::callgraph_store::CallGraphStore::open_ready_no_rebuild(
+        callgraph_dir.clone(),
         worktree_root.clone(),
     )
-    .expect("worktree API should degrade to the ready read-only callgraph store");
+    .expect("worktree writer opener should fail closed");
+    assert!(
+        writer_shaped.is_none(),
+        "borrow-only roots must not receive a writable-shaped callgraph store"
+    );
+    let _reader =
+        aft::callgraph_store::CallGraphStore::open_readonly(callgraph_dir, worktree_root.clone())
+            .expect("worktree read-only opener should remain available");
     let (callgraph_acquisitions, inspect_acquisitions) = worktree_writer_acquisitions();
     assert_eq!(
         callgraph_acquisitions + inspect_acquisitions,

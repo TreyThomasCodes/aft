@@ -4678,11 +4678,13 @@ impl AppContext {
         // LSP-reported paths (normalized form) against this root with
         // starts_with, and a verbatim root on Windows matches nothing.
         let project_root = crate::inspect::job::canonicalize_normalized(&project_root);
-        Some(InspectSnapshot::new(
+        Some(InspectSnapshot::new_with_capabilities(
             project_root,
             self.inspect_dir(),
             config,
             self.symbol_cache(),
+            self.inspect_writer(),
+            self.callgraph_writer(),
         ))
     }
 
@@ -6282,7 +6284,15 @@ mod subc_lifecycle_admission_tests {
 
     #[test]
     fn worktree_guard_prevents_partial_tier2_from_reporting_building() {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.set_cache_writer_capabilities(true, true);
         ctx.update_status_bar_tier2(Some(4), None, None, None, true);
         assert_eq!(
@@ -6302,6 +6312,8 @@ mod subc_lifecycle_admission_tests {
                 .status,
             "disabled"
         );
+        let tier2_snapshot = ctx.tier2_refresh_snapshot().expect("tier2 snapshot");
+        assert!(!tier2_snapshot.callgraph_writer);
     }
 
     #[test]

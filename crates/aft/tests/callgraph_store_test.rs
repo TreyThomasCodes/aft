@@ -880,6 +880,7 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
 
     let fallback = ctx
@@ -1183,6 +1184,7 @@ fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build()
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
 
     let (store, _) = CallGraphStore::ensure_built_with_lease(
@@ -1252,6 +1254,7 @@ fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build()
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
     let (fallback, _) = CallGraphStore::ensure_built_with_lease(
         ctx.callgraph_store_dir(),
@@ -1311,9 +1314,9 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(true);
-    let callgraph_dir = storage
-        .join("callgraph")
-        .join(artifact_cache_key_for_test(&root));
+    let project_key = artifact_cache_key_for_test(&root);
+    let callgraph_dir = storage.join("callgraph").join(&project_key);
+    aft::root_cache::configure_artifact_access(&root, &project_key, false);
     let (fallback, _) = CallGraphStore::ensure_built_with_lease(
         callgraph_dir.clone(),
         root.clone(),
@@ -1340,6 +1343,7 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
     );
     retry_ctx.set_harness(Harness::Opencode);
     retry_ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     retry_ctx.set_cache_role(false, None);
     let fallback = retry_ctx.ensure_callgraph_store().unwrap().unwrap();
     assert!(fallback.is_legacy_fallback());
@@ -1424,6 +1428,7 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
     let fallback = ctx.ensure_callgraph_store().unwrap().unwrap();
     assert!(fallback.is_legacy_fallback());
@@ -1480,10 +1485,13 @@ fn app_context_revalidates_to_newer_published_generation() {
     ctx.set_canonical_cache_root(root.clone());
     ctx.set_cache_role(true, None);
     let store_dir = ctx.callgraph_store_dir();
+    let project_key = artifact_cache_key_for_test(&root);
 
     // Publish gen 1 out-of-band so the context opens it warm (no background build).
+    aft::root_cache::configure_artifact_access(&root, &project_key, false);
     CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &project_files(&root))
         .unwrap();
+    aft::root_cache::configure_artifact_access(&root, &project_key, true);
 
     fn entry_leaf(access: CallgraphStoreAccess) -> String {
         match access {
@@ -1509,8 +1517,10 @@ fn app_context_revalidates_to_newer_published_generation() {
         &root.join("main.ts"),
         "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
     );
+    aft::root_cache::configure_artifact_access(&root, &project_key, false);
     CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &project_files(&root))
         .unwrap();
+    aft::root_cache::configure_artifact_access(&root, &project_key, true);
 
     // Next op on the SAME context revalidates (drops the stale resident store)
     // and serves gen 2.
@@ -1536,6 +1546,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(dir.path().to_path_buf());
+    aft::root_cache::configure_artifact_access(
+        dir.path(),
+        &artifact_cache_key_for_test(dir.path()),
+        false,
+    );
     ctx.set_cache_role(false, None);
 
     {
@@ -1577,6 +1592,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     );
     worktree_ctx.set_harness(Harness::Opencode);
     worktree_ctx.set_canonical_cache_root(dir.path().to_path_buf());
+    aft::root_cache::configure_artifact_access(
+        dir.path(),
+        &artifact_cache_key_for_test(dir.path()),
+        true,
+    );
     worktree_ctx.set_cache_role(true, None);
     assert!(worktree_ctx.ensure_callgraph_store().unwrap().is_some());
 
@@ -1592,6 +1612,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     );
     unavailable_ctx.set_harness(Harness::Opencode);
     unavailable_ctx.set_canonical_cache_root(unavailable_dir.path().to_path_buf());
+    aft::root_cache::configure_artifact_access(
+        unavailable_dir.path(),
+        &artifact_cache_key_for_test(unavailable_dir.path()),
+        true,
+    );
     unavailable_ctx.set_cache_role(true, None);
     assert!(unavailable_ctx.ensure_callgraph_store().unwrap().is_none());
 }
@@ -2088,6 +2113,8 @@ fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppCo
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());
+    let project_key = artifact_cache_key_for_test(root);
+    aft::root_cache::configure_artifact_access(root, &project_key, worktree);
     ctx.set_cache_role(worktree, None);
     ctx
 }
@@ -2760,6 +2787,7 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
+    aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
     let store_dir = ctx.callgraph_store_dir();
 

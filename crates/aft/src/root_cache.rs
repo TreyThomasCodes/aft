@@ -17,6 +17,7 @@
 //! activity or let another local user delete a protected marker.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -130,6 +131,7 @@ pub struct ArtifactAccess {
     shared_key: String,
     private_key: String,
     borrow_only_shared: bool,
+    registered: bool,
 }
 
 impl ArtifactAccess {
@@ -140,11 +142,12 @@ impl ArtifactAccess {
             project_root,
             shared_key: shared_key.to_string(),
             borrow_only_shared,
+            registered: true,
         }
     }
 
-    /// Resolve the capability registered during configure, probing Git only for
-    /// direct artifact API callers that have not configured an app context.
+    /// Resolve the capability registered during configure. Unregistered roots
+    /// receive a borrow-only capability without probing Git on the store path.
     pub fn for_root(project_root: &Path) -> Self {
         let project_root = canonical_root(project_root);
         if let Some(access) = configured_artifact_access()
@@ -165,17 +168,21 @@ impl ArtifactAccess {
             project_root.display()
         );
         let shared_key = crate::path_identity::project_scope_key(&project_root);
-        Self::configured(&project_root, &shared_key, true)
+        Self {
+            private_key: shared_key.clone(),
+            project_root,
+            shared_key,
+            borrow_only_shared: true,
+            registered: false,
+        }
     }
 
     /// Return whether this root may write the keyed artifact, logging the first
     /// denial for each concrete path so read-only degradation stays observable.
     pub fn allows_write(&self, artifact_key: &str, write_path: &Path) -> bool {
         let writes_keyed_dir = write_path
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == artifact_key);
+            .ancestors()
+            .any(|ancestor| ancestor.file_name() == Some(OsStr::new(artifact_key)));
         if !self.borrow_only_shared
             || artifact_key != self.shared_key
             || artifact_key == self.private_key
@@ -183,6 +190,49 @@ impl ArtifactAccess {
         {
             return true;
         }
+        self.warn_write_denied_once(write_path);
+        false
+    }
+
+    fn allows_writer_lease(
+        &self,
+        domain: RootCacheDomain,
+        artifact_key: &str,
+        write_path: &Path,
+    ) -> bool {
+        self.allows_writer_lease_inner(domain, artifact_key, write_path)
+    }
+
+    fn allows_writer_lease_inner(
+        &self,
+        domain: RootCacheDomain,
+        artifact_key: &str,
+        write_path: &Path,
+    ) -> bool {
+        let writes_keyed_dir = write_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == artifact_key);
+        if !self.borrow_only_shared {
+            return true;
+        }
+        if domain != RootCacheDomain::Callgraph
+            && writes_keyed_dir
+            && artifact_key == self.private_key
+        {
+            return true;
+        }
+        if !self.registered && !writes_keyed_dir {
+            // Caller-owned scratch paths are outside the shared root-keyed
+            // cache layout, so this capability does not govern them.
+            return true;
+        }
+        self.warn_write_denied_once(write_path);
+        false
+    }
+
+    fn warn_write_denied_once(&self, write_path: &Path) {
         let warning_key = (self.project_root.clone(), write_path.to_path_buf());
         let should_warn = WARNED_BORROW_ONLY_WRITES
             .get_or_init(|| Mutex::new(HashSet::new()))
@@ -196,11 +246,11 @@ impl ArtifactAccess {
             .unwrap_or(false);
         if should_warn {
             crate::slog_warn!(
-                "borrow-only worktree denied shared artifact write at {}",
-                write_path.display()
+                "borrow-only root denied shared artifact write at {} (configured shared key {})",
+                write_path.display(),
+                self.shared_key
             );
         }
-        false
     }
 }
 
@@ -418,7 +468,7 @@ impl WriterLease {
         project_root: &Path,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
         let access = ArtifactAccess::for_root(project_root);
-        if !access.allows_write(key, &writer_lease_path(cache_dir)) {
+        if !access.allows_writer_lease(domain, key, &writer_lease_path(cache_dir)) {
             return Ok(None);
         }
         let registry_key = ProcessLeaseKey {
@@ -1212,8 +1262,16 @@ mod tests {
             worktree_root.path(),
         )
         .unwrap();
+        let unkeyed_worktree_lease = WriterLease::acquire_shared(
+            RootCacheDomain::Callgraph,
+            &storage.path().join("scratch"),
+            shared_key,
+            worktree_root.path(),
+        )
+        .unwrap();
 
         assert!(worktree_lease.is_none());
+        assert!(unkeyed_worktree_lease.is_none());
         assert!(parent_lease.verify().unwrap());
         assert_eq!(
             writer_lease_acquisition_count_for_test(
@@ -1223,6 +1281,34 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn unregistered_root_cannot_acquire_keyed_shared_writer_lease() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let shared_key = "unregistered-shared-key";
+        let cache_dir = storage.path().join("callgraph").join(shared_key);
+        reset_writer_lease_acquisition_counts_for_test();
+
+        let lease = WriterLease::acquire_shared(
+            RootCacheDomain::Callgraph,
+            &cache_dir,
+            shared_key,
+            root.path(),
+        )
+        .unwrap();
+
+        assert!(lease.is_none());
+        assert_eq!(
+            writer_lease_acquisition_count_for_test(
+                RootCacheDomain::Callgraph,
+                shared_key,
+                root.path(),
+            ),
+            0
+        );
+        assert!(!writer_lease_path(&cache_dir).exists());
     }
 
     #[test]
@@ -1251,6 +1337,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocked_cache_dir = dir.path().join("callgraph").join("blocked");
         let free_cache_dir = dir.path().join("callgraph").join("free");
+        configure_artifact_access(&blocked_cache_dir, "blocked", false);
+        configure_artifact_access(&free_cache_dir, "free", false);
         let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -1317,6 +1405,7 @@ mod tests {
     fn writer_lease_acquire_shared_reuses_single_process_lease_concurrently() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("inspect").join("project");
+        configure_artifact_access(&cache_dir, "project", false);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut handles = Vec::new();
         for _ in 0..8 {

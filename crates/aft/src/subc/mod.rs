@@ -5037,6 +5037,8 @@ mod tests {
             },
         ));
         ctx.set_canonical_cache_root(canonical_root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&canonical_root);
+        crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
         assert!(ctx
             .ensure_callgraph_store()
             .expect("build callgraph store")

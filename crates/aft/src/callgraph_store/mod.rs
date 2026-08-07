@@ -48,8 +48,29 @@ const MARKED_GENERATION_RETENTION_TTL: Duration = Duration::from_secs(6 * 60 * 6
 const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
 const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
+const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RebuildCooldownKey {
+    callgraph_dir: PathBuf,
+    project_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct RebuildCooldownRecord {
+    project_root: PathBuf,
+    published_at: Instant,
+    cross_root_cooldown_armed: bool,
+}
+
+// Prevent repeated rebuilds when requests rapidly switch between project
+// roots. Allow the first successful rebuild for a different root; after that
+// transition, report the artifact as unavailable instead of publishing another
+// complete generation. Record only successful publications in this map.
+static SUCCESSFUL_REBUILDS: OnceLock<Mutex<HashMap<RebuildCooldownKey, RebuildCooldownRecord>>> =
+    OnceLock::new();
 #[cfg(test)]
 type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
@@ -77,6 +98,8 @@ thread_local! {
 
 mod dead_code_projection;
 pub use dead_code_projection::project_dead_code_snapshot;
+#[cfg(test)]
+pub(crate) use dead_code_projection::set_projection_before_open_observer;
 
 #[doc(hidden)]
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
@@ -1584,10 +1607,9 @@ impl CallGraphStore {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
-            return match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
-                Some(store) => Ok(store.into_inner()),
-                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key),
-            };
+            return Err(CallGraphStoreError::Unavailable(
+                "writer capability denied; use the read-only callgraph opener".to_string(),
+            ));
         };
         std::fs::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
@@ -1685,21 +1707,21 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true, true, true)
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, true, true)
     }
 
     /// Open a ready store for bounded maintenance work without repairing root
     /// metadata or starting a cold rebuild. A store that needs either action is
     /// reported as unavailable so a background build can own that work.
     pub fn open_ready(callgraph_dir: PathBuf, project_root: PathBuf) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, false, false)
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, false)
     }
 
     pub fn open_ready_no_rebuild(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<Self>> {
-        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, true, true)
+        Self::open_ready_with_rebuild_policy(callgraph_dir, project_root, false, true)
     }
 
     fn open_ready_with_rebuild_policy(
@@ -1707,16 +1729,11 @@ impl CallGraphStore {
         project_root: PathBuf,
         allow_cold_build: bool,
         allow_root_repair: bool,
-        allow_borrow_only: bool,
     ) -> Result<Option<Self>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
-            if !allow_borrow_only {
-                return Ok(None);
-            }
-            return Self::open_readonly(callgraph_dir, project_root)
-                .map(|store| store.map(ReadonlyCallGraphStore::into_inner));
+            return Ok(None);
         };
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
@@ -1800,26 +1817,14 @@ impl CallGraphStore {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
-            if require_new_publication {
-                return Err(CallGraphStoreError::Unavailable(
-                    "forced rebuild could not acquire the writer lease".to_string(),
-                ));
-            }
-            let store = match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
-                Some(store) => store.into_inner(),
-                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key)?,
+            let operation = if require_new_publication {
+                "forced rebuild"
+            } else {
+                "cold build"
             };
-            return Ok((
-                store,
-                ColdBuildStats {
-                    files: 0,
-                    nodes: 0,
-                    refs: 0,
-                    edges: 0,
-                    failed_files: Vec::new(),
-                    elapsed_ms: 0,
-                },
-            ));
+            return Err(CallGraphStoreError::Unavailable(format!(
+                "{operation} could not acquire writer capability"
+            )));
         };
         std::fs::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
@@ -1857,11 +1862,9 @@ impl CallGraphStore {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         let Some(writer_lease) = acquire_writer_lease(&callgraph_dir, &project_key, &project_root)?
         else {
-            return match Self::open_readonly(callgraph_dir.clone(), project_root.clone())? {
-                Some(store) => Ok((store.into_inner(), None)),
-                None => Self::borrow_only_empty(callgraph_dir, project_root, project_key)
-                    .map(|store| (store, None)),
-            };
+            return Err(CallGraphStoreError::Unavailable(
+                "callgraph ensure could not acquire writer capability".to_string(),
+            ));
         };
         std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
@@ -2006,6 +2009,15 @@ impl CallGraphStore {
         chunk_size: usize,
         writer_lease: Arc<crate::root_cache::WriterLease>,
     ) -> Result<(ColdBuildStats, String)> {
+        if let Some((previous_root, remaining)) =
+            rebuild_cooldown_denial(callgraph_dir, project_key, project_root, Instant::now())
+        {
+            return Err(CallGraphStoreError::Unavailable(format!(
+                "cache key {project_key} was rebuilt for {} too recently; retry {} ms after the per-key cooldown",
+                previous_root.display(),
+                remaining.as_millis()
+            )));
+        }
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
         let temp_path = callgraph_dir.join(format!(
@@ -2063,6 +2075,7 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
         publication?;
+        record_successful_rebuild(callgraph_dir, project_key, project_root, Instant::now());
         Ok((stats, generation))
     }
 
@@ -2169,27 +2182,6 @@ impl CallGraphStore {
             conn,
         );
         Ok(OpenedStore { store, root_repair })
-    }
-
-    fn borrow_only_empty(
-        callgraph_dir: PathBuf,
-        project_root: PathBuf,
-        project_key: String,
-    ) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        initialize_schema(&conn)?;
-        conn.pragma_update(None, "query_only", true)?;
-        Ok(Self::from_connection(
-            project_root,
-            project_key.clone(),
-            callgraph_dir.join(format!("{project_key}.borrow-only")),
-            callgraph_dir,
-            false,
-            None,
-            None,
-            None,
-            conn,
-        ))
     }
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
@@ -3283,10 +3275,6 @@ impl CallGraphStore {
 impl ReadonlyCallGraphStore {
     fn from_inner(inner: CallGraphStore) -> Self {
         Self { inner }
-    }
-
-    fn into_inner(self) -> CallGraphStore {
-        self.inner
     }
 
     pub fn project_root(&self) -> &Path {
@@ -4456,6 +4444,65 @@ pub fn live_callgraph_edge_snapshot(
         }
     }
     Ok(edges)
+}
+
+fn rebuild_cooldown_records() -> &'static Mutex<HashMap<RebuildCooldownKey, RebuildCooldownRecord>>
+{
+    SUCCESSFUL_REBUILDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rebuild_cooldown_key(callgraph_dir: &Path, project_key: &str) -> RebuildCooldownKey {
+    RebuildCooldownKey {
+        callgraph_dir: std::fs::canonicalize(callgraph_dir)
+            .unwrap_or_else(|_| callgraph_dir.to_path_buf()),
+        project_key: project_key.to_string(),
+    }
+}
+
+fn rebuild_cooldown_denial(
+    callgraph_dir: &Path,
+    project_key: &str,
+    project_root: &Path,
+    now: Instant,
+) -> Option<(PathBuf, Duration)> {
+    let key = rebuild_cooldown_key(callgraph_dir, project_key);
+    let records = rebuild_cooldown_records()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let record = records.get(&key)?;
+    if record.project_root == project_root || !record.cross_root_cooldown_armed {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(record.published_at);
+    (elapsed < REBUILD_COOLDOWN).then(|| (record.project_root.clone(), REBUILD_COOLDOWN - elapsed))
+}
+
+fn record_successful_rebuild(
+    callgraph_dir: &Path,
+    project_key: &str,
+    project_root: &Path,
+    published_at: Instant,
+) {
+    let key = rebuild_cooldown_key(callgraph_dir, project_key);
+    let mut records = rebuild_cooldown_records()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if records.len() >= 4_096 && !records.contains_key(&key) {
+        if let Some(evict) = records.keys().next().cloned() {
+            records.remove(&evict);
+        }
+    }
+    let cross_root_cooldown_armed = records.get(&key).is_some_and(|previous| {
+        previous.cross_root_cooldown_armed || previous.project_root != project_root
+    });
+    records.insert(
+        key,
+        RebuildCooldownRecord {
+            project_root: project_root.to_path_buf(),
+            published_at,
+            cross_root_cooldown_armed,
+        },
+    );
 }
 
 fn acquire_writer_lease(
@@ -10848,12 +10895,10 @@ mod refresh_worker_tests {
         clear_callgraph_refresh_worker_test_seam(&root);
     }
 
-    #[test]
-    fn forced_rebuild_without_writer_capability_cannot_report_old_store_as_ready() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
+    fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String, PathBuf) {
         let temp = tempdir().unwrap();
         let main = temp.path().join("main");
-        let root = temp.path().join("worktree");
+        let worktree = temp.path().join("worktree");
         fs::create_dir_all(&main).unwrap();
         let mut git = std::process::Command::new("git");
         assert!(
@@ -10862,8 +10907,7 @@ mod refresh_worker_tests {
                 .unwrap()
                 .success()
         );
-        let source = main.join("lib.rs");
-        fs::write(&source, "pub fn marker() {}\n").unwrap();
+        fs::write(main.join("lib.rs"), "pub fn marker() {}\n").unwrap();
         for args in [
             vec![
                 "-C",
@@ -10888,27 +10932,210 @@ mod refresh_worker_tests {
                 .unwrap()
                 .success());
         }
-        let mut worktree = std::process::Command::new("git");
+        let mut add_worktree = std::process::Command::new("git");
         assert!(crate::test_env::apply_hermetic_git_env(
-            worktree
+            add_worktree
                 .arg("-C")
                 .arg(&main)
                 .args(["worktree", "add", "--detach"])
-                .arg(&root),
+                .arg(&worktree),
         )
         .status()
         .unwrap()
         .success());
+        let main = fs::canonicalize(main).unwrap();
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&main);
+        assert_eq!(
+            crate::search_index::artifact_cache_key(&worktree),
+            project_key
+        );
+        let callgraph_dir = temp.path().join("callgraph").join(&project_key);
+        (temp, main, worktree, project_key, callgraph_dir)
+    }
 
+    #[test]
+    fn linked_worktree_never_acquires_writer_or_publishes_any_build_path() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, _main, root, project_key, callgraph_dir) = linked_worktree_fixture();
+        crate::root_cache::configure_artifact_access(&root, &project_key, true);
+        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+        let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publications_for_observer = Arc::clone(&publications);
+        set_cold_build_swap_observer(Some(Arc::new(move |_, _| {
+            publications_for_observer.fetch_add(1, AtomicOrdering::SeqCst);
+        })));
+        let source = root.join("lib.rs");
+
+        let open_error = CallGraphStore::open(callgraph_dir.clone(), root.clone())
+            .expect_err("borrow-only writable open must remain unavailable");
+        assert!(matches!(open_error, CallGraphStoreError::Unavailable(_)));
+        assert!(
+            CallGraphStore::open_ready_repairing(callgraph_dir.clone(), root.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            CallGraphStore::open_ready_no_rebuild(callgraph_dir.clone(), root.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            CallGraphStore::cold_build_with_lease(
+                callgraph_dir.clone(),
+                root.clone(),
+                std::slice::from_ref(&source),
+            ),
+            Err(CallGraphStoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            CallGraphStore::ensure_built_with_lease(
+                callgraph_dir.clone(),
+                root.clone(),
+                std::slice::from_ref(&source),
+            ),
+            Err(CallGraphStoreError::Unavailable(_))
+        ));
+        let force_error = CallGraphStore::force_cold_build_with_lease_chunked(
+            callgraph_dir.clone(),
+            root.clone(),
+            &[source],
+            1,
+        )
+        .expect_err("borrow-only forced rebuild must remain unsatisfied");
+        set_cold_build_swap_observer(None);
+
+        assert!(matches!(force_error, CallGraphStoreError::Unavailable(_)));
+        assert_eq!(
+            crate::root_cache::writer_lease_acquisition_count_for_test(
+                crate::root_cache::RootCacheDomain::Callgraph,
+                &project_key,
+                &root,
+            ),
+            0
+        );
+        assert_eq!(publications.load(AtomicOrdering::SeqCst), 0);
+        assert!(!pointer_path(&callgraph_dir, &project_key).exists());
+    }
+
+    #[test]
+    fn owner_and_linked_worktree_alternation_rebuilds_storm_generation_once() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, owner, worktree, project_key, callgraph_dir) = linked_worktree_fixture();
+        crate::root_cache::configure_artifact_access(&owner, &project_key, false);
+        crate::root_cache::configure_artifact_access(&worktree, &project_key, true);
+        let source = owner.join("lib.rs");
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            callgraph_dir.clone(),
+            owner.clone(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let sqlite_path = store.sqlite_path().to_path_buf();
+        drop(store);
+
+        let conn = Connection::open(&sqlite_path).unwrap();
+        conn.execute(
+            "UPDATE backend_file_state SET workspace_root = ?1",
+            [worktree.display().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publications_for_observer = Arc::clone(&publications);
+        set_cold_build_swap_observer(Some(Arc::new(move |_, _| {
+            publications_for_observer.fetch_add(1, AtomicOrdering::SeqCst);
+        })));
+        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+
+        let repaired = CallGraphStore::open_ready_repairing(callgraph_dir.clone(), owner.clone())
+            .unwrap()
+            .expect("owner should purge the storm-era worktree root");
+        drop(repaired);
+        for _ in 0..3 {
+            let borrower = CallGraphStore::open_readonly(callgraph_dir.clone(), worktree.clone())
+                .unwrap()
+                .expect("linked worktree should borrow the owner generation");
+            drop(borrower);
+            assert!(
+                CallGraphStore::open_ready_repairing(callgraph_dir.clone(), worktree.clone())
+                    .unwrap()
+                    .is_none()
+            );
+            let owner_store =
+                CallGraphStore::open_ready_repairing(callgraph_dir.clone(), owner.clone())
+                    .unwrap()
+                    .expect("owner generation should remain ready");
+            drop(owner_store);
+        }
+        set_cold_build_swap_observer(None);
+
+        assert_eq!(
+            publications.load(AtomicOrdering::SeqCst),
+            1,
+            "the owner performs one expected post-storm purge and alternation stays read-only"
+        );
+        assert_eq!(
+            crate::root_cache::writer_lease_acquisition_count_for_test(
+                crate::root_cache::RootCacheDomain::Callgraph,
+                &project_key,
+                &worktree,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn rebuild_cooldown_records_only_successful_publication_per_cache_key() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("owner");
+        let other_root = temp.path().join("other");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other_root).unwrap();
+        let source = root.join("lib.rs");
+        fs::write(&source, "pub fn marker() {}\n").unwrap();
         let project_key = crate::search_index::artifact_cache_key(&root);
         let callgraph_dir = temp.path().join("callgraph").join(&project_key);
-        crate::root_cache::configure_artifact_access(&root, &project_key, true);
-        let source = root.join("lib.rs");
-        let error =
-            CallGraphStore::force_cold_build_with_lease_chunked(callgraph_dir, root, &[source], 1)
-                .expect_err("borrow-only forced rebuild must remain unsatisfied");
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let cooldown_key = rebuild_cooldown_key(&callgraph_dir, &project_key);
+        rebuild_cooldown_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cooldown_key);
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let stale_epoch = epoch.current();
+        epoch.next();
 
-        assert!(matches!(error, CallGraphStoreError::Unavailable(_)));
+        let failed = with_publish_epoch(epoch, stale_epoch, || {
+            CallGraphStore::cold_build_with_lease(
+                callgraph_dir.clone(),
+                root.clone(),
+                std::slice::from_ref(&source),
+            )
+        });
+        assert!(matches!(failed, Err(CallGraphStoreError::Superseded)));
+        assert!(
+            rebuild_cooldown_denial(&callgraph_dir, &project_key, &other_root, Instant::now(),)
+                .is_none()
+        );
+
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            callgraph_dir.clone(),
+            root.clone(),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        drop(store);
+        assert!(
+            rebuild_cooldown_denial(&callgraph_dir, &project_key, &other_root, Instant::now(),)
+                .is_none()
+        );
+
+        record_successful_rebuild(&callgraph_dir, &project_key, &other_root, Instant::now());
+        assert!(
+            rebuild_cooldown_denial(&callgraph_dir, &project_key, &root, Instant::now(),).is_some()
+        );
     }
 
     #[test]

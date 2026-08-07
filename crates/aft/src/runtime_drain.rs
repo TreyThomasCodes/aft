@@ -3133,6 +3133,8 @@ mod tests {
             },
         );
         ctx.set_canonical_cache_root(project_root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
         let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
             ctx.callgraph_store_dir(),
             project_root,
@@ -3193,6 +3195,8 @@ mod tests {
             },
         );
         ctx.set_canonical_cache_root(project_root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
         let callgraph_dir = ctx.callgraph_store_dir();
         let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
             callgraph_dir.clone(),
@@ -3257,6 +3261,8 @@ mod tests {
             },
         );
         ctx.set_canonical_cache_root(project_root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
         let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
             ctx.callgraph_store_dir(),
             project_root,

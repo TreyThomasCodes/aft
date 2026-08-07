@@ -170,7 +170,6 @@ impl ModuleProcess {
             .arg("--subc")
             .arg(conn_path)
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
-            .env("AFT_TEST_ALLOW_WORKTREE_STORE_BUILD", "1")
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
             .stdin(Stdio::null())
