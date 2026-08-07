@@ -170,7 +170,14 @@ fn write_publish_diagnostics_versioned(
 }
 
 fn opened_diagnostics() -> Value {
-    let warming = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1");
+    let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
+    if server_status_mode.as_deref() == Some("empty_then_quiescent") {
+        return json!([]);
+    }
+    let warming = matches!(
+        server_status_mode.as_deref(),
+        Some("1" | "publish_then_quiescent")
+    );
     let error_message = if warming {
         "warming garbage diagnostic"
     } else {
@@ -614,7 +621,10 @@ fn main() -> io::Result<()> {
                 "initialized" => {
                     let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
                     if server_status_mode.as_deref() != Some("disabled") {
-                        let warming = server_status_mode.as_deref() == Some("1");
+                        let warming = matches!(
+                            server_status_mode.as_deref(),
+                            Some("1" | "publish_then_quiescent" | "empty_then_quiescent")
+                        );
                         write_notification(
                             &mut writer,
                             &Notification::new(
@@ -675,6 +685,22 @@ fn main() -> io::Result<()> {
                         opened_diagnostics(),
                         version,
                     )?;
+                    if matches!(
+                        std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref(),
+                        Some("publish_then_quiescent" | "empty_then_quiescent")
+                    ) {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new(
+                                "experimental/serverStatus",
+                                Some(json!({
+                                    "health": "ok",
+                                    "quiescent": true,
+                                    "message": "workspace analysis is ready",
+                                })),
+                            ),
+                        )?;
+                    }
                 }
                 "textDocument/didChange" => {
                     let uri = document_uri(&params);

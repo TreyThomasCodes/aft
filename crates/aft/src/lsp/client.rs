@@ -469,8 +469,8 @@ impl LspClient {
     }
 
     /// Record a rust-analyzer server-status transition. Returns true only for
-    /// the first transition to quiescent, which is when cached warming reports
-    /// must be invalidated before later publishes become authoritative.
+    /// the first transition to quiescent, which is the completion boundary that
+    /// makes each latest warming report authoritative.
     pub fn set_rust_analyzer_quiescent(&mut self, quiescent: bool) -> bool {
         if !matches!(&self.kind, ServerKind::Rust) || !quiescent || self.rust_analyzer_quiescent {
             return false;

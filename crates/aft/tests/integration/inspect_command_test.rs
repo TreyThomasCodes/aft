@@ -2479,6 +2479,155 @@ fn close_with_lsp(ctx: &AppContext, file: &Path) {
     );
 }
 
+fn open_with_server_status_mode(ctx: &AppContext, file: &Path, mode: &str) {
+    configure_fake_rust_lsp(ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", mode);
+    let config = ctx.config().clone();
+    ctx.lsp()
+        .notify_file_changed(file, "fn main() {}\n", &config)
+        .expect("start fake rust-analyzer");
+}
+
+fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let ready = {
+            let mut lsp = ctx.lsp();
+            lsp.drain_events();
+            lsp.has_diagnostic_report_for_file(file)
+                && (!lsp.provisional_server_keys().is_empty()) == provisional
+        };
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for provisional={provisional} LSP report for {}",
+            file.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn rust_quiescence_promotes_latest_publish_for_warm_inspect_and_status_bar() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-settle\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    open_with_server_status_mode(&ctx, &file, "publish_then_quiescent");
+    wait_for_lsp_report_state(&ctx, &file, false);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-after-settle",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "topK": 10,
+        }),
+    );
+    let summary = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(1));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(1));
+    assert!(
+        !summary.contains_key("status"),
+        "quiescent diagnostics must be complete: {response:#}"
+    );
+    assert_eq!(
+        response["details"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics details")
+            .len(),
+        2
+    );
+
+    ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+    let counts = ctx.status_bar_counts().expect("status bar populated");
+    assert_eq!((counts.errors, counts.warnings), (1, 1));
+}
+
+#[test]
+fn rust_quiescence_promotes_empty_latest_publish_as_checked_clean() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-clean-settle\"\n",
+    );
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    open_with_server_status_mode(&ctx, &file, "empty_then_quiescent");
+    wait_for_lsp_report_state(&ctx, &file, false);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-empty-diagnostics-after-settle",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+        }),
+    );
+    let summary = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
+    assert!(
+        !summary.contains_key("status"),
+        "latest empty publish must prove checked-clean: {response:#}"
+    );
+    assert!(response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details")
+        .is_empty());
+}
+
+#[test]
+fn rust_pre_quiescence_publish_remains_provisional_and_uncounted() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-warming\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    open_with_server_status_mode(&ctx, &file, "1");
+    wait_for_lsp_report_state(&ctx, &file, true);
+
+    ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
+    let counts = ctx.status_bar_counts().expect("status bar populated");
+    assert_eq!(
+        (counts.errors, counts.warnings),
+        (0, 0),
+        "pre-quiescence reports must stay out of status-bar counts"
+    );
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-before-settle",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+        }),
+    );
+    let summary = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(
+        summary.get("status").and_then(Value::as_str),
+        Some("pending")
+    );
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        summary
+            .get("provisional_counts")
+            .and_then(|value| value.get("errors"))
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+}
+
 #[test]
 fn inspect_command_diagnostics_default_reports_warm_counts_and_details() {
     let (_temp_dir, root) = fixture_project();

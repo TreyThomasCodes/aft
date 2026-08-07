@@ -1903,8 +1903,9 @@ impl AppContext {
                         None => lsp.warm_error_warning_counts_with_provisional(),
                     };
                 // A warming report can replace an older authoritative entry. Do
-                // not turn that transient gap into E/W=0; keep the last values
-                // until the server publishes after quiescence.
+                // not turn that transient gap into E/W=0; keep the last values until
+                // the server first becomes quiescent, ending the warming phase and
+                // making its latest report authoritative.
                 let (errors, warnings) = if provisional {
                     previous_authoritative.unwrap_or((current_errors, current_warnings))
                 } else {
@@ -8120,7 +8121,7 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn status_bar_preserves_authoritative_counts_during_provisional_publish() {
+    fn status_bar_preserves_authoritative_counts_until_provisional_report_is_promoted() {
         use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
         use crate::lsp::registry::ServerKind;
         use crate::lsp::roots::ServerKey;
@@ -8133,14 +8134,14 @@ mod status_bar_tests {
             kind: ServerKind::Rust,
             root,
         };
-        let diagnostic = || StoredDiagnostic {
+        let diagnostic = |severity, message: &str| StoredDiagnostic {
             file: file.clone(),
             line: 1,
             column: 1,
             end_line: 1,
             end_column: 2,
-            severity: DiagnosticSeverity::Error,
-            message: "analyzer result".into(),
+            severity,
+            message: message.into(),
             code: None,
             source: None,
         };
@@ -8150,10 +8151,11 @@ mod status_bar_tests {
             lsp.diagnostics_store_mut_for_test().publish(
                 key.clone(),
                 file.clone(),
-                vec![diagnostic()],
+                vec![diagnostic(DiagnosticSeverity::Error, "settled error")],
             );
         }
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+        let counts = ctx.status_bar_counts().expect("populated");
+        assert_eq!((counts.errors, counts.warnings), (1, 0));
 
         {
             let mut lsp = ctx.lsp();
@@ -8161,36 +8163,34 @@ mod status_bar_tests {
                 .publish_full_with_provisional(
                     key.clone(),
                     file.clone(),
-                    vec![diagnostic()],
+                    vec![diagnostic(
+                        DiagnosticSeverity::Warning,
+                        "latest warming warning",
+                    )],
                     None,
                     None,
                     true,
                 );
         }
+        let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            1,
-            "warming diagnostics must not replace the last authoritative E count"
+            (counts.errors, counts.warnings),
+            (1, 0),
+            "pre-quiescence diagnostics must not replace authoritative counts"
         );
 
         {
             let mut lsp = ctx.lsp();
             assert!(lsp
                 .diagnostics_store_mut_for_test()
-                .mark_provisional_for_server_stale(&key));
+                .promote_provisional_for_server(&key));
         }
+        let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            1,
-            "invalidating warming entries must retain the last authoritative E count"
+            (counts.errors, counts.warnings),
+            (0, 1),
+            "the latest report becomes authoritative at quiescence"
         );
-
-        {
-            let mut lsp = ctx.lsp();
-            lsp.diagnostics_store_mut_for_test()
-                .publish(key, file.clone(), vec![diagnostic()]);
-        }
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
     }
 
     #[test]

@@ -723,14 +723,15 @@ impl DiagnosticsStore {
         changed
     }
 
-    /// Mark all provisional reports from one server stale when it first becomes
-    /// quiescent. The server will publish fresh reports after this transition;
-    /// keeping the old reports stale avoids treating them as revalidated.
-    pub fn mark_provisional_for_server_stale(&mut self, key: &ServerKey) -> bool {
+    /// Promote the latest provisional report for each file when its server reaches
+    /// quiescence. Each store entry is already the server's latest replacement
+    /// publish, so the settle boundary makes it authoritative without requiring a
+    /// later publish. Independent watcher staleness is preserved.
+    pub fn promote_provisional_for_server(&mut self, key: &ServerKey) -> bool {
         let mut changed = false;
         for ((stored_key, _), entry) in &mut self.entries {
-            if stored_key == key && entry.provisional && !entry.stale {
-                entry.stale = true;
+            if stored_key == key && entry.provisional {
+                entry.provisional = false;
                 changed = true;
             }
         }

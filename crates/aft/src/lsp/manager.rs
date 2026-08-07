@@ -1987,7 +1987,7 @@ impl LspManager {
             .get_mut(&key)
             .is_some_and(|client| client.set_rust_analyzer_quiescent(true));
         if became_quiescent {
-            self.diagnostics.mark_provisional_for_server_stale(&key);
+            self.diagnostics.promote_provisional_for_server(&key);
         }
     }
 
