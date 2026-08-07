@@ -98,7 +98,10 @@ jobs:
   pi-rpc-e2e:
     name: E2E (Pi RPC)
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    # 25: the job builds cargo + bun deps + dists before testing; with cold or
+    # degraded caches (e.g. after an Actions incident) 10 minutes cancels it
+    # mid-build — three v0.49.3 release attempts died exactly that way.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
