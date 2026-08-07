@@ -49,3 +49,13 @@ done
 
 echo "gated-push: preflight green — pushing to $remote $branch"
 git push "$remote" "$branch"
+
+# Outcome check, not just command check: a push can report success through a
+# wrapper (or fail on auth) while origin never moved. Non-empty @{u}..HEAD
+# after a "successful" push is the tell that survives any false green.
+git fetch -q "$remote" "$branch"
+unpushed=$(git rev-list --count "$remote/$branch".."$branch")
+if [[ "$unpushed" -ne 0 ]]; then
+  echo "gated-push: push reported success but $unpushed commit(s) not on $remote/$branch — origin did not move" >&2
+  exit 1
+fi
