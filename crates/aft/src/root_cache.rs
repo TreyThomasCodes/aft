@@ -330,7 +330,13 @@ pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_o
 }
 
 fn canonical_root(project_root: &Path) -> PathBuf {
-    std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf())
+    // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
+    // registration can precede the directory's creation (and lookups can follow
+    // it), and on macOS the raw tempdir spelling (/var/...) differs from the
+    // canonical one (/private/var/...). Keying the access registry by whichever
+    // spelling happened to win the existence race made a registered root miss
+    // its own entry and fail closed.
+    canonical_process_lease_dir(project_root)
 }
 
 fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
@@ -1354,6 +1360,38 @@ mod tests {
             0
         );
         assert!(!writer_lease_path(&cache_dir).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_before_directory_creation_survives_alias_canonicalization() {
+        // Regression for the concurrent-acquire flake: configure registered the
+        // root before its directory existed (raw alias spelling), the first
+        // lease's create_dir_all made later lookups canonicalize to the real
+        // spelling, and the registered root missed its own capability entry.
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let real_parent = roots.path().join("real");
+        let alias_parent = roots.path().join("alias");
+        fs::create_dir_all(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+
+        let root = alias_parent.join("pre-registered");
+        configure_artifact_access(&root, "pre-registered", false);
+        fs::create_dir_all(&root).unwrap();
+
+        let cache_dir = storage.path().join("inspect").join("pre-registered");
+        let lease = WriterLease::acquire_shared(
+            RootCacheDomain::Inspect,
+            &cache_dir,
+            "pre-registered",
+            &root,
+        )
+        .unwrap();
+        assert!(
+            lease.is_some(),
+            "a root registered before its directory existed must keep its capability"
+        );
     }
 
     #[test]
