@@ -326,24 +326,23 @@ EOF
       expect(response.format_skipped_reason).toBe("formatter_excluded_path");
     }, 20_000);
 
-    test("patch with formatter timeout", async () => {
+    test("patch with formatter timeout succeeds with the unformatted patch", async () => {
       const { h, tools, sdkCtx } = await harness(BIOME_TS_PRESET, [hangingFormatterShim()], {
         format_on_edit: true,
         validate_on_edit: "syntax",
       });
 
-      await expect(
-        tools.apply_patch.execute(
-          {
-            patchText: `*** Begin Patch
+      const output = await tools.apply_patch.execute(
+        {
+          patchText: `*** Begin Patch
 *** Add File: timeout.ts
 +export    const   slow   = 1;
 *** End Patch`,
-          },
-          sdkCtx,
-        ),
-      ).rejects.toThrow("timed out");
+        },
+        sdkCtx,
+      );
 
+      expect(toolResultText(output)).toContain("Created timeout.ts");
       expect(await readTextFile(h.path("timeout.ts"))).toBe("export    const   slow   = 1;\n");
     }, 25_000);
 
