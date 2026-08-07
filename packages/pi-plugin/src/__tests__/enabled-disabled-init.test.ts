@@ -40,6 +40,9 @@ describe.serial("Pi enabled config toggle", () => {
     process.chdir(projectDir);
     const loggedProjectDir = process.cwd();
     releaseEnv = await acquireEnv({
+      // CI exports an ambient AFT_CACHE_DIR; it outranks XDG_CACHE_HOME in the
+      // shared cache resolver, so clear it for the sandbox to apply.
+      AFT_CACHE_DIR: undefined,
       HOME: join(tempDir, "home"),
       XDG_CONFIG_HOME: join(tempDir, "config"),
       XDG_CACHE_HOME: join(tempDir, "cache"),

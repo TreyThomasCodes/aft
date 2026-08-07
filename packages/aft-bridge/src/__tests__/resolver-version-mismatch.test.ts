@@ -90,6 +90,9 @@ describe("findBinarySync versioned cache validation", () => {
     // Bun runs test files concurrently in one process. Keep resolver env
     // overrides guarded for the full test so other files cannot clobber them.
     releaseEnv = await acquireEnv({
+      // CI exports an ambient AFT_CACHE_DIR (highest precedence in the shared
+      // cache resolver); clear it so the XDG sandbox below actually applies.
+      AFT_CACHE_DIR: undefined,
       XDG_CACHE_HOME: tmpDir,
       PATH: "",
       HOME: tmpDir,
@@ -151,6 +154,7 @@ describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () 
     const pathDir = join(tmpDir, "path-bin");
     mkdirSync(pathDir, { recursive: true });
     releaseEnv = await acquireEnv({
+      AFT_CACHE_DIR: undefined,
       XDG_CACHE_HOME: join(tmpDir, "cache"),
       PATH: `${pathDir}:${process.env.PATH ?? ""}`,
       HOME: join(tmpDir, "home"),

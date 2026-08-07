@@ -52,6 +52,9 @@ describe.serial("Pi migration bootstrap", () => {
     const home = join(tempDir, "home");
     const xdgCacheHome = join(tempDir, "cache");
     releaseEnv = await acquireEnv({
+      // CI exports an ambient AFT_CACHE_DIR; it outranks XDG_CACHE_HOME in the
+      // shared cache resolver, so clear it for the sandbox to apply.
+      AFT_CACHE_DIR: undefined,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       HOME: home,
       XDG_DATA_HOME: join(tempDir, "data"),

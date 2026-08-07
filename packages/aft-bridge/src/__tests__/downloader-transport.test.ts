@@ -37,7 +37,9 @@ describe("downloadBinary hardened transport", () => {
     // platform-specific cache environment variables.
     const cacheEnv =
       process.platform === "win32" ? { LOCALAPPDATA: tmpDir } : { XDG_CACHE_HOME: tmpDir };
-    releaseEnv = await acquireEnv(cacheEnv);
+    // AFT_CACHE_DIR outranks the platform vars in the resolver, and CI exports
+    // one ambiently; clear it so the tmpDir sandbox wins.
+    releaseEnv = await acquireEnv({ AFT_CACHE_DIR: undefined, ...cacheEnv });
     originalFetch = globalThis.fetch;
   });
 

@@ -48,6 +48,9 @@ describe.serial("OpenCode migration bootstrap", () => {
     const xdgCacheHome = join(tempDir, "cache");
     const opencodeConfigDir = join(tempDir, "opencode-config");
     releaseEnv = await acquireEnv({
+      // CI exports an ambient AFT_CACHE_DIR; it outranks XDG_CACHE_HOME in the
+      // shared cache resolver, so clear it for the sandbox to apply.
+      AFT_CACHE_DIR: undefined,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       HOME: join(tempDir, "home"),
       XDG_DATA_HOME: join(tempDir, "data"),
