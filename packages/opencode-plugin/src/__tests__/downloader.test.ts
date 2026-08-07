@@ -23,7 +23,10 @@ function createCacheRoot() {
 function runDownloaderScript(script: string, env: Record<string, string> = {}) {
   const result = spawnSync(process.execPath, ["-e", script], {
     cwd: packageRoot,
-    env: { ...process.env, AFT_LOG_STDERR: "1", ...env },
+    // Other Bun test files use AFT_CACHE_DIR for their temporary roots. Clear
+    // that process-wide override so these subprocesses exercise the XDG root
+    // requested by each test instead of inheriting a concurrent fixture.
+    env: { ...process.env, AFT_CACHE_DIR: "", AFT_LOG_STDERR: "1", ...env },
     encoding: "utf8",
   });
 

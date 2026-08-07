@@ -33,8 +33,8 @@ describe("downloadBinary hardened transport", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "aft-download-test-"));
-    // getCacheDir() reads different env vars per platform:
-    // Windows → LOCALAPPDATA, POSIX → XDG_CACHE_HOME
+    // The shared cache resolver reads AFT_CACHE_DIR first, then the
+    // platform-specific cache environment variables.
     const cacheEnv =
       process.platform === "win32" ? { LOCALAPPDATA: tmpDir } : { XDG_CACHE_HOME: tmpDir };
     releaseEnv = await acquireEnv(cacheEnv);

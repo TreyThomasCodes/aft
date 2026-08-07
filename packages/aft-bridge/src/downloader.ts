@@ -28,11 +28,11 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { getAftBinaryCacheDir } from "./cache-paths.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 
 const REPO = "cortexkit/aft";
@@ -88,17 +88,8 @@ function isExpectedCachedBinary(binaryPath: string, tag: string): boolean {
   return false;
 }
 
-/** Get the cache directory, respecting XDG_CACHE_HOME / LOCALAPPDATA. */
-export function getCacheDir(): string {
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || process.env.APPDATA;
-    const base = localAppData || join(homedir(), "AppData", "Local");
-    return join(base, "aft", "bin");
-  }
-
-  const base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
-  return join(base, "aft", "bin");
-}
+/** Keep getCacheDir as an alias for getAftBinaryCacheDir so existing callers using the older name continue to work. */
+export { getAftBinaryCacheDir as getCacheDir } from "./cache-paths.js";
 
 /** Binary name for the current platform. */
 export function getBinaryName(): string {
@@ -111,7 +102,7 @@ export function getBinaryName(): string {
  *  because it can be overwritten by other instances, corrupting running processes. */
 export function getCachedBinaryPath(version?: string): string | null {
   if (!version) return null;
-  const binaryPath = join(getCacheDir(), version, getBinaryName());
+  const binaryPath = join(getAftBinaryCacheDir(), version, getBinaryName());
   return existsSync(binaryPath) ? binaryPath : null;
 }
 
@@ -151,7 +142,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   const tag = rawTag.startsWith("v") ? rawTag : `v${rawTag}`;
 
   // Version-specific cache: ~/.cache/aft/bin/<tag>/aft
-  const versionedCacheDir = join(getCacheDir(), tag);
+  const versionedCacheDir = join(getAftBinaryCacheDir(), tag);
   const binaryName = getBinaryName();
   const binaryPath = join(versionedCacheDir, binaryName);
 

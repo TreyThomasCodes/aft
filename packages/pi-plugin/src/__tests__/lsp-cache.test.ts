@@ -3,8 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { getAftCacheRoot, getAftLspPackagesDir } from "../../../aft-bridge/src/cache-paths.js";
 import {
   acquireInstallLock,
+  aftCacheBase,
   isInstalled,
   lspBinaryPath,
   lspBinDir,
@@ -46,6 +48,11 @@ function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
 }
 
 describe("lsp-cache layout", () => {
+  test("delegates cache paths to aft-bridge", () => {
+    expect(aftCacheBase()).toBe(getAftCacheRoot());
+    expect(lspCacheRoot()).toBe(getAftLspPackagesDir());
+  });
+
   test("lspCacheRoot honors AFT_CACHE_DIR", () => {
     expect(lspCacheRoot()).toBe(join(tempCache, "lsp-packages"));
   });

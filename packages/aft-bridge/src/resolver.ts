@@ -14,7 +14,8 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log, warn } from "./active-logger.js";
-import { ensureBinary, getCacheDir, readBinaryVersion } from "./downloader.js";
+import { getAftBinaryCacheDir } from "./cache-paths.js";
+import { ensureBinary, readBinaryVersion } from "./downloader.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 type EnsureBinary = typeof ensureBinary;
@@ -43,7 +44,7 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     const version = knownVersion ?? readBinaryVersion(npmBinaryPath);
     if (!version) return null;
     const tag = version.startsWith("v") ? version : `v${version}`;
-    const cacheDir = getCacheDir();
+    const cacheDir = getAftBinaryCacheDir();
     const versionedDir = join(cacheDir, tag);
     const ext = process.platform === "win32" ? ".exe" : "";
     const cachedPath = join(versionedDir, `aft${ext}`);
@@ -90,18 +91,8 @@ function homeDirFromEnv(env: ResolverEnv): string {
   return (process.platform === "win32" ? env.USERPROFILE || env.HOME : env.HOME) || homedir();
 }
 
-function cacheDirFromEnv(env: ResolverEnv): string {
-  if (process.platform === "win32") {
-    const base = env.LOCALAPPDATA || env.APPDATA || join(homeDirFromEnv(env), "AppData", "Local");
-    return join(base, "aft", "bin");
-  }
-
-  const base = env.XDG_CACHE_HOME || join(homeDirFromEnv(env), ".cache");
-  return join(base, "aft", "bin");
-}
-
 function cachedBinaryPathFromEnv(version: string, env: ResolverEnv, ext: string): string | null {
-  const binaryPath = join(cacheDirFromEnv(env), version, `aft${ext}`);
+  const binaryPath = join(getAftBinaryCacheDir(env), version, `aft${ext}`);
   return existsSync(binaryPath) ? binaryPath : null;
 }
 

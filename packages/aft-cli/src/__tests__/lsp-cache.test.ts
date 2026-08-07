@@ -17,7 +17,17 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import {
+  getAftBinaryCacheDir as sharedBinaryCacheDir,
+  getAftLspBinariesDir as sharedLspBinariesDir,
+  getAftLspPackagesDir as sharedLspPackagesDir,
+} from "../../../aft-bridge/src/cache-paths.js";
 import { clearLspCaches, getLspCacheReport } from "../lib/lsp-cache.js";
+import {
+  getAftBinaryCacheDir as cliBinaryCacheDir,
+  getAftLspBinariesDir as cliLspBinariesDir,
+  getAftLspPackagesDir as cliLspPackagesDir,
+} from "../lib/paths.js";
 
 let tmpRoot = "";
 let releaseEnv: (() => void) | undefined;
@@ -51,6 +61,12 @@ function writeFakeGithubInstall(id: string, sizeBytes: number): void {
 }
 
 describe("getLspCacheReport", () => {
+  test("CLI cache paths delegate to aft-bridge", () => {
+    expect(cliBinaryCacheDir()).toBe(sharedBinaryCacheDir());
+    expect(cliLspPackagesDir()).toBe(sharedLspPackagesDir());
+    expect(cliLspBinariesDir()).toBe(sharedLspBinariesDir());
+  });
+
   test("returns empty report when neither subtree exists", () => {
     const report = getLspCacheReport();
     expect(report.npm.entries).toHaveLength(0);

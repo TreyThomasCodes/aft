@@ -24,34 +24,18 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { getAftCacheRoot, getAftLspPackagesDir } from "@cortexkit/aft-bridge";
 import { log, warn } from "./logger.js";
 
-/**
- * Root directory that holds all AFT-installed LSP packages.
- *
- * Honors `AFT_CACHE_DIR` for tests so suites do not pollute the real
- * user cache. Falls back to the platform cache root used by the CLI:
- * `%LOCALAPPDATA%/aft` on Windows, `$XDG_CACHE_HOME/aft` or `~/.cache/aft`
- * elsewhere.
- */
+/** Keep aftCacheBase as an alias for getAftCacheRoot so existing callers using the older name continue to work. */
 export function aftCacheBase(): string {
-  const override = process.env.AFT_CACHE_DIR;
-  if (override && override.length > 0) return override;
-
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || process.env.APPDATA;
-    const base = localAppData || join(homedir(), "AppData", "Local");
-    return join(base, "aft");
-  }
-
-  const base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
-  return join(base, "aft");
+  return getAftCacheRoot();
 }
 
+/** Root directory for npm-installed LSP packages. */
 export function lspCacheRoot(): string {
-  return join(aftCacheBase(), "lsp-packages");
+  return getAftLspPackagesDir();
 }
 
 /** Directory for one specific npm package's install. */

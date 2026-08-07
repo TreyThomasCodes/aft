@@ -15,6 +15,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { getAftLspBinariesDir } from "../../../aft-bridge/src/cache-paths.js";
 import {
   discoverRelevantGithubServers,
   ghBinaryPath,
@@ -109,6 +110,14 @@ describe("discoverRelevantGithubServers", () => {
 });
 
 describe("isGithubInstalled", () => {
+  test("GitHub cache paths use the shared LSP binary root", () => {
+    const clangd = findGithubServerById("clangd");
+    if (!clangd) throw new Error("clangd missing");
+    expect(ghBinaryPath(clangd, "linux")).toBe(
+      join(getAftLspBinariesDir(), clangd.id, "bin", clangd.binary),
+    );
+  });
+
   test("false when binary file missing", () => {
     const clangd = findGithubServerById("clangd");
     if (!clangd) throw new Error("clangd missing");

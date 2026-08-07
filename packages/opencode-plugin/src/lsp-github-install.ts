@@ -51,9 +51,9 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { getAftLspBinariesDir } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
-  aftCacheBase,
   readInstalledMetaIn,
   readVersionCheck,
   shouldRecheckVersion,
@@ -79,7 +79,7 @@ import { hasRootMarker, relevantExtensionsInProject } from "./lsp-project-releva
 /* ─────────────────────────── cache layout ─────────────────────────── */
 
 function ghCacheRoot(): string {
-  return join(aftCacheBase(), "lsp-binaries");
+  return getAftLspBinariesDir();
 }
 
 function ghPackageDir(spec: GithubServerSpec): string {

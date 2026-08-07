@@ -40,6 +40,13 @@ export {
   isBridgeTransportTimeout,
   tagStderrLine,
 } from "./bridge.js";
+// --- cache paths and binary resolution ---
+export {
+  getAftBinaryCacheDir,
+  getAftCacheRoot,
+  getAftLspBinariesDir,
+  getAftLspPackagesDir,
+} from "./cache-paths.js";
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
 export type { CallgraphFormatOptions, CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";
@@ -61,7 +68,6 @@ export {
 // --- config tiers ---
 export type { ConfigTier } from "./config-tiers.js";
 export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";
-// --- binary resolution ---
 export {
   downloadBinary,
   ensureBinary,
