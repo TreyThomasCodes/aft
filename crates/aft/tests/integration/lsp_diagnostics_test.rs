@@ -141,7 +141,27 @@ fn collect_watched_file_events_from_ctx(ctx: &AppContext) -> serde_json::Value {
             LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
         )
     })
-    .expect("timed out waiting for watched-file notification");
+    .unwrap_or_else(|| {
+        #[cfg(windows)]
+        panic!(
+            "timed out waiting for watched-file notification; routing trace:\n{}",
+            ctx.lsp().watched_file_notification_trace_for_test()
+        );
+        #[cfg(not(windows))]
+        panic!("timed out waiting for watched-file notification");
+    });
+
+    #[cfg(windows)]
+    {
+        let trace = ctx
+            .lsp()
+            .watched_file_notification_trace_for_test()
+            .to_string();
+        assert!(
+            trace.contains("outcome=sent"),
+            "fake server replied without a recorded watched-file send; routing trace:\n{trace}"
+        );
+    }
 
     match event {
         LspEvent::Notification { params, .. } => params.expect("watched event params"),

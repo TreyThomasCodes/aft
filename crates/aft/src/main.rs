@@ -312,19 +312,30 @@ fn main() {
         }
     }
 
+    let shutdown_started = Instant::now();
+    aft::slog_info!(
+        "shutdown phase=begin graceful_stdin={}",
+        graceful_stdin_shutdown
+    );
     pending.drain_on_shutdown();
+    aft::slog_info!("shutdown phase=pending_responses_drained");
     if graceful_stdin_shutdown {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
         flush_indexes_on_graceful_shutdown(&registry);
     }
+    aft::slog_info!("shutdown phase=runtime_cleanup_start");
     for runtime in registry.iter() {
         runtime.lsp().shutdown_all();
         runtime.bash_background().detach();
     }
+    aft::slog_info!("shutdown phase=runtime_cleanup_done");
     aft::artifact_owner::shutdown_heartbeat_thread();
-    aft::slog_info!("stdin closed, shutting down");
+    aft::slog_info!(
+        "shutdown phase=complete elapsed_ms={}",
+        shutdown_started.elapsed().as_millis()
+    );
 }
 
 fn drain_runtime_events(registry: &RuntimeRegistry) {
@@ -350,8 +361,19 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
-    for runtime in registry.iter() {
-        let _ = runtime.flush_search_index_on_graceful_shutdown();
+    for (runtime_index, runtime) in registry.iter().enumerate() {
+        let started = Instant::now();
+        aft::slog_info!(
+            "shutdown phase=search_index_flush_start runtime={}",
+            runtime_index
+        );
+        let flushed = runtime.flush_search_index_on_graceful_shutdown();
+        aft::slog_info!(
+            "shutdown phase=search_index_flush_done runtime={} flushed={} elapsed_ms={}",
+            runtime_index,
+            flushed,
+            started.elapsed().as_millis()
+        );
     }
     // Tests run in parallel, but callgraph refreshes use one process-wide
     // worker. Without this lock, one test's graceful shutdown can reject
@@ -360,7 +382,14 @@ fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+    let started = Instant::now();
+    aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
+    let drained = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+    aft::slog_info!(
+        "shutdown phase=callgraph_refresh_flush_done drained={} elapsed_ms={}",
+        drained,
+        started.elapsed().as_millis()
+    );
 }
 
 fn drain_runtime_events_and_write_pending(

@@ -432,8 +432,24 @@ fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
         "should not warn for non-auto-installable file-discovered LSP: {configure:?}"
     );
 
-    let shutdown = aft.shutdown();
+    let (shutdown, stderr) = aft.stderr_output();
     assert!(shutdown.success());
+    for phase in [
+        "begin graceful_stdin=true",
+        "pending_responses_drained",
+        "search_index_flush_start",
+        "search_index_flush_done",
+        "callgraph_refresh_flush_start",
+        "callgraph_refresh_flush_done",
+        "runtime_cleanup_start",
+        "runtime_cleanup_done",
+        "complete",
+    ] {
+        assert!(
+            stderr.contains(&format!("shutdown phase={phase}")),
+            "empty-PATH configure missed shutdown phase {phase}; stderr:\n{stderr}"
+        );
+    }
 }
 
 #[test]

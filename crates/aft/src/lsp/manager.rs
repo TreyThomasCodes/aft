@@ -30,6 +30,14 @@ use crate::slog_error;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 
+fn server_key_for_definition(def: &ServerDef, file_path: &Path) -> Option<ServerKey> {
+    def.workspace_root_for_file(file_path)
+        .map(|root| ServerKey {
+            kind: def.kind.clone(),
+            root,
+        })
+}
+
 /// Outcome of attempting to ensure a server is running for a single matching
 /// `ServerDef`. Returned per matching server so the caller can report exactly
 /// what happened to the user instead of collapsing all failures into "no
@@ -274,6 +282,10 @@ pub struct LspManager {
     /// Server/root pairs for which we already logged that watched-file
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
+    /// The last watched-file routing decision, retained on Windows so a CI
+    /// timeout can distinguish a skipped send from a delayed fake-server reply.
+    #[cfg(windows)]
+    last_watched_file_notification_trace: String,
     /// Tracks PIDs of spawned LSP child processes so the signal handler can
     /// kill them on SIGTERM/SIGINT before aft exits, preventing orphans.
     /// Defaults to empty; production wires this from `AppContext`.
@@ -294,6 +306,9 @@ impl LspManager {
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
+            #[cfg(windows)]
+            last_watched_file_notification_trace: "no watched-file notification attempted"
+                .to_string(),
             child_registry: LspChildRegistry::new(),
         }
     }
@@ -371,20 +386,11 @@ impl LspManager {
     }
 
     fn running_server_keys_for_file(&self, file_path: &Path, config: &Config) -> Vec<ServerKey> {
-        let mut keys = Vec::new();
-        for def in servers_for_file(file_path, config) {
-            let Some(root) = def.workspace_root_for_file(file_path) else {
-                continue;
-            };
-            let key = ServerKey {
-                kind: def.kind.clone(),
-                root,
-            };
-            if self.clients.contains_key(&key) {
-                keys.push(key);
-            }
-        }
-        keys
+        servers_for_file(file_path, config)
+            .into_iter()
+            .filter_map(|def| server_key_for_definition(&def, file_path))
+            .filter(|key| self.clients.contains_key(key))
+            .collect()
     }
 
     /// Detailed version of [`ensure_server_for_file`] that records every
@@ -406,7 +412,7 @@ impl LspManager {
             let server_id = def.kind.id_str().to_string();
             let server_name = def.name.to_string();
 
-            let Some(root) = def.workspace_root_for_file(file_path) else {
+            let Some(key) = server_key_for_definition(&def, file_path) else {
                 outcomes.attempts.push(ServerAttempt {
                     server_id,
                     server_name,
@@ -415,11 +421,6 @@ impl LspManager {
                     },
                 });
                 continue;
-            };
-
-            let key = ServerKey {
-                kind: def.kind.clone(),
-                root,
             };
 
             if !self.clients.contains_key(&key) {
@@ -756,7 +757,18 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
+        #[cfg(windows)]
+        let mut trace = vec![format!(
+            "input_paths={paths:?}; active_keys={:?}",
+            self.clients.keys().collect::<Vec<_>>()
+        )];
+
         if paths.is_empty() {
+            #[cfg(windows)]
+            {
+                trace.push("outcome=no-input-paths".to_string());
+                self.last_watched_file_notification_trace = trace.join("\n");
+            }
             return Ok(());
         }
 
@@ -765,8 +777,14 @@ impl LspManager {
             let canonical_path = resolve_for_lsp_uri(path);
             canonical_events.push((canonical_path, *typ));
         }
+        #[cfg(windows)]
+        trace.push(format!("resolved_events={canonical_events:?}"));
 
         let keys: Vec<ServerKey> = self.clients.keys().cloned().collect();
+        #[cfg(windows)]
+        if keys.is_empty() {
+            trace.push("outcome=no-active-client".to_string());
+        }
         for key in keys {
             let mut changes = Vec::new();
             for (path, typ) in &canonical_events {
@@ -777,6 +795,8 @@ impl LspManager {
             }
 
             if changes.is_empty() {
+                #[cfg(windows)]
+                trace.push(format!("key={key:?}; outcome=outside-root"));
                 continue;
             }
 
@@ -789,6 +809,10 @@ impl LspManager {
                 let supports_static_watched_files = client.supports_watched_files();
                 let has_dynamic_registration = client.has_watched_file_registration();
                 if !(supports_static_watched_files || has_dynamic_registration) {
+                    #[cfg(windows)]
+                    trace.push(format!(
+                        "key={key:?}; changes={changes:?}; outcome=unsupported; static={supports_static_watched_files}; dynamic={has_dynamic_registration}"
+                    ));
                     if self.watched_file_skip_logged.insert(key.clone()) {
                         log::debug!(
                             "skipping didChangeWatchedFiles for {:?} (not supported or registered)",
@@ -797,12 +821,34 @@ impl LspManager {
                     }
                     continue;
                 }
-                client.send_notification::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams {
-                    changes,
-                })?;
+                #[cfg(windows)]
+                trace.push(format!("key={key:?}; changes={changes:?}; action=send"));
+                let send_result = client.send_notification::<DidChangeWatchedFiles>(
+                    DidChangeWatchedFilesParams { changes },
+                );
+                #[cfg(windows)]
+                trace.push(format!(
+                    "key={key:?}; outcome={}",
+                    if send_result.is_ok() {
+                        "sent"
+                    } else {
+                        "send-error"
+                    }
+                ));
+                if let Err(error) = send_result {
+                    #[cfg(windows)]
+                    {
+                        self.last_watched_file_notification_trace = trace.join("\n");
+                    }
+                    return Err(error);
+                }
             }
         }
 
+        #[cfg(windows)]
+        {
+            self.last_watched_file_notification_trace = trace.join("\n");
+        }
         Ok(())
     }
 
@@ -1680,6 +1726,15 @@ impl LspManager {
         self.clients.keys().cloned().collect()
     }
 
+    /// Return the last watched-file routing decision for Windows CI timeout
+    /// diagnostics. The trace records whether a matching client was absent,
+    /// outside the changed path's root, unsupported, or successfully written.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    pub fn watched_file_notification_trace_for_test(&self) -> &str {
+        &self.last_watched_file_notification_trace
+    }
+
     pub fn get_diagnostics_for_file(&self, file: &Path) -> Vec<&StoredDiagnostic> {
         let normalized = normalize_lookup_path(file);
         self.diagnostics.for_file(&normalized)
@@ -2016,11 +2071,7 @@ impl LspManager {
 
     fn server_key_for_file(&self, file_path: &Path, config: &Config) -> Option<ServerKey> {
         for def in servers_for_file(file_path, config) {
-            let root = def.workspace_root_for_file(file_path)?;
-            let key = ServerKey {
-                kind: def.kind.clone(),
-                root,
-            };
+            let key = server_key_for_definition(&def, file_path)?;
             if self.clients.contains_key(&key) {
                 return Some(key);
             }
@@ -2273,6 +2324,65 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
         .collect();
     let key = format!("AFT_LSP_{suffix}_BINARY");
     std::env::var_os(key).map(PathBuf::from)
+}
+
+#[cfg(all(test, windows))]
+mod windows_server_key_tests {
+    use std::fs;
+    use std::os::windows::ffi::OsStrExt;
+
+    use super::{canonicalize_for_lsp, server_key_for_definition};
+    use crate::config::{Config, UserServerDef};
+    use crate::lsp::registry::servers_for_file;
+
+    #[test]
+    fn normalized_and_verbatim_inputs_produce_identical_server_key_material() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("workspace");
+        let source = root.join("src").join("main.customts");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
+        fs::write(root.join("custom-root.json"), "{}\n").expect("write root marker");
+        fs::write(&source, "export const value = 1;\n").expect("write source");
+
+        let config = Config {
+            project_root: Some(root),
+            lsp_servers: vec![UserServerDef {
+                id: "custom-ts".to_string(),
+                extensions: vec!["customts".to_string()],
+                binary: "custom-ts-lsp".to_string(),
+                args: Vec::new(),
+                root_markers: vec!["custom-root.json".to_string()],
+                env: Default::default(),
+                initialization_options: None,
+                disabled: false,
+            }],
+            ..Config::default()
+        };
+
+        let normalized_input = canonicalize_for_lsp(&source).expect("normalized source path");
+        let bare_canonical_input = fs::canonicalize(&source).expect("canonical source path");
+        let key_for = |path: &std::path::Path| {
+            let def = servers_for_file(path, &config)
+                .into_iter()
+                .find(|def| def.kind.id_str() == "custom-ts")
+                .expect("custom server definition");
+            server_key_for_definition(&def, path).expect("custom server root")
+        };
+
+        let key_material = |key: &crate::lsp::roots::ServerKey| {
+            let root_bytes = key
+                .root
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            (key.kind.id_str().to_string(), root_bytes)
+        };
+        let ensure_key = key_for(&normalized_input);
+        let running_lookup_key = key_for(&bare_canonical_input);
+
+        assert_eq!(key_material(&ensure_key), key_material(&running_lookup_key));
+    }
 }
 
 #[cfg(test)]
