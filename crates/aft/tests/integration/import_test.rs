@@ -39,6 +39,37 @@ fn assert_node_import_semantics_succeed(file: &Path, context: &str) -> Output {
     output
 }
 
+/// Execute an attributed ES module and require Node to reject its binding shape.
+/// Legacy `assert` clauses are rewritten only in the temporary runtime copy so
+/// the import engine's preservation of that spelling remains under test.
+fn assert_node_import_semantics_fail(file: &Path, context: &str) -> Output {
+    let source = fs::read_to_string(file).unwrap();
+    let (runtime_file, runtime_source) = if source.contains(" assert {") {
+        (
+            Some(file.with_extension("node-with.mjs")),
+            source.replacen(" assert {", " with {", 1),
+        )
+    } else {
+        (None, source)
+    };
+    if let Some(runtime_file) = &runtime_file {
+        fs::write(runtime_file, runtime_source).unwrap();
+    }
+    let path = runtime_file.as_deref().unwrap_or(file);
+    let output = std::process::Command::new("node")
+        .arg(path)
+        .output()
+        .expect("Node.js is required for JSON module import regression tests");
+    if let Some(runtime_file) = runtime_file {
+        fs::remove_file(runtime_file).unwrap();
+    }
+    assert!(
+        !output.status.success(),
+        "{context}: Node unexpectedly accepted an invalid import shape"
+    );
+    output
+}
+
 /// Helper: copy a fixture to a uniquely-named temp file for mutation testing.
 fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +117,23 @@ fn send_add_import(
         params["type_only"] = serde_json::json!(true);
     }
 
+    aft.send(&serde_json::to_string(&params).unwrap())
+}
+
+fn send_add_namespace_import(
+    aft: &mut AftProcess,
+    id: &str,
+    file: &str,
+    module: &str,
+    namespace: &str,
+) -> serde_json::Value {
+    let params = serde_json::json!({
+        "id": id,
+        "command": "add_import",
+        "file": file,
+        "module": module,
+        "namespace": namespace,
+    });
     aft.send(&serde_json::to_string(&params).unwrap())
 }
 
@@ -3036,6 +3084,163 @@ fn add_import_rejects_non_default_json_named_export_without_mutation_or_backup()
             Some(0)
         );
     }
+
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_rejects_fresh_json_named_import_without_mutation_or_backup() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("config.json");
+    fs::write(&module, "{\"ok\":true}\n").unwrap();
+    aft.send(&format!(
+        r#"{{"id":"cfg-json-fresh","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
+    ));
+
+    for (keyword, quote, quote_name) in [
+        ("with", "\"", "double"),
+        ("with", "'", "single"),
+        ("assert", "\"", "double"),
+        ("assert", "'", "single"),
+    ] {
+        let case = format!("{keyword}-{quote_name}");
+        let clause = format!("{keyword} {{ type: {quote}json{quote} }}");
+        let file = dir.path().join(format!("fresh-json-name-{case}.mjs"));
+        let original = format!(
+            "import * as config from './config.json' {clause};\nconsole.log(config.default.ok);\n"
+        );
+        fs::write(&file, &original).unwrap();
+        assert_eq!(
+            assert_node_import_semantics_succeed(
+                &file,
+                &format!("JSON namespace import before rejected fresh {case} add")
+            )
+            .status
+            .code(),
+            Some(0)
+        );
+
+        let invalid = file.with_extension("invalid.mjs");
+        fs::write(
+            &invalid,
+            format!("{original}import {{ extra }} from './config.json' {clause};\n"),
+        )
+        .unwrap();
+        assert_node_import_semantics_fail(&invalid, &format!("JSON named import sibling {case}"));
+        fs::remove_file(&invalid).unwrap();
+
+        let add = send_add_import(
+            &mut aft,
+            &format!("add-invalid-json-fresh-{case}"),
+            file.to_str().unwrap(),
+            "./config.json",
+            Some(&["extra"]),
+            None,
+            false,
+        );
+        assert_eq!(add["success"], false, "add should be refused: {add:?}");
+        assert_eq!(add["code"], "unsupported_json_named_export", "{add:?}");
+        assert!(add.get("backup_id").is_none(), "{add:?}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    }
+
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_rejects_json_namespace_binding_without_mutation_or_backup() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("config.json");
+    let file = dir.path().join("namespace-json.mjs");
+    fs::write(&module, "{\"ok\":true}\n").unwrap();
+    let original = "import config from './config.json' with { type: \"json\" };\n";
+    fs::write(&file, original).unwrap();
+    aft.send(&format!(
+        r#"{{"id":"cfg-json-namespace","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
+    ));
+
+    let add = send_add_namespace_import(
+        &mut aft,
+        "add-invalid-json-namespace",
+        file.to_str().unwrap(),
+        "./config.json",
+        "configNamespace",
+    );
+    assert_eq!(
+        add["success"], false,
+        "namespace add should be refused: {add:?}"
+    );
+    assert_eq!(add["code"], "unsupported_json_named_export", "{add:?}");
+    assert!(add.get("backup_id").is_none(), "{add:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    aft.shutdown();
+}
+
+#[test]
+fn add_import_allows_json_default_import_add_and_dedup() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let module = dir.path().join("config.json");
+    let file = dir.path().join("default-json.mjs");
+    fs::write(&module, "{\"ok\":true}\n").unwrap();
+    let original =
+        "import config from './config.json' with { type: \"json\" };\nconsole.log(config.ok);\n";
+    fs::write(&file, original).unwrap();
+    aft.send(&format!(
+        r#"{{"id":"cfg-json-default","command":"configure","harness":"opencode","project_root":{}}}"#,
+        crate::helpers::json_string(&dir.path().display())
+    ));
+
+    let add = send_add_import(
+        &mut aft,
+        "add-json-default",
+        file.to_str().unwrap(),
+        "./config.json",
+        None,
+        Some("settings"),
+        false,
+    );
+    assert_eq!(add["success"], true, "default add should succeed: {add:?}");
+    assert_eq!(add["added"], true, "default add should mutate: {add:?}");
+    let after_add = fs::read_to_string(&file).unwrap();
+    assert!(
+        after_add.contains("import settings from './config.json'"),
+        "{after_add}"
+    );
+    assert!(
+        after_add.matches("type: \"json\"").count() >= 2,
+        "{after_add}"
+    );
+    assert_eq!(
+        assert_node_import_semantics_succeed(&file, "JSON default import after default add")
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let duplicate = send_add_import(
+        &mut aft,
+        "dedup-json-default",
+        file.to_str().unwrap(),
+        "./config.json",
+        None,
+        Some("settings"),
+        false,
+    );
+    assert_eq!(
+        duplicate["success"], true,
+        "default dedup should succeed: {duplicate:?}"
+    );
+    assert_eq!(
+        duplicate["added"], false,
+        "default dedup should be a no-op: {duplicate:?}"
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), after_add);
 
     aft.shutdown();
 }

@@ -81,6 +81,78 @@ pub(crate) fn merge_named_import_specifiers(
     merged
 }
 
+/// Reject bindings that cannot be represented by an attributed JSON module.
+///
+/// The same check runs before either the merge branch or the fresh-import branch
+/// constructs replacement text, so a rejected request cannot create a backup or
+/// change the file. JSON modules expose only their default export; namespace
+/// bindings are also refused because the import engine treats them as invalid
+/// for this module type.
+fn json_module_binding_error(
+    req: &RawRequest,
+    file: &str,
+    module: &str,
+    names: &[String],
+    namespace: Option<&str>,
+    lang: LangId,
+    block: &imports::ImportBlock,
+) -> Option<Response> {
+    if !matches!(
+        lang,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
+    ) {
+        return None;
+    }
+
+    let unsupported_json_names = names
+        .iter()
+        .filter(|name| imports::specifier_imported_name(name) != "default")
+        .collect::<Vec<_>>();
+    if unsupported_json_names.is_empty() && namespace.is_none() {
+        return None;
+    }
+
+    if !block.imports.iter().any(|imp| {
+        imp.module_path == module && imports::es_import_attribute_type(imp) == Some("json")
+    }) {
+        return None;
+    }
+
+    if !unsupported_json_names.is_empty() {
+        let unsupported = unsupported_json_names
+            .iter()
+            .map(|name| format!("'{}'", imports::specifier_imported_name(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(Response::error_with_data(
+            &req.id,
+            "unsupported_json_named_export",
+            format!(
+                "add_import: cannot add named binding(s) {unsupported} from JSON module '{module}': JSON modules expose no named exports other than 'default'"
+            ),
+            serde_json::json!({
+                "file": file,
+                "module": module,
+                "unsupported_names": unsupported_json_names,
+            }),
+        ));
+    }
+
+    let namespace = namespace.expect("namespace is present when no named binding is unsupported");
+    Some(Response::error_with_data(
+        &req.id,
+        "unsupported_json_named_export",
+        format!(
+            "add_import: cannot add namespace binding '* as {namespace}' from JSON module '{module}': JSON modules expose no named exports other than 'default'"
+        ),
+        serde_json::json!({
+            "file": file,
+            "module": module,
+            "unsupported_names": [],
+        }),
+    ))
+}
+
 /// Handle an `add_import` request.
 ///
 /// Params:
@@ -236,39 +308,16 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // JSON module records expose only a `default` export. The named-import syntax
-    // may spell that export as `{ default as local }`, but every other imported
-    // name is impossible and must be rejected before backup or write.
-    let unsupported_json_names = names
-        .iter()
-        .filter(|name| imports::specifier_imported_name(name) != "default")
-        .collect::<Vec<_>>();
-    if !unsupported_json_names.is_empty()
-        && matches!(
-            lang,
-            LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
-        )
-        && block.imports.iter().any(|imp| {
-            imp.module_path == module && imports::es_import_attribute_type(imp) == Some("json")
-        })
-    {
-        let unsupported = unsupported_json_names
-            .iter()
-            .map(|name| format!("'{}'", imports::specifier_imported_name(name)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Response::error_with_data(
-            &req.id,
-            "unsupported_json_named_export",
-            format!(
-                "add_import: cannot add named binding(s) {unsupported} from JSON module '{module}': JSON modules expose no named exports other than 'default'"
-            ),
-            serde_json::json!({
-                "file": file,
-                "module": module,
-                "unsupported_names": unsupported_json_names,
-            }),
-        );
+    if let Some(error) = json_module_binding_error(
+        req,
+        file,
+        module,
+        &names,
+        namespace.as_deref(),
+        lang,
+        &block,
+    ) {
+        return error;
     }
 
     if matches!(lang, LangId::CSharp | LangId::Php)
