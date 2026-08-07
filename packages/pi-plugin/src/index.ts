@@ -182,11 +182,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.49.2";
+const ANNOUNCEMENT_VERSION = "0.49.3";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "No more zombie tasks: background commands die with their session — reclaimed worktrees and aborted calls both terminate their process groups, while deliberately backgrounded tasks keep surviving restarts.",
-  "aft_inspect stops crying wolf: diagnostics from a still-warming analyzer no longer count as errors (rust-analyzer's readiness signal is now consumed), so E-counts match what the compiler actually says.",
-  "Piped commands can't hide failures: when an upstream command fails behind a successful pipe tail, the output says so. Plus zoom into nested JSON paths, range hints on large reads, and better edit errors (thanks @iceteaSA).",
+  "Callgraph stays consistent under load: edits arriving mid-rebuild can no longer be silently lost from navigation results.",
+  "aft_zoom handles real-world .jsonc: files with comment banners above the opening brace now resolve, and not-found errors point at the segment that actually failed (thanks @iceteaSA).",
+  "Disk hygiene: stale per-checkout inspect caches from old worktrees are now swept automatically \u2014 one machine reclaimed 21 GB.",
 ];
 
 /**
