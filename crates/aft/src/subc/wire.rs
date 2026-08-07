@@ -424,6 +424,7 @@ struct ToolResponseEnvelope<'a> {
 // reply without `structuredContent.text`, so a module-first rollout breaks
 // every installed plugin). Collapsing it safely means emitting both shapes,
 // waiting for plugins to update, then dropping one behind a version floor.
+// The bridge now accepts replies that omit `structuredContent.text`, and the module may omit that field after the minimum supported plugin version includes this compatibility behavior.
 //
 // Measured on a live daemon: the largest real frames were ~200 KB, with zero
 // egress-write time, writer queue depth 1, never full, and no reserve

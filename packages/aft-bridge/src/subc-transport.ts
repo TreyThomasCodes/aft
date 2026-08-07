@@ -351,13 +351,16 @@ class RouteTornDownError extends Error {}
  * `structuredContent`, so re-lifting it makes everything downstream (status_bar,
  * bg_completions, preview_diff, code, …) byte-identical to NDJSON.
  *
- * Every AFT tool reply over subc carries this envelope with a boolean `success`
- * and string `text`. A reply missing the envelope, or whose lifted shape lacks a
- * boolean `success`, is a PROTOCOL VIOLATION — never a tool result — and is thrown
- * rather than coerced. Coercing it (the old `{success:false,text:""}` /
- * raw-record fallback) could let a malformed reply with `success === undefined`
- * read downstream as a successful tool result (audit B-#7). Surfacing it loudly is
- * the honest contract: a broken wire shape is a failure, not a silent empty pass.
+ * Every AFT tool reply over subc carries this envelope with a boolean `success`.
+ * During the wire transition, `structuredContent.text` may be omitted; the bridge
+ * synthesizes it only from exactly one outer text block, while a present field wins
+ * unchanged. A reply missing the envelope, lacking boolean `success`, or missing
+ * text without an unambiguous outer block is a PROTOCOL VIOLATION — never a tool
+ * result — and is thrown rather than coerced. Coercing it (the old
+ * `{success:false,text:""}` / raw-record fallback) could let a malformed reply with
+ * `success === undefined` read downstream as a successful tool result (audit B-#7).
+ * Surfacing it loudly is the honest contract: a broken wire shape is a failure, not
+ * a silent empty pass.
  */
 function reliftReply(reply: unknown): Record<string, unknown> {
   if (!isRecord(reply) || !isRecord(reply.structuredContent)) {
@@ -366,7 +369,19 @@ function reliftReply(reply: unknown): Record<string, unknown> {
     );
   }
   const flat = reply.structuredContent;
-  if (typeof flat.success !== "boolean" || typeof flat.text !== "string") {
+  if (typeof flat.success !== "boolean") {
+    throw new Error(
+      "subc tool reply structuredContent lacks a boolean `success` / string `text` (protocol violation)",
+    );
+  }
+  if (!Object.hasOwn(flat, "text")) {
+    const content = reply.content;
+    const block = Array.isArray(content) && content.length === 1 ? content[0] : undefined;
+    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
+      return { ...flat, text: block.text };
+    }
+  }
+  if (typeof flat.text !== "string") {
     throw new Error(
       "subc tool reply structuredContent lacks a boolean `success` / string `text` (protocol violation)",
     );

@@ -168,6 +168,33 @@ function envelope(flat: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
+// This fixture preserves the field order from a real read response: the Rust wire
+// serializer emits `text` as the final structured field.
+const CAPTURED_FIRST_PARTY_READ_ENVELOPE: Record<string, unknown> = {
+  content: [
+    {
+      type: "text",
+      text: "export function readFixture(): string { return 'captured'; }\n",
+    },
+  ],
+  isError: false,
+  structuredContent: {
+    id: "read-fixture-1",
+    success: true,
+    status_bar: { errors: 0, warnings: 1 },
+    bg_completions: [{ task_id: "bash-fixture-1" }],
+    text: "export function readFixture(): string { return 'captured'; }\n",
+  },
+};
+
+function withoutStructuredText(envelopeResponse: Record<string, unknown>): Record<string, unknown> {
+  const structuredContent = {
+    ...(envelopeResponse.structuredContent as Record<string, unknown>),
+  };
+  delete structuredContent.text;
+  return { ...envelopeResponse, structuredContent };
+}
+
 describe("SubcTransport.toolCall", () => {
   test("sends {name, arguments} and re-lifts structuredContent to the flat result", async () => {
     const client = new FakeClient(async () =>
@@ -436,6 +463,68 @@ describe("SubcTransport Rd reconnect", () => {
 });
 
 describe("SubcTransport reply envelope (B-#7)", () => {
+  test("synthesizes missing structuredContent.text from a single outer text block", async () => {
+    const duplicatedClient = new FakeClient(async () => CAPTURED_FIRST_PARTY_READ_ENVELOPE);
+    const { pool: duplicatedPool } = poolWith(duplicatedClient);
+    const duplicated = await duplicatedPool
+      .getBridge("/work/proj")
+      .toolCall("sess-1", "read", { filePath: "fixture.ts" });
+
+    const synthesizedClient = new FakeClient(async () =>
+      withoutStructuredText(CAPTURED_FIRST_PARTY_READ_ENVELOPE),
+    );
+    const { pool: synthesizedPool } = poolWith(synthesizedClient);
+    const synthesized = await synthesizedPool
+      .getBridge("/work/proj")
+      .toolCall("sess-1", "read", { filePath: "fixture.ts" });
+
+    const capturedBytes = new TextEncoder().encode(
+      JSON.stringify(CAPTURED_FIRST_PARTY_READ_ENVELOPE.structuredContent),
+    );
+    expect(new TextEncoder().encode(JSON.stringify(duplicated))).toEqual(capturedBytes);
+    expect(new TextEncoder().encode(JSON.stringify(synthesized))).toEqual(capturedBytes);
+  });
+
+  test("present structuredContent.text wins without inspecting outer content", async () => {
+    const response = {
+      ...CAPTURED_FIRST_PARTY_READ_ENVELOPE,
+      content: [{ type: "image", data: "not inspected" }],
+    };
+    const client = new FakeClient(async () => response);
+    const { pool } = poolWith(client);
+
+    const result = await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+
+    expect(new TextEncoder().encode(JSON.stringify(result))).toEqual(
+      new TextEncoder().encode(
+        JSON.stringify(CAPTURED_FIRST_PARTY_READ_ENVELOPE.structuredContent),
+      ),
+    );
+  });
+
+  test.each([
+    ["zero blocks", []],
+    [
+      "multiple blocks",
+      [
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ],
+    ],
+    ["non-text block", [{ type: "image", data: "not text" }]],
+  ])("missing structuredContent.text with %s stays fail-closed", async (_name, content) => {
+    const client = new FakeClient(async () => ({
+      content,
+      isError: false,
+      structuredContent: { id: "read-1", success: true },
+    }));
+    const { pool } = poolWith(client);
+
+    await expect(pool.getBridge("/work/proj").toolCall("sess-1", "read", {})).rejects.toThrow(
+      "subc tool reply structuredContent lacks a boolean `success` / string `text` (protocol violation)",
+    );
+  });
+
   test("a reply missing the structuredContent envelope throws (protocol violation)", async () => {
     // No structuredContent → must NOT be coerced to a silent {success:false}.
     const client = new FakeClient(async () => ({ content: [], isError: false }));
