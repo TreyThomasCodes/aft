@@ -1,0 +1,196 @@
+schema_version = 1
+corpus_id = "bash-rewrite-differential-v1"
+
+[[rows]]
+id = "grep-accept-basic"
+command = "grep -n needle src/notes.txt"
+route = "rewritten:grep"
+basis = "grep-match-set"
+normalizations = ["footer-removal"]
+decision_class = "dc.grep.accept.v1"
+branch_ids = ["grep.accept"]
+semantic_dimensions = ["shell-tokenization", "match-completeness", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "first needle\nsecond\n" }]
+
+[[rows]]
+id = "grep-decline-unsupported-flag"
+command = "grep -x needle src/notes.txt"
+route = "native"
+basis = "bytes"
+branch_ids = ["grep.decline"]
+semantic_dimensions = ["shell-tokenization", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "first needle\nsecond\n" }]
+
+[[rows]]
+id = "rg-accept-basic"
+command = "rg -n needle src/notes.txt"
+route = "rewritten:rg"
+basis = "grep-match-set"
+normalizations = ["footer-removal"]
+decision_class = "dc.rg.accept.v1"
+branch_ids = ["rg.accept"]
+semantic_dimensions = ["shell-tokenization", "match-completeness", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "first needle\nsecond\n" }]
+
+[[rows]]
+id = "rg-decline-unsupported-mode"
+command = "rg --files src"
+route = "native"
+basis = "bytes"
+branch_ids = ["rg.decline"]
+semantic_dimensions = ["shell-tokenization", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "first needle\nsecond\n" }]
+
+[[rows]]
+id = "find-accept-file-name"
+command = "find . -name '*.txt' -type f"
+route = "rewritten:find"
+basis = "find-path-set"
+normalizations = ["footer-removal"]
+decision_class = "dc.find.accept.v1"
+branch_ids = ["find.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "ordering", "match-completeness"]
+manifest = [{ path = "src/notes.txt", content = "needle\n" }]
+
+[[rows]]
+id = "find-decline-maxdepth"
+command = "find . -maxdepth 1 -name '*.txt'"
+route = "native"
+basis = "bytes"
+branch_ids = ["find.decline"]
+semantic_dimensions = ["shell-tokenization", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "needle\n" }]
+
+[[rows]]
+id = "cat-accept-line-content"
+command = "cat src/notes.txt"
+route = "rewritten:cat"
+basis = "bytes"
+normalizations = ["gutter-removal", "footer-removal"]
+decision_class = "dc.cat.accept.v1"
+branch_ids = ["cat.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "content-limit"]
+manifest = [{ path = "src/notes.txt", content = "one\ntwo\n" }]
+
+[[rows]]
+id = "cat-accept-double-quote-backslash-r18"
+command = "cat \"read\\q.txt\""
+route = "rewritten:cat"
+basis = "bytes"
+normalizations = ["gutter-removal", "footer-removal"]
+decision_class = "dc.cat.accept.v1"
+branch_ids = ["cat.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "error-outcome"]
+manifest = [{ path = "read\\q.txt", content = "preserved\n" }]
+
+[[rows]]
+id = "cat-decline-multiple-files"
+command = "cat src/notes.txt src/other.txt"
+route = "native"
+basis = "bytes"
+branch_ids = ["cat.decline"]
+semantic_dimensions = ["shell-tokenization", "exit-status", "error-outcome"]
+manifest = [
+  { path = "src/notes.txt", content = "one\n" },
+  { path = "src/other.txt", content = "two\n" },
+]
+
+[[rows]]
+id = "append-accept-once"
+command = "echo appended >> notes.txt"
+route = "rewritten:cat_append"
+basis = "bytes"
+normalizations = ["footer-removal"]
+decision_class = "dc.cat_append.accept.v1"
+branch_ids = ["cat_append.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "mutation", "append-no-double-apply"]
+mutating = true
+manifest = [{ path = "notes.txt", content = "before\n" }]
+
+[[rows]]
+id = "append-decline-overwrite"
+command = "cat > notes.txt"
+route = "native"
+basis = "bytes"
+branch_ids = ["cat_append.decline"]
+semantic_dimensions = ["shell-tokenization", "mutation", "error-outcome"]
+mutating = true
+manifest = [{ path = "notes.txt", content = "before\n" }]
+
+[[rows]]
+id = "sed-accept-range"
+command = "sed -n '1,2p' src/notes.txt"
+route = "rewritten:sed"
+basis = "bytes"
+normalizations = ["gutter-removal", "footer-removal"]
+decision_class = "dc.sed.accept.v1"
+branch_ids = ["sed.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "content-limit"]
+manifest = [{ path = "src/notes.txt", content = "one\ntwo\nthree\n" }]
+
+[[rows]]
+id = "sed-decline-substitution"
+command = "sed 's/one/ONE/' src/notes.txt"
+route = "native"
+basis = "bytes"
+branch_ids = ["sed.decline"]
+semantic_dimensions = ["shell-tokenization", "mutation", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "one\ntwo\n" }]
+
+[[rows]]
+id = "ls-accept-hides-dotfiles"
+command = "ls src"
+route = "rewritten:ls"
+basis = "ls-entry-set"
+normalizations = ["footer-removal"]
+decision_class = "dc.ls.accept.v1"
+branch_ids = ["ls.accept"]
+semantic_dimensions = ["shell-tokenization", "path-resolution", "hidden-files", "ordering"]
+manifest = [
+  { path = "src", kind = "directory" },
+  { path = "src/visible.txt", content = "visible\n" },
+  { path = "src/.secret", content = "secret\n" },
+]
+
+[[rows]]
+id = "ls-decline-all-mode"
+command = "ls -A src"
+route = "native"
+basis = "ls-entry-sequence"
+branch_ids = ["ls.decline"]
+semantic_dimensions = ["shell-tokenization", "hidden-files", "ordering", "exit-status"]
+manifest = [
+  { path = "src", kind = "directory" },
+  { path = "src/visible.txt", content = "visible\n" },
+  { path = "src/.secret", content = "secret\n" },
+]
+
+[[rows]]
+id = "native-no-rule-control"
+command = "printf 'native\\n'"
+route = "native"
+basis = "bytes"
+branch_ids = ["dispatch.native.no_rule"]
+semantic_dimensions = ["shell-tokenization", "environment-path", "locale", "exit-status"]
+
+[[rows]]
+id = "native-non-root-workdir-control"
+command = "cat note.txt"
+route = "native"
+basis = "bytes"
+branch_ids = ["dispatch.native.non_root_workdir"]
+semantic_dimensions = ["shell-tokenization", "working-directory", "path-resolution"]
+workdir = "subdir"
+manifest = [
+  { path = "subdir", kind = "directory" },
+  { path = "subdir/note.txt", content = "subdir content\n" },
+]
+
+[[rows]]
+id = "native-sandbox-control"
+command = "cat note.txt"
+route = "native"
+basis = "bytes"
+platform = "windows"
+branch_ids = ["dispatch.native.sandbox"]
+semantic_dimensions = ["handler-lifecycle", "environment-path"]

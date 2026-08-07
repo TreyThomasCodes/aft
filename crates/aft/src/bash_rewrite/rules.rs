@@ -7,7 +7,7 @@ const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 
 use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
 use crate::bash_rewrite::parser::parse;
-use crate::bash_rewrite::RewriteRule;
+use crate::bash_rewrite::{RewriteRequest, RewriteRule};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -24,26 +24,40 @@ impl RewriteRule for GrepRule {
         "grep"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        grep_request(command, "grep").is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = grep_request(command, "grep").ok_or("not a grep rewrite")?;
-        let path = params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        try_call_and_grep_footer(
-            crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
-            ctx,
-            path.as_deref(),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = grep_request(command, "grep") else {
+            return decline("grep", "grep.decline", "unsupported grep shape");
+        };
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !path_is_safe(ctx, path, true) {
+                return decline(
+                    "grep",
+                    "grep.decline",
+                    "grep path is outside the project root or missing",
+                );
+            }
+        }
+        accept(
+            "grep",
+            "grep.accept",
+            "dc.grep.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
         )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        let path = request.params.get("path").and_then(Value::as_str);
+        let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
+        grep_footer_response(response, ctx, path)
     }
 }
 
@@ -52,26 +66,40 @@ impl RewriteRule for RgRule {
         "rg"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        grep_request(command, "rg").is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = grep_request(command, "rg").ok_or("not an rg rewrite")?;
-        let path = params
-            .get("path")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        try_call_and_grep_footer(
-            crate::commands::grep::handle_grep(&request("grep", params, session_id), ctx),
-            ctx,
-            path.as_deref(),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = grep_request(command, "rg") else {
+            return decline("rg", "rg.decline", "unsupported rg shape");
+        };
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !path_is_safe(ctx, path, true) {
+                return decline(
+                    "rg",
+                    "rg.decline",
+                    "rg path is outside the project root or missing",
+                );
+            }
+        }
+        accept(
+            "rg",
+            "rg.accept",
+            "dc.rg.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
         )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        let path = request.params.get("path").and_then(Value::as_str);
+        let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
+        grep_footer_response(response, ctx, path)
     }
 }
 
@@ -80,19 +108,39 @@ impl RewriteRule for FindRule {
         "find"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        find_request(command).is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = find_request(command).ok_or("not a find rewrite")?;
-        try_call_and_footer(
-            crate::commands::glob::handle_glob(&request("glob", params, session_id), ctx),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = find_request(command) else {
+            return decline("find", "find.decline", "unsupported find shape");
+        };
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !path_is_safe(ctx, path, true) {
+                return decline(
+                    "find",
+                    "find.decline",
+                    "find path is outside the project root or missing",
+                );
+            }
+        }
+        accept(
+            "find",
+            "find.accept",
+            "dc.find.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
             "glob",
         )
     }
@@ -103,19 +151,44 @@ impl RewriteRule for CatRule {
         "cat"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        cat_read_request(command).is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = cat_read_request(command).ok_or("not a cat rewrite")?;
-        try_call_and_footer(
-            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = cat_read_request(command) else {
+            return decline("cat", "cat.decline", "unsupported cat shape");
+        };
+        let path = params
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !path_is_safe(ctx, path, true) || !read_shape_is_faithful(ctx, path) {
+            crate::slog_warn!(
+                "bash rewrite rule cat declined: read declined: path is outside the project root or exceeds the read contract"
+            );
+            return decline(
+                "cat",
+                "cat.decline",
+                "read path is outside the project root or exceeds the read contract",
+            );
+        }
+        accept(
+            "cat",
+            "cat.accept",
+            "dc.cat.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
         )
     }
@@ -126,20 +199,46 @@ impl RewriteRule for CatAppendRule {
         "cat_append"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        append_request(command).is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = append_request(command).ok_or("not an append rewrite")?;
-        try_call_and_footer(
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = append_request(command) else {
+            return decline(
+                "cat_append",
+                "cat_append.decline",
+                "unsupported append shape",
+            );
+        };
+        let path = params
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !append_path_is_safe(ctx, path) {
+            return decline(
+                "cat_append",
+                "cat_append.decline",
+                "append path is outside the project root or has no existing parent",
+            );
+        }
+        accept(
+            "cat_append",
+            "cat_append.accept",
+            "dc.cat_append.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
             crate::commands::edit_match::handle_edit_match(
-                &request("edit_match", params, session_id),
+                &tool_request("edit_match", request, ctx),
                 ctx,
             ),
             "edit",
@@ -152,19 +251,41 @@ impl RewriteRule for SedRule {
         "sed"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        sed_request(command).is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = sed_request(command).ok_or("not a sed rewrite")?;
-        try_call_and_footer(
-            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = sed_request(command) else {
+            return decline("sed", "sed.decline", "unsupported sed shape");
+        };
+        let path = params
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !path_is_safe(ctx, path, true) || !read_shape_is_faithful(ctx, path) {
+            return decline(
+                "sed",
+                "sed.decline",
+                "sed path is outside the project root or exceeds the read contract",
+            );
+        }
+        accept(
+            "sed",
+            "sed.accept",
+            "dc.sed.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
         )
     }
@@ -175,63 +296,118 @@ impl RewriteRule for LsRule {
         "ls"
     }
 
-    fn matches(&self, command: &str) -> bool {
-        ls_request(command).is_some()
-    }
-
-    fn rewrite(
+    fn decide(
         &self,
         command: &str,
+        request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
-    ) -> Result<Response, String> {
-        let params = ls_request(command).ok_or("not an ls rewrite")?;
-        try_call_and_footer(
-            crate::commands::read::handle_read(&request("read", params, session_id), ctx),
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = ls_request(command, ctx) else {
+            return decline("ls", "ls.decline", "unsupported ls shape or target");
+        };
+        accept(
+            "ls",
+            "ls.accept",
+            "dc.ls.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
         )
     }
 }
 
-fn request(command: &str, params: Value, session_id: Option<&str>) -> RawRequest {
-    RawRequest {
-        id: "bash_rewrite".to_string(),
+fn accept(
+    rule_id: &'static str,
+    branch_id: &'static str,
+    decision_class_id: &'static str,
+    command: &str,
+    request_id: &str,
+    session_id: Option<&str>,
+    params: Value,
+) -> crate::bash_rewrite::RewriteDecision {
+    crate::bash_rewrite::RewriteDecision::Accept(RewriteRequest {
+        request_id: request_id.to_string(),
         command: command.to_string(),
+        session_id: session_id.map(str::to_owned),
+        rule_id,
+        branch_id,
+        decision_class_id,
+        params,
+    })
+}
+
+fn decline(
+    rule_id: &'static str,
+    branch_id: &'static str,
+    reason: &str,
+) -> crate::bash_rewrite::RewriteDecision {
+    let decision_class_id = match rule_id {
+        "grep" => "dc.grep.decline.v1",
+        "rg" => "dc.rg.decline.v1",
+        "find" => "dc.find.decline.v1",
+        "cat" => "dc.cat.decline.v1",
+        "cat_append" => "dc.cat_append.decline.v1",
+        "sed" => "dc.sed.decline.v1",
+        "ls" => "dc.ls.decline.v1",
+        _ => "dc.native.decline.v1",
+    };
+    crate::bash_rewrite::RewriteDecision::Decline(crate::bash_rewrite::DeclineReason {
+        rule_id: Some(rule_id),
+        branch_id,
+        decision_class_id,
+        reason: reason.to_string(),
+    })
+}
+
+fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRequest {
+    let mut params = request.params.clone();
+    let root = grep_project_root(ctx);
+    if matches!(tool, "read" | "edit_match") {
+        if let Some(file) = params.get("file").and_then(Value::as_str) {
+            let path = Path::new(file);
+            if path.is_relative() {
+                params["file"] = Value::String(root.join(path).display().to_string());
+            }
+        }
+    }
+    if tool == "glob" && params.get("path").is_none() {
+        params["path"] = Value::String(root.display().to_string());
+    }
+    RawRequest {
+        id: request.request_id.clone(),
+        command: tool.to_string(),
         lsp_hints: None,
-        session_id: session_id.map(str::to_string),
+        session_id: request.session_id.clone(),
         params,
     }
 }
 
-/// Run an underlying tool through the rewrite path. If the tool returned
-/// `success: false`, propagate as Err so dispatch falls through to actual bash
-/// — the agent's intent was bash, the rewrite is a transparent optimization.
-/// Returning a wrapped error response would surprise the agent (e.g. read's
-/// `outside project root` rejecting a sed that bash would have allowed).
-fn try_call_and_footer(response: Response, replacement_tool: &str) -> Result<Response, String> {
-    if let Some(err) = declined_error(&response, replacement_tool) {
-        return Err(err);
-    }
-    Ok(call_and_footer(response, replacement_tool))
+/// Add the normal tool footer while preserving a handler error as the final
+/// response. A handler error is not a permission to execute native bash: the
+/// request has already entered the internal handler.
+fn call_and_footer(response: Response, replacement_tool: &str) -> Response {
+    let output = response_output(&response.data);
+    let footered = add_footer(&output, replacement_tool);
+    apply_footer(response, footered)
 }
 
-/// Grep/rg variant: same decline handling, but the footer is the enforced
-/// code-search redirect, steering to `aft_search` when it's registered.
-fn try_call_and_grep_footer(
-    response: Response,
-    ctx: &AppContext,
-    path: Option<&str>,
-) -> Result<Response, String> {
-    if let Some(err) = declined_error(&response, "grep") {
-        return Err(err);
-    }
+fn grep_footer_response(response: Response, ctx: &AppContext, path: Option<&str>) -> Response {
     let output = response_output(&response.data);
     let footered = if should_suppress_grep_footer(path, &grep_project_root(ctx)) {
         output
     } else {
         add_grep_footer(&output, ctx.config().aft_search_registered)
     };
-    Ok(apply_footer(response, footered))
+    apply_footer(response, footered)
 }
 
 fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {
@@ -280,25 +456,6 @@ fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool 
         .is_ok_and(|age| age < GREP_FOOTER_FRESHNESS_WINDOW)
 }
 
-fn declined_error(response: &Response, replacement_tool: &str) -> Option<String> {
-    if response.success {
-        return None;
-    }
-    let message = response
-        .data
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| response.data.get("code").and_then(Value::as_str))
-        .unwrap_or("error");
-    Some(format!("{replacement_tool} declined: {message}"))
-}
-
-fn call_and_footer(response: Response, replacement_tool: &str) -> Response {
-    let output = response_output(&response.data);
-    let footered = add_footer(&output, replacement_tool);
-    apply_footer(response, footered)
-}
-
 fn apply_footer(mut response: Response, output: String) -> Response {
     if let Some(object) = response.data.as_object_mut() {
         object.insert("output".to_string(), Value::String(output.clone()));
@@ -337,6 +494,68 @@ fn response_output(data: &Value) -> String {
             .join("\n");
     }
     serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
+}
+
+fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
+    let root = grep_project_root(ctx);
+    let candidate = Path::new(path);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    if require_existing && !candidate.exists() {
+        return false;
+    }
+    let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    resolved.starts_with(&root)
+}
+
+fn read_shape_is_faithful(ctx: &AppContext, path: &str) -> bool {
+    let root = grep_project_root(ctx);
+    let candidate = if Path::new(path).is_absolute() {
+        Path::new(path).to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let Ok(metadata) = std::fs::metadata(&candidate) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 50 * 1024 {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(candidate) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    text.lines().all(|line| line.len() <= 2_000)
+}
+
+fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
+    let root = grep_project_root(ctx);
+    let candidate = if Path::new(path).is_absolute() {
+        Path::new(path).to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let parent = candidate.parent().unwrap_or(&root);
+    if !parent.exists() {
+        return false;
+    }
+    let resolved_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    if !resolved_parent.starts_with(&root) {
+        return false;
+    }
+    if candidate.exists() {
+        let Ok(resolved) = std::fs::canonicalize(&candidate) else {
+            return false;
+        };
+        resolved.starts_with(&root)
+    } else {
+        true
+    }
 }
 
 fn grep_request(command: &str, binary: &str) -> Option<Value> {
@@ -504,7 +723,7 @@ fn sed_request(command: &str) -> Option<Value> {
     }))
 }
 
-fn ls_request(command: &str) -> Option<Value> {
+fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
     let parsed = parse(command)?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != "ls" {
         return None;
@@ -552,15 +771,20 @@ fn ls_request(command: &str) -> Option<Value> {
     // directory (or is missing/cwd, where `read` of cwd also makes sense).
     // Stat the path and fall through to bash for files.
     let target = path.clone().unwrap_or_else(|| ".".to_string());
-    if let Ok(metadata) = std::fs::metadata(&target) {
-        if !metadata.is_dir() {
+    let root = grep_project_root(ctx);
+    let target_for_metadata = if Path::new(&target).is_absolute() {
+        Path::new(&target).to_path_buf()
+    } else {
+        root.join(&target)
+    };
+    if let Ok(metadata) = std::fs::metadata(&target_for_metadata) {
+        if !metadata.is_dir() || !path_is_safe(ctx, &target, true) {
             return None;
         }
-    }
-    // Path doesn't exist (yet)? Let bash handle the error itself — its
-    // wording is well-known to agents and we don't gain anything by
-    // rewriting a guaranteed-failing rewrite call.
-    else if path.is_some() {
+    } else {
+        // Path doesn't exist (yet)? Let bash handle the error itself — its
+        // wording is well-known to agents, and rewriting a guaranteed failure
+        // would change the native error outcome.
         return None;
     }
 

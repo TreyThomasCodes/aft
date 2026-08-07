@@ -275,20 +275,35 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
     if host_escalation.is_none() && workdir_matches_project_root(&workdir, ctx) {
-        if let Some(mut response) = crate::bash_rewrite::try_rewrite(
+        if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
             &params.command,
+            &req.id,
             req.session_id.as_deref(),
             ctx,
             &principal,
         ) {
-            // Rewriter rules build their own internal request with a placeholder
-            // id (e.g. "bash_rewrite") to call into read/grep/glob handlers.
-            // Stamp the original bash request id back onto the response so the
-            // bridge correlates it with the in-flight `send()` instead of timing
-            // out.
-            response.id = req.id.clone();
+            // The typed rewrite request already carries the public request ID,
+            // so the bridge can correlate the handler response without a
+            // second response mutation or a native fallback.
             return response;
         }
+    } else {
+        let reason = if host_escalation.is_some() {
+            "host escalation owns process execution"
+        } else {
+            "bash workdir differs from the project root"
+        };
+        let branch = if host_escalation.is_some() {
+            "dispatch.native.no_rule"
+        } else {
+            "dispatch.native.non_root_workdir"
+        };
+        crate::bash_rewrite::dispatch::record_native(
+            &req.id,
+            crate::bash_rewrite::catalog::ControlRole::Native,
+            branch,
+            reason,
+        );
     }
 
     let workdir = spawn_workdir;

@@ -1,42 +1,95 @@
 //! Bash command rewriter for hoisted bash.
 //!
-//! When the agent calls `bash("grep -n foo src/")`, the rewriter detects this
-//! pattern, dispatches internally to AFT's `grep` command, and returns the
-//! result with a footer hint nudging the agent to use the `grep` tool directly.
+//! Rewriting is an optimization of native bash, not a second command
+//! language. The dispatch layer makes a pre-execution decision and records it
+//! for differential tests. Once a request is accepted, its handler response is
+//! returned directly; native bash is never run as a recovery path.
 
+pub mod catalog;
+pub mod differential;
 pub mod dispatch;
 pub mod footer;
+pub mod observation;
 pub mod parser;
 pub mod rules;
+
+use serde_json::Value;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
 use crate::sandbox_spawn::{native_sandbox_enforced, AuthenticatedPrincipal};
 
-/// A `RewriteRule` matches a specific bash invocation pattern and dispatches
-/// internally to an AFT tool.
-pub trait RewriteRule: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn matches(&self, command: &str) -> bool;
-    fn rewrite(
-        &self,
-        command: &str,
-        session_id: Option<&str>,
-        ctx: &AppContext,
-    ) -> Result<Response, String>;
+#[derive(Debug, Clone, PartialEq)]
+pub struct RewriteRequest {
+    pub request_id: String,
+    pub command: String,
+    pub session_id: Option<String>,
+    pub rule_id: &'static str,
+    pub branch_id: &'static str,
+    pub decision_class_id: &'static str,
+    pub params: Value,
 }
 
-/// Try to rewrite a bash command into an internal AFT tool call.
-/// Returns `Some(response)` if rewritten and `None` when no rule matched or the
-/// command must execute inside the native sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclineReason {
+    pub rule_id: Option<&'static str>,
+    pub branch_id: &'static str,
+    pub decision_class_id: &'static str,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RewriteDecision {
+    Accept(RewriteRequest),
+    Decline(DeclineReason),
+}
+
+/// A rewrite rule owns both the pre-execution shape decision and the typed
+/// request it emits. Implementations keep parsing in the decision phase so an
+/// accepted request has one stable request ID and one decision class.
+pub trait RewriteRule: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> RewriteDecision;
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response;
+}
+
+/// Try to rewrite a synthetic request. Production bash calls
+/// [`try_rewrite_for_request`] with the caller's request ID; this compatibility
+/// wrapper is retained for direct library users and existing unit tests.
 pub fn try_rewrite(
     command: &str,
     session_id: Option<&str>,
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
+    try_rewrite_for_request(command, "bash_rewrite", session_id, ctx, principal)
+}
+
+/// Make the rewrite decision for one public bash request. A native route is
+/// recorded when the sandbox owns execution or when no rule accepts the
+/// command. The record is test-visible through `dispatch::route_record` and an
+/// opt-in JSONL sidecar, without changing the agent-facing response.
+pub fn try_rewrite_for_request(
+    command: &str,
+    request_id: &str,
+    session_id: Option<&str>,
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+) -> Option<Response> {
     if native_sandbox_enforced(ctx, principal) {
+        dispatch::record_native(
+            request_id,
+            catalog::ControlRole::Sandbox,
+            "dispatch.native.sandbox",
+            "native sandbox is enforced",
+        );
         return None;
     }
-    dispatch::dispatch(command, session_id, ctx)
+    dispatch::dispatch_for_request(command, request_id, session_id, ctx)
 }
