@@ -10696,12 +10696,14 @@ mod refresh_worker_tests {
     fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let artifact_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &artifact_key, false);
         let callgraph_dir = temp
             .path()
             .join("storage")
             .join("callgraph")
-            .join(crate::search_index::artifact_cache_key(&root));
-        fs::create_dir_all(&root).unwrap();
+            .join(artifact_key);
         let source = root.join("main.rs");
         fs::write(&source, "fn entry() { old_leaf(); }\nfn old_leaf() {}\n").unwrap();
         let (store, _) = CallGraphStore::cold_build_with_lease(
@@ -10759,12 +10761,14 @@ mod refresh_worker_tests {
     fn workspace_refresh_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempdir().unwrap();
         let root = temp.path().join("workspace");
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        let artifact_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &artifact_key, false);
         let callgraph_dir = temp
             .path()
             .join("storage")
             .join("callgraph")
-            .join(crate::search_index::artifact_cache_key(&root));
-        fs::create_dir_all(root.join("app/src")).unwrap();
+            .join(artifact_key);
         fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",

@@ -209,11 +209,18 @@ impl ArtifactAccess {
         artifact_key: &str,
         write_path: &Path,
     ) -> bool {
-        let writes_keyed_dir = write_path
-            .parent()
+        // Classify the layout from a comparison-local canonical copy rather
+        // than trusting key equality. A key derived while the root's final
+        // component was absent can encode a symlink alias (for example,
+        // /var versus /private/var) that disappears after the root exists.
+        let comparison_cache_dir = write_path.parent().map(canonical_process_lease_dir);
+        let writes_keyed_dir = comparison_cache_dir.as_deref().and_then(Path::file_name)
+            == Some(OsStr::new(artifact_key));
+        let writes_root_keyed_dir = comparison_cache_dir
+            .as_deref()
+            .and_then(Path::parent)
             .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == artifact_key);
+            == Some(OsStr::new(domain.as_str()));
         if !self.borrow_only_shared {
             return true;
         }
@@ -223,7 +230,7 @@ impl ArtifactAccess {
         {
             return true;
         }
-        if !self.registered && !writes_keyed_dir {
+        if !self.registered && !writes_root_keyed_dir {
             // Caller-owned scratch paths are outside the shared root-keyed
             // cache layout, so this capability does not govern them.
             return true;
@@ -1305,6 +1312,44 @@ mod tests {
                 RootCacheDomain::Callgraph,
                 shared_key,
                 root.path(),
+            ),
+            0
+        );
+        assert!(!writer_lease_path(&cache_dir).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregistered_root_denies_symlink_aliased_stale_key() {
+        let storage = tempfile::tempdir().unwrap();
+        let roots = tempfile::tempdir().unwrap();
+        let real_parent = roots.path().join("real");
+        let alias_parent = roots.path().join("alias");
+        fs::create_dir_all(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+
+        let root = alias_parent.join("root");
+        let stale_key = crate::search_index::artifact_cache_key(&root);
+        fs::create_dir_all(&root).unwrap();
+        let canonical_key = crate::search_index::artifact_cache_key(&root);
+        assert_ne!(stale_key, canonical_key, "fixture must exercise the alias");
+
+        let cache_dir = storage.path().join("callgraph").join(&stale_key);
+        reset_writer_lease_acquisition_counts_for_test();
+        let lease = WriterLease::acquire_shared(
+            RootCacheDomain::Callgraph,
+            &cache_dir,
+            &canonical_key,
+            &root,
+        )
+        .unwrap();
+
+        assert!(lease.is_none());
+        assert_eq!(
+            writer_lease_acquisition_count_for_test(
+                RootCacheDomain::Callgraph,
+                &canonical_key,
+                &root,
             ),
             0
         );
