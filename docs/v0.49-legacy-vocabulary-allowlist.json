@@ -1415,8 +1415,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_storm_test.rs",
-      "location": "line 2130, column 22",
-      "line": 2130,
+      "location": "line 2137, column 22",
+      "line": 2137,
       "column": 22,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1424,8 +1424,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_storm_test.rs",
-      "location": "line 2139, column 18",
-      "line": 2139,
+      "location": "line 2146, column 18",
+      "line": 2146,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
