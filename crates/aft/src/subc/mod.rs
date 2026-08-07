@@ -724,8 +724,8 @@ fn quiesce_unbound_root(
     meta.unbound_quiesced = true;
     meta.maintenance_queued_kinds.clear();
     meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
-    log::debug!(
-        "subc attach: quiesced unbound root {} (cancelled {} queued maintenance job(s), cancelled {} configure maintenance job(s))",
+    log::info!(
+        "subc attach: quiesced unbound root {} (cancelled {} queued maintenance job(s), cancelled {} configure maintenance job(s)); cause=goodbye_unbound",
         root_id.as_path().display(),
         cancelled,
         discarded
@@ -1044,7 +1044,7 @@ fn purge_deleted_root_residents(
     bg_sub_by_session.retain(|(root, _), _| root != root_id);
 
     log::info!(
-        "subc attach: fully forgot deleted root {}",
+        "subc attach: fully forgot deleted root {}; cause=absence_reclaim",
         root_id.as_path().display()
     );
 }
