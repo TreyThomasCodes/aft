@@ -128,6 +128,7 @@ pub struct InspectManager {
     soft_deadline: Duration,
     next_job_id: AtomicU64,
     heavy_root_work_allowed: Arc<AtomicBool>,
+    cold_build_limiter: Mutex<Arc<cold_build_limiter::ColdBuildLimiter>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -177,6 +178,7 @@ impl InspectManager {
             soft_deadline,
             next_job_id: AtomicU64::new(1),
             heavy_root_work_allowed,
+            cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
@@ -187,6 +189,25 @@ impl InspectManager {
 
     fn heavy_root_work_allowed(&self) -> bool {
         self.heavy_root_work_allowed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_cold_build_limiter(
+        &self,
+        limiter: Arc<cold_build_limiter::ColdBuildLimiter>,
+    ) {
+        *self
+            .cold_build_limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limiter;
+    }
+
+    fn cold_build_limiter(&self) -> Arc<cold_build_limiter::ColdBuildLimiter> {
+        Arc::clone(
+            &self
+                .cold_build_limiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -343,10 +364,11 @@ impl InspectManager {
         if in_flight.contains_key(&key) {
             return Ok(Some(key));
         }
-        let Some(permit) = cold_build_limiter::try_acquire() else {
+        let limiter = self.cold_build_limiter();
+        let Some(permit) = limiter.try_acquire() else {
             return Err(format!(
                 "cold build concurrency limit ({}) reached; retrying later",
-                cold_build_limiter::limit()
+                limiter.limit()
             ));
         };
         in_flight.insert(key.clone(), Vec::new());
@@ -435,7 +457,8 @@ impl InspectManager {
             return submission;
         }
 
-        let Some(permit) = cold_build_limiter::try_acquire() else {
+        let limiter = self.cold_build_limiter();
+        let Some(permit) = limiter.try_acquire() else {
             let deferred = submission.newly_queued_categories.clone();
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 for category in &deferred {

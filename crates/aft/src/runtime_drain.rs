@@ -1609,14 +1609,15 @@ fn spawn_search_corpus_refresh_admitted(
     let persist_epoch_flag = ctx.search_persist_epoch_flag();
     let persist_epoch = ctx.next_search_persist_epoch();
     let lifecycle = ctx.subc_lifecycle_admission();
+    let cold_build_limiter = ctx.cold_build_limiter();
     thread::spawn(move || {
         let _terminal_guard = receiver_terminal_guard;
         log_ctx::with_session(session_id, || {
-            let Some(_permit) =
-                crate::cold_build_limiter::acquire_blocking_while("search corpus refresh", || {
-                    lifecycle.is_current(&generation_flag, generation)
-                })
-            else {
+            let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                &cold_build_limiter,
+                "search corpus refresh",
+                || lifecycle.is_current(&generation_flag, generation),
+            ) else {
                 return;
             };
             if !lifecycle.is_current(&generation_flag, generation)

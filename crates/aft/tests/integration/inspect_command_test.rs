@@ -139,6 +139,10 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
             ..Config::default()
         },
     );
+    // Libtest runs these independent contexts in one process, whereas nextest
+    // gives each test a process and therefore a separate production limiter.
+    // Preserve the production cap within each context without cross-test denial.
+    ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
         "id": "configure",
         "command": "configure",

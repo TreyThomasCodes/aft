@@ -10,6 +10,14 @@ const DEFAULT_COLD_BUILD_LIMIT: usize = 1024;
 static GLOBAL_COLD_BUILD_LIMITER: LazyLock<Arc<ColdBuildLimiter>> =
     LazyLock::new(|| Arc::new(ColdBuildLimiter::new(DEFAULT_COLD_BUILD_LIMIT)));
 
+pub(crate) fn global_limiter() -> Arc<ColdBuildLimiter> {
+    Arc::clone(&GLOBAL_COLD_BUILD_LIMITER)
+}
+
+pub(crate) fn isolated_limiter(limit: usize) -> Arc<ColdBuildLimiter> {
+    Arc::new(ColdBuildLimiter::new(limit))
+}
+
 pub fn try_acquire() -> Option<ColdBuildPermit> {
     GLOBAL_COLD_BUILD_LIMITER.try_acquire()
 }
@@ -33,7 +41,7 @@ pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option
     acquire_blocking_while_with_limiter(&GLOBAL_COLD_BUILD_LIMITER, kind, admitted)
 }
 
-fn acquire_blocking_while_with_limiter(
+pub(crate) fn acquire_blocking_while_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
     admitted: impl Fn() -> bool,
@@ -106,11 +114,11 @@ impl ColdBuildLimiter {
         }
     }
 
-    fn limit(&self) -> usize {
+    pub(crate) fn limit(&self) -> usize {
         self.limit
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
         loop {
             let available = self.available.load(Ordering::Acquire);
             if available == 0 {

@@ -177,31 +177,18 @@ const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
 
 #[derive(Clone)]
-enum SemanticRefreshLimiter {
-    ProcessWide,
-    #[cfg(test)]
-    Test(Arc<crate::cold_build_limiter::ColdBuildLimiter>),
-}
+struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
 
 impl SemanticRefreshLimiter {
     fn acquire(
         &self,
         admitted: impl Fn() -> bool,
     ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
-        match self {
-            Self::ProcessWide => crate::cold_build_limiter::acquire_blocking_while(
-                SEMANTIC_REFRESH_LIMITER_KIND,
-                admitted,
-            ),
-            #[cfg(test)]
-            Self::Test(limiter) => {
-                crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
-                    limiter,
-                    SEMANTIC_REFRESH_LIMITER_KIND,
-                    admitted,
-                )
-            }
-        }
+        crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+            &self.0,
+            SEMANTIC_REFRESH_LIMITER_KIND,
+            admitted,
+        )
     }
 }
 
@@ -2778,6 +2765,7 @@ fn schedule_artifact_loads(
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
         let session_id_for_bg = log_ctx::current_session();
+        let search_cold_build_limiter = ctx.cold_build_limiter();
         let search_generation = configure_generation;
         let search_generation_flag = ctx.configure_generation_flag();
         let search_content_generation = configure_content_generation;
@@ -2868,7 +2856,8 @@ fn schedule_artifact_loads(
                 ) else {
                     return;
                 };
-                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while(
+                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                    &search_cold_build_limiter,
                     "search index post-configure load",
                     || {
                         search_lifecycle
@@ -3116,6 +3105,7 @@ fn schedule_artifact_loads(
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
         let semantic_cold_seed_active = ctx.semantic_cold_seed_active_flag();
+        let semantic_cold_build_limiter = ctx.cold_build_limiter();
         let semantic_cold_seed_generation_flag = ctx.semantic_cold_seed_generation_flag();
         let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
         let semantic_generation = configure_generation;
@@ -3299,7 +3289,8 @@ fn schedule_artifact_loads(
                             // acknowledgement path, and waits only while this root
                             // remains bound so an unbound root cannot take a slot.
                             let Some(_refresh_permit) =
-                                crate::cold_build_limiter::acquire_blocking_while(
+                                crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                                    &semantic_cold_build_limiter,
                                     SEMANTIC_REFRESH_LIMITER_KIND,
                                     || {
                                         semantic_lifecycle.is_current(
@@ -3696,7 +3687,9 @@ fn schedule_artifact_loads(
                                     semantic_lifecycle.clone(),
                                     Arc::clone(&semantic_generation_flag),
                                     semantic_generation,
-                                    SemanticRefreshLimiter::ProcessWide,
+                                    SemanticRefreshLimiter(Arc::clone(
+                                        &semantic_cold_build_limiter,
+                                    )),
                                     log_ctx::current_session(),
                                 );
                                 if let Ok(mut slot) = refresh_worker_slot.lock() {
@@ -5579,7 +5572,7 @@ mod tests {
             let (ctx, request_tx, event_rx, worker) = spawn_semantic_corpus_refresh_worker_for_test(
                 root,
                 &config,
-                super::SemanticRefreshLimiter::Test(Arc::clone(&limiter)),
+                super::SemanticRefreshLimiter(Arc::clone(&limiter)),
             );
             request_tx
                 .send(SemanticRefreshRequest::Corpus)
@@ -5629,7 +5622,7 @@ mod tests {
         let (ctx, request_tx, event_rx, worker) = spawn_semantic_corpus_refresh_worker_for_test(
             root,
             &config,
-            super::SemanticRefreshLimiter::Test(Arc::clone(&limiter)),
+            super::SemanticRefreshLimiter(Arc::clone(&limiter)),
         );
         request_tx
             .send(SemanticRefreshRequest::Corpus)

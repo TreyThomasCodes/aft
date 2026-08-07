@@ -1389,6 +1389,7 @@ pub struct AppContext {
     /// closes it for degraded home roots and every heavy-work entry point reads
     /// the same atomic so the decision cannot drift after configure returns.
     heavy_root_work_allowed: Arc<AtomicBool>,
+    cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_store_force_requested: AtomicU64,
     callgraph_store_force_fulfilled: AtomicU64,
@@ -1751,6 +1752,7 @@ impl AppContext {
             artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
+            cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_store_force_requested: AtomicU64::new(0),
             callgraph_store_force_fulfilled: AtomicU64::new(0),
@@ -3761,10 +3763,11 @@ impl AppContext {
             return false;
         }
 
-        let Some(permit) = crate::cold_build_limiter::try_acquire() else {
+        let limiter = self.cold_build_limiter();
+        let Some(permit) = limiter.try_acquire() else {
             crate::slog_info!(
                 "callgraph store background work deferred by cold build limit ({})",
-                crate::cold_build_limiter::limit()
+                limiter.limit()
             );
             return false;
         };
@@ -4461,6 +4464,28 @@ impl AppContext {
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {
         Arc::clone(&self.inspect_manager)
+    }
+
+    pub(crate) fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
+        Arc::clone(
+            &self
+                .cold_build_limiter
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Give one integration-test context its own maintenance-build capacity.
+    /// Production contexts continue to share the process-wide limiter.
+    #[doc(hidden)]
+    pub fn isolate_cold_build_limiter_for_test(&self, limit: usize) {
+        let limiter = crate::cold_build_limiter::isolated_limiter(limit);
+        self.inspect_manager
+            .set_cold_build_limiter(Arc::clone(&limiter));
+        *self
+            .cold_build_limiter
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = limiter;
     }
 
     pub fn add_pending_tier2_paths<I>(&self, paths: I)
