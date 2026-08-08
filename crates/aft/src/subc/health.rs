@@ -422,8 +422,22 @@ pub(super) fn build_health_report(
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
+    let mut repair_roots_annotated = 0usize;
     for root in &mut roots {
-        let project_key = crate::search_index::artifact_cache_key(Path::new(&root.project_root));
+        // Memo-only, never a git probe: artifact_cache_key() spawns a git
+        // subprocess per unmemoized root, and this loop runs on the channel-0
+        // reply path across every live root. On a host with exec stalls — the
+        // exact fault health probes ride through — a spawn loop here pushes
+        // the reply past the supervisor deadline and the module is killed as
+        // unresponsive (2026-08-08 second outage). An unmemoized root simply
+        // loses its per-root repair annotation; the process-wide total above
+        // does not depend on cache keys.
+        let Some(project_key) =
+            crate::search_index::artifact_cache_key_memoized_only(Path::new(&root.project_root))
+        else {
+            continue;
+        };
+        repair_roots_annotated += 1;
         if let Some((count, _window_start)) =
             crate::callgraph_store::repair_entry_rate(&project_key)
         {
@@ -432,6 +446,11 @@ pub(super) fn build_health_report(
             }
         }
     }
+    // Absent-vs-zero disambiguation for the per-root repair annotation: a
+    // root without a derived cache key is NOT MEASURED, which must render
+    // differently from "measured, zero". The denominator pair makes the
+    // coverage visible instead of letting absence read as health.
+    let repair_roots_total = roots.len();
 
     // Compact memory rollup for operator drill-down (`ck health aft`): per-root
     // attributed bytes with the same top-N cap as the status payload, plus
@@ -483,6 +502,8 @@ pub(super) fn build_health_report(
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
             "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+            "callgraph_repair_roots_annotated": repair_roots_annotated,
+            "callgraph_repair_roots_total": repair_roots_total,
             "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
             "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
             // Lifecycle audit counters (fleet leak tracking): process-wide
@@ -559,6 +580,9 @@ mod tests {
         assert!(executor.register_actor(root.clone(), test_ctx()));
         let metrics = DispatchPathMetrics::new();
         let app = crate::context::App::default_shared();
+        // The production annotation path reads the derivation map only
+        // (never spawns git), so derive the key the way configure would —
+        // artifact_cache_key records it as a side effect.
         let project_key = crate::search_index::artifact_cache_key(root.as_path());
 
         let quiet = build_health_report(&executor, &HashMap::new(), &metrics, &app);

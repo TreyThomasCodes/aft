@@ -3853,7 +3853,7 @@ impl std::fmt::Display for ArtifactCacheKeyProbeError {
 impl std::error::Error for ArtifactCacheKeyProbeError {}
 
 pub fn artifact_cache_key(project_root: &Path) -> String {
-    match repo_root_commit_with_retry(project_root) {
+    let key = match repo_root_commit_with_retry(project_root) {
         RootCommitResolution::Commit(root_commit) => artifact_key_from_git_identity(&root_commit),
         RootCommitResolution::NotARepo => artifact_key_from_path_identity(project_root),
         RootCommitResolution::Failed(detail) => {
@@ -3865,7 +3865,9 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
             );
             artifact_key_from_path_identity(project_root)
         }
-    }
+    };
+    record_derived_cache_key(project_root, &key);
+    key
 }
 
 pub fn artifact_cache_key_with_memo(
@@ -3883,6 +3885,7 @@ pub fn artifact_cache_key_with_memo(
     match repo_root_commit_with_retry(probe_root) {
         RootCommitResolution::Commit(root_commit) => {
             let key = artifact_key_from_git_identity(&root_commit);
+            record_derived_cache_key(memo_root, &key);
             if let Err(error) =
                 record_artifact_cache_key_memo(storage_root, &memo_root_key, &key, &root_commit)
             {
@@ -3919,6 +3922,37 @@ pub fn artifact_cache_key_with_memo(
             }
         }
     }
+}
+
+/// In-process root→key map recorded at every successful cache-key
+/// derivation, for paths that must NEVER block. Unlike the persisted memo
+/// (git identities only, lazily loaded from disk), this covers path-identity
+/// roots too and never touches disk or spawns.
+static DERIVED_CACHE_KEYS: OnceLock<RwLock<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn record_derived_cache_key(project_root: &Path, key: &str) {
+    let map = DERIVED_CACHE_KEYS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(mut map) = map.write() {
+        map.insert(project_root.to_path_buf(), key.to_string());
+    }
+}
+
+/// Non-blocking cache-key lookup for the channel-0 health reply path:
+/// consults only the in-process derivation map — no git subprocess, no disk
+/// read, try-lock only. Returns `None` for a root that has not derived a key
+/// this process (callers treat that as "annotation unavailable").
+///
+/// Why this exists: `artifact_cache_key()` spawns a git probe (up to 3 execs
+/// + backoff sleeps), and on a host whose exec path is stalling — the exact
+/// condition health probes exist to ride out — a per-root spawn loop pushes
+/// the health reply past the supervisor's deadline and reads as module death
+/// (2026-08-08 second outage). The health-path rule is not just
+/// try-lock-only: NOTHING on the reply path may block, and exec is worse
+/// than any lock.
+pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
+    let map = DERIVED_CACHE_KEYS.get()?;
+    let map = map.try_read().ok()?;
+    map.get(project_root).cloned()
 }
 
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
