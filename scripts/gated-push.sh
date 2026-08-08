@@ -6,6 +6,18 @@
 # Example: scripts/gated-push.sh -- cargo test -p agent-file-tools --lib
 set -euo pipefail
 
+# Refuse to gate a tree that is mid-merge/cherry-pick/rebase: a conflicted
+# tree can compile stale HEAD state while the gate's pipes mask failures,
+# and the final push becomes a no-op "up-to-date" that reads as success.
+for marker in CHERRY_PICK_HEAD MERGE_HEAD REBASE_HEAD; do
+  if [ -e "$(git rev-parse --git-dir)/$marker" ]; then
+    echo "gated-push: refusing — $marker present (unresolved git operation)" >&2
+    exit 2
+  fi
+done
+set -o pipefail
+
+
 remote="origin"
 branch="main"
 while [[ $# -gt 0 ]]; do
