@@ -26,8 +26,8 @@
     },
     {
       "path": "STRUCTURE.md",
-      "location": "line 117, column 53",
-      "line": 117,
+      "location": "line 122, column 53",
+      "line": 122,
       "column": 53,
       "token": "filePath",
       "class": "internal-compatibility",
