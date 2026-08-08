@@ -3795,12 +3795,15 @@ fn sort_shared_grep_matches_by_cached_mtime_desc<F>(
 }
 
 pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> SearchScope {
-    let resolved_project_root = canonicalize_for_search_membership(project_root);
+    // Keep the returned scope path in the historical canonical/lexical form.
+    // Only `is_within_search_root` normalizes its operands for the membership
+    // comparison; callers pass this path on to filesystem and display logic.
+    let resolved_project_root = canonicalize_or_normalize(project_root);
     let root = match path {
         Some(path) => {
             let path = PathBuf::from(path);
             if path.is_absolute() {
-                canonicalize_for_search_membership(&path)
+                canonicalize_or_normalize(&path)
             } else {
                 normalize_path(&resolved_project_root.join(path))
             }
