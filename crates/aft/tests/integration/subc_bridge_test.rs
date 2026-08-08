@@ -189,6 +189,14 @@ impl SubcBridgeTestRoots {
         let push_burst_root = tempfile::tempdir().expect("push burst root tempdir");
         let slow_root = tempfile::tempdir().expect("slow root tempdir");
         let callgraph_root = tempfile::tempdir().expect("callgraph root tempdir");
+        let canonical_callgraph_root = std::fs::canonicalize(callgraph_root.path())
+            .unwrap_or_else(|_| callgraph_root.path().to_path_buf());
+        // Register the fixture's writer capability before transport timing begins.
+        aft::root_cache::configure_artifact_access(
+            &canonical_callgraph_root,
+            &aft::search_index::artifact_cache_key(&canonical_callgraph_root),
+            false,
+        );
         let callgraph_src = callgraph_root.path().join("src");
         std::fs::create_dir_all(&callgraph_src).expect("callgraph src dir");
         let callgraph_file = callgraph_src.join("lib.rs");
