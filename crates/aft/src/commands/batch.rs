@@ -473,7 +473,9 @@ fn resolve_edit(
         if line_start == total_lines {
             let byte_pos = source.len();
             let mut replacement_str = content.to_string();
-            if !source.ends_with('\n') && !replacement_str.starts_with('\n') {
+            // An empty file has no preceding line to separate from the append.
+            // Only add a leading newline when existing content needs separation.
+            if !source.is_empty() && !source.ends_with('\n') && !replacement_str.starts_with('\n') {
                 replacement_str.insert(0, '\n');
             }
             if !replacement_str.ends_with('\n') {
