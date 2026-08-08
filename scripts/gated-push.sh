@@ -6,6 +6,23 @@
 # Example: scripts/gated-push.sh -- cargo test -p agent-file-tools --lib
 set -euo pipefail
 
+# Run the entire gate at reduced scheduling priority so saturated test
+# windows cannot starve the supervised ck-* modules into missing health
+# probes (three health-kills on 2026-08-08 traced to gate-window load).
+# taskpolicy demotes to the utility QoS class on macOS (E-cores under
+# contention); nice covers Linux and the priority dimension everywhere.
+# Self-demotion only covers load WE generate; the supervisor-side
+# threshold fix covers foreign load.
+if [ -z "${AFT_GATE_DEMOTED:-}" ]; then
+  export AFT_GATE_DEMOTED=1
+  if command -v taskpolicy >/dev/null 2>&1; then
+    exec taskpolicy -c utility nice -n 10 "$0" "$@"
+  else
+    exec nice -n 10 "$0" "$@"
+  fi
+fi
+
+
 # Refuse to gate a tree that is mid-merge/cherry-pick/rebase: a conflicted
 # tree can compile stale HEAD state while the gate's pipes mask failures,
 # and the final push becomes a no-op "up-to-date" that reads as success.
