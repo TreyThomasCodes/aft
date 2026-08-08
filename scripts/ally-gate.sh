@@ -18,7 +18,7 @@ set -euo pipefail
 # and probe ssh as ufuka (hostname reports AsusAllyKO).
 # mDNS first: the DHCP address drifts across re-images (.42 -> .33 so far).
 # Override with ALLY=user@host. Box conventions (SYNAPSE-shared): mkdir lock
-# at C:\Users\ufuka\ally.lock with HOLDER.txt; ssh DefaultShell is git-bash.
+# at C:\Users\ufuka\ally.lock with HOLDER.txt; ssh DefaultShell is git-bash, so remote paths use ~ (POSIX), not %USERPROFILE%.
 ALLY="${ALLY:-ufuka@asusallyko.local}"
 FILTER="${1:-test(status_memory) | test(refresh_worker_tests) | test(subc_storm) | test(subc_bridge) | test(bash_background)}"
 
@@ -33,7 +33,7 @@ echo "== nextest on ally: $FILTER"
 # Bare runner over ssh; ssh propagates the remote exit code, which is this
 # script's verdict. No pipes between the runner and the gate (rule 8231).
 ssh -o BatchMode=yes "$ALLY" \
-  "cd %USERPROFILE%\\aft && git fetch origin ally-gate && git reset --hard FETCH_HEAD && cargo nextest run -p agent-file-tools -E \"$FILTER\" --no-fail-fast"
+  "cd ~/aft && git fetch origin ally-gate && git reset --hard FETCH_HEAD && cargo nextest run -p agent-file-tools -E \"$FILTER\" --no-fail-fast"
 rc=$?
 echo "ALLY_GATE_RC=$rc"
 exit $rc
