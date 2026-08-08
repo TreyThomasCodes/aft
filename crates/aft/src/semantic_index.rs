@@ -5032,16 +5032,19 @@ mod tests {
         install_test_crypto_provider();
         let url = env::var("AFT_PLATFORM_VERIFIER_TLS_URL").expect("test TLS URL");
         let tls_config = crate::platform_tls::client_config().expect("build platform TLS config");
-        // Generous budgets: on macOS the FIRST evaluation of an untrusted chain
-        // can take >10s when the keychain holds a pathological trust-settings
-        // entry (trustd walks user trust settings and storms signature checks),
-        // and >45s when the parallel lib-test fan-out loads the machine on top
-        // of that. The verifier still rejects correctly; a short timeout would
-        // surface a transient "operation timed out" before the certificate
-        // error exists. Clean keychains answer in milliseconds, so this budget
-        // only ever costs time on machines with hostile trust settings.
+        // This test asserts the ERROR CLASS (certificate trust failure), not
+        // latency, so the budget must be unreachable by keychain slowness: on
+        // macOS the first evaluation of an untrusted chain walks user trust
+        // settings (trustd), which a pathological keychain entry plus machine
+        // load has stretched past 120s — at which point the request surfaces a
+        // transient "operation timed out" BEFORE the certificate verdict
+        // exists and the assertion fails on the wrong error class. 120s was
+        // tried twice and breached twice (485s observed once under load ~100).
+        // Clean keychains answer in milliseconds; this budget only ever costs
+        // time on machines with hostile trust settings, where a slow correct
+        // verdict beats a fast wrong one.
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(600))
             .use_preconfigured_tls(tls_config)
             .build()
             .expect("build test embedding client");
@@ -5049,7 +5052,7 @@ mod tests {
             || client.post(&url).body("{}"),
             "openai compatible",
             EmbeddingRequestPolicy::Query(QueryBudget {
-                timeout_ms: 120_000,
+                timeout_ms: 600_000,
             }),
         );
 
