@@ -517,13 +517,22 @@ pub fn drain_search_index_events(ctx: &AppContext) {
 }
 
 pub fn drain_callgraph_store_events(ctx: &AppContext) {
-    let (latest, settled, disconnected, fulfilled_force_token, receiver_generation, receiver_epoch) = {
+    let (
+        latest,
+        denied,
+        settled,
+        disconnected,
+        fulfilled_force_token,
+        receiver_generation,
+        receiver_epoch,
+    ) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
             return;
         };
 
         let mut latest = None;
+        let mut denied = None;
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
@@ -546,6 +555,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                         settled = true;
                     }
                 }
+                Ok(CallGraphStoreBuildEvent::Denied { reason }) => denied = Some(reason),
                 Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -556,6 +566,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         }
         (
             latest,
+            denied,
             settled,
             disconnected,
             fulfilled_force_token,
@@ -565,7 +576,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     };
 
     let ready_received = latest.is_some();
-    let terminal = ready_received || settled || disconnected;
+    let terminal = ready_received || denied.is_some() || settled || disconnected;
     if !terminal {
         return;
     }
@@ -595,6 +606,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     let installed =
         ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
             let installed = if let Some(store) = reopened {
+                ctx.clear_callgraph_store_build_denied();
                 *ctx.callgraph_store()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
@@ -613,6 +625,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             } else {
                 false
             };
+            if let Some(reason) = denied {
+                ctx.record_callgraph_store_build_denied(receiver_generation, reason);
+            }
             if terminal {
                 *receiver = None;
             }

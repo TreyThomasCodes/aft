@@ -468,6 +468,9 @@ pub enum CallGraphStoreBuildEvent {
         fulfilled_force_token: Option<u64>,
         publication_epoch: u64,
     },
+    Denied {
+        reason: String,
+    },
     Settled,
 }
 
@@ -498,6 +501,11 @@ impl CallGraphStoreBuildSettlement {
             fulfilled_force_token: self.force_token,
             publication_epoch: self.publication_epoch,
         });
+        self.sent = true;
+    }
+
+    fn denied(&mut self, reason: String) {
+        let _ = self.tx.send(CallGraphStoreBuildEvent::Denied { reason });
         self.sent = true;
     }
 }
@@ -1397,6 +1405,7 @@ pub struct AppContext {
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
     callgraph_store_rx_generation: AtomicU64,
     callgraph_store_rx_epoch: AtomicU64,
+    callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
@@ -1759,6 +1768,7 @@ impl AppContext {
             callgraph_store_rx: parking_lot::Mutex::new(None),
             callgraph_store_rx_generation: AtomicU64::new(0),
             callgraph_store_rx_epoch: AtomicU64::new(0),
+            callgraph_store_build_denied: parking_lot::Mutex::new(None),
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -3308,6 +3318,31 @@ impl AppContext {
             .fetch_max(token, Ordering::SeqCst);
     }
 
+    #[doc(hidden)]
+    pub fn record_callgraph_store_build_denied(&self, generation: u64, reason: String) {
+        *self.callgraph_store_build_denied.lock() = Some((generation, reason));
+    }
+
+    #[doc(hidden)]
+    pub fn clear_callgraph_store_build_denied(&self) {
+        *self.callgraph_store_build_denied.lock() = None;
+    }
+
+    fn callgraph_store_build_denial(&self) -> Option<String> {
+        let generation = self.configure_generation();
+        let mut denied = self.callgraph_store_build_denied.lock();
+        match denied.as_ref() {
+            Some((denied_generation, reason)) if *denied_generation == generation => {
+                Some(reason.clone())
+            }
+            Some(_) => {
+                *denied = None;
+                None
+            }
+            None => None,
+        }
+    }
+
     pub fn callgraph_store_dir(&self) -> PathBuf {
         if let Some(root) = self.callgraph_project_root() {
             self.storage_dir()
@@ -3500,6 +3535,7 @@ impl AppContext {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.as_ref().map(Arc::clone)
             } {
+                self.clear_callgraph_store_build_denied();
                 self.schedule_legacy_callgraph_migration_if_needed(
                     store.as_ref(),
                     store.project_root().to_path_buf(),
@@ -3507,6 +3543,10 @@ impl AppContext {
                 );
                 return CallgraphStoreAccess::Ready(store);
             }
+        }
+
+        if let Some(reason) = self.callgraph_store_build_denial() {
+            return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason));
         }
 
         // A background build is already running; don't start a second one.
@@ -3534,6 +3574,7 @@ impl AppContext {
                     let Some(store) = installed else {
                         return CallgraphStoreAccess::Unavailable;
                     };
+                    self.clear_callgraph_store_build_denied();
                     self.schedule_legacy_callgraph_migration_if_needed(
                         store.as_ref(),
                         project_root.clone(),
@@ -3630,6 +3671,7 @@ impl AppContext {
                             match reopened {
                                 Ok(Some(store)) => {
                                     let ready = Arc::new(store);
+                                    self.clear_callgraph_store_build_denied();
                                     *self
                                         .callgraph_store
                                         .write()
@@ -3666,6 +3708,21 @@ impl AppContext {
                         let _ = self.request_tier2_refresh_pull();
                     }
                     return outcome;
+                }
+                Ok(CallGraphStoreBuildEvent::Denied { reason }) => {
+                    let denied = self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| {
+                            *receiver = None;
+                            self.record_callgraph_store_build_denied(
+                                receiver_generation,
+                                reason.clone(),
+                            );
+                            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason))
+                        },
+                    );
+                    return denied.unwrap_or(CallgraphStoreAccess::Unavailable);
                 }
                 Ok(CallGraphStoreBuildEvent::Settled) => {
                     let _ = self.with_current_callgraph_store_rx(
@@ -3875,6 +3932,15 @@ impl AppContext {
                             "callgraph store disk publication skipped for superseded epoch {}",
                             persist_epoch
                         );
+                    }
+                    Err(crate::callgraph_store::CallGraphStoreError::Unavailable(reason))
+                        if reason.ends_with("could not acquire writer capability") =>
+                    {
+                        crate::slog_warn!(
+                            "callgraph store background work denied writer capability: {}",
+                            reason
+                        );
+                        settlement.denied(reason);
                     }
                     Err(error) => {
                         crate::slog_warn!("callgraph store background work failed: {}", error);
@@ -7174,6 +7240,8 @@ mod callgraph_store_for_ops_tests {
                 ..Config::default()
             },
         );
+        let project_key = crate::search_index::artifact_cache_key(project.path());
+        crate::root_cache::configure_artifact_access(project.path(), &project_key, false);
         let pending = project.path().join("pending.rs");
         ctx.add_pending_callgraph_store_paths([pending.clone()]);
         REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.store(true, Ordering::SeqCst);
@@ -7456,6 +7524,53 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             taken, expected,
             "root-relative and deleted in-root paths must survive the filter"
+        );
+    }
+
+    #[test]
+    fn writer_denied_callgraph_build_is_terminal_not_building() {
+        let _env_guard = callgraph_build_wait_ms(30_000);
+        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
+
+        let denied_ctx = cold_build_context();
+        let denied_reason = match denied_ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason)) => reason,
+            CallgraphStoreAccess::Building => {
+                panic!("writer-denied build must not remain in the retryable Building state")
+            }
+            _ => panic!("unregistered root must terminate with an unavailable reason"),
+        };
+        assert!(
+            denied_reason.contains("could not acquire writer capability"),
+            "terminal status must explain the writer-capability denial: {denied_reason}"
+        );
+        assert!(matches!(
+            denied_ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason))
+                if reason.contains("could not acquire writer capability")
+        ));
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "polling a denied root must not spawn another doomed build"
+        );
+
+        // Control case: granting the artifact-access capability installed by
+        // `configure_artifact_access` should change this cold build from denied to ready.
+        let writable_ctx = cold_build_context();
+        let writable_root = writable_ctx
+            .config()
+            .project_root
+            .clone()
+            .expect("writable fixture root");
+        let writable_key = crate::search_index::artifact_cache_key(&writable_root);
+        crate::root_cache::configure_artifact_access(&writable_root, &writable_key, false);
+        assert!(
+            matches!(
+                writable_ctx.callgraph_store_for_ops(),
+                CallgraphStoreAccess::Ready(_)
+            ),
+            "removing the forced denial must change the terminal status"
         );
     }
 
