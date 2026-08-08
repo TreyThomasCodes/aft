@@ -578,6 +578,18 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
                 "project_key",
                 "manifest_path",
                 "owner_project_scope_key",
+                // Callgraph write instrumentation counts real commits inside a
+                // rolling 60s window; the direct and tool_call processes each
+                // run their own store setup, so under CI load their commit
+                // counts and byte totals legitimately diverge. The FIELDS'
+                // presence stays asserted (always-present-total contract);
+                // only the sampled values are masked.
+                "callgraph_commits_60s_total",
+                "callgraph_pages_or_bytes_written_60s_total",
+                "callgraph_commits_60s",
+                "callgraph_pages_or_bytes_written_60s",
+                "callgraph_repair_entries_60s_total",
+                "callgraph_repair_entries_60s",
             ] {
                 if map.contains_key(key) {
                     map.insert(key.to_string(), Value::String(format!("<{key}>")));
