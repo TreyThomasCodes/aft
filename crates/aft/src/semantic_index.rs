@@ -5111,9 +5111,19 @@ mod tests {
                 command.env("SSL_CERT_FILE", ca_path);
             }
             let output = command.output().expect("run TLS child test");
+            // Name the exit status and any terminating signal in the failure:
+            // under heavy machine load this child has died with EMPTY output,
+            // and a blind "child failed" leaves nothing to diagnose with.
+            #[cfg(unix)]
+            let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+            #[cfg(not(unix))]
+            let signal: Option<i32> = None;
             assert!(
                 output.status.success(),
-                "TLS child failed:\n{}\n{}",
+                "TLS child failed: status={:?} code={:?} signal={:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                output.status.code(),
+                signal,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
