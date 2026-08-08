@@ -599,12 +599,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     poolOptions,
     configOverrides,
     subcConnectionFile: config.subc?.connection_file,
-    onBgEventsNudge: (projectRoot, session) => {
+    onBgEventsNudgeRef: (ref) => {
       void handleSubcBgEventsNudge({
         ctx,
-        directory: projectRoot,
-        sessionID: session,
+        directory: ref.canonicalRoot,
+        sessionID: ref.session,
+        nudgeRef: ref,
         runtime: pi,
+      }).catch((err) => {
+        warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
       });
     },
   });

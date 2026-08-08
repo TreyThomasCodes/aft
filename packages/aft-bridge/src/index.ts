@@ -176,7 +176,12 @@ export {
   shouldEmitStatusBar,
   statusBarLine,
 } from "./status-bar.js";
-export { SubcTransportPool, type SubcTransportPoolOptions } from "./subc-transport.js";
+export {
+  type BgNudgeRef,
+  resolveBridgeForNudge,
+  SubcTransportPool,
+  type SubcTransportPoolOptions,
+} from "./subc-transport.js";
 // --- shared agent-facing tool formatting ---
 export type { ReadFooterOptions } from "./tool-format.js";
 export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";

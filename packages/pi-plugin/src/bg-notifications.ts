@@ -1,3 +1,8 @@
+import {
+  type AftProjectTransport,
+  type BgNudgeRef,
+  resolveBridgeForNudge,
+} from "@cortexkit/aft-bridge";
 import { sessionWarn } from "./logger.js";
 import type { PluginContext } from "./types.js";
 
@@ -131,6 +136,10 @@ interface DrainContext {
   ctx: PluginContext;
   directory: string;
   sessionID?: string;
+  /** Complete provenance for a subc bg_events nudge. */
+  nudgeRef?: BgNudgeRef;
+  /** Cached bridge so one nudge resolves drain and ack through one authority. */
+  resolvedBridge?: AftProjectTransport;
 }
 
 /**
@@ -442,6 +451,9 @@ export async function handleTurnEndBgCompletions(
 export async function handleSubcBgEventsNudge(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
+  // Resolve before touching session state. A stale nudge must be a terminal,
+  // side-effect-free rejection rather than a reason to create a successor.
+  bridgeForDrain(drainContext);
   stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
   await triggerWakeIfPending(drainContext, false, true, true);
 }
@@ -505,6 +517,16 @@ async function triggerWakeIfPending(
       if (acked) confirmAcked(state, ackTargetIds);
     },
     (err, hardStopped) => {
+      if (isTerminalNudgeError(err)) {
+        sessionWarn(drainContext.sessionID ?? "", `${LOG_PREFIX} nudge rejected; terminal`, {
+          event: "subc_bg_nudge_terminal",
+          code: "root_generation_expired",
+          canonical_root: drainContext.nudgeRef?.canonicalRoot,
+          expected_generation: drainContext.nudgeRef?.generation,
+          expected_concrete_pool_id: drainContext.nudgeRef?.concretePoolId,
+        });
+        return;
+      }
       sessionWarn(
         drainContext.sessionID ?? "",
         hardStopped
@@ -569,15 +591,34 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
 }
 
-async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Promise<void> {
-  const state = stateFor(sessionID);
+function bridgeForDrain(drainContext: DrainContext): AftProjectTransport {
+  if (drainContext.resolvedBridge) return drainContext.resolvedBridge;
+  const bridge = drainContext.nudgeRef
+    ? resolveBridgeForNudge(drainContext.ctx.pool, drainContext.nudgeRef)
+    : drainContext.ctx.pool.getActiveBridgeForRoot(drainContext.directory);
+  if (!bridge) {
+    throw new Error(`active bridge unavailable for ${drainContext.directory}`);
+  }
+  drainContext.resolvedBridge = bridge;
+  return bridge;
+}
+
+function isTerminalNudgeError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error as Error & { code?: unknown }).code === "root_generation_expired"
+  );
+}
+
+async function drainCompletions(drainContext: DrainContext): Promise<void> {
   try {
-    const bridge = ctx.pool.getActiveBridgeForRoot(directory) ?? ctx.pool.getBridge(directory);
-    const params = sessionID ? { session_id: sessionID } : {};
+    const bridge = bridgeForDrain(drainContext);
+    const state = stateFor(drainContext.sessionID);
+    const params = drainContext.sessionID ? { session_id: drainContext.sessionID } : {};
     const response = await bridge.send("bash_drain_completions", params);
     if (response.success === false) {
       sessionWarn(
-        sessionID ?? "",
+        drainContext.sessionID ?? "",
         `${LOG_PREFIX} drain failed: ${String(response.message ?? "unknown error")}`,
       );
       return;
@@ -589,10 +630,10 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
     // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
     // double-delivers.
     const reackTaskIds = reconcileAwaitingAck(state, response.bg_completions);
-    ingestDrainedBgCompletions(sessionID, response.bg_completions);
+    ingestDrainedBgCompletions(drainContext.sessionID, response.bg_completions);
     if (reackTaskIds.length > 0) {
       const reacked = await ackCompletions(
-        { ctx, directory, sessionID },
+        drainContext,
         reackTaskIds.map((task_id) => ({
           task_id,
           status: "unknown",
@@ -603,34 +644,38 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
       if (reacked) confirmAcked(state, reackTaskIds);
     }
   } catch (err) {
+    if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
     sessionWarn(
-      sessionID ?? "",
+      drainContext.sessionID ?? "",
       `${LOG_PREFIX} drain failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
 
 async function ackCompletions(
-  { ctx, directory, sessionID }: DrainContext,
+  drainContext: DrainContext,
   completions: readonly BgCompletion[],
 ): Promise<boolean> {
   const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
   if (taskIds.length === 0) return true;
   try {
-    const bridge = ctx.pool.getActiveBridgeForRoot(directory) ?? ctx.pool.getBridge(directory);
-    const params = sessionID ? { session_id: sessionID, task_ids: taskIds } : { task_ids: taskIds };
+    const bridge = bridgeForDrain(drainContext);
+    const params = drainContext.sessionID
+      ? { session_id: drainContext.sessionID, task_ids: taskIds }
+      : { task_ids: taskIds };
     const response = await bridge.send("bash_ack_completions", params);
     if (response.success === false) {
       sessionWarn(
-        sessionID ?? "",
+        drainContext.sessionID ?? "",
         `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
       );
       return false;
     }
     return true;
   } catch (err) {
+    if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
     sessionWarn(
-      sessionID ?? "",
+      drainContext.sessionID ?? "",
       `${LOG_PREFIX} ack failed: ${err instanceof Error ? err.message : String(err)}`,
     );
     return false;
@@ -753,6 +798,16 @@ function scheduleWake(
         state.wakeHardStopped = false;
       })
       .catch((err) => {
+        // A stale nudge is terminal. Do not re-pend or retry it: the reference
+        // has expired and must never revive a pool or mutate successor state.
+        if (isTerminalNudgeError(err)) {
+          clearDelivering(state, ackTargetIds);
+          clearAwaitingAck(state, ackTargetIds);
+          state.retryDelayMs = null;
+          state.wakeHardStopped = true;
+          onSendFailure(err, true);
+          return;
+        }
         // C-#1 site 3: delivery failed before departing (sendWake rejects only
         // before the awaiting-ack move). Clear in-flight so re-pended tasks are
         // redeliverable on retry.
@@ -941,6 +996,11 @@ function clearDelivering(state: SessionBgState, taskIds: readonly string[]): voi
 
 /** Ack confirmed (Rust dropped them): stop tracking — they will never re-nudge. */
 function confirmAcked(state: SessionBgState, taskIds: readonly string[]): void {
+  for (const id of taskIds) state.deliveredAwaitingAckTaskIds.delete(id);
+}
+
+/** Terminal nudge rejection: discard local delivery markers without retrying. */
+function clearAwaitingAck(state: SessionBgState, taskIds: readonly string[]): void {
   for (const id of taskIds) state.deliveredAwaitingAckTaskIds.delete(id);
 }
 

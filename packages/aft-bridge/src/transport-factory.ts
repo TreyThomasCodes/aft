@@ -28,7 +28,7 @@ import {
 } from "./lifecycle-registry.js";
 import { BridgePool, type PoolOptions } from "./pool.js";
 import { RevivableTransportPool } from "./revivable-transport.js";
-import { SubcTransportPool } from "./subc-transport.js";
+import { type BgNudgeRef, SubcTransportPool } from "./subc-transport.js";
 import type { AftTransportPool } from "./transport.js";
 
 export interface AftTransportFactoryOptions {
@@ -69,6 +69,8 @@ export interface AftTransportFactoryOptions {
    * handler MUST force a drain (the nudge is payload-less). Ignored standalone.
    */
   onBgEventsNudge?: (projectRoot: string, session: string) => void;
+  /** Subc path: idle bg-completion wake handler with complete root provenance. */
+  onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
 }
 
 function resolveConnectionFilePath(raw: string): string {
@@ -194,6 +196,7 @@ async function createConcreteAftTransportPool(
       harness: opts.harness,
       consumerIdentity: opts.subcConsumerIdentity,
       onBgEventsNudge: opts.onBgEventsNudge,
+      onBgEventsNudgeRef: opts.onBgEventsNudgeRef,
       lifecycleDemandCheck: opts.subcLifecycleDemandCheck ?? ((root) => existsSync(root)),
     });
   }

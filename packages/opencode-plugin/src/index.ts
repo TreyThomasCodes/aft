@@ -617,12 +617,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     poolOptions,
     configOverrides,
     subcConnectionFile: aftConfig.subc?.connection_file,
-    onBgEventsNudge: (projectRoot, session) => {
+    onBgEventsNudgeRef: (ref) => {
       void handleSubcBgEventsNudge({
         ctx,
-        directory: projectRoot,
-        sessionID: session,
+        directory: ref.canonicalRoot,
+        sessionID: ref.session,
+        nudgeRef: ref,
         client: input.client,
+      }).catch((err) => {
+        warn(`[aft-plugin] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
       });
     },
   });

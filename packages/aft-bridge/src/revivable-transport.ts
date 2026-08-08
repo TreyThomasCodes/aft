@@ -1,5 +1,6 @@
 import { warn } from "./active-logger.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
+import type { BgNudgeRef } from "./subc-transport.js";
 import type {
   AftProjectTransport,
   AftTransportPool,
@@ -137,6 +138,40 @@ export class RevivableTransportPool implements AftTransportPool {
       },
     );
     return revival;
+  }
+
+  /**
+   * Return only the existing outer facade that matches a live concrete nudge.
+   * Unlike getActiveBridgeForRoot, this path never creates a wrapper facade or
+   * asks the active pool for demand.
+   */
+  getActiveBridgeForRootGeneration(ref: BgNudgeRef): RevivableProjectTransport | null {
+    const concretePool = this.activePool as AftTransportPool & {
+      getActiveBridgeForRootGeneration?: (value: BgNudgeRef) => AftProjectTransport | null;
+    };
+    if (!concretePool.getActiveBridgeForRootGeneration?.(ref)) return null;
+    return this.transports.get(ref.canonicalRoot) ?? null;
+  }
+
+  recordBgNudgeRejection(ref: BgNudgeRef): void {
+    const pool = this.activePool as AftTransportPool & {
+      recordBgNudgeRejection?: (value: BgNudgeRef) => void;
+    };
+    pool.recordBgNudgeRejection?.(ref);
+  }
+
+  getCurrentRootGeneration(root: string): BgNudgeRef["generation"] | undefined {
+    const pool = this.activePool as AftTransportPool & {
+      getCurrentRootGeneration?: (value: string) => BgNudgeRef["generation"] | undefined;
+    };
+    return pool.getCurrentRootGeneration?.(root);
+  }
+
+  getConcretePoolId(): BgNudgeRef["concretePoolId"] | undefined {
+    const pool = this.activePool as AftTransportPool & {
+      getConcretePoolId?: () => BgNudgeRef["concretePoolId"] | undefined;
+    };
+    return pool.getConcretePoolId?.();
   }
 
   currentBridge(projectRoot: string): AftProjectTransport | null {
