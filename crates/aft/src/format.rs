@@ -2640,8 +2640,13 @@ mod tests {
             ..Config::default()
         };
         let (formatted, reason) = auto_format(&path, &config);
-        assert!(formatted, "expected formatting to succeed");
-        assert!(reason.is_none());
+        // Name the skip reason on failure: this has failed on loaded Windows
+        // runners with no way to tell a rustfmt timeout from a resolve miss.
+        assert!(
+            formatted,
+            "expected formatting to succeed (reason: {reason:?})"
+        );
+        assert!(reason.is_none(), "unexpected skip reason: {reason:?}");
 
         let content = fs::read_to_string(&path).unwrap();
         assert!(
