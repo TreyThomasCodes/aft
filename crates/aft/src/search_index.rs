@@ -6,7 +6,7 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -80,6 +80,33 @@ struct ArtifactCacheKeyMemoEntry {
 #[derive(Default)]
 struct ArtifactCacheKeyMemoState {
     by_storage_root: BTreeMap<PathBuf, BTreeMap<String, ArtifactCacheKeyMemoEntry>>,
+}
+
+pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
+
+/// Read an artifact pointer without allowing a writer to strand an interactive request.
+///
+/// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
+/// validating or replacing a large artifact. Search must treat that contention as temporary
+/// unavailability and use its bounded fallback rather than waiting for transport timeout.
+pub(crate) fn try_read_with_budget<T>(
+    lock: &RwLock<T>,
+    budget: Duration,
+) -> Option<RwLockReadGuard<'_, T>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match lock.try_read() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            }
+        }
+    }
 }
 
 pub struct CacheLock {
@@ -6783,6 +6810,34 @@ mod warm_reload_verification_tests {
         assert!(
             index.files.is_empty(),
             "a write-denied build must not materialize an in-RAM index"
+        );
+    }
+}
+
+#[cfg(test)]
+mod interactive_artifact_read_budget_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn contended_read_returns_within_interactive_budget() {
+        let lock = Arc::new(RwLock::new(()));
+        let writer = lock.write().expect("acquire test writer");
+        let reader_lock = Arc::clone(&lock);
+        let reader = thread::spawn(move || {
+            let started = Instant::now();
+            let result = try_read_with_budget(&reader_lock, Duration::from_millis(20));
+            (result.is_some(), started.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(75));
+        drop(writer);
+        let (acquired, elapsed) = reader.join().expect("join bounded reader");
+        assert!(!acquired, "a live writer must force bounded degradation");
+        assert!(
+            elapsed < Duration::from_millis(60),
+            "contended read exceeded its 20ms budget: {elapsed:?}"
         );
     }
 }

@@ -16,8 +16,9 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, GrepMatch, GrepPathExclusion,
-    GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
+    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, try_read_with_budget, GrepMatch,
+    GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
+    INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -301,16 +302,18 @@ fn execute_root_profiled(
     }
 
     let snapshot_started = Instant::now();
-    let indexed_snapshot = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match search_index.as_ref() {
-            Some(index) if index.ready && root.use_index => Some(index.snapshot()),
-            _ => None,
-        }
-    };
+    let mut snapshot_timed_out = false;
+    let indexed_snapshot =
+        match try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
+            Some(search_index) => match search_index.as_ref() {
+                Some(index) if index.ready && root.use_index => Some(index.snapshot()),
+                _ => None,
+            },
+            None => {
+                snapshot_timed_out = true;
+                None
+            }
+        };
     let snapshot_acquire = snapshot_started.elapsed();
     if let Some(snapshot) = indexed_snapshot {
         let scope_started = Instant::now();
@@ -339,7 +342,11 @@ fn execute_root_profiled(
         crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
     }
     let index_status = if root.use_index {
-        current_index_status(ctx)
+        if snapshot_timed_out {
+            IndexStatus::Fallback
+        } else {
+            current_index_status(ctx)
+        }
     } else {
         IndexStatus::Fallback
     };
@@ -905,32 +912,19 @@ pub(crate) fn ripgrep_glob(
 }
 
 fn current_index_status(ctx: &AppContext) -> IndexStatus {
-    let index_ready = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index.as_ref().is_some_and(|index| index.ready)
+    let Some(search_index) =
+        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+    else {
+        return IndexStatus::Fallback;
     };
-    if index_ready {
+    if search_index.as_ref().is_some_and(|index| index.ready) {
         return IndexStatus::Ready;
     }
 
-    let build_in_progress = {
-        let search_index_rx = ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index_rx.is_some()
-    };
-    let has_index = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index.is_some()
-    };
-    if build_in_progress || has_index {
+    let build_in_progress =
+        try_read_with_budget(ctx.search_index_rx(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+            .is_some_and(|search_index_rx| search_index_rx.is_some());
+    if build_in_progress || search_index.is_some() {
         IndexStatus::Building
     } else {
         IndexStatus::Fallback

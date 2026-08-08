@@ -21,8 +21,8 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, GrepMatch, GrepPathExclusion, GrepResult, IndexStatus,
-    SearchIndex, SearchIndexSnapshot,
+    sort_grep_matches_by_mtime_desc, try_read_with_budget, GrepMatch, GrepPathExclusion,
+    GrepResult, IndexStatus, SearchIndex, SearchIndexSnapshot, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
     query_embedding_timeout_budget, strip_query_embedding_timeout_marker, EmbeddingModel,
@@ -100,6 +100,7 @@ struct LexicalCollection {
     files: Vec<(PathBuf, f32)>,
     ready: bool,
     engine_capped: bool,
+    artifact_lock_timed_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,15 +217,40 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             return handle_external_search(req, ctx, params, top_k, shape, external_root);
         }
     }
-    let semantic_status_snapshot = ctx
-        .semantic_index_status()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let semantic_status_snapshot = match try_read_with_budget(
+        ctx.semantic_index_status(),
+        INTERACTIVE_ARTIFACT_READ_BUDGET,
+    ) {
+        Some(status) => status.clone(),
+        None => {
+            return artifact_contention_fallback_response(
+                req,
+                ctx,
+                &params,
+                &shape,
+                &project_root,
+                top_k,
+                "semantic index status remained busy",
+            );
+        }
+    };
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = search_index_ready(ctx);
+    let lexical_ready = match search_index_ready_with_budget(ctx) {
+        Ok(ready) => ready,
+        Err(()) => {
+            return artifact_contention_fallback_response(
+                req,
+                ctx,
+                &params,
+                &shape,
+                &project_root,
+                top_k,
+                "search index remained busy",
+            );
+        }
+    };
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
 
     match mode {
@@ -625,6 +651,7 @@ fn handle_external_semantic_or_hybrid_search(
             files: Vec::new(),
             ready: true,
             engine_capped: false,
+            artifact_lock_timed_out: false,
         }
     };
 
@@ -1314,12 +1341,33 @@ fn handle_semantic_or_hybrid_search(
             project_root,
         )
     } else {
-        LexicalCollection {
-            files: Vec::new(),
-            ready: search_index_ready(ctx),
-            engine_capped: false,
+        match search_index_ready_with_budget(ctx) {
+            Ok(ready) => LexicalCollection {
+                files: Vec::new(),
+                ready,
+                engine_capped: false,
+                artifact_lock_timed_out: false,
+            },
+            Err(()) => LexicalCollection {
+                files: Vec::new(),
+                ready: false,
+                engine_capped: false,
+                artifact_lock_timed_out: true,
+            },
         }
     };
+
+    if lexical.artifact_lock_timed_out {
+        return artifact_contention_fallback_response(
+            req,
+            ctx,
+            &params,
+            &shape,
+            project_root,
+            top_k,
+            "search index remained busy",
+        );
+    }
 
     match status {
         SemanticIndexStatus::Disabled => {
@@ -1474,7 +1522,21 @@ fn handle_semantic_or_hybrid_search(
         }
     }
 
-    if !semantic_index_loaded(ctx) {
+    let semantic_loaded = match semantic_index_loaded_with_budget(ctx) {
+        Ok(loaded) => loaded,
+        Err(()) => {
+            return artifact_contention_fallback_response(
+                req,
+                ctx,
+                &params,
+                &shape,
+                project_root,
+                top_k,
+                "semantic index remained busy",
+            );
+        }
+    };
+    if !semantic_loaded {
         let reloading = super::configure::trigger_semantic_index_reload_if_evicted(ctx);
         let detail = if reloading {
             "Semantic index is reloading; retry shortly."
@@ -1540,16 +1602,45 @@ fn handle_semantic_or_hybrid_search(
         MAX_TOP_K
     };
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
-    let mut semantic_results = {
-        let semantic_index = ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        semantic_index
-            .as_ref()
-            .map(|index| index.search(&query_vector, semantic_fetch_limit))
-            .unwrap_or_default()
-    };
+    let mut semantic_results =
+        match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
+            Some(semantic_index) => semantic_index
+                .as_ref()
+                .map(|index| index.search(&query_vector, semantic_fetch_limit))
+                .unwrap_or_default(),
+            None => {
+                let lexical = if mode == SearchMode::Semantic {
+                    collect_lexical_files(
+                        ctx,
+                        &params.query,
+                        &shape,
+                        params.include_tests,
+                        project_root,
+                    )
+                } else {
+                    lexical
+                };
+                return semantic_unavailable_or_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    mode,
+                    &shape,
+                    "unavailable",
+                    "unavailable",
+                    format!(
+                        "Semantic search artifacts remained busy beyond {}ms.",
+                        INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
+                    ),
+                    "artifact contention",
+                    true,
+                    lexical,
+                    warnings,
+                    project_root,
+                    top_k,
+                );
+            }
+        };
     if ctx.shared_artifacts_read_only() {
         semantic_results.retain(|result| result.file.is_file());
     }
@@ -1795,6 +1886,32 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
     Response::success(&req.id, serde_json::Value::Object(object))
 }
 
+fn artifact_contention_fallback_response(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: &SemanticSearchParams,
+    shape: &QueryShape,
+    project_root: &Path,
+    top_k: usize,
+    artifact: &str,
+) -> Response {
+    semantic_unavailable_grep_fallback_response(
+        req,
+        ctx,
+        params,
+        shape,
+        "unavailable",
+        format!(
+            "Search artifacts were busy beyond the {}ms interactive budget ({artifact}).",
+            INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
+        ),
+        "artifact contention",
+        Vec::new(),
+        project_root,
+        top_k,
+    )
+}
+
 fn semantic_unavailable_or_fallback_response(
     req: &RawRequest,
     ctx: &AppContext,
@@ -1811,6 +1928,17 @@ fn semantic_unavailable_or_fallback_response(
     project_root: &Path,
     top_k: usize,
 ) -> Response {
+    if lexical.artifact_lock_timed_out {
+        return artifact_contention_fallback_response(
+            req,
+            ctx,
+            params,
+            shape,
+            project_root,
+            top_k,
+            "search index remained busy",
+        );
+    }
     let lexical_ready = (mode == SearchMode::Hybrid || force_lexical_fallback) && lexical.ready;
     if lexical_ready {
         let lexical_count = lexical.files.len();
@@ -2264,11 +2392,10 @@ fn record_degraded_grep_match(
     (true, true)
 }
 
-fn semantic_index_loaded(ctx: &AppContext) -> bool {
-    ctx.semantic_index()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some()
+fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
+    let semantic_index =
+        try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET).ok_or(())?;
+    Ok(semantic_index.is_some())
 }
 
 fn collect_lexical_files(
@@ -2278,16 +2405,20 @@ fn collect_lexical_files(
     include_tests: bool,
     project_root: &Path,
 ) -> LexicalCollection {
-    let snapshot = {
-        let search_index = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        search_index
-            .as_ref()
-            .filter(|index| index.ready)
-            .map(SearchIndex::snapshot)
+    let Some(search_index) =
+        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+    else {
+        return LexicalCollection {
+            files: Vec::new(),
+            ready: false,
+            engine_capped: false,
+            artifact_lock_timed_out: true,
+        };
     };
+    let snapshot = search_index
+        .as_ref()
+        .filter(|index| index.ready)
+        .map(SearchIndex::snapshot);
     collect_lexical_files_from_snapshot(snapshot, query, shape, include_tests, project_root)
 }
 
@@ -2319,6 +2450,7 @@ fn collect_lexical_files_from_snapshot(
             files: Vec::new(),
             ready: false,
             engine_capped: false,
+            artifact_lock_timed_out: false,
         };
     };
     let production_file_filter =
@@ -2331,23 +2463,30 @@ fn collect_lexical_files_from_snapshot(
         files: ranked.files,
         ready: true,
         engine_capped: ranked.engine_capped,
+        artifact_lock_timed_out: false,
     }
 }
 
+fn search_index_ready_with_budget(ctx: &AppContext) -> Result<bool, ()> {
+    let search_index =
+        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET).ok_or(())?;
+    Ok(search_index.as_ref().is_some_and(|index| index.ready))
+}
+
 fn search_index_ready(ctx: &AppContext) -> bool {
-    ctx.search_index()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|index| index.ready)
+    search_index_ready_with_budget(ctx).unwrap_or(false)
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     let index_dimension = {
-        let semantic_index = ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let semantic_index =
+            try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic index remained busy beyond {}ms",
+                        INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
+                    )
+                })?;
         semantic_index
             .as_ref()
             .filter(|index| index.len() > 0)
@@ -3387,15 +3526,13 @@ fn blast_radius_annotations(ctx: &AppContext, results: &[HybridResult]) -> Vec<O
 fn warm_callgraph_store(
     ctx: &AppContext,
 ) -> Option<std::sync::Arc<crate::callgraph_store::ReadonlyCallGraphStore>> {
-    if ctx.callgraph_store_rx().lock().is_some() {
+    let receiver = ctx.callgraph_store_rx().try_lock()?;
+    if receiver.is_some() {
         return None;
     }
-    ctx.revalidate_callgraph_store_generation();
-    ctx.callgraph_store()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(std::sync::Arc::clone)
+    drop(receiver);
+    try_read_with_budget(ctx.callgraph_store(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+        .and_then(|store| store.as_ref().map(std::sync::Arc::clone))
 }
 
 fn blast_radius_annotation_for_result(
@@ -3626,6 +3763,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     fn semantic_request(query: &str, top_k: usize) -> RawRequest {
         serde_json::from_value(serde_json::json!({
@@ -5700,5 +5838,81 @@ mod tests {
         assert_eq!(json["source"], "semantic");
         assert_eq!(json["semantic_score"], 0.75);
         assert!(json["lexical_score"].is_null());
+    }
+
+    #[test]
+    fn ready_uncontended_search_keeps_indexed_literal_results() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "pub fn parity_marker() {}\n").expect("write source");
+        let ctx = test_context(project.path());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, b"pub fn parity_marker() {}\n");
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("parity_marker", 5, "literal"),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "lexical");
+        assert_eq!(response["results"][0]["source"], "lexical");
+        assert!(response["results"][0]["file"]
+            .as_str()
+            .expect("result file")
+            .ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn contended_search_index_degrades_with_disclosure() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "pub fn contention_marker() {}\n").expect("write source");
+        let ctx = test_context(project.path());
+        let writer_guard = ctx
+            .search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = std::time::Instant::now();
+        let response = response_value(handle_semantic_search(
+            &semantic_request("contention_marker", 5),
+            &ctx,
+        ));
+        drop(writer_guard);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "contended search exceeded bounded response time"
+        );
+        assert_eq!(response["success"], true);
+        assert_eq!(response["lexical_only_fallback"], true);
+        assert!(response["text"]
+            .as_str()
+            .expect("fallback text")
+            .contains("artifact contention"));
+    }
+
+    #[test]
+    fn contended_callgraph_receiver_does_not_block_search_formatting() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = test_context(project.path());
+        let receiver_guard = ctx.callgraph_store_rx().lock();
+        let started = std::time::Instant::now();
+        assert!(warm_callgraph_store(&ctx).is_none());
+        assert!(
+            started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET,
+            "callgraph receiver contention exceeded artifact budget"
+        );
+        drop(receiver_guard);
     }
 }
