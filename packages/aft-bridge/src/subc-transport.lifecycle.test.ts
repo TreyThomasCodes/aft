@@ -8,6 +8,11 @@ import type {
   RouteTarget,
 } from "@cortexkit/subc-client";
 import {
+  TEST_INFLIGHT_ROOT,
+  TEST_REAPED_ROOT,
+  TEST_SYNTHETIC_ROOT,
+} from "./__tests__/subc-test-roots.js";
+import {
   asCanonicalRootPath,
   LifecycleRegistry,
   type LifecycleTimerSeam,
@@ -84,7 +89,7 @@ function setup(present: () => boolean): {
     lifecycleDemandCheck: () => present(),
     reapingEnabled: true,
   });
-  return { pool, registry, client, root: asCanonicalRootPath("/work/reaped") };
+  return { pool, registry, client, root: asCanonicalRootPath(TEST_REAPED_ROOT) };
 }
 
 describe("SubcTransportPool lifecycle integration", () => {
@@ -139,7 +144,7 @@ describe("SubcTransportPool lifecycle integration", () => {
       reapingEnabled: false,
     });
 
-    await pool.getBridge("/synthetic/root").toolCall("session", "read", {});
+    await pool.getBridge(TEST_SYNTHETIC_ROOT).toolCall("session", "read", {});
     await registry.sweep();
     expect(stats).toBe(0);
     expect(pool.getLifecycleRegistration()?.reapingEnabled).toBe(false);
@@ -149,7 +154,7 @@ describe("SubcTransportPool lifecycle integration", () => {
   test("annotates an in-flight reap failure without charging or dropping the client", async () => {
     const present = true;
     const rig = setup(() => present);
-    const root = asCanonicalRootPath("/work/inflight");
+    const root = asCanonicalRootPath(TEST_INFLIGHT_ROOT);
     const bridge = rig.pool.getBridge(root);
     const gate = new Promise<void>((resolve) => {
       rig.client.releaseRequest = resolve;

@@ -15,6 +15,7 @@ import {
   type SubcSubscriptionLike,
   SubcTransportPool,
 } from "../subc-transport.js";
+import { TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
 class FakeClient implements SubcClientLike {
   readonly routeOpens: BindIdentity[] = [];
@@ -84,7 +85,7 @@ describe("RevivableTransportPool", () => {
       if (!client) throw new Error("unexpected extra pool creation");
       return makeSubcPool(client);
     });
-    const transport = owner.getBridge("/work/project");
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
 
     await transport.toolCall("before-shutdown", "read", {});
     await owner.shutdown();
@@ -119,7 +120,7 @@ describe("RevivableTransportPool", () => {
       await revivalGate;
       return makeSubcPool(revivedClient);
     });
-    const transport = owner.getBridge("/work/project");
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
 
     await owner.shutdown();
     const first = transport.toolCall("session-a", "read", {});
@@ -150,7 +151,7 @@ describe("RevivableTransportPool", () => {
     );
 
     await owner.shutdown();
-    await owner.getBridge("/work/project").toolCall("session", "read", {});
+    await owner.getBridge(TEST_PROJECT_ROOT).toolCall("session", "read", {});
 
     expect(messages).toContain(
       "transport was shut down but new demand arrived — reviving (host quit hook fired without process exit?)",

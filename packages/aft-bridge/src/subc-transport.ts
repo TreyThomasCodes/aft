@@ -17,6 +17,8 @@
  * published plugin dist; it is never a published runtime dependency.
  */
 
+import { existsSync, statSync } from "node:fs";
+
 import type { RouteHandle } from "@cortexkit/subc-client";
 import {
   type BindIdentity,
@@ -31,6 +33,7 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 
+import { log } from "./active-logger.js";
 import type { StatusSnapshot } from "./bridge.js";
 import {
   asCanonicalRootPath,
@@ -313,6 +316,9 @@ class BgSubscription {
     private readonly consumerIdentity: ConsumerIdentity | null | undefined,
     private readonly onNudge: () => void,
     private readonly sleep: (ms: number) => Promise<void>,
+    private readonly canAttach: () => boolean,
+    private readonly onRootAttachFailure: (error: unknown) => boolean,
+    private readonly onDormant: () => void,
     readonly nudgeRef?: BgNudgeRef,
     private readonly isCurrent: () => boolean = () => true,
   ) {
@@ -341,6 +347,10 @@ class BgSubscription {
     let attempt = 0;
     while (!this.stopped) {
       if (!this.isCurrent()) return;
+      if (!this.canAttach()) {
+        this.onDormant();
+        return;
+      }
       let client: SubcClientLike;
       try {
         client = await this.acquireClient();
@@ -349,6 +359,10 @@ class BgSubscription {
         continue;
       }
       if (this.stopped || !this.isCurrent()) return;
+      if (!this.canAttach()) {
+        this.onDormant();
+        return;
+      }
 
       let route: RouteHandle;
       try {
@@ -360,6 +374,10 @@ class BgSubscription {
           { consumerIdentity: this.consumerIdentity },
         );
       } catch (err) {
+        if (this.isCurrent() && this.onRootAttachFailure(err)) {
+          this.onDormant();
+          return;
+        }
         // routeOpen failed. If it signals a dead CONNECTION, drop the shared
         // client so the next `acquireClient` reconnects fresh — the idle-stranding
         // fix (B-#1): `acquireClient` returns the cached client, so without this an
@@ -428,6 +446,27 @@ function isRouteProvenAbsentError(err: unknown): boolean {
   return (
     (err instanceof SubcError && err.code === "unknown_channel") ||
     err instanceof StaleRouteHandleError
+  );
+}
+
+/**
+ * A daemon can reject a route bind after the root has been reclaimed. This
+ * signature is deliberately narrower than config_divergence: other divergence
+ * causes remain transient from the transport's point of view.
+ */
+function isAbsentRootRouteError(err: unknown): boolean {
+  return (
+    isRecord(err) &&
+    err.code === "config_divergence" &&
+    typeof err.message === "string" &&
+    err.message.includes("project root does not exist")
+  );
+}
+
+function absentRootError(root: CanonicalRootPath): SubcError {
+  return new SubcError(
+    `invalid route project root: project root does not exist: ${root}`,
+    "config_divergence",
   );
 }
 
@@ -714,6 +753,8 @@ export class SubcTransportPool implements AftTransportPool {
    * removed by the same detacher that removes the corresponding session record.
    */
   private readonly rootIndex = new Map<CanonicalRootPath, Set<IdentityKey>>();
+  /** Roots whose route binds must stay dormant until their directories return. */
+  private readonly dormantRoots = new Map<CanonicalRootPath, SubcError>();
   /** Consecutive non-transient failures on the current pool-local client. */
   private transportFailures = 0;
   /** Concrete per-root facades, including their captured root generation. */
@@ -830,6 +871,48 @@ export class SubcTransportPool implements AftTransportPool {
 
   private canonicalRoot(projectRoot: string): CanonicalRootPath {
     return asCanonicalRootPath(canonicalizeProjectRoot(projectRoot));
+  }
+
+  /**
+   * Check a root immediately before opening a route. The reclaim marker is only
+   * an existence hint; a directory that has already returned wins over a stale
+   * sibling marker, so the marker contents are never parsed.
+   */
+  private rootCanAttach(root: CanonicalRootPath): boolean {
+    let directoryExists = false;
+    try {
+      directoryExists = statSync(root).isDirectory();
+    } catch {
+      // Missing, inaccessible, or otherwise unusable roots cannot be bound.
+    }
+    if (directoryExists) {
+      this.dormantRoots.delete(root);
+      return true;
+    }
+
+    // Read the marker only as a latency hint. Directory absence is sufficient
+    // to suspend the bind, and the marker's JSON is intentionally irrelevant.
+    const reclaimedMarkerPresent = existsSync(`${root}.reclaimed`);
+    if (reclaimedMarkerPresent) {
+      this.markRootDormant(root);
+      return false;
+    }
+    this.markRootDormant(root);
+    return false;
+  }
+
+  private markRootDormant(root: CanonicalRootPath, rejection?: unknown): SubcError {
+    const existing = this.dormantRoots.get(root);
+    if (existing) return existing;
+    const error = rejection instanceof SubcError ? rejection : absentRootError(root);
+    this.dormantRoots.set(root, error);
+    log(`root ${root} reclaimed/absent; suspending attach until it exists`);
+    return error;
+  }
+
+  private assertRootCanAttach(root: CanonicalRootPath): void {
+    if (this.rootCanAttach(root)) return;
+    throw this.dormantRoots.get(root) ?? absentRootError(root);
   }
 
   private lifecycleEnabled(): boolean {
@@ -1209,6 +1292,7 @@ export class SubcTransportPool implements AftTransportPool {
       if (generation === undefined) throw new SubcRootDemandRequiredError(root);
       this.assertGeneration(root, generation, "route_request");
     }
+    this.assertRootCanAttach(root);
     const key = identityKey(identity);
     const record = this.getOrCreateSession(identity, generation);
     record.inflight += 1;
@@ -1366,6 +1450,7 @@ export class SubcTransportPool implements AftTransportPool {
       handle: null,
       closed: false,
     };
+    this.assertRootCanAttach(record.canonicalRoot);
     const opening = client
       .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
         consumerIdentity: this.consumerIdentity,
@@ -1388,6 +1473,8 @@ export class SubcTransportPool implements AftTransportPool {
         return route;
       })
       .catch((error) => {
+        const currentEntry =
+          this.isCurrentSession(record.identityKey, record) && record.routeEntry === entry;
         if (record.routeEntry === entry) {
           entry.closed = true;
           record.routeEntry = null;
@@ -1397,6 +1484,9 @@ export class SubcTransportPool implements AftTransportPool {
           !(error instanceof RouteTornDownError)
         ) {
           throw new RouteTornDownError("subc route opened after session closed");
+        }
+        if (currentEntry && isAbsentRootRouteError(error)) {
+          this.markRootDormant(record.canonicalRoot, error);
         }
         throw error;
       });
@@ -1408,6 +1498,7 @@ export class SubcTransportPool implements AftTransportPool {
   private ensureBgSubscription(identity: BindIdentity, record: SessionRecord): void {
     if (this.shuttingDown || (!this.onBgEventsNudge && !this.onBgEventsNudgeRef)) return;
     if (!this.isCurrentSession(record.identityKey, record)) return;
+    if (!this.rootCanAttach(record.canonicalRoot)) return;
     if (record.bgSub) return;
 
     const poolId = this.currentPoolId();
@@ -1426,19 +1517,34 @@ export class SubcTransportPool implements AftTransportPool {
       this.onBgEventsNudge?.(identity.project_root, identity.session);
       if (nudgeRef) this.onBgEventsNudgeRef?.(nudgeRef);
     };
-    const sub = new BgSubscription(
+    let sub: BgSubscription | null = null;
+    const clearDormantSubscription = (): void => {
+      if (sub && record.bgSub === sub) record.bgSub = null;
+    };
+    sub = new BgSubscription(
       identity,
       () => this.ensureClient(),
       (client) => this.dropClient(client),
       this.consumerIdentity,
       onNudge,
       this.bgBackoffSleep,
+      () => this.rootCanAttach(record.canonicalRoot),
+      (error) => {
+        if (!isAbsentRootRouteError(error)) return false;
+        this.markRootDormant(record.canonicalRoot, error);
+        return true;
+      },
+      clearDormantSubscription,
       nudgeRef,
       () =>
         this.isCurrentSession(record.identityKey, record) &&
         this.isCurrentLiveGeneration(record.canonicalRoot, record.generation),
     );
     record.bgSub = sub;
+    if (!this.rootCanAttach(record.canonicalRoot)) {
+      record.bgSub = null;
+      void sub.stop();
+    }
   }
 
   /**
@@ -1536,6 +1642,7 @@ export class SubcTransportPool implements AftTransportPool {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.dormantRoots.clear();
 
     // Deregistration synchronously tombstones all registered roots and invokes
     // closeProjectRoot before this method reaches its first await.

@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-
 import {
   type BindIdentity,
   type RouteHandle,
@@ -9,8 +8,8 @@ import {
   SubcCallError,
   SubcError,
 } from "@cortexkit/subc-client";
-
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
+import { TEST_OTHER_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
 /** A controllable held-open subscription handle. */
 class FakeSubscription {
@@ -209,7 +208,7 @@ describe("SubcTransport.toolCall", () => {
     const { pool } = poolWith(client);
 
     const result = await pool
-      .getBridge("/work/proj")
+      .getBridge(TEST_PROJECT_ROOT)
       .toolCall("sess-1", "read", { filePath: "a.ts" });
 
     // Body is the tool-route shape, NOT {method, params}.
@@ -223,7 +222,7 @@ describe("SubcTransport.toolCall", () => {
     expect(result.status_bar).toEqual({ errors: 0, warnings: 1 });
     expect(result.bg_completions).toEqual([{ task_id: "bash-1" }]);
     // getStatusBar captured + normalized the counts from the response (full shape).
-    expect(pool.getBridge("/work/proj").getStatusBar()).toEqual({
+    expect(pool.getBridge(TEST_PROJECT_ROOT).getStatusBar()).toEqual({
       errors: 0,
       warnings: 1,
       dead_code: 0,
@@ -243,7 +242,7 @@ describe("SubcTransport.toolCall", () => {
       connect: async () => client,
     });
 
-    await pool.getBridge("/work/proj").toolCall("sess", "read", { filePath: "a.ts" });
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess", "read", { filePath: "a.ts" });
 
     expect(client.routeConsumerIdentities).toEqual([null]);
   });
@@ -254,7 +253,9 @@ describe("SubcTransport.toolCall", () => {
     );
     const { pool } = poolWith(client);
 
-    await pool.getBridge("/work/proj").toolCall("s", "edit", { oldString: "a" }, { preview: true });
+    await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("s", "edit", { oldString: "a" }, { preview: true });
 
     expect(client.requests[0]?.body).toEqual({
       name: "edit",
@@ -266,7 +267,7 @@ describe("SubcTransport.toolCall", () => {
   test("transportTimeoutMs (wait-aware bash budget) reaches the wire request deadline", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "ok" }));
     const { pool } = poolWith(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     // Orchestrated bash passes its wait-aware budget as transportTimeoutMs;
     // it must win over timeoutMs and reach client.request, otherwise long
@@ -290,7 +291,7 @@ describe("SubcTransport.toolCall", () => {
   test("caches the route per (root, harness, session) and reuses it", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = poolWith(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     await t.toolCall("sess-A", "read", {});
     await t.toolCall("sess-A", "grep", {}); // same identity -> same channel, no new routeOpen
@@ -309,7 +310,7 @@ describe("SubcTransport.toolCall", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = poolWith(client);
 
-    await pool.getBridge("/work/proj").toolCall(undefined, "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall(undefined, "read", {});
 
     expect(client.routeOpens[0]?.session).toBe("__default__");
   });
@@ -320,7 +321,7 @@ describe("SubcTransport.toolCall", () => {
     );
     const { pool } = poolWith(client);
 
-    const result = await pool.getBridge("/work/proj").toolCall("s", "read", {});
+    const result = await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
     expect(result.success).toBe(false);
     expect(result.code).toBe("path_not_found");
   });
@@ -351,7 +352,7 @@ describe("SubcTransport Rd reconnect", () => {
         return new FakeClient(onRequest);
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     // First call surfaces the transport error (Rd never auto-retries).
     await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SocketClosedError);
@@ -373,7 +374,7 @@ describe("SubcTransport Rd reconnect", () => {
       return envelope({ id: "r", success: true, text: "resent after reopen" });
     });
     const { pool } = poolWith(client);
-    const transport = pool.getBridge("/work/proj");
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
 
     const result = await transport.toolCall("s", "write", { filePath: "a.txt", content: "ok" });
 
@@ -396,7 +397,7 @@ describe("SubcTransport Rd reconnect", () => {
       throw outcomeUnknown;
     });
     const { pool } = poolWith(client);
-    const transport = pool.getBridge("/work/proj");
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
 
     await expect(
       transport.toolCall("s", "write", { filePath: "a.txt", content: "ok" }),
@@ -424,7 +425,7 @@ describe("SubcTransport Rd reconnect", () => {
         });
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
     await expect(t.toolCall("s", "read", {})).rejects.toBe(notQueued);
     await t.toolCall("s", "read", {});
     expect(madeClients).toBe(2);
@@ -449,7 +450,7 @@ describe("SubcTransport Rd reconnect", () => {
         return client;
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     expect(client.closed).toBe(0); // client kept alive
@@ -467,7 +468,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
     const duplicatedClient = new FakeClient(async () => CAPTURED_FIRST_PARTY_READ_ENVELOPE);
     const { pool: duplicatedPool } = poolWith(duplicatedClient);
     const duplicated = await duplicatedPool
-      .getBridge("/work/proj")
+      .getBridge(TEST_PROJECT_ROOT)
       .toolCall("sess-1", "read", { filePath: "fixture.ts" });
 
     const synthesizedClient = new FakeClient(async () =>
@@ -475,7 +476,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
     );
     const { pool: synthesizedPool } = poolWith(synthesizedClient);
     const synthesized = await synthesizedPool
-      .getBridge("/work/proj")
+      .getBridge(TEST_PROJECT_ROOT)
       .toolCall("sess-1", "read", { filePath: "fixture.ts" });
 
     const capturedBytes = new TextEncoder().encode(
@@ -493,7 +494,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
     const client = new FakeClient(async () => response);
     const { pool } = poolWith(client);
 
-    const result = await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    const result = await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
 
     expect(new TextEncoder().encode(JSON.stringify(result))).toEqual(
       new TextEncoder().encode(
@@ -520,7 +521,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
     }));
     const { pool } = poolWith(client);
 
-    await expect(pool.getBridge("/work/proj").toolCall("sess-1", "read", {})).rejects.toThrow(
+    await expect(pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {})).rejects.toThrow(
       "subc tool reply structuredContent lacks a boolean `success` / string `text` (protocol violation)",
     );
   });
@@ -529,7 +530,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
     // No structuredContent → must NOT be coerced to a silent {success:false}.
     const client = new FakeClient(async () => ({ content: [], isError: false }));
     const { pool } = poolWith(client);
-    await expect(pool.getBridge("/work/proj").toolCall("s", "read", {})).rejects.toThrow(
+    await expect(pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {})).rejects.toThrow(
       /structuredContent envelope/,
     );
   });
@@ -541,7 +542,7 @@ describe("SubcTransport reply envelope (B-#7)", () => {
       structuredContent: { text: "x" }, // success is undefined
     }));
     const { pool } = poolWith(client);
-    await expect(pool.getBridge("/work/proj").toolCall("s", "read", {})).rejects.toThrow(
+    await expect(pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {})).rejects.toThrow(
       /boolean `success`/,
     );
   });
@@ -568,11 +569,11 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       return envelope({ id: "r", success: true, text: "ok" });
     });
     const { pool } = poolWith(client); // no bg sub → routeOpens count is just tool routes
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const r1 = t.toolCall("sess-1", "read", {}).catch((e) => e); // opens E (ch 1), held
     await tick();
-    await pool.closeSession("/work/proj", "sess-1"); // deletes E, closes ch 1
+    await pool.closeSession(TEST_PROJECT_ROOT, "sess-1"); // deletes E, closes ch 1
     const r2 = await t.toolCall("sess-1", "read", {}); // opens successor E2 (ch 2)
     expect(r2.text).toBe("ok");
     const opensAfterR2 = client.routeOpens.length; // 2 (E + E2)
@@ -603,11 +604,11 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       onBgEventsNudge: () => undefined,
       bgBackoffSleep: async () => undefined,
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const call = t.toolCall("sess-1", "read", {});
     await tick();
-    await pool.closeSession("/work/proj", "sess-1");
+    await pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
     releaseConnect();
 
     await expect(call).rejects.toBeInstanceOf(Error);
@@ -654,7 +655,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       onBgEventsNudge: () => undefined,
       bgBackoffSleep: async () => undefined,
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const r1 = t.toolCall("sess-1", "read", {});
     await tick();
@@ -701,16 +702,16 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       onBgEventsNudge: () => undefined,
       bgBackoffSleep: async () => undefined,
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     await t.toolCall("sess-1", "read", {});
     await tick();
     expect(oldClient.subscriptions.length).toBe(1);
 
-    const closing = pool.closeSession("/work/proj", "sess-1");
+    const closing = pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
     await tick();
     await expect(
-      pool.getBridge("/work/other").toolCall("other", "drop", {}),
+      pool.getBridge(TEST_OTHER_ROOT).toolCall("other", "drop", {}),
     ).rejects.toBeInstanceOf(SocketClosedError);
     await t.toolCall("sess-1", "read", {});
     expect(successor.requests[0]?.channel).toBe(1);
@@ -744,12 +745,12 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         return client;
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     for (let i = 0; i < 3; i += 1) {
       const call = t.toolCall("sess-1", "edit", {}).catch((err) => err);
       await tick();
-      const closing = pool.closeSession("/work/proj", "sess-1");
+      const closing = pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
       releaseFailure();
       const err = await call;
       await closing;
@@ -770,7 +771,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       release = r;
     });
     const { pool } = poolWith(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const a = t.toolCall("sess-1", "read", {});
     const b = t.toolCall("sess-1", "grep", {});
@@ -789,11 +790,11 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       release = r;
     });
     const { pool } = poolWith(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const call = t.toolCall("sess-1", "read", {}).catch((e) => e);
     await tick(); // let routeOpen start (now gated)
-    const close = pool.closeSession("/work/proj", "sess-1");
+    const close = pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
     release();
     const [err] = await Promise.all([call, close]);
 
@@ -811,11 +812,11 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       releaseA = r;
     });
     const { pool } = poolWith(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const callA = t.toolCall("sess-1", "read", {}).catch((e) => e);
     await tick(); // A's routeOpen is now gated
-    await pool.closeSession("/work/proj", "sess-1"); // tombstone A
+    await pool.closeSession(TEST_PROJECT_ROOT, "sess-1"); // Mark route A as reclaimed so its late completion can close only its own channel without affecting the newer route opened by call B.
 
     // call B (same identity) opens a fresh route and succeeds.
     client.routeOpenGate = null; // B opens immediately
@@ -857,7 +858,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         });
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     // Two non-transient timeouts on A → counter = 2 (A kept, not yet 3).
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
@@ -909,7 +910,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         return c;
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const r1 = t.toolCall("s", "read", {}).catch((e) => e); // in flight on A
     await tick();
@@ -942,7 +943,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         return c;
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     await expect(t.toolCall("s", "read", {})).rejects.toBeInstanceOf(SocketClosedError);
     const res = await t.toolCall("s", "read", {});
@@ -965,7 +966,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         });
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     // Three non-transient timeouts: client kept for the first two, dropped on the third.
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
@@ -993,7 +994,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         });
       },
     });
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     await t.toolCall("s", "edit", {}); // success resets the counter
@@ -1015,7 +1016,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
     });
 
     const call = pool
-      .getBridge("/work/proj")
+      .getBridge(TEST_PROJECT_ROOT)
       .toolCall("s", "read", {})
       .catch((e) => e);
     await tick(); // connect now in flight
@@ -1033,8 +1034,8 @@ describe("SubcTransport.send", () => {
     const { pool } = poolWith(client);
 
     const res = await pool
-      .getBridge("/work/proj")
-      .send("configure", { project_root: "/work/proj" });
+      .getBridge(TEST_PROJECT_ROOT)
+      .send("configure", { project_root: TEST_PROJECT_ROOT });
     expect(res.success).toBe(true);
     expect(res.subc_local).toBe(true);
     expect(client.requests.length).toBe(0); // no route request issued
@@ -1046,7 +1047,9 @@ describe("SubcTransport.send", () => {
     );
     const { pool } = poolWith(client);
 
-    await pool.getBridge("/work/proj").send("bash_drain_completions", { session_id: "sess-Z" });
+    await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .send("bash_drain_completions", { session_id: "sess-Z" });
 
     expect(client.routeOpens[0]?.session).toBe("sess-Z");
     expect(client.requests[0]?.body).toEqual({
@@ -1076,7 +1079,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
 
     // Two route.opens: the tool route + the dedicated bg_events route.
@@ -1091,7 +1094,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool, nudges } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
     // Immediate replay nudge on subscribe.
     expect(nudges.length).toBe(1);
@@ -1099,13 +1102,16 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     // A wake nudge from the module drives another drain.
     client.subscriptions[0]?.emit();
     expect(nudges.length).toBe(2);
-    expect(nudges[1]).toEqual({ root: pool.getBridge("/work/proj").getCwd(), session: "sess-1" });
+    expect(nudges[1]).toEqual({
+      root: pool.getBridge(TEST_PROJECT_ROOT).getCwd(),
+      session: "sess-1",
+    });
   });
 
   test("is idempotent — one subscription per session even across many tool calls", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     await t.toolCall("sess-1", "read", {});
     await tick();
@@ -1131,14 +1137,14 @@ describe("SubcTransport bg_events subscription (S3)", () => {
       return envelope({ id: "r", success: true, text: "" });
     });
     const { pool } = bgPool(client);
-    const t = pool.getBridge("/work/proj");
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
 
     const inflight = t.toolCall("sess-1", "read", {}); // held on `gate`
     await tick();
     expect(client.subscriptions.length).toBe(0); // not subscribed yet (reply pending)
 
     // Close the session WHILE the request is in flight.
-    await pool.closeSession("/work/proj", "sess-1");
+    await pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
 
     // Now let the held request succeed LATE.
     releaseReq();
@@ -1153,7 +1159,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool, nudges } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
     expect(nudges.length).toBe(1); // initial subscribe replay
     const firstSub = client.subscriptions[0];
@@ -1188,7 +1194,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
       bgBackoffSleep: async () => undefined,
     });
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
     expect(madeClients).toBe(1);
 
@@ -1206,7 +1212,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
     const firstBgChannel = client.subscriptions[0]?.channel;
 
@@ -1223,7 +1229,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
     client.subscriptions[0]?.end(); // StreamEnd
     await tick();
@@ -1236,9 +1242,9 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
-    await pool.closeSession("/work/proj", "sess-1");
+    await pool.closeSession(TEST_PROJECT_ROOT, "sess-1");
 
     expect(client.subscriptions[0]?.unsubscribed).toBe(1);
     // Both the bg route and the tool route were closed.
@@ -1249,7 +1255,7 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = poolWith(client); // no onBgEventsNudge
 
-    await pool.getBridge("/work/proj").toolCall("sess-1", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
 
     expect(client.subscriptions.length).toBe(0);
@@ -1262,21 +1268,21 @@ describe("SubcTransportPool lifecycle", () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = poolWith(client);
 
-    expect(pool.getActiveBridgeForRoot("/work/proj")).toBeNull();
-    await pool.getBridge("/work/proj").toolCall("s", "read", {});
-    expect(pool.getActiveBridgeForRoot("/work/proj")).not.toBeNull();
+    expect(pool.getActiveBridgeForRoot(TEST_PROJECT_ROOT)).toBeNull();
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
+    expect(pool.getActiveBridgeForRoot(TEST_PROJECT_ROOT)).not.toBeNull();
   });
 
   test("shutdown closes the client and rejects further calls", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = poolWith(client);
-    await pool.getBridge("/work/proj").toolCall("s", "read", {});
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
 
     await pool.shutdown();
     expect(client.closed).toBe(1);
-    await expect(pool.getBridge("/work/proj").toolCall("s", "read", {})).rejects.toBeInstanceOf(
-      SubcCallError,
-    );
+    await expect(
+      pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {}),
+    ).rejects.toBeInstanceOf(SubcCallError);
   });
 
   test("setConfigureOverride and replaceBinary are no-ops over subc", async () => {
