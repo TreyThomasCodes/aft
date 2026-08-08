@@ -787,6 +787,25 @@ mod nested {
         !precise_tree_edge && !precise_reverse_edge,
         "root Engine field must not precisely match nested Engine::start; call_tree: {tree:#}; callers: {callers:#}"
     );
+
+    // Stronger pin than the precise-edge checks above: the scope rejection
+    // leaves this call with NO dispatch edge at all (the direct-self-field
+    // path suppresses the name-match fallback rather than guessing). A
+    // regression that re-created the old name_match false edge would pass
+    // the precise-only assertions, so count edges of ANY provenance.
+    let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+    let any_engine_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE target_symbol = ?1 \
+             AND provenance IN ('name_match', 'type_match')",
+            params!["Engine::start"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        any_engine_edges, 0,
+        "no dispatch edge of any provenance may target nested Engine::start"
+    );
 }
 
 fn canonical_root(path: &Path) -> PathBuf {
