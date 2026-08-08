@@ -356,7 +356,7 @@ impl Car {
 }
 
 #[test]
-fn rust_scoped_field_type_does_not_precisely_match_unrelated_same_named_method() {
+fn rust_scoped_field_type_does_not_match_unrelated_same_named_method() {
     let dir = tempdir().unwrap();
     let root = canonical_root(dir.path());
     write_file(
@@ -423,7 +423,7 @@ impl Car {
 }
 
 #[test]
-fn rust_imported_field_type_does_not_precisely_match_unrelated_same_named_method() {
+fn rust_imported_field_type_does_not_match_unrelated_same_named_method() {
     let dir = tempdir().unwrap();
     let root = canonical_root(dir.path());
     write_file(
