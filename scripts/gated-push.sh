@@ -15,11 +15,13 @@ set -euo pipefail
 # threshold fix covers foreign load.
 if [ -z "${AFT_GATE_DEMOTED:-}" ]; then
   export AFT_GATE_DEMOTED=1
-  if command -v taskpolicy >/dev/null 2>&1; then
-    exec taskpolicy -c utility nice -n 10 "$0" "$@"
-  else
-    exec nice -n 10 "$0" "$@"
-  fi
+  # nice-only, deliberately NOT taskpolicy utility: the QoS class pins the
+  # whole gate to E-cores, and the integration suite's per-test 60s response
+  # deadlines then fail wholesale (three gate runs red while the same suite
+  # was green undemoted). nice yields to the normal-priority ck-* modules
+  # under contention but keeps P-cores when the machine has headroom, which
+  # is the property the demotion exists for.
+  exec nice -n 10 "$0" "$@"
 fi
 
 
