@@ -314,6 +314,10 @@ pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_repair_entries_60s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub callgraph_commits_60s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callgraph_pages_or_bytes_written_60s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash: Option<BgTaskHealthCounts>,
@@ -329,6 +333,8 @@ impl RootHealthSnapshot {
             semantic_index: None,
             callgraph_store: None,
             callgraph_repair_entries_60s: None,
+            callgraph_commits_60s: None,
+            callgraph_pages_or_bytes_written_60s: None,
             tier2: None,
             bash: None,
         }
@@ -2061,6 +2067,21 @@ impl AppContext {
             "building"
         };
 
+        let callgraph_write_metrics = crate::callgraph_store::callgraph_write_metrics_for_project(
+            &crate::search_index::artifact_cache_key(project_root),
+        );
+        let (callgraph_commits_60s, callgraph_pages_or_bytes_written_60s) =
+            if callgraph_write_metrics.commits_60s > 0
+                || callgraph_write_metrics.pages_or_bytes_written_60s > 0
+            {
+                (
+                    Some(callgraph_write_metrics.commits_60s),
+                    Some(callgraph_write_metrics.pages_or_bytes_written_60s),
+                )
+            } else {
+                (None, None)
+            };
+
         RootHealthSnapshot {
             project_root: project_root.display().to_string(),
             actor_count: 1,
@@ -2075,6 +2096,8 @@ impl AppContext {
                 status: callgraph_store_status,
             }),
             callgraph_repair_entries_60s: None,
+            callgraph_commits_60s,
+            callgraph_pages_or_bytes_written_60s,
             tier2: Some(Tier2HealthSnapshot {
                 status: tier2_status,
             }),

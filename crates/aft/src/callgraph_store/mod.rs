@@ -20,7 +20,7 @@ use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, Ve
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +50,9 @@ const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 const ROOT_REPAIR_WARN_INTERVAL: Duration = Duration::from_secs(60);
+const CALLGRAPH_WRITE_METRIC_WINDOW: Duration = Duration::from_secs(60);
+const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
+const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 
@@ -89,6 +92,109 @@ struct RootRepairWarningRecord {
 static ROOT_REPAIR_WARNINGS: OnceLock<
     Mutex<HashMap<RootRepairWarningKey, RootRepairWarningRecord>>,
 > = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CallgraphWriteMetricsSnapshot {
+    pub commits_60s: u64,
+    pub pages_or_bytes_written_60s: u64,
+}
+
+#[derive(Debug, Default)]
+struct CallgraphWriteMetrics {
+    window_start_ms: AtomicU64,
+    commits_60s: AtomicU64,
+    pages_or_bytes_written_60s: AtomicU64,
+}
+
+static CALLGRAPH_WRITE_METRICS: OnceLock<Mutex<HashMap<String, Arc<CallgraphWriteMetrics>>>> =
+    OnceLock::new();
+
+fn callgraph_write_metrics_for_key(project_key: &str) -> Arc<CallgraphWriteMetrics> {
+    let metrics = CALLGRAPH_WRITE_METRICS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut metrics = metrics
+        .lock()
+        .expect("callgraph write metrics mutex poisoned");
+    Arc::clone(
+        metrics
+            .entry(project_key.to_string())
+            .or_insert_with(|| Arc::new(CallgraphWriteMetrics::default())),
+    )
+}
+
+fn roll_callgraph_write_metric_window(metrics: &CallgraphWriteMetrics, now_ms: u64) {
+    let current_start = metrics.window_start_ms.load(AtomicOrdering::Acquire);
+    if current_start == 0 {
+        let _ = metrics.window_start_ms.compare_exchange(
+            0,
+            now_ms,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+        return;
+    }
+    if now_ms.saturating_sub(current_start) < CALLGRAPH_WRITE_METRIC_WINDOW.as_millis() as u64 {
+        return;
+    }
+    if metrics
+        .window_start_ms
+        .compare_exchange(
+            current_start,
+            now_ms,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        )
+        .is_ok()
+    {
+        metrics.commits_60s.store(0, AtomicOrdering::Release);
+        metrics
+            .pages_or_bytes_written_60s
+            .store(0, AtomicOrdering::Release);
+    }
+}
+
+impl CallgraphWriteMetrics {
+    fn record_commit(&self, pages_or_bytes_written: u64) {
+        let now_ms = unix_millis_now();
+        roll_callgraph_write_metric_window(self, now_ms);
+        self.commits_60s.fetch_add(1, AtomicOrdering::Relaxed);
+        self.pages_or_bytes_written_60s
+            .fetch_add(pages_or_bytes_written, AtomicOrdering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CallgraphWriteMetricsSnapshot {
+        roll_callgraph_write_metric_window(self, unix_millis_now());
+        CallgraphWriteMetricsSnapshot {
+            commits_60s: self.commits_60s.load(AtomicOrdering::Acquire),
+            pages_or_bytes_written_60s: self
+                .pages_or_bytes_written_60s
+                .load(AtomicOrdering::Acquire),
+        }
+    }
+}
+
+pub(crate) fn callgraph_write_metrics_for_project(
+    project_key: &str,
+) -> CallgraphWriteMetricsSnapshot {
+    callgraph_write_metrics_for_key(project_key).snapshot()
+}
+
+pub(crate) fn callgraph_write_metrics_total() -> CallgraphWriteMetricsSnapshot {
+    let Some(metrics) = CALLGRAPH_WRITE_METRICS.get() else {
+        return CallgraphWriteMetricsSnapshot::default();
+    };
+    let metrics = metrics
+        .lock()
+        .expect("callgraph write metrics mutex poisoned");
+    metrics.values().map(|metrics| metrics.snapshot()).fold(
+        CallgraphWriteMetricsSnapshot::default(),
+        |total, current| CallgraphWriteMetricsSnapshot {
+            commits_60s: total.commits_60s.saturating_add(current.commits_60s),
+            pages_or_bytes_written_60s: total
+                .pages_or_bytes_written_60s
+                .saturating_add(current.pages_or_bytes_written_60s),
+        },
+    )
+}
 
 const ROOT_REPAIR_WARNING_TEXT: &str =
     "callgraph store root repair requires rebuild; open-only reader reports unavailable";
@@ -206,6 +312,109 @@ mod root_repair_warning_tests {
         assert!(repeated.ends_with("(repeated 1x in 60s)"));
         expire_repair_entry_window_for_test("test-project");
         assert!(repair_entry_rate("test-project").is_none());
+    }
+}
+
+#[cfg(test)]
+mod write_amplification_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn callgraph_writer_and_reader_use_bounded_normal_pragmas() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        fs::write(&source, "export function main() {}\n").unwrap();
+        let store_dir = temp.path().join("store");
+        let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let autocheckpoint: i64 = conn
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "NORMAL synchronous mode is value 1");
+        assert_eq!(autocheckpoint, CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES);
+        drop(conn);
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        drop(store);
+
+        let readonly = CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .expect("writer-created empty schema should be readable");
+        let conn = readonly.inner.conn.lock().unwrap();
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1);
+    }
+
+    #[test]
+    fn own_refresh_skips_identical_extract_but_not_position_shift() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        fs::write(&source, "export function main() { return 1; }\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        let write_metrics = callgraph_write_metrics_for_project(store.project_key());
+        assert!(write_metrics.commits_60s > 0);
+        assert!(write_metrics.pages_or_bytes_written_60s > 0);
+
+        let before = store.conn.lock().unwrap().total_changes();
+        fs::write(&source, "export function main() { return 1; }\n\n").unwrap();
+        let (stats, _) = store
+            .refresh_files_profiled(std::slice::from_ref(&source))
+            .unwrap();
+        let after = store.conn.lock().unwrap().total_changes();
+        assert_eq!(stats.unchanged_extract_files, 1);
+        assert_eq!(stats.refreshed_own_files, 0);
+        assert_eq!(
+            after - before,
+            2,
+            "only files and backend freshness rows update"
+        );
+
+        fs::write(&source, "\nexport function main() { return 1; }\n\n").unwrap();
+        let (shifted_stats, _) = store
+            .refresh_files_profiled(std::slice::from_ref(&source))
+            .unwrap();
+        assert_eq!(shifted_stats.unchanged_extract_files, 0);
+        assert_eq!(shifted_stats.refreshed_own_files, 1);
+    }
+
+    #[test]
+    fn idle_checkpoint_interval_prevents_checkpoint_storms() {
+        let now = Instant::now();
+        assert!(idle_checkpoint_due(None, now));
+        assert!(!idle_checkpoint_due(
+            Some(now),
+            now + Duration::from_secs(REFRESH_IDLE_CHECKPOINT_INTERVAL.as_secs() - 1),
+        ));
+        assert!(idle_checkpoint_due(
+            Some(now),
+            now + REFRESH_IDLE_CHECKPOINT_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn write_metrics_decay_after_the_sixty_second_window() {
+        let key = format!("metrics-test-{}", now_nanos());
+        let metrics = callgraph_write_metrics_for_key(&key);
+        metrics.record_commit(17);
+        assert_eq!(metrics.snapshot().commits_60s, 1);
+        assert_eq!(metrics.snapshot().pages_or_bytes_written_60s, 17);
+        metrics.window_start_ms.store(
+            unix_millis_now().saturating_sub(CALLGRAPH_WRITE_METRIC_WINDOW.as_millis() as u64),
+            AtomicOrdering::Release,
+        );
+        assert_eq!(metrics.snapshot(), CallgraphWriteMetricsSnapshot::default());
     }
 }
 
@@ -902,10 +1111,15 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
     drained
 }
 
+fn idle_checkpoint_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= REFRESH_IDLE_CHECKPOINT_INTERVAL)
+}
+
 fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
     // The worker owns these caches so maps are shared only by refreshes for the
     // same canonical root and disappear when the worker shuts down.
     let mut workspace_crate_prefixes = HashMap::new();
+    let mut last_idle_checkpoints: HashMap<RefreshRoot, Instant> = HashMap::new();
     loop {
         let batch = {
             let mut queue = shared
@@ -931,21 +1145,37 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
             }
         };
 
-        process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes);
+        let store = process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes);
 
         let mut queue = shared
             .queue
             .lock()
             .expect("callgraph refresh queue mutex poisoned");
         queue.active = None;
+        let became_idle = queue.order.is_empty();
         shared.wake.notify_all();
+        drop(queue);
+
+        if became_idle {
+            let checkpoint_due = idle_checkpoint_due(
+                last_idle_checkpoints.get(&batch.root).copied(),
+                Instant::now(),
+            );
+            if checkpoint_due {
+                if let Some(store) = store {
+                    if store.checkpoint_wal_truncate() {
+                        last_idle_checkpoints.insert(batch.root.clone(), Instant::now());
+                    }
+                }
+            }
+        }
     }
 }
 
 fn process_callgraph_refresh_batch(
     batch: &RefreshBatch,
     workspace_crate_prefixes: &mut HashMap<RefreshRoot, WorkspaceCratePrefixCache>,
-) {
+) -> Option<CallGraphStore> {
     // A manifest event is an invalidation signal, not a source file to parse.
     // Drop the root's map even for a superseded batch: the filesystem changed,
     // and a later configure must never inherit crate membership from before it.
@@ -964,7 +1194,7 @@ fn process_callgraph_refresh_batch(
         .cloned()
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        return;
+        return None;
     }
     note_refresh_worker_batch_for_test(&batch.root.project_root);
     if batch
@@ -975,7 +1205,7 @@ fn process_callgraph_refresh_batch(
         // Superseded before starting: park the paths so the next configure's
         // pending replay (or unbind cleanup) decides their fate.
         batch.defer();
-        return;
+        return None;
     }
     let workspace_crate_prefix_cache =
         workspace_crate_prefix_cache_for_root(workspace_crate_prefixes, &batch.root);
@@ -1000,7 +1230,7 @@ fn process_callgraph_refresh_batch(
         Ok(Some(store)) => store,
         Ok(None) => {
             batch.defer_after_open_failure();
-            return;
+            return None;
         }
         Err(error) => {
             batch.defer_after_open_failure();
@@ -1008,7 +1238,7 @@ fn process_callgraph_refresh_batch(
                 "callgraph store writer open failed during refresh; deferred paths: {}",
                 error
             );
-            return;
+            return None;
         }
     };
     if !test_seam.delay.is_zero() {
@@ -1022,7 +1252,7 @@ fn process_callgraph_refresh_batch(
         // This is a superseded-ticket defer, not an open-failure defer: leave
         // the paths for the replacement configure instead of self-replaying.
         batch.defer();
-        return;
+        return Some(store);
     }
     let refresh_result = if test_seam.fail_refresh {
         Err(CallGraphStoreError::Unavailable(
@@ -1061,7 +1291,7 @@ fn process_callgraph_refresh_batch(
         // owns the store now. Defer instead of stale-marking — the paths were
         // never committed, and the replacement generation re-indexes them.
         batch.defer();
-        return;
+        return Some(store);
     }
     if let Err(error) = refresh_result {
         crate::slog_warn!("callgraph store refresh failed: {}", error);
@@ -1081,6 +1311,7 @@ fn process_callgraph_refresh_batch(
     } else {
         crate::logging::note_callgraph_invalidations(paths.len());
     }
+    Some(store)
 }
 
 fn workspace_crate_prefix_cache_for_root(
@@ -1276,6 +1507,7 @@ pub struct CallGraphStore {
     // Readiness is monotonic for an open generation: builds only publish `ready=1`.
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
+    write_metrics: Arc<CallgraphWriteMetrics>,
     conn: Mutex<Connection>,
 }
 
@@ -1395,6 +1627,7 @@ pub struct IncrementalStats {
     pub deleted_files: Vec<String>,
     pub dependency_selected_refs: usize,
     pub refreshed_own_files: usize,
+    pub unchanged_extract_files: usize,
 }
 
 /// Phase timings for the copy-based incremental refresh benchmark.
@@ -2177,6 +2410,7 @@ impl CallGraphStore {
             )?
             .store;
             let stats = temp_store.cold_build_chunked(files, chunk_size)?;
+            let _ = temp_store.checkpoint_wal_truncate();
             temp_store.prepare_for_atomic_swap()?;
             stats
         };
@@ -2352,6 +2586,7 @@ impl CallGraphStore {
         read_marker: Option<crate::root_cache::ReadMarker>,
         conn: Connection,
     ) -> Self {
+        let write_metrics = callgraph_write_metrics_for_key(&project_key);
         Self {
             project_root,
             project_key,
@@ -2362,6 +2597,7 @@ impl CallGraphStore {
             writer_lease,
             read_marker,
             database_ready: AtomicBool::new(false),
+            write_metrics,
             conn: Mutex::new(conn),
         }
     }
@@ -2418,6 +2654,16 @@ impl CallGraphStore {
             marker.touch_if_due()?;
         }
         Ok(())
+    }
+
+    fn record_commit(&self, total_changes_before: u64, conn: &Connection) {
+        self.write_metrics
+            .record_commit(conn.total_changes().saturating_sub(total_changes_before));
+    }
+
+    fn checkpoint_wal_truncate(&self) -> bool {
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        checkpoint_wal_truncate(&conn)
     }
 
     /// True if this store still reflects the currently-published generation.
@@ -2492,6 +2738,7 @@ impl CallGraphStore {
             let t = Instant::now();
             self.verify_writer_lease()?;
             let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+            let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
             insert_meta(&tx)?;
@@ -2523,6 +2770,7 @@ impl CallGraphStore {
                 insert_method_dispatch_edges(&tx, &self.project_root, None)?;
             set_meta_ready(&tx, true)?;
             tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
             phase!("sqlite_insert", t);
 
             let elapsed_ms = started.elapsed().as_millis();
@@ -2552,6 +2800,7 @@ impl CallGraphStore {
         let t = Instant::now();
         self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
         clear_tables(&tx)?;
         insert_meta(&tx)?;
@@ -2643,6 +2892,7 @@ impl CallGraphStore {
         )?;
         set_meta_ready(&tx, true)?;
         tx.commit()?;
+        self.record_commit(total_changes_before, &conn);
         phase!("sqlite_insert", t);
 
         let elapsed_ms = started.elapsed().as_millis();
@@ -2710,12 +2960,15 @@ impl CallGraphStore {
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
         ensure_database_ready(&tx)?;
         let mut changed = Vec::new();
         let mut surface_changed = BTreeSet::new();
         let mut deleted = BTreeSet::new();
         let mut own_refresh = BTreeSet::new();
+        let mut candidate_own_refresh = BTreeSet::new();
+        let mut unchanged_extracts = 0usize;
         let mut selected_ref_ids = BTreeSet::new();
         let mut selected_refs_by_caller = BTreeMap::new();
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
@@ -2754,6 +3007,7 @@ impl CallGraphStore {
                     } => {
                         update_file_fresh_metadata(
                             &tx,
+                            &self.project_root,
                             &rel_path,
                             &row.freshness.content_hash,
                             new_mtime,
@@ -2801,20 +3055,14 @@ impl CallGraphStore {
                     dependent_refs,
                 );
             }
-            own_refresh.insert(rel_path.clone());
-            let started = Instant::now();
-            delete_file_rows(&tx, &rel_path)?;
-            profile.row_deletes += started.elapsed();
-            let started = Instant::now();
-            insert_file_extract(&tx, &self.project_root, &extract)?;
-            profile.row_inserts += started.elapsed();
+            candidate_own_refresh.insert(rel_path.clone());
             changed_extracts.insert(rel_path, extract);
         }
 
         let dependency_selected_refs = selected_ref_ids.len();
         let mut touched_callers: BTreeSet<String> =
             selected_refs_by_caller.keys().cloned().collect();
-        touched_callers.extend(own_refresh.iter().cloned());
+        touched_callers.extend(candidate_own_refresh.iter().cloned());
 
         let mut caller_extracts: HashMap<String, FileExtract> = HashMap::new();
         for rel_path in &touched_callers {
@@ -2834,9 +3082,46 @@ impl CallGraphStore {
             }
         }
 
+        let started = Instant::now();
+        let index = ProjectIndex::from_db_and_callers(
+            &tx,
+            &self.project_root,
+            &caller_extracts,
+            workspace_crate_prefixes,
+        )?;
+        profile.index_load += started.elapsed();
+
+        for rel_path in &candidate_own_refresh {
+            let Some(extract) = changed_extracts.get(rel_path) else {
+                continue;
+            };
+            if stored_extract_matches(&tx, rel_path, extract, &index)? {
+                unchanged_extracts += 1;
+                update_file_fresh_metadata(
+                    &tx,
+                    &self.project_root,
+                    rel_path,
+                    &extract.freshness.content_hash,
+                    extract.freshness.mtime,
+                    extract.freshness.size,
+                )?;
+                continue;
+            }
+
+            own_refresh.insert(rel_path.clone());
+            let started = Instant::now();
+            delete_file_rows(&tx, rel_path)?;
+            profile.row_deletes += started.elapsed();
+            let started = Instant::now();
+            insert_file_extract(&tx, &self.project_root, extract)?;
+            profile.row_inserts += started.elapsed();
+        }
+
         let dependency_callers = touched_callers
             .iter()
-            .filter(|rel_path| !deleted.contains(*rel_path) && !own_refresh.contains(*rel_path))
+            .filter(|rel_path| {
+                !deleted.contains(*rel_path) && !candidate_own_refresh.contains(*rel_path)
+            })
             .cloned()
             .collect::<Vec<_>>();
         for rel_path in dependency_callers {
@@ -2855,15 +3140,6 @@ impl CallGraphStore {
             insert_file_extract(&tx, &self.project_root, extract)?;
             profile.row_inserts += started.elapsed();
         }
-
-        let started = Instant::now();
-        let index = ProjectIndex::from_db_and_callers(
-            &tx,
-            &self.project_root,
-            &caller_extracts,
-            workspace_crate_prefixes,
-        )?;
-        profile.index_load += started.elapsed();
         let started = Instant::now();
         for rel_path in &touched_callers {
             if deleted.contains(rel_path) {
@@ -2902,6 +3178,7 @@ impl CallGraphStore {
 
         let started = Instant::now();
         commit_incremental_if_current(tx)?;
+        self.record_commit(total_changes_before, &conn);
         profile.commit += started.elapsed();
         profile.total = total_started.elapsed();
         Ok((
@@ -2911,6 +3188,7 @@ impl CallGraphStore {
                 deleted_files: deleted.into_iter().collect(),
                 dependency_selected_refs,
                 refreshed_own_files: own_refresh.len(),
+                unchanged_extract_files: unchanged_extracts,
             },
             profile,
         ))
@@ -2923,6 +3201,7 @@ impl CallGraphStore {
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
         self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
         let mut marked = Vec::new();
         for path in files {
@@ -2939,6 +3218,7 @@ impl CallGraphStore {
             marked.push(rel_path);
         }
         tx.commit()?;
+        self.record_commit(total_changes_before, &conn);
         marked.sort();
         marked.dedup();
         Ok(marked)
@@ -5176,6 +5456,7 @@ fn publish_migrated_generation(
     method: &str,
 ) -> Result<String> {
     let gen_path = callgraph_dir.join(generation);
+    checkpoint_sqlite_before_publication(temp_path);
     let publication = publish_if_current(|| {
         verify_writer_lease(&writer_lease)?;
         remove_sqlite_file_set(&gen_path);
@@ -5432,6 +5713,7 @@ fn open_readonly_connection(path: &Path) -> Result<Connection> {
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(reader_busy_timeout())?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
@@ -5469,14 +5751,54 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(
+        None,
+        "wal_autocheckpoint",
+        CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES,
+    )?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
 
 fn configure_build_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "DELETE")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
+}
+
+/// A copied migration generation may carry a WAL sidecar. Checkpoint only the
+/// private temporary copy before publishing it; a busy reader is harmless because
+/// the next publication or cleanup pass can retry without affecting the source.
+fn checkpoint_sqlite_before_publication(path: &Path) {
+    let Ok(conn) = Connection::open(path) else {
+        return;
+    };
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    let _ = conn.busy_timeout(Duration::from_secs(5));
+    let _ = checkpoint_wal_truncate(&conn);
+}
+
+fn checkpoint_wal_truncate(conn: &Connection) -> bool {
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            false
+        }
+        Err(error) => {
+            log::debug!("callgraph WAL truncate checkpoint skipped: {error}");
+            false
+        }
+    }
 }
 
 fn initialize_schema(conn: &Connection) -> Result<()> {
@@ -10161,29 +10483,303 @@ fn stored_node_ids_match_extract(
     Ok(stored == extracted)
 }
 
+/// Compare every persisted graph row that comes from this file before rewriting it.
+/// Ranges and reference byte offsets are part of the key because queries expose
+/// source locations; equal names and edges are not enough after a body shift.
+fn stored_extract_matches(
+    tx: &Transaction<'_>,
+    rel_path: &str,
+    extract: &FileExtract,
+    index: &ProjectIndex<'_>,
+) -> Result<bool> {
+    let stored_file = tx
+        .query_row(
+            "SELECT lang, surface_fingerprint FROM files WHERE path = ?1",
+            params![rel_path],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if stored_file
+        != Some((
+            lang_label(extract.lang).to_string(),
+            extract.surface_fingerprint.clone(),
+        ))
+    {
+        return Ok(false);
+    }
+
+    let mut stored_nodes_stmt = tx.prepare(
+        "SELECT id, file_path, name, scoped_name, kind, start_line, start_col,
+                end_line, end_col, range_ordinal, signature, exported,
+                is_default_export, is_type_like, is_callgraph_entry_point, provenance
+         FROM nodes WHERE file_path = ?1",
+    )?;
+    let stored_nodes = stored_nodes_stmt
+        .query_map(params![rel_path], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, String>(15)?,
+            ])
+            .to_string())
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_nodes = extract
+        .nodes
+        .iter()
+        .map(|node| {
+            serde_json::json!([
+                node.id,
+                node.file_path,
+                node.name,
+                node.scoped_name,
+                node.kind,
+                node.range.start_line,
+                node.range.start_col,
+                node.range.end_line,
+                node.range.end_col,
+                node.range_ordinal,
+                node.signature,
+                bool_int(node.exported),
+                bool_int(node.is_default_export),
+                bool_int(node.is_type_like),
+                bool_int(node.is_callgraph_entry_point),
+                PROVENANCE_TREESITTER,
+            ])
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let mut stored_nodes = stored_nodes;
+    let mut expected_nodes = expected_nodes;
+    stored_nodes.sort();
+    expected_nodes.sort();
+    if stored_nodes != expected_nodes {
+        return Ok(false);
+    }
+
+    let resolved_refs = extract
+        .raw_refs
+        .iter()
+        .cloned()
+        .map(|raw| resolve_ref(raw, index))
+        .collect::<Result<Vec<_>>>()?;
+    let mut stored_refs_stmt = tx.prepare(
+        "SELECT ref_id, caller_node, caller_file, kind, short_name, full_ref,
+                module_path, import_kind, local_name, requested_name, namespace_alias,
+                wildcard, line, byte_start, byte_end, status, target_node,
+                target_file, target_symbol, provenance
+         FROM refs WHERE caller_file = ?1",
+    )?;
+    let stored_refs = stored_refs_stmt
+        .query_map(params![rel_path], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, String>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, String>(19)?,
+            ])
+            .to_string())
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_refs = resolved_refs
+        .iter()
+        .map(|resolved| {
+            let raw = &resolved.raw;
+            serde_json::json!([
+                raw.ref_id,
+                raw.caller_node,
+                raw.caller_file,
+                raw.kind,
+                raw.short_name,
+                raw.full_ref,
+                raw.module_path,
+                raw.import_kind,
+                raw.local_name,
+                raw.requested_name,
+                raw.namespace_alias,
+                bool_int(raw.wildcard),
+                raw.line,
+                raw.byte_start,
+                raw.byte_end,
+                resolved.status,
+                resolved.target_node,
+                resolved.target_file,
+                resolved.target_symbol,
+                PROVENANCE_TREESITTER,
+            ])
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let mut stored_refs = stored_refs;
+    let mut expected_refs = expected_refs;
+    stored_refs.sort();
+    expected_refs.sort();
+    if stored_refs != expected_refs {
+        return Ok(false);
+    }
+
+    let mut stored_edges_stmt = tx.prepare(
+        "SELECT e.edge_id, e.ref_id, e.source_node, e.target_node,
+                e.target_file, e.target_symbol, e.kind, e.line, e.provenance
+         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+         WHERE r.caller_file = ?1 AND e.provenance = ?2",
+    )?;
+    let stored_edges = stored_edges_stmt
+        .query_map(params![rel_path, PROVENANCE_TREESITTER], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+            ])
+            .to_string())
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_edges = resolved_refs
+        .iter()
+        .filter_map(|resolved| {
+            resolved.edge.as_ref().map(|edge| {
+                serde_json::json!([
+                    edge.edge_id,
+                    resolved.raw.ref_id,
+                    edge.source_node,
+                    edge.target_node,
+                    edge.target_file,
+                    edge.target_symbol,
+                    edge.kind,
+                    edge.line,
+                    PROVENANCE_TREESITTER,
+                ])
+                .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut stored_edges = stored_edges;
+    let mut expected_edges = expected_edges;
+    stored_edges.sort();
+    expected_edges.sort();
+    if stored_edges != expected_edges {
+        return Ok(false);
+    }
+
+    let mut stored_dependencies_stmt =
+        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+    let stored_dependencies = stored_dependencies_stmt
+        .query_map(params![rel_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let expected_dependencies = extract
+        .raw_refs
+        .iter()
+        .flat_map(|raw| raw.dependencies.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if stored_dependencies != expected_dependencies {
+        return Ok(false);
+    }
+
+    let mut stored_hints_stmt = tx.prepare(
+        "SELECT id, method_name, caller_node, file, line, byte_start, byte_end, provenance
+         FROM dispatch_hints WHERE file = ?1",
+    )?;
+    let stored_hints = stored_hints_stmt
+        .query_map(params![rel_path], |row| {
+            Ok(serde_json::json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ])
+            .to_string())
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected_hints = extract
+        .dispatch_hints
+        .iter()
+        .map(|hint| {
+            serde_json::json!([
+                hint.id,
+                hint.method_name,
+                hint.caller_node,
+                hint.file,
+                hint.line,
+                hint.byte_start,
+                hint.byte_end,
+                PROVENANCE_TREESITTER,
+            ])
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    let mut stored_hints = stored_hints;
+    let mut expected_hints = expected_hints;
+    stored_hints.sort();
+    expected_hints.sort();
+    Ok(stored_hints == expected_hints)
+}
+
 fn update_file_fresh_metadata(
     tx: &Transaction<'_>,
+    project_root: &Path,
     rel_path: &str,
     hash: &blake3::Hash,
     mtime: SystemTime,
     size: u64,
 ) -> Result<()> {
     tx.execute(
-        "UPDATE files SET mtime_ns = ?2, size = ?3, indexed_at = ?4 WHERE path = ?1",
+        "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5
+         WHERE path = ?1",
         params![
             rel_path,
+            hash_to_hex(*hash),
             system_time_to_ns(mtime),
             size as i64,
             unix_seconds_now()
         ],
     )?;
     tx.execute(
-        "UPDATE backend_file_state SET status = 'fresh', updated_at = ?4
-         WHERE backend = ?1 AND file_path = ?2 AND content_hash = ?3",
+        "UPDATE backend_file_state SET content_hash = ?3, status = 'fresh', updated_at = ?5
+         WHERE backend = ?1 AND file_path = ?2 AND workspace_root = ?4",
         params![
             BACKEND_TREESITTER,
             rel_path,
             hash_to_hex(*hash),
+            project_root.display().to_string(),
             unix_seconds_now(),
         ],
     )?;
@@ -10809,6 +11405,14 @@ fn system_time_to_ns(time: SystemTime) -> i64 {
 
 fn ns_to_system_time(value: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn unix_seconds_now() -> i64 {
@@ -11641,6 +12245,54 @@ mod refresh_worker_tests {
             .unwrap()
             .expect("ready callgraph store");
         assert_eq!(store.stale_files().unwrap(), vec!["main.rs"]);
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn idle_refresh_truncates_wal() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        let generation = read_pointer(
+            &callgraph_dir,
+            &crate::search_index::artifact_cache_key(&root),
+        )
+        .expect("fixture publishes a generation");
+        let wal_path = callgraph_dir.join(format!("{generation}-wal"));
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+
+        fs::write(&source, "fn entry() { old_leaf(); }\nfn old_leaf() {}\n\n").unwrap();
+        enqueue_callgraph_store_refresh(
+            callgraph_dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+        );
+        wait_for_refresh_calls(&root, 1);
+        wait_for_refresh_worker_idle();
+        let checkpoint_deadline = Instant::now() + Duration::from_secs(2);
+        while fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+            != 0
+        {
+            assert!(
+                Instant::now() < checkpoint_deadline,
+                "idle checkpoint did not truncate WAL"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            0,
+            "idle transition truncates the refresh WAL"
+        );
+
         clear_callgraph_refresh_worker_test_seam(&root);
     }
 

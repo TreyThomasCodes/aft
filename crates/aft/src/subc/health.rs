@@ -421,6 +421,7 @@ pub(super) fn build_health_report(
         .collect();
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
+    let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     for root in &mut roots {
         let project_key = crate::search_index::artifact_cache_key(Path::new(&root.project_root));
         if let Some((count, _window_start)) =
@@ -482,6 +483,8 @@ pub(super) fn build_health_report(
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
             "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
+            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
             // Lifecycle audit counters (fleet leak tracking): process-wide
             // watcher runtimes, registered actor roots, and open routes.
             "runtime": {
@@ -564,6 +567,11 @@ mod tests {
             quiet_metrics["callgraph_repair_entries_60s_total"].as_u64(),
             Some(0)
         );
+        assert!(quiet_metrics["callgraph_commits_60s_total"].is_u64());
+        assert!(quiet_metrics["callgraph_pages_or_bytes_written_60s_total"].is_u64());
+        assert!(quiet_metrics["roots"][0]
+            .get("callgraph_commits_60s")
+            .is_none());
         assert!(quiet_metrics["roots"][0]
             .get("callgraph_repair_entries_60s")
             .is_none());

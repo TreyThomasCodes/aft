@@ -260,8 +260,32 @@ impl AppContext {
         let memory_root = self
             .canonical_cache_root_opt()
             .or_else(|| config.project_root.clone());
+        let callgraph_write_metrics = memory_root
+            .as_deref()
+            .and_then(|root| self.cached_artifact_cache_key(root))
+            .map(|project_key| {
+                crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
+            })
+            .unwrap_or_default();
+        let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
         let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
             .unwrap_or(serde_json::Value::Null);
+        let mut runtime = serde_json::json!({
+            "live_watchers": self.app().watcher_count(),
+            "live_actor_roots": self.app().actor_root_count(),
+            "open_routes": self.app().open_route_count(),
+            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
+            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total
+                .pages_or_bytes_written_60s,
+        });
+        if callgraph_write_metrics.commits_60s > 0 {
+            runtime["callgraph_commits_60s"] =
+                serde_json::json!(callgraph_write_metrics.commits_60s);
+        }
+        if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
+            runtime["callgraph_pages_or_bytes_written_60s"] =
+                serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
+        }
 
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -287,11 +311,7 @@ impl AppContext {
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
             "memory": memory,
-            "runtime": {
-                "live_watchers": self.app().watcher_count(),
-                "live_actor_roots": self.app().actor_root_count(),
-                "open_routes": self.app().open_route_count(),
-            },
+            "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,
             // Project-wide (all sessions): total in-memory checkpoint count.
@@ -386,6 +406,8 @@ mod tests {
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "not_initialized");
         assert!(response.data["canonical_root"].is_null());
+        assert!(response.data["runtime"]["callgraph_commits_60s_total"].is_u64());
+        assert!(response.data["runtime"]["callgraph_pages_or_bytes_written_60s_total"].is_u64());
 
         let temp = tempfile::tempdir().unwrap();
         ctx.update_config(|config| {

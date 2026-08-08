@@ -1875,6 +1875,7 @@ fn open_readonly_connection(path: &Path) -> Result<Connection, InspectCacheError
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(reader_busy_timeout())?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
