@@ -9807,6 +9807,8 @@ fn infer_rust_direct_self_field_receiver_type(
 
 fn rust_direct_self_field_name(receiver_expression: &str) -> Option<&str> {
     let (base, field) = receiver_expression.split_once('.')?;
+    let base = base.trim();
+    let field = field.trim();
     (base == "self" && rust_direct_nominal_type_name(field).is_some()).then_some(field)
 }
 
@@ -14100,6 +14102,16 @@ void handle() {
             infer_receiver_type(root, &factory_ref, &mut cache).as_deref(),
             Some("FactoryFoo")
         );
+    }
+
+    #[test]
+    fn rust_direct_self_field_name_trims_separator_whitespace() {
+        for receiver_expression in ["self .engine", "self. engine", "self . engine"] {
+            assert_eq!(
+                rust_direct_self_field_name(receiver_expression),
+                Some("engine")
+            );
+        }
     }
 
     #[test]
