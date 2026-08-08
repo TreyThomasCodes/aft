@@ -2,8 +2,10 @@ import { appendFile, mkdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export const DEFAULT_LOG_BYTES = 20 * 1024 * 1024;
-export const DEFAULT_LOG_GENERATIONS = 5;
+/** Maximum size of the active plugin log before its single backup rotates in. */
+export const DEFAULT_LOG_BYTES = 32 * 1024 * 1024;
+/** Retention hygiene keeps one backup generation and no numbered chain. */
+export const DEFAULT_LOG_GENERATIONS = 1;
 
 function homeDir(): string {
   if (process.platform === "win32") return process.env.USERPROFILE || process.env.HOME || homedir();

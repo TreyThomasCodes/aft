@@ -354,6 +354,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_lsp_events(runtime);
     }
     aft::logging::perf_tick(None);
+    aft::logging::maybe_sweep_logs();
 }
 
 #[cfg(test)]

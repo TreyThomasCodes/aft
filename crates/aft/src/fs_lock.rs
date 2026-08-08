@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{slog_error, slog_info, slog_warn};
+use crate::{slog_debug, slog_error, slog_info, slog_warn};
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const STALE_HEARTBEAT_MS: u64 = 15_000;
@@ -179,7 +179,7 @@ impl Drop for LockGuard {
         while self.heartbeat_done.try_recv().is_ok() {}
 
         match remove_lock_if_owned(&self.path, &self.metadata) {
-            Ok(true) => slog_info!("released filesystem lock at {}", self.path.display()),
+            Ok(true) => slog_debug!("released filesystem lock at {}", self.path.display()),
             Ok(false) => {}
             Err(error) => slog_warn!(
                 "failed to release filesystem lock at {}: {}",
@@ -397,7 +397,7 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
             let _ = done_tx.send(());
         })?;
 
-    slog_info!("acquired filesystem lock at {}", path.display());
+    slog_debug!("acquired filesystem lock at {}", path.display());
 
     Ok(LockGuard {
         path: path.to_path_buf(),
@@ -959,6 +959,19 @@ mod tests {
     fn current_process_metadata() -> LockMetadata {
         let now = now_ms();
         synthetic_metadata(std::process::id(), current_hostname(), now)
+    }
+
+    #[test]
+    fn lock_operation_trace_lines_are_debug_not_info() {
+        let source = include_str!("fs_lock.rs");
+        assert!(source.contains("slog_debug!(\"acquired filesystem lock at {}\", path.display())"));
+        assert!(
+            source.contains("slog_debug!(\"released filesystem lock at {}\", self.path.display())")
+        );
+        assert!(!source.contains("slog_info!(\"acquired filesystem lock at {}\", path.display())"));
+        assert!(
+            !source.contains("slog_info!(\"released filesystem lock at {}\", self.path.display())")
+        );
     }
 
     #[test]

@@ -2799,6 +2799,7 @@ where
                 // inbound route/control messages and push completions have run,
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
+                crate::logging::maybe_sweep_logs();
                 let reaped_lsp_children = shared_app
                     .lsp_child_registry()
                     .reap_children_with_gone_cwd();

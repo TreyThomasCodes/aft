@@ -312,6 +312,8 @@ pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_store: Option<HealthComponentSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub callgraph_repair_entries_60s: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash: Option<BgTaskHealthCounts>,
@@ -326,6 +328,7 @@ impl RootHealthSnapshot {
             search_index: None,
             semantic_index: None,
             callgraph_store: None,
+            callgraph_repair_entries_60s: None,
             tier2: None,
             bash: None,
         }
@@ -2071,6 +2074,7 @@ impl AppContext {
             callgraph_store: Some(HealthComponentSnapshot {
                 status: callgraph_store_status,
             }),
+            callgraph_repair_entries_60s: None,
             tier2: Some(Tier2HealthSnapshot {
                 status: tier2_status,
             }),

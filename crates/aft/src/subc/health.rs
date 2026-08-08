@@ -1,5 +1,6 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -419,6 +420,17 @@ pub(super) fn build_health_report(
         .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
         .collect();
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+    let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
+    for root in &mut roots {
+        let project_key = crate::search_index::artifact_cache_key(Path::new(&root.project_root));
+        if let Some((count, _window_start)) =
+            crate::callgraph_store::repair_entry_rate(&project_key)
+        {
+            if count > 0 {
+                root.callgraph_repair_entries_60s = Some(count);
+            }
+        }
+    }
 
     // Compact memory rollup for operator drill-down (`ck health aft`): per-root
     // attributed bytes with the same top-N cap as the status payload, plus
@@ -469,6 +481,7 @@ pub(super) fn build_health_report(
         metrics: Some(json!({
             "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
             "root_count": roots.len(),
+            "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
             // Lifecycle audit counters (fleet leak tracking): process-wide
             // watcher runtimes, registered actor roots, and open routes.
             "runtime": {
@@ -528,6 +541,57 @@ mod tests {
                 "breadcrumb omitted configure phase timings: {breadcrumb}"
             );
         }
+    }
+
+    #[test]
+    fn callgraph_repair_rate_is_always_present_and_hot_root_scoped() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-callgraph-repair-rate");
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let project_key = crate::search_index::artifact_cache_key(root.as_path());
+
+        let quiet = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let quiet_metrics = quiet.metrics.expect("quiet health metrics");
+        assert_eq!(
+            quiet_metrics["callgraph_repair_entries_60s_total"].as_u64(),
+            Some(0)
+        );
+        assert!(quiet_metrics["roots"][0]
+            .get("callgraph_repair_entries_60s")
+            .is_none());
+
+        for _ in 0..3 {
+            crate::callgraph_store::note_repair_entry(&project_key);
+        }
+        let hot = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let hot_metrics = hot.metrics.expect("hot health metrics");
+        assert_eq!(
+            hot_metrics["callgraph_repair_entries_60s_total"].as_u64(),
+            Some(3)
+        );
+        assert_eq!(
+            hot_metrics["roots"][0]["callgraph_repair_entries_60s"].as_u64(),
+            Some(3)
+        );
+
+        crate::callgraph_store::expire_repair_entry_window_for_test(&project_key);
+        let decayed = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let decayed_metrics = decayed.metrics.expect("decayed health metrics");
+        assert_eq!(
+            decayed_metrics["callgraph_repair_entries_60s_total"].as_u64(),
+            Some(0)
+        );
+        assert!(decayed_metrics["roots"][0]
+            .get("callgraph_repair_entries_60s")
+            .is_none());
     }
 
     #[test]

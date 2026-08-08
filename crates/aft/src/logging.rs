@@ -3,6 +3,7 @@
 //! Rust module processes use one file per PID. That avoids cross-process rename
 //! races while preserving a single greppable directory for all AFT activity.
 
+use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
 use crate::run_tool_call::ToolCallPhaseDurations;
 use std::collections::{BTreeMap, VecDeque};
@@ -15,11 +16,19 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-const LOG_FILE_BYTES: u64 = 20 * 1024 * 1024;
-const LOG_GENERATIONS: usize = 5;
-const ROTATION_CHECK_EVERY: u64 = 64;
+/// Maximum size of an active Rust or plugin log before its single backup rotates in.
+const LOG_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Keep one backup generation; retention is hygiene rather than a user setting.
+const LOG_GENERATIONS: usize = 1;
+/// Check the active file on every write so the cap is not exceeded by a burst.
+const ROTATION_CHECK_EVERY: u64 = 1;
 const LOG_CHANNEL_CAPACITY: usize = 4096;
-const DEAD_PROCESS_LOG_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Do not reap a dead PID's file until it has been quiet for at least one day.
+const DEAD_PROCESS_LOG_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Limit the total regular-file footprint left in the log directory.
+const LOG_DIRECTORY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
+/// Maintenance ticks may call the sweep, but actual directory work is hourly.
+const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
@@ -31,9 +40,11 @@ pub fn init() {
     let logs_dir = storage_root.join("logs");
     let file_name = format!("aft-{}.log", std::process::id());
     let file_path = logs_dir.join(file_name);
+    let mut startup_sweep = None;
 
     let file_tx = match prepare_file_sink(&logs_dir, &file_path) {
-        Ok(sink) => {
+        Ok((sink, summary)) => {
+            startup_sweep = Some(summary);
             let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
             thread::Builder::new()
                 .name("aft-log-writer".to_string())
@@ -84,6 +95,10 @@ pub fn init() {
             )
         })
         .init();
+
+    if let Some(summary) = startup_sweep {
+        log_sweep_summary(summary);
+    }
 }
 
 /// Render `now` as `YYYY-MM-DDTHH:MM:SSZ` without a date-time dependency.
@@ -117,15 +132,25 @@ fn format_epoch_secs(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-fn prepare_file_sink(logs_dir: &Path, file_path: &Path) -> io::Result<RotatingFile> {
+fn prepare_file_sink(
+    logs_dir: &Path,
+    file_path: &Path,
+) -> io::Result<(RotatingFile, SweepSummary)> {
     fs::create_dir_all(logs_dir)?;
-    sweep_dead_process_logs(logs_dir, SystemTime::now(), DEAD_PROCESS_LOG_MAX_AGE)?;
-    RotatingFile::open(
+    let summary = sweep_logs(
+        logs_dir,
+        SystemTime::now(),
+        DEAD_PROCESS_LOG_MAX_AGE,
+        LOG_DIRECTORY_BUDGET_BYTES,
+    )?;
+    mark_log_sweep_ran();
+    let sink = RotatingFile::open(
         file_path.to_path_buf(),
         LOG_FILE_BYTES,
         LOG_GENERATIONS,
         ROTATION_CHECK_EVERY,
-    )
+    )?;
+    Ok((sink, summary))
 }
 
 enum LogMessage {
@@ -199,7 +224,10 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
             let logs_dir = storage_root.join("logs");
             let path = logs_dir.join(format!("aft-{}.log", std::process::id()));
             match prepare_file_sink(&logs_dir, &path) {
-                Ok(new_sink) => sink = new_sink,
+                Ok((new_sink, summary)) => {
+                    sink = new_sink;
+                    log_sweep_summary(summary);
+                }
                 Err(error) => write_stderr_once(&format!(
                     "[aft] durable log could not switch to {}: {error}\n",
                     path.display()
@@ -232,7 +260,7 @@ impl RotatingFile {
     ) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size = file.metadata()?.len();
-        Ok(Self {
+        let mut sink = Self {
             path,
             writer: Some(BufWriter::new(file)),
             size,
@@ -240,7 +268,11 @@ impl RotatingFile {
             generations,
             check_every: check_every.max(1),
             writes_since_check: 0,
-        })
+        };
+        if size > threshold {
+            sink.rotate()?;
+        }
+        Ok(sink)
     }
 
     fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()> {
@@ -319,29 +351,118 @@ fn rename_if_present(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-fn sweep_dead_process_logs(dir: &Path, now: SystemTime, max_age: Duration) -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SweepSummary {
+    removed_files: usize,
+    bytes_freed: u64,
+}
+
+struct ProcessLogFile {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    bytes: u64,
+    dead: bool,
+    old_enough: bool,
+    removed: bool,
+}
+
+fn log_sweep_summary(summary: SweepSummary) {
+    crate::slog_info!(
+        "log retention sweep: removed_files={} bytes_freed={}",
+        summary.removed_files,
+        summary.bytes_freed
+    );
+}
+
+/// Sweep dead Rust process logs, then enforce the directory budget without ever
+/// deleting a live PID's file or the plugin logger's pid-less file.
+fn sweep_logs(
+    dir: &Path,
+    now: SystemTime,
+    max_age: Duration,
+    budget_bytes: u64,
+) -> io::Result<SweepSummary> {
+    let mut total_bytes = 0_u64;
+    let mut process_logs = Vec::new();
+    let mut live_pids = BTreeMap::new();
+    let own_pid = std::process::id();
+
     for entry in fs::read_dir(dir)? {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => continue,
         };
+        let metadata = match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) | Err(_) => continue,
+        };
+        let bytes = metadata.len();
+        total_bytes = total_bytes.saturating_add(bytes);
         let name = entry.file_name();
-        let Some(pid) = process_log_pid(name.to_string_lossy().as_ref()) else {
+        let name = name.to_string_lossy();
+        let pid = match name.as_ref() {
+            // This shared TypeScript-owned file has no PID. Keep this explicit
+            // so a future default branch cannot accidentally make it reaped.
+            "aft-plugin.log" => continue,
+            _ => process_log_pid(&name),
+        };
+        let Some(pid) = pid else {
             continue;
         };
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let age = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok());
-        if age.is_some_and(|age| age >= max_age) && !process_is_alive(pid) {
-            let _ = fs::remove_file(entry.path());
+        let modified = metadata.modified().ok();
+        let old_enough = modified
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        let alive = *live_pids
+            .entry(pid)
+            .or_insert_with(|| is_process_alive(pid));
+        process_logs.push(ProcessLogFile {
+            path: entry.path(),
+            modified,
+            bytes,
+            dead: pid != own_pid && !alive,
+            old_enough,
+            removed: false,
+        });
+    }
+
+    let mut summary = SweepSummary::default();
+    for file in &mut process_logs {
+        if file.dead && file.old_enough && remove_sweep_candidate(&file.path) {
+            file.removed = true;
+            total_bytes = total_bytes.saturating_sub(file.bytes);
+            summary.removed_files += 1;
+            summary.bytes_freed = summary.bytes_freed.saturating_add(file.bytes);
         }
     }
-    Ok(())
+
+    // The budget backstop is deliberately separate from the age-gated reap:
+    // once liveness says a PID is dead, budget pressure may remove even a fresh
+    // dead file so the directory can actually converge under its hard limit.
+    // Live files remain ineligible regardless of age or budget pressure.
+    process_logs.sort_by_key(|file| file.modified);
+    for file in process_logs
+        .iter_mut()
+        .filter(|file| file.dead && !file.removed)
+    {
+        if total_bytes <= budget_bytes {
+            break;
+        }
+        if remove_sweep_candidate(&file.path) {
+            file.removed = true;
+            total_bytes = total_bytes.saturating_sub(file.bytes);
+            summary.removed_files += 1;
+            summary.bytes_freed = summary.bytes_freed.saturating_add(file.bytes);
+        }
+    }
+
+    Ok(summary)
+}
+
+fn remove_sweep_candidate(path: &Path) -> bool {
+    // A sharing violation means another process has the file pinned (notably on
+    // Windows). Leave it for a later sweep instead of failing the maintenance pass.
+    fs::remove_file(path).is_ok()
 }
 
 fn process_log_pid(name: &str) -> Option<u32> {
@@ -355,52 +476,51 @@ fn process_log_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid == std::process::id() {
-        return true;
+static LAST_LOG_SWEEP: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+fn mark_log_sweep_ran() {
+    if let Ok(mut last_run) = LAST_LOG_SWEEP.lock() {
+        *last_run = Some(Instant::now());
     }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    use std::ffi::c_void;
-
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const STILL_ACTIVE: u32 = 259;
-    const ERROR_INVALID_PARAMETER: u32 = 87;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        #[link_name = "OpenProcess"]
-        fn open_process(access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
-        #[link_name = "GetExitCodeProcess"]
-        fn get_exit_code_process(process: *mut c_void, exit_code: *mut u32) -> i32;
-        #[link_name = "CloseHandle"]
-        fn close_handle(object: *mut c_void) -> i32;
-        #[link_name = "GetLastError"]
-        fn get_last_error() -> u32;
+/// Run log maintenance from an existing idle/maintenance tick at most hourly.
+pub fn maybe_sweep_logs() {
+    let now = Instant::now();
+    let should_run = LAST_LOG_SWEEP
+        .lock()
+        .map(|mut last_run| {
+            if last_run.is_some_and(|last| now.duration_since(last) < LOG_SWEEP_INTERVAL) {
+                false
+            } else {
+                *last_run = Some(now);
+                true
+            }
+        })
+        .unwrap_or(false);
+    if !should_run {
+        return;
     }
 
-    if pid == std::process::id() {
-        return true;
+    let storage_root = FILE_CONTROL
+        .lock()
+        .ok()
+        .and_then(|control| control.storage_root.clone())
+        .unwrap_or_else(|| crate::bash_background::storage_dir(None));
+    let logs_dir = storage_root.join("logs");
+    match sweep_logs(
+        &logs_dir,
+        SystemTime::now(),
+        DEAD_PROCESS_LOG_MAX_AGE,
+        LOG_DIRECTORY_BUDGET_BYTES,
+    ) {
+        Ok(summary) => log_sweep_summary(summary),
+        Err(error) => crate::slog_warn!(
+            "log retention sweep failed for {}: {}",
+            logs_dir.display(),
+            error
+        ),
     }
-    let handle = unsafe { open_process(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        // ERROR_INVALID_PARAMETER means no process owns this PID. For access
-        // errors, retain the file rather than risk deleting a live process log.
-        return unsafe { get_last_error() } != ERROR_INVALID_PARAMETER;
-    }
-    let mut exit_code = 0;
-    let queried = unsafe { get_exit_code_process(handle, &mut exit_code) } != 0;
-    unsafe { close_handle(handle) };
-    queried && exit_code == STILL_ACTIVE
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_is_alive(pid: u32) -> bool {
-    pid == std::process::id()
 }
 
 #[derive(Default)]
@@ -828,10 +948,11 @@ mod tests {
     }
 
     #[test]
-    fn rotation_rolls_at_threshold_and_preserves_newest_generations() {
+    fn rotation_rolls_once_and_replaces_the_single_backup_generation() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("aft-123.log");
-        let mut sink = RotatingFile::open(path.clone(), 10, 2, 1).unwrap();
+        fs::write(rotated_path(&path, 1), "stale backup\n").unwrap();
+        let mut sink = RotatingFile::open(path.clone(), 10, 1, 1).unwrap();
         sink.write_batch(&line("aaaa")).unwrap();
         sink.write_batch(&line("bbbb")).unwrap();
         sink.write_batch(&line("cccc")).unwrap();
@@ -843,36 +964,73 @@ mod tests {
             fs::read_to_string(rotated_path(&path, 1)).unwrap(),
             "cccc\ndddd\n"
         );
-        assert_eq!(
-            fs::read_to_string(rotated_path(&path, 2)).unwrap(),
-            "aaaa\nbbbb\n"
-        );
-        assert!(!rotated_path(&path, 3).exists());
+        assert!(!rotated_path(&path, 2).exists());
     }
 
     #[test]
-    fn dead_pid_sweep_removes_only_old_process_logs() {
+    fn dead_pid_sweep_respects_age_liveness_and_explicit_plugin_exclusion() {
         let temp = TempDir::new().unwrap();
         let dead = temp.path().join("aft-4294967294.log");
         let dead_rotated = temp.path().join("aft-4294967294.log.1");
-        let live = temp.path().join(format!("aft-{}.log", std::process::id()));
-        let unrelated = temp.path().join("aft-plugin.log");
-        for path in [&dead, &dead_rotated, &live, &unrelated] {
+        let fresh_dead = temp.path().join("aft-4294967293.log");
+        let own = temp.path().join(format!("aft-{}.log", std::process::id()));
+        let live_rotated = rotated_path(&own, 1);
+        let plugin = temp.path().join("aft-plugin.log");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        for path in [&dead, &dead_rotated, &own, &live_rotated, &plugin] {
             fs::write(path, "log").unwrap();
             set_file_mtime(path, FileTime::from_unix_time(1, 0)).unwrap();
         }
-
-        sweep_dead_process_logs(
-            temp.path(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60),
-            DEAD_PROCESS_LOG_MAX_AGE,
+        fs::write(&fresh_dead, "fresh").unwrap();
+        set_file_mtime(
+            &fresh_dead,
+            FileTime::from_unix_time(
+                (now - DEAD_PROCESS_LOG_MAX_AGE + Duration::from_secs(1))
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                0,
+            ),
         )
         .unwrap();
 
+        let summary = sweep_logs(temp.path(), now, DEAD_PROCESS_LOG_MAX_AGE, u64::MAX).unwrap();
+
+        assert_eq!(summary.removed_files, 2);
         assert!(!dead.exists());
         assert!(!dead_rotated.exists());
+        assert!(fresh_dead.exists());
+        assert!(own.exists());
+        assert!(live_rotated.exists());
+        assert!(plugin.exists());
+    }
+
+    #[test]
+    fn budget_backstop_deletes_oldest_dead_files_but_not_live_files() {
+        let temp = TempDir::new().unwrap();
+        let oldest = temp.path().join("aft-4294967294.log");
+        let newest = temp.path().join("aft-4294967293.log");
+        let live = temp.path().join(format!("aft-{}.log", std::process::id()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        fs::write(&oldest, "oldest").unwrap();
+        fs::write(&newest, "newest").unwrap();
+        fs::write(&live, "live-live").unwrap();
+        set_file_mtime(&oldest, FileTime::from_unix_time(1, 0)).unwrap();
+        set_file_mtime(&newest, FileTime::from_unix_time(2, 0)).unwrap();
+        set_file_mtime(&live, FileTime::from_unix_time(1, 0)).unwrap();
+
+        let summary = sweep_logs(
+            temp.path(),
+            now,
+            Duration::from_secs(365 * 24 * 60 * 60),
+            15,
+        )
+        .unwrap();
+
+        assert_eq!(summary.removed_files, 1);
+        assert!(!oldest.exists());
+        assert!(newest.exists());
         assert!(live.exists());
-        assert!(unrelated.exists());
     }
 
     #[test]

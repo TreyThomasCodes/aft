@@ -24,18 +24,17 @@ describe("durable plugin logging", () => {
     }
   });
 
-  test("rotates at the byte threshold and enforces the generation cap", async () => {
+  test("rotates at the byte threshold and replaces the single backup generation", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
     cleanup.push(root);
     const path = join(root, "logs", "aft-plugin.log");
-    const sink = new RotatingLogSink(path, { maxBytes: 10, generations: 2 });
+    const sink = new RotatingLogSink(path, { maxBytes: 10 });
 
     for (const value of ["aaaa\n", "bbbb\n", "cccc\n", "dddd\n", "eeee\n"]) sink.append(value);
     await sink.drain();
 
     expect(readFileSync(path, "utf8")).toBe("eeee\n");
     expect(readFileSync(`${path}.1`, "utf8")).toBe("cccc\ndddd\n");
-    expect(readFileSync(`${path}.2`, "utf8")).toBe("aaaa\nbbbb\n");
-    expect(() => readFileSync(`${path}.3`, "utf8")).toThrow();
+    expect(() => readFileSync(`${path}.2`, "utf8")).toThrow();
   });
 });

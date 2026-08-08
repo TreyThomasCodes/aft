@@ -49,6 +49,7 @@ const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
 const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
 const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
+const ROOT_REPAIR_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 
@@ -71,6 +72,143 @@ struct RebuildCooldownRecord {
 // complete generation. Record only successful publications in this map.
 static SUCCESSFUL_REBUILDS: OnceLock<Mutex<HashMap<RebuildCooldownKey, RebuildCooldownRecord>>> =
     OnceLock::new();
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RootRepairWarningKey {
+    project_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct RootRepairWarningRecord {
+    window_start: Instant,
+    last_emitted: Instant,
+    entry_count: u64,
+    suppressed: u64,
+}
+
+static ROOT_REPAIR_WARNINGS: OnceLock<
+    Mutex<HashMap<RootRepairWarningKey, RootRepairWarningRecord>>,
+> = OnceLock::new();
+
+const ROOT_REPAIR_WARNING_TEXT: &str =
+    "callgraph store root repair requires rebuild; open-only reader reports unavailable";
+
+fn next_root_repair_warning(key: RootRepairWarningKey, now: Instant) -> Option<String> {
+    let warnings = ROOT_REPAIR_WARNINGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut warnings = warnings.lock().ok()?;
+    let entry = warnings.entry(key);
+    let record = match entry {
+        Entry::Vacant(entry) => {
+            entry.insert(RootRepairWarningRecord {
+                window_start: now,
+                last_emitted: now,
+                entry_count: 1,
+                suppressed: 0,
+            });
+            return Some(ROOT_REPAIR_WARNING_TEXT.to_string());
+        }
+        Entry::Occupied(entry) => entry.into_mut(),
+    };
+
+    if now.saturating_duration_since(record.window_start) >= ROOT_REPAIR_WARN_INTERVAL {
+        let suppressed = record.suppressed;
+        record.window_start = now;
+        record.last_emitted = now;
+        record.entry_count = 1;
+        record.suppressed = 0;
+        return Some(if suppressed == 0 {
+            ROOT_REPAIR_WARNING_TEXT.to_string()
+        } else {
+            format!("{ROOT_REPAIR_WARNING_TEXT} (repeated {suppressed}x in 60s)")
+        });
+    }
+
+    record.entry_count = record.entry_count.saturating_add(1);
+    if now.saturating_duration_since(record.last_emitted) < ROOT_REPAIR_WARN_INTERVAL {
+        record.suppressed = record.suppressed.saturating_add(1);
+        None
+    } else {
+        record.last_emitted = now;
+        Some(ROOT_REPAIR_WARNING_TEXT.to_string())
+    }
+}
+
+pub(crate) fn note_repair_entry(project_key: &str) -> Option<String> {
+    next_root_repair_warning(
+        RootRepairWarningKey {
+            project_key: project_key.to_string(),
+        },
+        Instant::now(),
+    )
+}
+
+/// Return the number of repair entries in the active 60-second window.
+///
+/// The window start is returned for callers that need to show freshness without
+/// adding another status verdict or turning this into a user-facing setting.
+pub(crate) fn repair_entry_rate(project_key: &str) -> Option<(u64, Instant)> {
+    let warnings = ROOT_REPAIR_WARNINGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let warnings = warnings.lock().ok()?;
+    let record = warnings.get(&RootRepairWarningKey {
+        project_key: project_key.to_string(),
+    })?;
+    (Instant::now().saturating_duration_since(record.window_start) < ROOT_REPAIR_WARN_INTERVAL)
+        .then_some((record.entry_count, record.window_start))
+}
+
+pub(crate) fn repair_entry_rate_total() -> u64 {
+    let Ok(warnings) = ROOT_REPAIR_WARNINGS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        return 0;
+    };
+    let now = Instant::now();
+    warnings
+        .values()
+        .filter(|record| {
+            now.saturating_duration_since(record.window_start) < ROOT_REPAIR_WARN_INTERVAL
+        })
+        .map(|record| record.entry_count)
+        .sum()
+}
+
+#[cfg(test)]
+pub(crate) fn expire_repair_entry_window_for_test(project_key: &str) {
+    let warnings = ROOT_REPAIR_WARNINGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut warnings = warnings.lock().unwrap();
+    if let Some(record) = warnings.get_mut(&RootRepairWarningKey {
+        project_key: project_key.to_string(),
+    }) {
+        record.window_start = Instant::now() - ROOT_REPAIR_WARN_INTERVAL;
+    }
+}
+
+#[cfg(test)]
+mod root_repair_warning_tests {
+    use super::*;
+
+    #[test]
+    fn repair_warning_emits_once_then_reemits_with_suppressed_count() {
+        let key = RootRepairWarningKey {
+            project_key: "test-project".to_string(),
+        };
+        let first_at = Instant::now();
+        let first = next_root_repair_warning(key.clone(), first_at).unwrap();
+        assert_eq!(first, ROOT_REPAIR_WARNING_TEXT);
+        assert!(next_root_repair_warning(key.clone(), first_at + Duration::from_secs(1)).is_none());
+        assert_eq!(
+            repair_entry_rate("test-project").map(|rate| rate.0),
+            Some(2)
+        );
+
+        let repeated = next_root_repair_warning(key, first_at + ROOT_REPAIR_WARN_INTERVAL).unwrap();
+        assert!(repeated.ends_with("(repeated 1x in 60s)"));
+        expire_repair_entry_window_for_test("test-project");
+        assert!(repair_entry_rate("test-project").is_none());
+    }
+}
+
 #[cfg(test)]
 type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: the observer fires synchronously on the
@@ -1741,7 +1879,7 @@ impl CallGraphStore {
         };
         let OpenedStore { store, root_repair } = Self::open_at_path_with_root_repair(
             project_root.clone(),
-            project_key,
+            project_key.clone(),
             sqlite_path,
             generation,
             true,
@@ -1760,9 +1898,9 @@ impl CallGraphStore {
                 Ok(Some(store))
             }
             OpenRootRepair::NeedsRebuild { .. } => {
-                crate::slog_info!(
-                    "callgraph store root repair requires rebuild; open-only reader reports unavailable"
-                );
+                if let Some(message) = note_repair_entry(&project_key) {
+                    crate::slog_warn!("{message}");
+                }
                 Ok(None)
             }
             OpenRootRepair::None | OpenRootRepair::ReRooted => Ok(Some(store)),
