@@ -638,6 +638,22 @@ fn normalize_text(text: &str, project_root: &Path, cache_dir: &Path) -> String {
     if let Ok(canonical) = fs::canonicalize(cache_dir) {
         base_roots.push(canonical.to_string_lossy().to_string());
     }
+    // Windows: the raw temp root can carry an 8.3 short component
+    // (RUNNER~1) while renderers that canonicalize-and-strip (apply_patch
+    // diff headers) emit the LONG spelling without the `\\?\` prefix — a
+    // form neither the raw nor the verbatim-canonical entry matches. Add the
+    // prefix-stripped canonical spellings so those paths mask too.
+    for stripped in base_roots
+        .iter()
+        .filter_map(|root| {
+            root.strip_prefix("\\\\?\\UNC\\")
+                .map(|rest| format!("\\\\{rest}"))
+                .or_else(|| root.strip_prefix("\\\\?\\").map(str::to_string))
+        })
+        .collect::<Vec<_>>()
+    {
+        base_roots.push(stripped);
+    }
 
     // The `status` tool is the only spine case rendered via serde_json
     // `to_string_pretty`, which JSON-ESCAPES backslashes — so a Windows root
