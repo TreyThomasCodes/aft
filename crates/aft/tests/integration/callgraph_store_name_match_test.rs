@@ -399,12 +399,12 @@ impl Car {
         true,
     ));
     assert!(
-        tree["children"].as_array().unwrap().iter().all(|child| {
-            child["name"] != "Engine::start"
-                || child["approximate"] != false
-                || child["resolved_by"] != "type_match"
-        }),
-        "unresolved actual::Engine must not precisely match unrelated Engine::start: {tree:#}"
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["name"] != "Engine::start"),
+        "unresolved actual::Engine must not match unrelated Engine::start: {tree:#}"
     );
 
     let callers = json(callgraph_store_adapter::callers_result(
@@ -415,12 +415,10 @@ impl Car {
         true,
     ));
     assert!(
-        flattened_callers(&callers).iter().all(|entry| {
-            entry["symbol"] != "Car::run"
-                || entry["approximate"] != false
-                || entry["resolved_by"] != "type_match"
-        }),
-        "unrelated Engine::start must not report Car::run as a precise caller: {callers:#}"
+        flattened_callers(&callers)
+            .iter()
+            .all(|entry| entry["symbol"] != "Car::run"),
+        "unrelated Engine::start must not report Car::run as a caller: {callers:#}"
     );
 }
 
@@ -470,12 +468,12 @@ impl Car {
         true,
     ));
     assert!(
-        tree["children"].as_array().unwrap().iter().all(|child| {
-            child["name"] != "Engine::start"
-                || child["approximate"] != false
-                || child["resolved_by"] != "type_match"
-        }),
-        "imported Engine must not precisely match unrelated Engine::start: {tree:#}"
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["name"] != "Engine::start"),
+        "imported Engine must not match unrelated Engine::start: {tree:#}"
     );
 
     let callers = json(callgraph_store_adapter::callers_result(
@@ -486,12 +484,10 @@ impl Car {
         true,
     ));
     assert!(
-        flattened_callers(&callers).iter().all(|entry| {
-            entry["symbol"] != "Car::run"
-                || entry["approximate"] != false
-                || entry["resolved_by"] != "type_match"
-        }),
-        "unrelated Engine::start must not report Car::run as a precise caller: {callers:#}"
+        flattened_callers(&callers)
+            .iter()
+            .all(|entry| entry["symbol"] != "Car::run"),
+        "unrelated Engine::start must not report Car::run as a caller: {callers:#}"
     );
 }
 
