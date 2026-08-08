@@ -34,7 +34,7 @@ opencode-aft/
 
 **`crates/aft/`:**
 - Purpose: Keep the Rust execution engine, stdin/stdout protocol binary, and shared analysis logic together.
-- Contains: `src/` Rust modules, `tests/` integration suites, `tests/fixtures/` test fixtures, `tests/helpers/` test utilities, `tests/lsp/` LSP integration tests
+- Contains: `src/` Rust modules, `tests/` integration suites, `crates/aft/tests/fixtures/` test fixtures, `tests/helpers/` test utilities, `crates/aft/tests/lsp/` LSP integration tests
 - Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/runtime_drain.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, `crates/aft/src/subc/mod.rs`, `crates/aft/src/subc/`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/memory.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/executor/`, `crates/aft/src/bash_background/`, `crates/aft/src/bash_rewrite/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/legacy_partitions.rs`, `crates/aft/src/cold_build_limiter.rs`, `crates/aft/src/sandbox_spawn.rs`, `crates/aft/src/sandbox_profile.rs`, `crates/aft/src/cli/sandbox_launch.rs`, `crates/aft/tests/integration/`
 
 **`crates/aft-tokenizer/`:**
@@ -82,6 +82,11 @@ opencode-aft/
 - Contains: Process pool, PTY runtime, watchdog thread, persistence, buffer management, async pattern watches
 - Key files: `crates/aft/src/bash_background/registry.rs`, `crates/aft/src/bash_background/process.rs`, `crates/aft/src/bash_background/pty_process.rs`, `crates/aft/src/bash_background/watchdog.rs`, `crates/aft/src/bash_background/watches.rs`
 
+**`crates/aft/src/bash_rewrite/`:**
+- Purpose: Execute bash command rewriting, rule branch evaluations, differential test campaigns, and observation logging.
+- Contains: Rewrite dispatch, decision catalog, rule implementations, differential testing engine, observation logger, command parser, and output footers.
+- Key files: `crates/aft/src/bash_rewrite/mod.rs`, `crates/aft/src/bash_rewrite/dispatch.rs`, `crates/aft/src/bash_rewrite/catalog.rs`, `crates/aft/src/bash_rewrite/rules.rs`, `crates/aft/src/bash_rewrite/differential.rs`, `crates/aft/src/bash_rewrite/observation.rs`
+
 **`crates/aft/src/db/`:**
 - Purpose: Provide persistent SQLite-backed storage for backups, bash tasks, pattern watches, compression events, and state.
 - Contains: Database modules for each storage domain
@@ -99,8 +104,8 @@ opencode-aft/
 
 **`packages/aft-bridge/`:**
 - Purpose: Ship the shared bridge transport layer used by both OpenCode and Pi plugins.
-- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, session lifecycle records caching (`SessionRecord` wrapping route entry and bg subscriptions), background event subscriptions, bridge lifecycle management, binary resolution, download, ONNX runtime detection, storage migration, compact formatting, zoom-format rendering, canonical path alias resolution, and host-neutral error adaptation
-- Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/path-aliases.ts`, `packages/aft-bridge/src/error-contract.ts`
+- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, session lifecycle records caching (`SessionRecord` wrapping route entry and bg subscriptions), per-realm subc lifecycle management (`lifecycle-registry.ts`), consolidated cache root resolution (`cache-paths.ts`), background event subscriptions, bridge lifecycle management, binary resolution, download, ONNX runtime detection, storage migration, compact formatting, zoom-format rendering, canonical path alias resolution, and host-neutral error adaptation
+- Key files: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/path-aliases.ts`, `packages/aft-bridge/src/error-contract.ts`, `packages/aft-bridge/src/cache-paths.ts`, `packages/aft-bridge/src/lifecycle-registry.ts`
 
 **`packages/aft-cli/`:**
 - Purpose: Provide a unified `npx @cortexkit/aft` CLI entry point for setup, doctor, and LSP management across all harnesses.
@@ -200,6 +205,8 @@ opencode-aft/
 **New LSP behavior:** `crates/aft/src/lsp/[module].rs` -- keep transport and server-management code inside the LSP subsystem.
 
 **New sandbox confinement or backend rules:** `crates/aft/src/sandbox_profile.rs` (confinement profile definition), `crates/aft/src/sandbox_spawn.rs` (spawn policy logic), or `crates/aft/src/cli/sandbox_launch/` (OS-specific sandboxing backends).
+
+**New bash rewrite rule:** `crates/aft/src/bash_rewrite/rules.rs` -- implement the `RewriteRule` trait, register the decision class in `catalog.rs`, and dispatch it in `dispatch.rs`.
 
 **New platform binary package:** `packages/npm/[platform-key]/` -- add `package.json` and ship the platform binary in `bin/`.
 
