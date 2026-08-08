@@ -10,6 +10,7 @@ import type {
   ToolCallResult,
 } from "@cortexkit/aft-bridge";
 import {
+  adaptToolError,
   formatBridgeErrorMessage,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
@@ -147,11 +148,16 @@ export async function callBridge(
     configureWarningClient: extCtx,
     ...options,
   };
-  const response = await bridge.send(
-    command,
-    merged,
-    Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-  );
+  let response: Record<string, unknown>;
+  try {
+    response = await bridge.send(
+      command,
+      merged,
+      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+    );
+  } catch (error) {
+    throw adaptToolError(command, error);
+  }
   if (response.success === false) {
     throw new BridgeError(
       formatBridgeErrorMessage(command, response, merged),
@@ -182,12 +188,17 @@ export async function callToolCall(
     configureWarningClient: extCtx,
     ...options,
   };
-  const response = await bridge.toolCall(
-    sessionId,
-    name,
-    rawArgs,
-    Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-  );
+  let response: ToolCallResult;
+  try {
+    response = await bridge.toolCall(
+      sessionId,
+      name,
+      rawArgs,
+      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
+    );
+  } catch (error) {
+    throw adaptToolError(name, error);
+  }
   ingestBgCompletions(sessionId, response.bg_completions);
   return response;
 }

@@ -1,3 +1,4 @@
+use crate::commands::bash_status::format_unknown_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde::Deserialize;
@@ -36,9 +37,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 "promoted": promoted,
             }),
         ),
-        Err(message) if message.contains("not found") => {
-            Response::error(&req.id, "task_not_found", message)
-        }
+        Err(message) if message.contains("not found") => Response::error(
+            &req.id,
+            "task_not_found",
+            format_unknown_task_message(&params.task_id),
+        ),
         Err(message) => Response::error(&req.id, "execution_failed", message),
     }
 }

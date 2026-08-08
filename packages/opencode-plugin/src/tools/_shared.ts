@@ -25,7 +25,12 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "@cortexkit/aft-bridge";
-import { canonicalizeProjectRoot, decodeFileUrl, timeoutForCommand } from "@cortexkit/aft-bridge";
+import {
+  adaptToolError,
+  canonicalizeProjectRoot,
+  decodeFileUrl,
+  timeoutForCommand,
+} from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
@@ -262,6 +267,8 @@ export async function callBridge(
       merged,
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
+  } catch (error) {
+    throw adaptToolError(command, error);
   } finally {
     markBridgeEnd();
   }
@@ -304,6 +311,8 @@ export async function callToolCall(
       rawArgs,
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
+  } catch (error) {
+    throw adaptToolError(name, error);
   } finally {
     markBridgeEnd();
   }

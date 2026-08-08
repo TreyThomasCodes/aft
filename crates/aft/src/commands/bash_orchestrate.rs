@@ -258,7 +258,7 @@ pub(crate) fn task_not_found_response(request_id: &str, task_id: &str) -> Respon
     Response::error(
         request_id,
         "task_not_found",
-        format!("background task not found: {task_id}"),
+        crate::commands::bash_status::format_unknown_task_message(task_id),
     )
 }
 
@@ -288,9 +288,11 @@ pub(crate) fn promote_bash(
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
-        Err(message) if message.contains("not found") => {
-            Response::error(request_id, "task_not_found", message)
-        }
+        Err(message) if message.contains("not found") => Response::error(
+            request_id,
+            "task_not_found",
+            crate::commands::bash_status::format_unknown_task_message(task_id),
+        ),
         Err(message) => Response::error(request_id, "execution_failed", message),
     }
 }
@@ -303,9 +305,11 @@ pub(crate) fn detach_wait_mode_bash(
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => wait_detach_response(request_id, task_id),
-        Err(message) if message.contains("not found") => {
-            Response::error(request_id, "task_not_found", message)
-        }
+        Err(message) if message.contains("not found") => Response::error(
+            request_id,
+            "task_not_found",
+            crate::commands::bash_status::format_unknown_task_message(task_id),
+        ),
         Err(message) => Response::error(request_id, "execution_failed", message),
     }
 }

@@ -926,6 +926,10 @@ fn background_status_unknown_task_returns_task_not_found() {
     );
     assert_eq!(response["success"], false);
     assert_eq!(response["code"], "task_not_found");
+    assert_eq!(
+        response["message"],
+        "background task not found: missing-task. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
+    );
 
     assert!(aft.shutdown().success());
 }

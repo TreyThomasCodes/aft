@@ -1034,11 +1034,14 @@ describe("bash_status tool", () => {
     const { statusTool } = makeCtx(() => ({
       success: false,
       code: "not_found",
-      message: "task bash-unknown not found",
+      message:
+        "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.",
     }));
     await expect(
       statusTool.execute({ taskId: "bash-unknown" }, createMockSdkContext()),
-    ).rejects.toThrow("task bash-unknown not found");
+    ).rejects.toThrow(
+      "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.",
+    );
   });
 
   async function spill(contents: string): Promise<string> {

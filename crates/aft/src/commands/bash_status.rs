@@ -9,6 +9,12 @@ use serde_json::json;
 
 const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
+pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.";
+
+pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
+    format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
+}
+
 #[derive(Debug, Deserialize)]
 struct BashStatusParams {
     #[serde(default)]
@@ -148,7 +154,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         None => Response::error(
             &req.id,
             "task_not_found",
-            format!("background task not found: {task_id}"),
+            format_unknown_task_message(&task_id),
         ),
     }
 }
@@ -182,5 +188,18 @@ fn maybe_render_pty_screen(
             ));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_unknown_task_message;
+
+    #[test]
+    fn unknown_task_message_steers_agents_to_rerun() {
+        assert_eq!(
+            format_unknown_task_message("bash-unknown"),
+            "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
+        );
     }
 }

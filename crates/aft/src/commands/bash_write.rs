@@ -1,3 +1,4 @@
+use crate::commands::bash_status::format_unknown_task_message;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde::Deserialize;
@@ -78,7 +79,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(code) if code == "task_not_found" => Response::error(
             &req.id,
             "task_not_found",
-            format!("background task not found: {}", params.task_id),
+            format_unknown_task_message(&params.task_id),
         ),
         Err(code) if code == "task_not_pty" => Response::error(
             &req.id,

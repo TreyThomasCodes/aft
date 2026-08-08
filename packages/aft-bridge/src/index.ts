@@ -87,7 +87,13 @@ export {
 export type { EditSummaryInput } from "./edit-summary.js";
 export { formatEditSummary } from "./edit-summary.js";
 // --- host-neutral agent tool errors ---
-export { AftToolError, type AftToolErrorCause, toolErrorFromResponse } from "./error-contract.js";
+export {
+  AftToolError,
+  type AftToolErrorCause,
+  adaptToolError,
+  BASH_TRANSPORT_DISPOSITION,
+  toolErrorFromResponse,
+} from "./error-contract.js";
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
