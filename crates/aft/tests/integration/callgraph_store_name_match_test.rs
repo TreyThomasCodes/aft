@@ -239,7 +239,7 @@ struct Holder {
 
 impl Holder {
     fn check(&self) {
-        let _ = self.path.as_path();
+        let _ = self. path.as_path();
     }
 }
 

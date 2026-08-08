@@ -8755,7 +8755,7 @@ fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, String, bool
         return None;
     }
     let receiver_expression = full_ref[..delimiter].trim();
-    let receiver = last_name_segment(receiver_expression);
+    let receiver = last_name_segment(receiver_expression).trim();
     let member = &full_ref[member_start..];
     if receiver.is_empty() || member.is_empty() {
         return None;
