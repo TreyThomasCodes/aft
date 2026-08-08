@@ -206,3 +206,122 @@ fn report_dominant_phase(profile: &RefreshFilesProfile) {
         .expect("profile has phases");
     eprintln!("refresh_files hot_loop: {name} ({}ms)", elapsed.as_millis());
 }
+
+#[derive(Debug)]
+struct WriteAmplificationMeasurement {
+    directory_delta_bytes: u64,
+    output_blocks: u64,
+}
+
+/// Compare the shipped configuration with the legacy full-scan configuration,
+/// which scans 1,000 pages and skips row-difference checks. Keep this test ignored
+/// because it performs 50 edits for an offline write-amplification measurement.
+#[test]
+#[ignore = "offline write-amplification measurement"]
+fn measure_write_amplification_ab() {
+    let baseline = run_write_amplification_sequence(true);
+    let optimized = run_write_amplification_sequence(false);
+    let byte_ratio = if baseline.directory_delta_bytes == 0 {
+        None
+    } else {
+        Some(optimized.directory_delta_bytes as f64 / baseline.directory_delta_bytes as f64)
+    };
+    let block_ratio = if baseline.output_blocks == 0 {
+        None
+    } else {
+        Some(optimized.output_blocks as f64 / baseline.output_blocks as f64)
+    };
+    eprintln!(
+        "write_amplification_ab baseline={{directory_delta_bytes:{}, output_blocks:{}}} optimized={{directory_delta_bytes:{}, output_blocks:{}}} ratios={{bytes:{byte_ratio:?}, blocks:{block_ratio:?}}}",
+        baseline.directory_delta_bytes,
+        baseline.output_blocks,
+        optimized.directory_delta_bytes,
+        optimized.output_blocks,
+    );
+}
+
+fn run_write_amplification_sequence(baseline: bool) -> WriteAmplificationMeasurement {
+    let temp = tempfile::tempdir().expect("measurement temp dir");
+    let project_root = temp.path().join("project");
+    let store_dir = project_root.join(".store-write-amp");
+    fs::create_dir_all(&project_root).expect("create measurement project");
+    let mut files = Vec::new();
+    for index in 0..30 {
+        let path = project_root.join(format!("file{index}.ts"));
+        let next = (index + 1) % 30;
+        fs::write(
+            &path,
+            format!(
+                "import {{ fn{next} }} from './file{next}';\nexport function fn{index}() {{ return fn{next}(); }}\n"
+            ),
+        )
+        .expect("write measurement source");
+        files.push(path);
+    }
+
+    let previous = std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE");
+    if baseline {
+        std::env::set_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE", "1");
+    } else {
+        std::env::remove_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE");
+    }
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), project_root.clone(), &files)
+            .expect("cold-build measurement store");
+    let mut previous_bytes = directory_bytes(&store_dir);
+    let before_blocks = output_blocks();
+    let mut directory_delta_bytes = 0;
+    for edit in 0..50 {
+        let path = &files[edit % files.len()];
+        let mut source = fs::read_to_string(path).expect("read measurement source");
+        source.push_str(&format!("// whitespace-preserving edit {edit}\n"));
+        fs::write(path, source).expect("write measurement edit");
+        store
+            .refresh_files(std::slice::from_ref(path))
+            .expect("refresh measurement edit");
+        let current_bytes = directory_bytes(&store_dir);
+        directory_delta_bytes += current_bytes.abs_diff(previous_bytes);
+        previous_bytes = current_bytes;
+    }
+    drop(store);
+    let measurement = WriteAmplificationMeasurement {
+        directory_delta_bytes,
+        output_blocks: output_blocks().saturating_sub(before_blocks),
+    };
+    match previous {
+        Some(value) => std::env::set_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE", value),
+        None => std::env::remove_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE"),
+    }
+    measurement
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    for entry in fs::read_dir(path).expect("read measurement store") {
+        let entry = entry.expect("read measurement entry");
+        let metadata = entry.metadata().expect("stat measurement entry");
+        total += if metadata.is_dir() {
+            directory_bytes(&entry.path())
+        } else {
+            metadata.len()
+        };
+    }
+    total
+}
+
+#[cfg(unix)]
+fn output_blocks() -> u64 {
+    unsafe {
+        let mut usage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            usage.ru_oublock as u64
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn output_blocks() -> u64 {
+    0
+}

@@ -54,6 +54,10 @@ const CALLGRAPH_WRITE_METRIC_WINDOW: Duration = Duration::from_secs(60);
 const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
+fn write_amplification_baseline_enabled() -> bool {
+    std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE").is_some()
+}
+
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3095,7 +3099,9 @@ impl CallGraphStore {
             let Some(extract) = changed_extracts.get(rel_path) else {
                 continue;
             };
-            if stored_extract_matches(&tx, rel_path, extract, &index)? {
+            if !write_amplification_baseline_enabled()
+                && stored_extract_matches(&tx, rel_path, extract, &index)?
+            {
                 unchanged_extracts += 1;
                 update_file_fresh_metadata(
                     &tx,
@@ -5713,7 +5719,15 @@ fn open_readonly_connection(path: &Path) -> Result<Connection> {
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(
+        None,
+        "synchronous",
+        if write_amplification_baseline_enabled() {
+            "FULL"
+        } else {
+            "NORMAL"
+        },
+    )?;
     conn.busy_timeout(reader_busy_timeout())?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
@@ -5751,11 +5765,20 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    let baseline = write_amplification_baseline_enabled();
+    conn.pragma_update(
+        None,
+        "synchronous",
+        if baseline { "FULL" } else { "NORMAL" },
+    )?;
     conn.pragma_update(
         None,
         "wal_autocheckpoint",
-        CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES,
+        if baseline {
+            1_000
+        } else {
+            CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES
+        },
     )?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
@@ -5763,7 +5786,15 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 
 fn configure_build_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "DELETE")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(
+        None,
+        "synchronous",
+        if write_amplification_baseline_enabled() {
+            "FULL"
+        } else {
+            "NORMAL"
+        },
+    )?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
