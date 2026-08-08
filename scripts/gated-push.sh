@@ -51,6 +51,19 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
+# Warm the shared fixture binary before any gate that spawns it: a gate chain
+# that just rebuilt target/debug/aft mints a fresh inode, and macOS charges a
+# first-exec assessment (seconds warm, minutes under a wedged XprotectService)
+# to whichever test spawns it first — observed as 49 parallel tests all dying
+# at their 60s response deadline while the binary was still being assessed.
+# The throwaway exec is the load-bearing step (memory: signing alone does not
+# clear it); rust-test-gate.sh does this for test binaries, this covers the
+# fixture binary for ad-hoc gate commands.
+if [[ -x target/debug/aft ]]; then
+  codesign -f -s - target/debug/aft 2>/dev/null || true
+  ./target/debug/aft --version >/dev/null 2>&1 || true
+fi
+
 echo "gated-push: running gate: $*"
 "$@"
 rc=$?
