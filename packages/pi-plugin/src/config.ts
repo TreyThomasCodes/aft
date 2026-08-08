@@ -61,6 +61,8 @@ export interface SubcConfig {
    * `~/.local/share/cortexkit/run/subc-connection.json`.
    */
   connection_file?: string;
+  /** User-tier root-reaper switch; project config cannot set or override it. */
+  client_reaper?: boolean;
 }
 
 export interface SemanticConfig {
@@ -486,6 +488,8 @@ const BridgeConfigSchema = z.object({
 });
 
 const SubcConfigSchema = z.object({
+  /** User-tier root-reaper switch; project config cannot set or override it. */
+  client_reaper: z.boolean().optional(),
   connection_file: z.string().optional(),
 });
 
@@ -1262,6 +1266,14 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
 export const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BRIDGE_HANG_THRESHOLD = 2;
 
+/** Default the client-side root reaper to disabled when no user configuration is provided; production deployments may enable it through their own configuration. */
+export const DEFAULT_SUBC_CLIENT_REAPER = false;
+const SUBC_CLIENT_REAPER_PROCESS_KEY = "subc_client_reaper";
+
+export function resolveSubcClientReaper(config: AftConfig): boolean {
+  return config.subc?.client_reaper ?? DEFAULT_SUBC_CLIENT_REAPER;
+}
+
 /** Resolved pool/bridge options from `config.bridge` (defaults 30000 / 2). */
 export function resolveBridgePoolTransportOptions(config: AftConfig): {
   timeoutMs: number;
@@ -1318,10 +1330,25 @@ export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConf
 export function buildConfigTierConfigureParams(
   projectDirectory: string,
   processState: Record<string, unknown> = {},
-): Record<string, unknown> & { config: ConfigTier[]; cortexkit_user_config_path: string } {
+): Record<string, unknown> & {
+  config: ConfigTier[];
+  cortexkit_user_config_path: string;
+  subc_client_reaper?: boolean;
+} {
   const paths = resolveAftConfigPaths(projectDirectory);
+  // Only plugin initialization supplies process state. Keep this user-tier
+  // lifecycle switch out of per-project configure payloads, where it cannot
+  // change an existing registration.
+  const initialPluginState = Object.keys(processState).length > 0;
   return {
     ...processState,
+    ...(initialPluginState
+      ? {
+          [SUBC_CLIENT_REAPER_PROCESS_KEY]: resolveSubcClientReaper(
+            loadAftConfig(projectDirectory),
+          ),
+        }
+      : {}),
     cortexkit_user_config_path: paths.userConfigPath,
     config: readConfigTiers(paths),
   };
