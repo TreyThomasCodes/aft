@@ -455,7 +455,7 @@ impl SearchIndexSnapshot {
     }
 
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
             !file.path.as_os_str().is_empty() && is_within_search_root(&search_root, &file.path)
         })
@@ -1693,7 +1693,7 @@ impl SearchIndexSnapshot {
             Ok(filters) => filters,
             Err(_) => PathFilters::default(),
         };
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
 
         let trigram_started = Instant::now();
         let raw_pattern = pattern.raw_pattern_for_trigrams();
@@ -1889,7 +1889,7 @@ impl SearchIndexSnapshot {
             Ok(filters) => filters,
             Err(_) => return (Vec::new(), false, 0),
         };
-        let search_root = canonicalize_or_normalize(search_root);
+        let search_root = canonicalize_for_search_membership(search_root);
         let entries_visited = self.files.len();
         let mut scope_has_files = false;
         let mut entries = self
@@ -3641,16 +3641,17 @@ pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Optio
 
     match fs::canonicalize(&full_path) {
         Ok(canonical_path) => {
-            if canonical_path.starts_with(&normalized_root) {
+            // Normalize only the containment operands. The returned path
+            // remains in the cache's established lexical form because
+            // path_to_id and semantic-cache consumers use that exact key.
+            if is_within_search_root(&normalized_root, &canonical_path) {
                 return Some(full_path);
             }
 
             let canonical_root = fs::canonicalize(&normalized_root).ok()?;
-            canonical_path
-                .starts_with(&canonical_root)
-                .then_some(full_path)
+            is_within_search_root(&canonical_root, &canonical_path).then_some(full_path)
         }
-        Err(_) => full_path.starts_with(&normalized_root).then_some(full_path),
+        Err(_) => is_within_search_root(&normalized_root, &full_path).then_some(full_path),
     }
 }
 
@@ -3794,12 +3795,12 @@ fn sort_shared_grep_matches_by_cached_mtime_desc<F>(
 }
 
 pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> SearchScope {
-    let resolved_project_root = canonicalize_or_normalize(project_root);
+    let resolved_project_root = canonicalize_for_search_membership(project_root);
     let root = match path {
         Some(path) => {
             let path = PathBuf::from(path);
             if path.is_absolute() {
-                canonicalize_or_normalize(&path)
+                canonicalize_for_search_membership(&path)
             } else {
                 normalize_path(&resolved_project_root.join(path))
             }
@@ -4463,6 +4464,14 @@ impl PathFilters {
     }
 }
 
+fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
+    // Indexed files and requested scope roots meet in containment checks. Bare
+    // `fs::canonicalize` yields a Windows verbatim (`\\?\`) path, while the
+    // lexical fallback does not, so the two success/failure forms would silently
+    // miss each other without this shared non-verbatim normalizer.
+    crate::inspect::job::canonicalize_normalized(path)
+}
+
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
@@ -4606,7 +4615,8 @@ fn verify_file_mtimes(
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    normalize_path(path).starts_with(normalize_path(search_root))
+    crate::inspect::job::normalize_path(path)
+        .starts_with(crate::inspect::job::normalize_path(search_root))
 }
 
 impl QueryBuild {

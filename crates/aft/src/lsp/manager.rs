@@ -1790,51 +1790,19 @@ impl LspManager {
     }
 
     pub fn clear_diagnostics_for_file(&mut self, file: &Path) -> bool {
-        let mut removed = self.diagnostics.clear_for_file(file);
-
-        let normalized = normalize_lookup_path(file);
-        if normalized != file {
-            removed |= self.diagnostics.clear_for_file(&normalized);
-        }
-
-        // Reconstruct the canonical key via the parent dir (which still exists
-        // for a just-deleted file) so symlink-aliased roots still match.
-        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
-            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-                let reconstructed = canonical_parent.join(name);
-                if reconstructed != file && reconstructed != normalized {
-                    removed |= self.diagnostics.clear_for_file(&reconstructed);
-                }
-            }
-        }
-
-        removed
+        diagnostic_path_candidates(file)
+            .into_iter()
+            .fold(false, |removed, candidate| {
+                removed | self.diagnostics.clear_for_file(&candidate)
+            })
     }
 
     /// Mark cached diagnostics for this file stale after a watcher-observed
     /// external edit. The same path aliases as deletion are checked so canonical
     /// publish keys are found even when the watcher reports a symlinked path.
     pub fn mark_diagnostics_stale_for_file(&mut self, file: &Path) -> StaleDiagnosticsMark {
-        let mut candidates = vec![file.to_path_buf()];
-        let normalized = normalize_lookup_path(file);
-        if !candidates.iter().any(|candidate| candidate == &normalized) {
-            candidates.push(normalized.clone());
-        }
-
-        if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
-            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-                let reconstructed = canonical_parent.join(name);
-                if !candidates
-                    .iter()
-                    .any(|candidate| candidate == &reconstructed)
-                {
-                    candidates.push(reconstructed);
-                }
-            }
-        }
-
         let mut result = StaleDiagnosticsMark::default();
-        for candidate in candidates {
+        for candidate in diagnostic_path_candidates(file) {
             let (had_entries, changed) = self.diagnostics.mark_stale_for_file(&candidate);
             result.had_entries |= had_entries;
             result.changed |= changed;
@@ -2288,6 +2256,34 @@ fn normalize_lookup_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(4);
+    let mut add = |candidate: PathBuf| {
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    // Existing files normalize through the same URI path used when publishing
+    // diagnostics. A deleted file cannot be canonicalized, so retain the
+    // watcher spelling as a candidate too.
+    add(file.to_path_buf());
+    add(normalize_lookup_path(file));
+
+    // The parent survives a file deletion. Rebuild both forms used by the
+    // diagnostics store: raw filesystem canonicalization (legacy/direct
+    // publishers) and its non-verbatim normalized spelling (LSP URI events).
+    if let (Some(parent), Some(name)) = (file.parent(), file.file_name()) {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let reconstructed = canonical_parent.join(name);
+            add(reconstructed.clone());
+            add(crate::inspect::job::normalize_path(&reconstructed));
+        }
+    }
+
+    candidates
+}
+
 /// Classify an error returned by `spawn_server` into a structured
 /// `ServerAttemptResult`. The two interesting cases for callers are:
 /// - `BinaryNotInstalled` — the server's binary couldn't be resolved on PATH
@@ -2527,6 +2523,56 @@ mod clear_diagnostics_tests {
         let removed = manager.clear_diagnostics_for_file(&watcher_path);
 
         assert!(removed, "expected the deleted file's diagnostic to clear");
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_diagnostics_for_deleted_file_matches_normalized_publish_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("normalized-gone.ts");
+        std::fs::write(&file, "x").unwrap();
+        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: normalized_file.parent().unwrap().to_path_buf(),
+        };
+        manager.diagnostics_store_mut_for_test().publish(
+            key,
+            normalized_file.clone(),
+            vec![err_diag(&normalized_file)],
+        );
+        std::fs::remove_file(&file).unwrap();
+
+        assert!(manager.clear_diagnostics_for_file(&file));
+        assert_eq!(manager.warm_error_warning_counts(), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_diagnostics_for_deleted_file_matches_normalized_publish_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("normalized-stale.ts");
+        std::fs::write(&file, "x").unwrap();
+        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: normalized_file.parent().unwrap().to_path_buf(),
+        };
+        manager.diagnostics_store_mut_for_test().publish(
+            key,
+            normalized_file.clone(),
+            vec![err_diag(&normalized_file)],
+        );
+        std::fs::remove_file(&file).unwrap();
+
+        let result = manager.mark_diagnostics_stale_for_file(&file);
+        assert!(result.had_entries);
+        assert!(result.changed);
         assert_eq!(manager.warm_error_warning_counts(), (0, 0));
     }
 
