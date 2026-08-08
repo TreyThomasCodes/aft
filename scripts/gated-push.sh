@@ -60,7 +60,10 @@ fi
 # clear it); rust-test-gate.sh does this for test binaries, this covers the
 # fixture binary for ad-hoc gate commands.
 if [[ -x target/debug/aft ]]; then
-  codesign -f -s - target/debug/aft 2>/dev/null || true
+  # Exec only — do NOT re-sign here. cargo's output is already linker-signed,
+  # and `codesign -f` rewrites the file, which re-triggers the very assessment
+  # this step exists to prepay (observed: 3m58s for one --version during a
+  # wedged-assessment window; re-signing made every gate run pay it again).
   ./target/debug/aft --version >/dev/null 2>&1 || true
 fi
 
