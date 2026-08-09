@@ -44,7 +44,13 @@ const BIND_ACK_BOUND: Duration = Duration::from_secs(2 * DEBUG_BOUND_MULTIPLIER 
 const SETUP_BIND_BOUND: Duration = Duration::from_secs(12);
 const TOOL_BOUND: Duration = Duration::from_secs(5 * DEBUG_BOUND_MULTIPLIER as u64);
 const HEALTH_BOUND: Duration = Duration::from_millis(500 * DEBUG_BOUND_MULTIPLIER as u64);
-const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(700 * DEBUG_BOUND_MULTIPLIER as u64);
+/// Completion pushes ride the bg_events wake nudge, which coalesces at most
+/// once per 250ms tick BY DESIGN — so a completion landing just after a tick
+/// boundary pays up to a full tick before egress even starts. 700ms left
+/// ~zero headroom over that design latency and fired at 709ms on a quiet
+/// machine (isolation, 2026-08-09). The bound exists to catch pushes that do
+/// not arrive (the lossy-funnel bug class), not to police tick jitter.
+const COMPLETION_PUSH_BOUND: Duration = Duration::from_millis(1000 * DEBUG_BOUND_MULTIPLIER as u64);
 const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
 const CONCURRENCY_SCENARIO_BOUND: Duration =
     Duration::from_secs(10 * DEBUG_BOUND_MULTIPLIER as u64);
