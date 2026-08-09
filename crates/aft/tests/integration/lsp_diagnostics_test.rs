@@ -82,7 +82,11 @@ fn collect_event<F>(manager: &mut LspManager, predicate: F) -> Option<LspEvent>
 where
     F: Fn(&LspEvent) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Positive-wait budget: every caller either expects the event or drains
+    // best-effort. 2s raced the fake server's spawn+init under machine load
+    // (1-in-3 failures in isolation on a loaded host, 2026-08-09); green runs
+    // return on the event and never pay the full budget.
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         for event in manager.drain_events() {
             if predicate(&event) {
@@ -2157,19 +2161,36 @@ fn rust_analyzer_warming_diagnostics_are_provisional_until_quiescent() {
     manager
         .notify_file_changed_versioned(file, "fn main() {}\n", &config)
         .expect("start fake rust-analyzer");
-    let initialized = collect_event(&mut manager, |event| {
-        matches!(
-            event,
-            LspEvent::Notification { method, .. } if method == "custom/initialized"
-        )
-    })
-    .expect("fake server initialization event");
-    let initialized_params = match initialized {
-        LspEvent::Notification { params, .. } => params.expect("initialized params"),
-        other => panic!("unexpected event: {other:?}"),
-    };
+    // Collect BOTH startup events in one drain loop: the fake server sends
+    // custom/initialized and the warming publishDiagnostics back-to-back, and
+    // collect_event discards the non-matching remainder of a drained batch —
+    // two sequential collects lose the publish whenever both events land in
+    // one batch (1-in-3 locally).
+    let mut initialized_params = None;
+    let mut publish_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !(initialized_params.is_some() && publish_seen) {
+        for event in manager.drain_events() {
+            match event {
+                LspEvent::Notification { method, params, .. } if method == "custom/initialized" => {
+                    initialized_params = Some(params.expect("initialized params"));
+                }
+                LspEvent::Notification { method, .. }
+                    if method == "textDocument/publishDiagnostics" =>
+                {
+                    publish_seen = true;
+                }
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let initialized_params = initialized_params.expect("fake server initialization event");
     assert_eq!(initialized_params["serverStatusNotification"], true);
-    wait_for_publish(&mut manager);
+    assert!(
+        publish_seen,
+        "timed out waiting for warming publishDiagnostics"
+    );
 
     let entries = manager
         .diagnostics_store_for_test()
