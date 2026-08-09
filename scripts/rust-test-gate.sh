@@ -49,8 +49,16 @@ run_phase() {
 # `cargo test --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
 # `cargo test --workspace --doc` until doctests actually exist.
+# The platform-verifier TLS test spawns a subprocess whose keychain trust
+# evaluation is unbounded on Macs with third-party root CAs (NordVPN: ~10s
+# quiet, minutes under full-suite load — blew a 600s budget twice on
+# 2026-08-09). Isolation is the fix, not a bigger budget: run it alone
+# first (seconds when serial), then exclude it from the parallel phase.
+run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+  cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+
 run_phase "cargo test --workspace --lib --bins --quiet" \
-  cargo test --workspace --lib --bins --quiet
+  cargo test --workspace --lib --bins --quiet -- --skip platform_verifier_tls_client_subprocess
 
 # macOS: the first exec of a freshly-linked binary is expensive, and it is NOT
 # Gatekeeper assessment — setting com.apple.quarantine changes nothing, and a
