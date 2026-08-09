@@ -75,6 +75,7 @@ pub mod fs_lock;
 pub mod fuzzy_match;
 pub mod grep_executor;
 pub mod harness;
+pub mod hashline;
 pub mod imports;
 pub mod indent;
 pub mod inspect;

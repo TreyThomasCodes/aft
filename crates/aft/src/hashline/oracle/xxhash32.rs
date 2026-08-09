@@ -18,8 +18,7 @@ fn rotate_left(value: u32, count: u32) -> u32 {
 
 #[inline]
 fn round(accumulator: u32, lane: u32) -> u32 {
-    rotate_left(accumulator.wrapping_add(lane.wrapping_mul(PRIME2)), 13)
-        .wrapping_mul(PRIME1)
+    rotate_left(accumulator.wrapping_add(lane.wrapping_mul(PRIME2)), 13).wrapping_mul(PRIME1)
 }
 
 #[inline]
@@ -44,7 +43,10 @@ pub fn xxhash32(input: &[u8], seed: u32) -> u32 {
         let mut lane4 = seed.wrapping_sub(PRIME1);
 
         while offset <= length - 16 {
-            lane1 = round(lane1, u32::from_le_bytes(input[offset..offset + 4].try_into().unwrap()));
+            lane1 = round(
+                lane1,
+                u32::from_le_bytes(input[offset..offset + 4].try_into().unwrap()),
+            );
             lane2 = round(
                 lane2,
                 u32::from_le_bytes(input[offset + 4..offset + 8].try_into().unwrap()),
@@ -146,8 +148,14 @@ mod tests {
     #[test]
     fn normalization_only_removes_tag_ignored_suffix_bytes() {
         assert_eq!(normalize_for_tag(b"left \t\r\nright\r"), b"left\nright");
-        assert_eq!(normalize_for_tag(b"interior\rreturn\n"), b"interior\rreturn\n");
-        assert_eq!(normalize_for_tag(b"\xEF\xBB\xBFline\n"), b"\xEF\xBB\xBFline\n");
+        assert_eq!(
+            normalize_for_tag(b"interior\rreturn\n"),
+            b"interior\rreturn\n"
+        );
+        assert_eq!(
+            normalize_for_tag(b"\xEF\xBB\xBFline\n"),
+            b"\xEF\xBB\xBFline\n"
+        );
     }
 
     #[test]
