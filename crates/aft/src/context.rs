@@ -4722,11 +4722,7 @@ impl AppContext {
         let Some(snapshot) = self.tier2_refresh_snapshot() else {
             return;
         };
-        let categories = InspectCategory::active()
-            .iter()
-            .copied()
-            .filter(|category| category.is_tier2())
-            .collect::<Vec<_>>();
+        let categories = Self::automatic_tier2_refresh_categories(&snapshot);
         let submission =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
         if !submission.deferred_categories.is_empty() {
@@ -4758,6 +4754,31 @@ impl AppContext {
                 error.message
             );
         }
+    }
+
+    fn automatic_tier2_refresh_categories(snapshot: &InspectSnapshot) -> Vec<InspectCategory> {
+        let callgraph_store_enabled = snapshot.config.callgraph_store;
+        InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| category.is_tier2())
+            .filter(|category| {
+                if *category == InspectCategory::DeadCode && !callgraph_store_enabled {
+                    // With callgraph_store=false, the scan produces zero reusable
+                    // contributions: zero contributions → reuse rejection → full rescan →
+                    // discard, so automatic dead_code work is pure waste.
+                    return false;
+                }
+                true
+            })
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn automatic_tier2_refresh_categories_for_test(&self) -> Vec<InspectCategory> {
+        self.tier2_refresh_snapshot()
+            .map(|snapshot| Self::automatic_tier2_refresh_categories(&snapshot))
+            .unwrap_or_default()
     }
 
     fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {

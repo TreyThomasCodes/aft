@@ -220,6 +220,25 @@ fn inspect(ctx: &AppContext) -> Value {
     serde_json::to_value(response).expect("inspect response serializes")
 }
 
+fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
+    let response = handle_inspect_tier2_run(
+        &request(json!({
+            "id": "tier2-run",
+            "command": "inspect_tier2_run",
+            "categories": categories,
+        })),
+        ctx,
+    );
+    serde_json::to_value(response).expect("Tier-2 run response serializes")
+}
+
+fn automatic_tier2_category_names(ctx: &AppContext) -> Vec<&'static str> {
+    ctx.automatic_tier2_refresh_categories_for_test()
+        .into_iter()
+        .map(InspectCategory::as_str)
+        .collect()
+}
+
 fn scanner_state_categories(response: &Value, key: &str) -> Vec<String> {
     response["scanner_state"][key]
         .as_array()
@@ -306,6 +325,115 @@ fn watcher_tick_after_quiet_gap_triggers_tier2_refresh() {
         response["scanner_state"]["tier2_trigger_reason"].as_str(),
         Some("debounce"),
         "inspect should expose the watcher debounce trigger reason: {response:#}"
+    );
+}
+
+#[test]
+fn automatic_refresh_without_callgraph_store_skips_dead_code_only() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let ctx = configured_context_with_storage(&root, &root.join(".aft-test-storage"), false);
+    let expected = vec!["unused_exports", "duplicates", "cycles"];
+
+    assert_eq!(automatic_tier2_category_names(&ctx), expected);
+
+    let base = Instant::now();
+    ctx.reset_tier2_refresh_scheduler_at(base);
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(base + Duration::from_secs(1), 1),
+        None
+    );
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(base + TIER2_REFRESH_COLD_CACHE_DELAY, 0),
+        Some(Tier2TriggerReason::Debounce)
+    );
+    assert_eq!(
+        ctx.inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        expected.len() as u64,
+        "automatic scheduling should submit the three callgraph-independent categories"
+    );
+}
+
+#[test]
+fn manual_dead_code_query_without_callgraph_store_reports_unavailable() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let ctx = configured_context_with_storage(&root, &root.join(".aft-test-storage"), false);
+
+    let queued = enqueue_tier2_run(&ctx, &["dead_code"]);
+    assert_eq!(
+        queued["success"], true,
+        "manual Tier-2 run failed: {queued:#}"
+    );
+    assert_eq!(queued["queued_categories"], json!(["dead_code"]));
+
+    let response = wait_for_tier2(&ctx, &["dead_code"]);
+    assert_eq!(
+        response["summary"]["dead_code"]["callgraph_available"], false,
+        "manual dead_code must report the unavailable callgraph honestly: {response:#}"
+    );
+}
+
+#[test]
+fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = configured_context_with_storage(&root, &storage_dir, false);
+
+    let response = handle_configure(
+        &request(json!({
+            "id": "reconfigure-callgraph-on",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.to_string_lossy(),
+            "storage_dir": storage_dir.to_string_lossy(),
+            "config": crate::helpers::user_config(serde_json::json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true
+            })),
+        })),
+        &ctx,
+    );
+    let response = serde_json::to_value(response).expect("reconfigure response serializes");
+    assert_eq!(
+        response["success"], true,
+        "reconfigure failed: {response:#}"
+    );
+    assert_eq!(
+        automatic_tier2_category_names(&ctx),
+        vec!["dead_code", "unused_exports", "duplicates", "cycles"]
+    );
+
+    let base = Instant::now();
+    ctx.reset_tier2_refresh_scheduler_at(base);
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(base + Duration::from_secs(1), 1),
+        None
+    );
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(base + TIER2_REFRESH_COLD_CACHE_DELAY, 0),
+        Some(Tier2TriggerReason::Debounce)
+    );
+    assert_eq!(
+        ctx.inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        4,
+        "the next automatic refresh should include dead_code after reconfigure"
     );
 }
 
