@@ -60,21 +60,31 @@ fn init_repo(repo: &Path) -> String {
 }
 
 fn create_merge_conflict(repo: &Path, relative: &str) {
+    create_merge_conflicts(repo, &[relative]);
+}
+
+fn create_merge_conflicts(repo: &Path, relatives: &[&str]) {
     let base_branch = init_repo(repo);
-    write_file(repo, relative, "base\n");
+    for relative in relatives {
+        write_file(repo, relative, "base\n");
+    }
     write_file(repo, "packages/b/.keep", "keep\n");
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "base"]);
 
     git(repo, &["checkout", "-b", "ours"]);
-    write_file(repo, relative, "ours\n");
-    git(repo, &["add", relative]);
+    for relative in relatives {
+        write_file(repo, relative, "ours\n");
+        git(repo, &["add", relative]);
+    }
     git(repo, &["commit", "-m", "ours"]);
 
     git(repo, &["checkout", &base_branch]);
     git(repo, &["checkout", "-b", "theirs"]);
-    write_file(repo, relative, "theirs\n");
-    git(repo, &["add", relative]);
+    for relative in relatives {
+        write_file(repo, relative, "theirs\n");
+        git(repo, &["add", relative]);
+    }
     git(repo, &["commit", "-m", "theirs"]);
 
     git(repo, &["checkout", "ours"]);
@@ -109,8 +119,67 @@ fn conflicts_found_when_project_root_is_sibling_subdir() {
 
     assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
     assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["unmerged_count"], 1, "conflicts response: {resp:?}");
+    assert!(resp.get("complete").is_none() || resp["complete"] == true);
     assert!(response_text(&resp).contains("packages/a/x.txt"));
     assert!(response_text(&resp).contains("<<<<<<< HEAD"));
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn deleted_unmerged_file_is_reported_as_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    create_merge_conflict(dir.path(), "deleted.txt");
+    fs::remove_file(dir.path().join("deleted.txt")).expect("delete working-tree copy");
+
+    let (aft, resp) = configure_and_conflicts(dir.path());
+
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["complete"], false, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 0, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 0, "conflicts response: {resp:?}");
+    assert_eq!(resp["unmerged_count"], 1, "conflicts response: {resp:?}");
+    let skipped = resp["skipped_files"]
+        .as_array()
+        .expect("skipped_files array");
+    assert_eq!(skipped.len(), 1, "conflicts response: {resp:?}");
+    assert_eq!(skipped[0]["file"], "deleted.txt");
+    assert!(skipped[0]["reason"]
+        .as_str()
+        .expect("skip reason")
+        .contains("read_error"));
+    let text = response_text(&resp);
+    assert!(text.contains("unreadable — see skipped_files"));
+    assert!(text.contains("deleted.txt [error:"));
+    assert!(!text.contains("0 files, 0 conflicts\n"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn mixed_readable_and_deleted_unmerged_files_are_both_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    create_merge_conflicts(dir.path(), &["readable.txt", "deleted.txt"]);
+    fs::remove_file(dir.path().join("deleted.txt")).expect("delete working-tree copy");
+
+    let (aft, resp) = configure_and_conflicts(dir.path());
+
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["complete"], false, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["unmerged_count"], 2, "conflicts response: {resp:?}");
+    let skipped = resp["skipped_files"]
+        .as_array()
+        .expect("skipped_files array");
+    assert_eq!(skipped.len(), 1, "conflicts response: {resp:?}");
+    assert_eq!(skipped[0]["file"], "deleted.txt");
+    let text = response_text(&resp);
+    assert!(text.contains("readable.txt"));
+    assert!(text.contains("<<<<<<< HEAD"));
+    assert!(text.contains("unreadable — see skipped_files"));
+
     assert!(aft.shutdown().success());
 }
 

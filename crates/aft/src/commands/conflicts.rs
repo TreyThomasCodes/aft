@@ -64,11 +64,15 @@ fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
 }
 
 /// Find all conflicted files using index-unmerged state plus tracked working-tree markers.
-/// Returns the git toplevel and unique file paths relative to that toplevel.
-fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
+/// Returns the git toplevel, unique file paths relative to that toplevel, and the
+/// subset reported by Git as index-unmerged paths.
+fn discover_conflicted_files(
+    base_dir: &Path,
+) -> Result<(PathBuf, Vec<PathBuf>, HashSet<PathBuf>), String> {
     let toplevel = git_toplevel(base_dir)?;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
+    let mut unmerged_files = HashSet::new();
 
     let output = crate::effective_path::new_command("git")
         .args(["ls-files", "--unmerged", "-z"])
@@ -88,6 +92,7 @@ fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>),
         // Format: "<mode> <hash> <stage>\t<filename>\0"
         if let Some(tab_pos) = record.iter().position(|byte| *byte == b'\t') {
             let path = path_from_git_bytes(&record[tab_pos + 1..]);
+            unmerged_files.insert(path.clone());
             if seen.insert(path.clone()) {
                 files.push(path);
             }
@@ -118,7 +123,7 @@ fn discover_conflicted_files(base_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>),
     }
 
     files.sort();
-    Ok((toplevel, files))
+    Ok((toplevel, files, unmerged_files))
 }
 
 /// Parse a file's content and find all conflict regions (marker line numbers).
@@ -243,7 +248,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
     };
 
     // Discover conflicted files
-    let (git_toplevel, files) = match discover_conflicted_files(&discovery_base) {
+    let (git_toplevel, files, unmerged_files) = match discover_conflicted_files(&discovery_base) {
         Ok(result) => result,
         Err(e) => {
             if requested_path.is_some() && e == "not a git repository" {
@@ -268,6 +273,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
                 "text": format!("No merge conflicts found.\nChecked repo root: {}", checked_root),
                 "file_count": 0,
                 "conflict_count": 0,
+                "unmerged_count": unmerged_files.len(),
                 "checked_root": checked_root,
             }),
         );
@@ -276,6 +282,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
     let mut output = String::new();
     let mut total_conflicts = 0;
     let mut files_with_conflicts = 0;
+    let mut skipped_files = Vec::new();
 
     for file_path in &files {
         let full_path = git_toplevel.join(file_path);
@@ -289,7 +296,15 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         let content = match std::fs::read_to_string(&validated_path) {
             Ok(c) => c,
             Err(e) => {
+                // Keep the existing diagnostic in the text while also exposing
+                // index-unmerged read failures as a structured partial result.
                 output.push_str(&format!("── {} [error: {}] ──\n\n", display_path, e));
+                if unmerged_files.contains(file_path) {
+                    skipped_files.push(serde_json::json!({
+                        "file": display_path,
+                        "reason": format!("read_error: {}", e),
+                    }));
+                }
                 continue;
             }
         };
@@ -315,9 +330,20 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         output.push('\n');
     }
 
-    // Prepend summary header
+    // Put any unreadable unmerged paths in the first line so a partial scan
+    // cannot look like a clean scan to an agent.
+    let skipped_summary = if skipped_files.is_empty() {
+        String::new()
+    } else {
+        let skipped_count = skipped_files.len();
+        format!(
+            " ({} unmerged file{} unreadable — see skipped_files)",
+            skipped_count,
+            if skipped_count == 1 { "" } else { "s" },
+        )
+    };
     let header = format!(
-        "{} {}, {} {}\nChecked repo root: {}\n\n",
+        "{} {}, {} {}{}\nChecked repo root: {}\n\n",
         files_with_conflicts,
         if files_with_conflicts == 1 {
             "file"
@@ -330,20 +356,30 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         } else {
             "conflicts"
         },
+        skipped_summary,
         checked_root,
     );
 
     let text = format!("{}{}", header, output.trim_end());
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": text,
-            "file_count": files_with_conflicts,
-            "conflict_count": total_conflicts,
-            "checked_root": checked_root,
-        }),
-    )
+    let mut data = serde_json::json!({
+        "text": text,
+        "file_count": files_with_conflicts,
+        "conflict_count": total_conflicts,
+        "unmerged_count": unmerged_files.len(),
+        "checked_root": checked_root,
+    });
+    if !skipped_files.is_empty() {
+        if let Some(data) = data.as_object_mut() {
+            data.insert("complete".to_string(), serde_json::json!(false));
+            data.insert(
+                "skipped_files".to_string(),
+                serde_json::json!(skipped_files),
+            );
+        }
+    }
+
+    Response::success(&req.id, data)
 }
 
 #[cfg(test)]
