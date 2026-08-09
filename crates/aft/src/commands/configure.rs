@@ -2080,7 +2080,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let format_tool_cache_clear_needed = previous_project_root.as_ref() != Some(&root_path);
+    // A new configure generation may observe a changed project-local formatter.
+    // Clear its cached Ruff version before the next actual format, but never run
+    // the project binary here: configure/warm paths are existence-only by design.
+    let format_tool_cache_clear_needed = effective_configure_changed;
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     let artifact_key_needed = !home_match

@@ -231,6 +231,63 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
     assert!(shutdown.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
+    std::fs::write(dir.path().join("ruff.toml"), "line-length = 88\n").unwrap();
+    let bin_dir = dir.path().join("node_modules/.bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let canary = dir.path().join("ruff-configure-canary");
+    let ruff = bin_dir.join("ruff");
+    std::fs::write(
+        &ruff,
+        "#!/bin/sh\nprintf executed > \"$RUFF_CANARY\"\nprintf 'ruff 0.1.1\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ruff, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_DISABLE_WELL_KNOWN_LOOKUP", std::ffi::OsStr::new("1")),
+        ("RUFF_CANARY", canary.as_os_str()),
+    ]);
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-ruff-existence-only",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "config": user_config(serde_json::json!({ "format_on_edit": true }))
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    // Merge the deferred configure warnings; this drains the queued warning data
+    // and completes the formatter-availability check before the assertions.
+    let configure = aft.merge_configure_warnings(configure);
+    assert!(
+        warning_with_kind(&configure, "formatter_not_installed", "tool", "ruff").is_none(),
+        "an existing project-local Ruff binary should not be reported missing: {configure:?}"
+    );
+    assert!(
+        !canary.exists(),
+        "configure/warm warning detection must not execute project-local Ruff"
+    );
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
 #[test]
 fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
     let dir = tempfile::tempdir().unwrap();

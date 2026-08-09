@@ -62,9 +62,15 @@ struct ToolCandidate {
 
 #[derive(Debug, Clone)]
 enum ToolDetection {
-    Found(String, Vec<String>),
+    Found {
+        tool: String,
+        command: String,
+        args: Vec<String>,
+    },
     NotConfigured,
-    NotInstalled { tool: String },
+    NotInstalled {
+        tool: String,
+    },
 }
 
 impl std::fmt::Display for FormatError {
@@ -536,18 +542,13 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     true
 }
 
-/// Check if `ruff format` is available with a stable formatter.
-///
-/// Ruff's formatter became stable in v0.1.2. Versions before that output
-/// `NOT_YET_IMPLEMENTED_*` stubs instead of formatted code. We parse the
-/// version from `ruff --version` (format: "ruff X.Y.Z") and require >= 0.1.2.
-/// Falls back to false if ruff is not found or version cannot be parsed.
 /// Whether a tool referenced by configure missing-tool warnings is resolvable.
+///
+/// This check must remain existence-only. A project-local tool is repository-
+/// controlled code, so configure and warm paths must never execute it—even for
+/// a seemingly harmless `--version` probe. Version checks belong in the actual
+/// format operation below, after the user or agent has initiated formatting.
 pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path>) -> bool {
-    if tool == "ruff" {
-        return resolve_tool_uncached("ruff", project_root).is_some()
-            && ruff_format_available(project_root);
-    }
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
@@ -584,43 +585,43 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
     };
 
     let version_str = String::from_utf8_lossy(&output.stdout);
-    // Parse "ruff X.Y.Z" or just "X.Y.Z"
+    // Parse "ruff X.Y.Z" or just "X.Y.Z".
     let version_part = version_str
         .trim()
         .strip_prefix("ruff ")
         .unwrap_or(version_str.trim());
 
     let parts: Vec<&str> = version_part.split('.').collect();
-    if parts.len() < 3 {
-        return false;
+    let (major, minor, patch) = match (
+        parts.first().and_then(|part| part.parse::<u32>().ok()),
+        parts.get(1).and_then(|part| part.parse::<u32>().ok()),
+        parts.get(2).and_then(|part| part.parse::<u32>().ok()),
+    ) {
+        (Some(major), Some(minor), Some(patch)) => (major, minor, patch),
+        _ => {
+            crate::slog_warn!(
+                "ruff formatter version check could not parse {:?}; require >= 0.1.2",
+                version_part
+            );
+            return false;
+        }
+    };
+
+    // Require >= 0.1.2 where ruff format became stable.
+    let available = (major, minor, patch) >= (0, 1, 2);
+    if !available {
+        crate::slog_warn!(
+            "ruff formatter version {} is too old for `ruff format`; require >= 0.1.2",
+            version_part
+        );
     }
-
-    let major: u32 = match parts[0].parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let minor: u32 = match parts[1].parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let patch: u32 = match parts[2].parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    // Require >= 0.1.2 where ruff format became stable
-    (major, minor, patch) >= (0, 1, 2)
+    available
 }
 
 fn resolve_candidate_tool(
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
-    require_ruff_format: bool,
 ) -> Option<String> {
-    if require_ruff_format && candidate.tool == "ruff" && !ruff_format_available(project_root) {
-        return None;
-    }
-
     resolve_tool(&candidate.tool, project_root)
 }
 
@@ -1060,7 +1061,6 @@ fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> 
 fn resolve_tool_candidates(
     candidates: Vec<ToolCandidate>,
     project_root: Option<&Path>,
-    require_ruff_format: bool,
 ) -> ToolDetection {
     if candidates.is_empty() {
         return ToolDetection::NotConfigured;
@@ -1068,9 +1068,12 @@ fn resolve_tool_candidates(
 
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root, require_ruff_format)
-        {
-            return ToolDetection::Found(command, candidate.args);
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+            return ToolDetection::Found {
+                tool: candidate.tool,
+                command,
+                args: candidate.args,
+            };
         }
         if candidate.required && missing_required.is_none() {
             missing_required = Some(candidate.tool);
@@ -1104,7 +1107,6 @@ fn detect_formatter_for_path(path: &Path, lang: LangId, config: &Config) -> Tool
     resolve_tool_candidates(
         formatter_candidates(lang, config, &file_str),
         config.project_root.as_deref(),
-        true,
     )
 }
 
@@ -1118,11 +1120,14 @@ fn detect_checker_for_path(path: &Path, lang: LangId, config: &Config) -> ToolDe
     let project_root = config.project_root.as_deref();
     let mut missing_required = None;
     for candidate in candidates {
-        if let Some(command) = resolve_candidate_tool(&candidate, project_root, false) {
-            return ToolDetection::Found(
-                checker_command(&candidate, command),
-                checker_args(&candidate),
-            );
+        if let Some(command) = resolve_candidate_tool(&candidate, project_root) {
+            let command = checker_command(&candidate, command);
+            let args = checker_args(&candidate);
+            return ToolDetection::Found {
+                tool: candidate.tool,
+                command,
+                args,
+            };
         }
         if candidate.required && missing_required.is_none() {
             missing_required = Some(candidate.tool);
@@ -1245,11 +1250,8 @@ fn missing_tool_warning(
     language: &str,
     candidate: &ToolCandidate,
     project_root: Option<&Path>,
-    require_ruff_format: bool,
 ) -> Option<MissingTool> {
-    if !candidate.required
-        || resolve_candidate_tool(candidate, project_root, require_ruff_format).is_some()
-    {
+    if !candidate.required || resolve_candidate_tool(candidate, project_root).is_some() {
         return None;
     }
 
@@ -1278,7 +1280,6 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
-                true,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1296,7 +1297,6 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
                 language,
                 &candidate,
                 config.project_root.as_deref(),
-                false,
             ) {
                 if seen.insert((
                     warning.kind.clone(),
@@ -1330,7 +1330,7 @@ pub fn detect_formatter(
     config: &Config,
 ) -> Option<(String, Vec<String>)> {
     match detect_formatter_for_path(path, lang, config) {
-        ToolDetection::Found(cmd, args) => Some((cmd, args)),
+        ToolDetection::Found { command, args, .. } => Some((command, args)),
         ToolDetection::NotConfigured | ToolDetection::NotInstalled { .. } => None,
     }
 }
@@ -1431,8 +1431,12 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
         return (false, Some("unsupported_language".to_string()));
     }
 
-    let (cmd, args) = match detect_formatter_for_path(path, lang, config) {
-        ToolDetection::Found(cmd, args) => (cmd, args),
+    let (formatter_tool, cmd, args) = match detect_formatter_for_path(path, lang, config) {
+        ToolDetection::Found {
+            tool,
+            command,
+            args,
+        } => (tool, command, args),
         ToolDetection::NotConfigured => {
             log::debug!(
                 "format: {} (skipped: no_formatter_configured)",
@@ -1449,6 +1453,18 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
             return (false, Some("formatter_not_installed".to_string()));
         }
     };
+
+    // Ruff's pre-0.1.2 formatter is only a stub. Do this version probe here,
+    // immediately before the user/agent-initiated format operation—not during
+    // configure or warm-time availability detection. The availability cache
+    // makes a burst of formats probe once for this project generation.
+    if formatter_tool == "ruff" && !ruff_format_available(config.project_root.as_deref()) {
+        crate::slog_warn!(
+            "format: {} (skipped: formatter_not_installed: ruff; version gate requires >= 0.1.2)",
+            path.display()
+        );
+        return (false, Some("formatter_not_installed".to_string()));
+    }
 
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -1584,7 +1600,7 @@ pub fn detect_type_checker(
     config: &Config,
 ) -> Option<(String, Vec<String>)> {
     match detect_checker_for_path(path, lang, config) {
-        ToolDetection::Found(cmd, args) => Some((cmd, args)),
+        ToolDetection::Found { command, args, .. } => Some((command, args)),
         ToolDetection::NotConfigured | ToolDetection::NotInstalled { .. } => None,
     }
 }
@@ -2185,7 +2201,7 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
     }
 
     let (cmd, args) = match detect_checker_for_path(path, lang, config) {
-        ToolDetection::Found(cmd, args) => (cmd, args),
+        ToolDetection::Found { command, args, .. } => (command, args),
         ToolDetection::NotConfigured => {
             log::debug!(
                 "validate: {} (skipped: no_checker_configured)",
@@ -2466,7 +2482,7 @@ mod tests {
             ..Config::default()
         };
         let result = detect_formatter(&path, LangId::Python, &config);
-        if ruff_format_available(config.project_root.as_deref()) {
+        if resolve_tool("ruff", config.project_root.as_deref()).is_some() {
             let (cmd, args) = result.unwrap();
             assert_eq!(
                 std::path::Path::new(&cmd)

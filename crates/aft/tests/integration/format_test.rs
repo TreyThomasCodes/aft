@@ -339,6 +339,54 @@ fn format_integration_formatter_not_installed() {
 
 #[cfg(unix)]
 #[test]
+fn format_integration_ruff_old_version_is_gated_at_format_time() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = format_test_dir("ruff_old_version");
+    fs::write(dir.join("ruff.toml"), "line-length = 88\n").unwrap();
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let canary = dir.join("ruff-version-canary");
+    let _ = fs::remove_file(&canary);
+    let ruff = bin_dir.join("ruff");
+    fs::write(
+        &ruff,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf executed > \"$RUFF_CANARY\"; printf 'ruff 0.1.1\\n'; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ruff, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = dir.join("format_ruff_old.py");
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("RUFF_CANARY", canary.as_os_str()),
+    ]);
+    let cfg = aft.configure_format_on_edit(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-ruff-old","command":"write","file":{},"content":"x = 1\\n"}}"#,
+        crate::helpers::json_string(&target.display())
+    ));
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(resp["formatted"], false);
+    assert_eq!(resp["format_skipped_reason"], "formatter_not_installed");
+    assert!(
+        canary.exists(),
+        "the version probe should run on a format operation"
+    );
+
+    let (status, stderr) = aft.stderr_output();
+    assert!(status.success());
+    assert!(
+        stderr.contains("ruff formatter version 0.1.1 is too old"),
+        "version-gated format warning should name the detected version; stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn format_integration_oxfmt_config_runs_oxfmt() {
     let dir = format_test_dir("oxfmt_config_runs");
     fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();
