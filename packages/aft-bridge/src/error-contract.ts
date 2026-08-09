@@ -6,7 +6,11 @@
  * rewrite the contract-owned message while doing so.
  */
 
-import { isConsumerReconnectTransient, StaleRouteHandleError } from "@cortexkit/subc-client";
+import {
+  isConsumerReconnectTransient,
+  StaleRouteHandleError,
+  SubcError,
+} from "@cortexkit/subc-client";
 
 import { isBridgeTransportTimeout } from "./bridge.js";
 import { SubcRootGenerationExpiredError, SubcRootReapedError } from "./subc-transport.js";
@@ -52,6 +56,35 @@ export function toolErrorFromResponse(
 export const BASH_TRANSPORT_DISPOSITION =
   "The transport to the AFT daemon was interrupted; no background task was created for this command and no task ID exists. Re-run the command. Do not poll bash_status for it.";
 
+/**
+ * Agent-facing guidance for a call the daemon GOODBYE'd mid-flight.
+ *
+ * Deliberately does NOT say the call failed. The daemon emits route GOODBYEs
+ * after its drain wait regardless of whether that drain completed, so a call
+ * in flight at GOODBYE was admitted BEFORE the gate closed and may already
+ * have run to completion with only its reply lost. "Failed" reads as an
+ * invitation to re-run, which double-applies a mutation that already landed.
+ */
+export const SUBC_MODULE_RESTART_DISPOSITION =
+  "The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
+
+/**
+ * A route GOODBYE delivered against an in-flight request.
+ *
+ * COUPLING: subc-client raises this as a bare `SubcError` carrying no code
+ * (client.ts, the `FrameType.Goodbye` branch), so the message literal is the
+ * only discriminator available. Asked upstream for a stable `code` on that
+ * error; until it exists this match is the seam and will fail open (no
+ * disposition appended) rather than misclassify.
+ */
+function isRouteGoodbyeError(error: unknown): boolean {
+  return (
+    error instanceof SubcError &&
+    error.code === undefined &&
+    error.message.includes("route closed by subc")
+  );
+}
+
 function isTransportClassError(error: unknown): boolean {
   return (
     isBridgeTransportTimeout(error) ||
@@ -67,8 +100,20 @@ function isTransportClassError(error: unknown): boolean {
  * object, class, code, or retry behavior. Other commands retain their errors.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
-  if (command !== "bash" || !isTransportClassError(error)) return error;
   if (!(error instanceof Error)) return error;
+
+  // Checked before the bash branch, and applied to every command: a GOODBYE'd
+  // call has an unknown outcome, so BASH_TRANSPORT_DISPOSITION's "no task was
+  // created, re-run the command" would be actively wrong here.
+  if (isRouteGoodbyeError(error)) {
+    if (error.message.includes(SUBC_MODULE_RESTART_DISPOSITION)) return error;
+    error.message = error.message
+      ? `${error.message} ${SUBC_MODULE_RESTART_DISPOSITION}`
+      : SUBC_MODULE_RESTART_DISPOSITION;
+    return error;
+  }
+
+  if (command !== "bash" || !isTransportClassError(error)) return error;
   if (error.message.includes(BASH_TRANSPORT_DISPOSITION)) return error;
   error.message = error.message
     ? `${error.message} ${BASH_TRANSPORT_DISPOSITION}`
