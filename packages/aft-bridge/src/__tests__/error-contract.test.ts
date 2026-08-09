@@ -77,7 +77,7 @@ describe("adaptToolError", () => {
     expect(occurrences).toBe(1);
   });
 
-  test("a coded SubcError is left alone — only the bare GOODBYE shape matches", () => {
+  test("a differently-coded SubcError is left alone — GOODBYE never borrows other codes", () => {
     // module_reloading is proven-not-forwarded and retryable; it must not be
     // dressed up as an unknown outcome.
     const coded = new SubcError("route closed by subc (GOODBYE)", "module_reloading");
@@ -86,5 +86,27 @@ describe("adaptToolError", () => {
 
     expect(adapted).toBe(coded);
     expect(coded.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
+  });
+
+  test("a route_closed-coded GOODBYE gets the disposition (newer client generations)", () => {
+    // The subc-client source now stamps code "route_closed" on the GOODBYE
+    // failure; the shipped 0.5.0 line throws it bare. Both shapes must match
+    // or a client upgrade silently drops the unknown-outcome guidance.
+    const coded = new SubcError("route closed by subc (GOODBYE)", "route_closed");
+
+    const adapted = adaptToolError("write", coded) as Error;
+
+    expect(adapted.message).toContain(SUBC_MODULE_RESTART_DISPOSITION);
+  });
+
+  test("a local closeRoute with the route_closed code is NOT a GOODBYE", () => {
+    // Same code, different mechanism: closeRoute is a deliberate local close
+    // with a known outcome; the unknown-outcome guidance would be wrong.
+    const local = new SubcError("route closed by closeRoute", "route_closed");
+
+    const adapted = adaptToolError("write", local);
+
+    expect(adapted).toBe(local);
+    expect(local.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
   });
 });

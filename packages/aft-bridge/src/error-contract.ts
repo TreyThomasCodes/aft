@@ -78,11 +78,19 @@ export const SUBC_MODULE_RESTART_DISPOSITION =
  * disposition appended) rather than misclassify.
  */
 function isRouteGoodbyeError(error: unknown): boolean {
-  return (
-    error instanceof SubcError &&
-    error.code === undefined &&
-    error.message.includes("route closed by subc")
-  );
+  if (!(error instanceof SubcError)) return false;
+  // Two client generations mint the GOODBYE failure differently: the shipped
+  // 0.5.0 line throws it BARE (no code), while the current subc-client source
+  // stamps code "route_closed". Match both so a client upgrade cannot
+  // silently stop the unknown-outcome disposition from being appended — a
+  // false negative here recreates the blind re-run this contract exists to
+  // prevent. "route closed by closeRoute" (same code in newer clients) is a
+  // deliberate local close, not a daemon GOODBYE: outcome-known, excluded by
+  // the message check on the coded arm.
+  if (error.code === undefined) {
+    return error.message.includes("route closed by subc");
+  }
+  return error.code === "route_closed" && error.message.includes("route closed by subc");
 }
 
 function isTransportClassError(error: unknown): boolean {
@@ -96,8 +104,11 @@ function isTransportClassError(error: unknown): boolean {
 }
 
 /**
- * Add bash execution recovery guidance without changing the original error
- * object, class, code, or retry behavior. Other commands retain their errors.
+ * Append agent-facing recovery guidance without changing the original error
+ * object, class, code, or retry behavior. Two dispositions exist: a route
+ * GOODBYE appends the unknown-outcome guidance on EVERY command (checked
+ * first), and bash transport failures append the re-run guidance. Commands
+ * matching neither retain their errors untouched.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
