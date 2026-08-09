@@ -7,6 +7,18 @@
 //!   Pass 4: Normalize Unicode punctuation + trim
 //!   Pass 5: Reflowed line wraps/joins with whitespace-normalized content
 
+use crate::patch::matcher::{find_nearest_miss, NearestMissSearch};
+
+// A half-match floor keeps diagnostics useful for a likely stale edit while
+// suppressing suggestions for candidates that share too little of the needle.
+pub(crate) const NEAREST_MISS_SIMILARITY_FLOOR: f32 = 0.5;
+// Ten candidate lines provide context without turning an error into a file dump.
+pub(crate) const NEAREST_MISS_EXCERPT_LINES: usize = 10;
+// Eight occurrence entries are enough to choose a match while bounding error text.
+pub(crate) const AMBIGUOUS_OCCURRENCE_LIST_LIMIT: usize = 8;
+// Long generated lines need a byte-independent cap so one line cannot dominate the detail.
+pub(crate) const NEAREST_MISS_LINE_CHARS: usize = 240;
+
 /// A match result: byte offset in source and the matched byte length.
 #[derive(Debug, Clone)]
 pub struct FuzzyMatch {
@@ -100,6 +112,120 @@ pub fn find_all_fuzzy(haystack: &str, needle: &str) -> Vec<FuzzyMatch> {
     // runs only after every line-contiguous pass fails, and each candidate
     // window must have the same non-whitespace content as the needle.
     find_reflow_matches(&haystack_lines, &needle_lines, &line_byte_offsets, haystack)
+}
+
+pub(crate) fn render_nearest_miss_detail(source: &str, needle: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let pattern: Vec<&str> = needle.lines().collect();
+    let fallback = format!(" (file has {} lines)", lines.len());
+
+    let nearest = match find_nearest_miss(&lines, &pattern, source.len()) {
+        NearestMissSearch::Found(nearest) => nearest,
+        NearestMissSearch::NoSimilarRegion | NearestMissSearch::SkippedLargeFile => {
+            return fallback;
+        }
+    };
+    let similarity = nearest.matched_lines as f32 / pattern.len().max(1) as f32;
+    if similarity < NEAREST_MISS_SIMILARITY_FLOOR {
+        return fallback;
+    }
+
+    let start_line = nearest.start + 1;
+    let end_line = nearest.end;
+    let mut detail = format!("\nNearest candidate at lines {start_line}-{end_line}:");
+    let available_lines = nearest.end.saturating_sub(nearest.start);
+    let line_number_width = end_line.to_string().len();
+
+    if available_lines <= NEAREST_MISS_EXCERPT_LINES {
+        for (offset, line) in lines[nearest.start..nearest.end].iter().enumerate() {
+            append_diagnostic_line(&mut detail, nearest.start, offset, line, line_number_width);
+        }
+    } else {
+        let head_lines = NEAREST_MISS_EXCERPT_LINES / 2;
+        let tail_lines = NEAREST_MISS_EXCERPT_LINES - head_lines;
+        for (offset, line) in lines[nearest.start..nearest.start + head_lines]
+            .iter()
+            .enumerate()
+        {
+            append_diagnostic_line(&mut detail, nearest.start, offset, line, line_number_width);
+        }
+        detail.push_str("\n  ... (middle candidate lines truncated)");
+        for (offset, line) in lines[nearest.end - tail_lines..nearest.end]
+            .iter()
+            .enumerate()
+        {
+            append_diagnostic_line(
+                &mut detail,
+                nearest.start,
+                available_lines - tail_lines + offset,
+                line,
+                line_number_width,
+            );
+        }
+    }
+
+    let divergence = nearest.first_divergence;
+    let expected = pattern.get(divergence).copied().unwrap_or("<EOF>");
+    let actual = lines
+        .get(nearest.start + divergence)
+        .copied()
+        .unwrap_or("<EOF>");
+    detail.push_str(&format!(
+        "\nFirst divergence:\n- expected: {}\n+ actual: {}",
+        shorten_diagnostic_line(expected),
+        shorten_diagnostic_line(actual),
+    ));
+    detail
+}
+
+fn append_diagnostic_line(
+    detail: &mut String,
+    start: usize,
+    offset: usize,
+    line: &str,
+    line_number_width: usize,
+) {
+    let line_number = start + offset + 1;
+    detail.push_str(&format!(
+        "\n  {line_number:>line_number_width$} | {}",
+        shorten_diagnostic_line(line),
+        line_number_width = line_number_width,
+    ));
+}
+
+fn shorten_diagnostic_line(line: &str) -> String {
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.len() <= NEAREST_MISS_LINE_CHARS {
+        return line.to_string();
+    }
+
+    let head = NEAREST_MISS_LINE_CHARS / 2;
+    let tail = NEAREST_MISS_LINE_CHARS - head;
+    let mut shortened = chars[..head].iter().collect::<String>();
+    shortened.push('…');
+    shortened.extend(chars[chars.len() - tail..].iter());
+    shortened
+}
+
+/// Render a bounded 1-based occurrence list for an ambiguity error.
+pub(crate) fn render_occurrence_listing(source: &str, positions: &[usize]) -> String {
+    let listed = positions
+        .iter()
+        .take(AMBIGUOUS_OCCURRENCE_LIST_LIMIT)
+        .enumerate()
+        .map(|(index, position)| {
+            let line = source[0..*position].matches('\n').count() + 1;
+            format!("#{} at line {}", index + 1, line)
+        })
+        .collect::<Vec<_>>();
+    let mut detail = format!(" {} occurrences: {}", positions.len(), listed.join(", "));
+    if positions.len() > AMBIGUOUS_OCCURRENCE_LIST_LIMIT {
+        detail.push_str(&format!(
+            ", … and {} more",
+            positions.len() - AMBIGUOUS_OCCURRENCE_LIST_LIMIT
+        ));
+    }
+    detail
 }
 
 /// Compute byte offset of each line start in the source string.
@@ -401,5 +527,66 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pass, 1);
         assert_eq!(matches[0].byte_start, source.rfind("let total").unwrap());
+    }
+
+    #[test]
+    fn nearest_miss_renders_candidate_and_first_divergence() {
+        let source =
+            "fn calculate() {\n    let first = 1;\n    let actual = 2;\n    let last = 3;\n}\n";
+        let needle =
+            "fn calculate() {\n    let first = 1;\n    let expected = 2;\n    let last = 3;\n}";
+        let detail = render_nearest_miss_detail(source, needle);
+
+        assert!(detail.contains("Nearest candidate at lines 1-5"));
+        assert!(detail.contains("- expected:     let expected = 2;"));
+        assert!(detail.contains("+ actual:     let actual = 2;"));
+    }
+
+    #[test]
+    fn nearest_miss_below_floor_reports_only_line_count() {
+        let source = "function totallyDifferent() {\n    return 42;\n}\n";
+        let needle = "function target() {\n    return expected;\n}";
+        let detail = render_nearest_miss_detail(source, needle);
+
+        assert_eq!(detail, " (file has 3 lines)");
+    }
+
+    #[test]
+    fn nearest_miss_excerpt_middle_truncates_after_ten_lines() {
+        let source = (1..=12)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = (1..=12)
+            .map(|line| {
+                if line == 6 {
+                    "different line".to_string()
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = render_nearest_miss_detail(&source, &needle);
+
+        assert!(detail.contains("middle candidate lines truncated"));
+        assert!(detail.contains("line 1"));
+        assert!(detail.contains("line 12"));
+        assert!(!detail.contains("line 6 |"));
+    }
+
+    #[test]
+    fn occurrence_listing_is_one_based_and_capped() {
+        let source = "same\n".repeat(10);
+        let positions = source
+            .match_indices("same")
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        let detail = render_occurrence_listing(&source, &positions);
+
+        assert!(detail.starts_with(" 10 occurrences: #1 at line 1, #2 at line 2"));
+        assert!(detail.contains("#8 at line 8"));
+        assert!(detail.contains("… and 2 more"));
+        assert!(!detail.contains("#9 at line 9"));
     }
 }

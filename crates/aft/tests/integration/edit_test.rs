@@ -749,8 +749,10 @@ fn edit_match_multiple_occurrences_returns_candidates() {
     );
     assert_eq!(resp["code"], "ambiguous_match");
     let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Found 2 matches."));
     assert!(message.contains("occurrence"));
     assert!(message.contains("1-based"));
+    assert!(message.contains("2 occurrences: #1 at line 1, #2 at line 2"));
     assert!(!message.contains("0-based"));
     assert!(!message.contains("0-indexed"));
     let occurrences = resp["occurrences"]
@@ -1110,6 +1112,10 @@ fn batch_rollback_on_failure() {
 
     assert_eq!(resp["success"], false, "batch should fail: {:?}", resp);
     assert_eq!(resp["code"], "batch_edit_failed");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("batch: edit[1] match 'nonexistent_string' not found in file"));
+    assert!(message.contains("file has 2 lines"));
+    assert!(!message.contains("Nearest candidate"));
 
     // File should be unchanged — no partial application, no backup taken
     let on_disk = fs::read_to_string(&target).unwrap();
@@ -1165,6 +1171,41 @@ fn batch_fuzzy_match() {
     );
 
     let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn batch_near_miss_reports_candidate_and_divergence() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_near_miss.ts");
+    let original = "const first = 1;\nconst actual = 2;\nconst last = 3;\n";
+    fs::write(&target, original).unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-near-miss",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [{
+            "match": "const first = 1;\nconst expected = 2;\nconst last = 3;",
+            "replacement": "const first = 1;\nconst changed = 2;\nconst last = 3;"
+        }]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], false,
+        "batch near miss should fail: {resp:?}"
+    );
+    assert_eq!(resp["code"], "batch_edit_failed");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("batch: edit[0] match 'const first = 1;"));
+    assert!(message.contains("Nearest candidate at lines 1-3"));
+    assert!(message.contains("- expected: const expected = 2;"));
+    assert!(message.contains("+ actual: const actual = 2;"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+
     let status = aft.shutdown();
     assert!(status.success());
 }
@@ -1583,8 +1624,10 @@ fn batch_ambiguity_error_mentions_occurrence_and_replace_all() {
     assert_eq!(resp["success"], false, "batch should fail: {resp:?}");
     assert_eq!(resp["code"], "ambiguous_match");
     let message = resp["message"].as_str().unwrap();
+    assert!(message.starts_with("batch: edits[0] match 'same' is ambiguous ("));
     assert!(message.contains("occurrence"));
     assert!(message.contains("1-based"));
+    assert!(message.contains("2 occurrences: #1 at line 1, #2 at line 1"));
     assert!(!message.contains("0-based"));
     assert!(!message.contains("0-indexed"));
     assert!(message.contains("'replaceAll': true"));

@@ -1111,7 +1111,12 @@ fn handle_single_file_edit_match(
         return Response::error(
             &req.id,
             "match_not_found",
-            format!("edit_match: '{}' not found in {}", match_str, file),
+            format!(
+                "edit_match: '{}' not found in {}{}",
+                match_str,
+                file,
+                crate::fuzzy_match::render_nearest_miss_detail(&source, match_str),
+            ),
         );
     }
 
@@ -1169,8 +1174,9 @@ fn handle_single_file_edit_match(
             &req.id,
             "ambiguous_match",
             format!(
-                "Found {} matches. Use 'occurrence' (1-based) to select one, or 'replaceAll: true' to replace all.",
-                occurrences.len()
+                "Found {} matches. Use 'occurrence' (1-based) to select one, or 'replaceAll: true' to replace all.{}",
+                occurrences.len(),
+                crate::fuzzy_match::render_occurrence_listing(&source, &positions),
             ),
             serde_json::json!({
                 "occurrences": occurrences,

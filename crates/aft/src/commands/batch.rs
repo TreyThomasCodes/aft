@@ -317,14 +317,13 @@ fn resolve_edit(
         };
 
         if fuzzy_matches.is_empty() {
-            return Err(Response::error(
-                req_id,
-                "batch_edit_failed",
-                format!(
-                    "batch: edit[{}] match '{}' not found in file",
-                    index, match_str
-                ),
-            ));
+            let message = format!(
+                "batch: edit[{}] match '{}' not found in file{}",
+                index,
+                match_str,
+                crate::fuzzy_match::render_nearest_miss_detail(source, match_str),
+            );
+            return Err(Response::error(req_id, "batch_edit_failed", message));
         }
 
         if fuzzy_matches[0].pass > 1 {
@@ -382,14 +381,19 @@ fn resolve_edit(
                     })
                 })
                 .collect();
+            let occurrence_positions = fuzzy_matches
+                .iter()
+                .map(|matched| matched.byte_start)
+                .collect::<Vec<_>>();
             return Err(Response::error_with_data(
                 req_id,
                 "ambiguous_match",
                 format!(
-                    "batch: edits[{}] match '{}' is ambiguous ({} occurrences, expected 1). Use 'occurrence' (1-based) to select one, or 'replaceAll': true to replace every occurrence.",
+                    "batch: edits[{}] match '{}' is ambiguous ({} occurrences, expected 1). Use 'occurrence' (1-based) to select one, or 'replaceAll': true to replace every occurrence.{}",
                     index,
                     match_str,
-                    fuzzy_matches.len()
+                    fuzzy_matches.len(),
+                    crate::fuzzy_match::render_occurrence_listing(source, &occurrence_positions),
                 ),
                 serde_json::json!({ "occurrences": occurrences }),
             ));

@@ -367,6 +367,98 @@ fn edit_match_reflow_ambiguous_does_not_edit() {
 }
 
 #[test]
+fn edit_match_near_miss_reports_candidate_and_divergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("near_miss_detail.js");
+    let original =
+        "fn calculate() {\n    let first = 1;\n    let actual = 2;\n    let last = 3;\n}\n";
+    fs::write(&file, original).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "near-miss-detail",
+        "command": "edit_match",
+        "file": file,
+        "match": "fn calculate() {\n    let first = 1;\n    let expected = 2;\n    let last = 3;\n}",
+        "replacement": "fn calculate() {\n    let first = 1;\n    let changed = 2;\n    let last = 3;\n}"
+    });
+    let resp = aft.send(&req.to_string());
+
+    assert_eq!(resp["success"], false, "near miss should fail: {resp:?}");
+    assert_eq!(resp["code"], "match_not_found");
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("edit_match: 'fn calculate()"));
+    assert!(message.contains("Nearest candidate at lines 1-5"));
+    assert!(message.contains("- expected:     let expected = 2;"));
+    assert!(message.contains("+ actual:     let actual = 2;"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn edit_match_diagnostics_flow_through_tool_call_ndjson() {
+    let dir = tempfile::tempdir().unwrap();
+    let near_file = dir.path().join("tool_call_near.rs");
+    let ambiguous_file = dir.path().join("tool_call_ambiguous.rs");
+    fs::write(
+        &near_file,
+        "fn calculate() {\n    let first = 1;\n    let actual = 2;\n    let last = 3;\n}\n",
+    )
+    .unwrap();
+    fs::write(&ambiguous_file, "same\nother\nsame\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let near_resp = aft.send(
+        &json!({
+            "id": "tool-call-near",
+            "command": "tool_call",
+            "name": "edit_match",
+            "arguments": {
+                "file": near_file,
+                "match": "fn calculate() {\n    let first = 1;\n    let expected = 2;\n    let last = 3;\n}",
+                "replacement": "unused"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        near_resp["success"], false,
+        "near tool_call should fail: {near_resp:?}"
+    );
+    assert!(near_resp["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("First divergence:\n- expected:"));
+    assert!(near_resp["text"].is_string());
+
+    let ambiguous_resp = aft.send(
+        &json!({
+            "id": "tool-call-ambiguous",
+            "command": "tool_call",
+            "name": "edit_match",
+            "arguments": {
+                "file": ambiguous_file,
+                "match": "same",
+                "replacement": "changed"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        ambiguous_resp["success"], false,
+        "ambiguous tool_call should fail: {ambiguous_resp:?}"
+    );
+    let ambiguous_message = ambiguous_resp["message"].as_str().unwrap_or_default();
+    assert!(ambiguous_message.contains("2 occurrences: #1 at line 1, #2 at line 3"));
+    assert!(ambiguous_resp["text"].is_string());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn edit_match_reflow_near_miss_does_not_edit() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("near_miss.js");
@@ -388,6 +480,10 @@ fn edit_match_reflow_near_miss_does_not_edit() {
         resp["code"], "match_not_found",
         "wrong error code: {resp:?}"
     );
+    let message = resp["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("edit_match: 'const value = alpha + beta + delta;' not found in "));
+    assert!(message.contains("file has 3 lines"));
+    assert!(!message.contains("Nearest candidate"));
     assert_eq!(
         fs::read_to_string(dir.path().join("near_miss.js")).unwrap(),
         original
