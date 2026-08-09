@@ -192,7 +192,7 @@ const PLUGIN_VERSION: string = (() => {
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.49.3";
+const ANNOUNCEMENT_VERSION = "0.49.4";
 const ANNOUNCEMENT_FEATURES: string[] = [
   "Callgraph stays consistent under load: edits arriving mid-rebuild can no longer be silently lost from navigation results.",
   "aft_zoom handles real-world .jsonc: files with comment banners above the opening brace now resolve, and not-found errors point at the segment that actually failed (thanks @iceteaSA).",
