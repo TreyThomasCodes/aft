@@ -18,7 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -3837,8 +3837,57 @@ async fn send_route_bind_error_parts(
 ) -> Result<(), SubcError> {
     let response = build_error_frame(ver, 0, 0, corr, flags, code, message)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
-    log::warn!("subc attach: route bind rejected ({code}): {message}");
+    log_route_bind_rejection(code, message);
     Ok(())
+}
+
+/// Per-message rate limit for the bind-rejection warn line. A caller that
+/// re-attaches a dead root forever turns this line into the entire readable
+/// tail of the SHARED daemon log (measured 2026-08-09: 2.08M copies, ~40/sec,
+/// 936MB log — other modules' incident lines pushed out of the tail).
+/// The line itself stays byte-identical so external counters keep matching;
+/// repeats inside the window are summarized with a suppressed count on the
+/// next emission (volume stays diagnosable, per the log-diet convention).
+fn log_route_bind_rejection(code: &str, message: &str) {
+    const WINDOW: Duration = Duration::from_secs(60);
+    static SUPPRESSED: OnceLock<StdMutex<HashMap<String, (Instant, u64)>>> = OnceLock::new();
+    let map = SUPPRESSED.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut map = match map.try_lock() {
+        Ok(map) => map,
+        // Contended: log unsuppressed rather than blocking or dropping.
+        Err(_) => {
+            log::warn!("subc attach: route bind rejected ({code}): {message}");
+            return;
+        }
+    };
+    let now = Instant::now();
+    // Bound the map: dead roots churn, and an unbounded suppression map is
+    // its own leak. Sweep expired entries once it grows past a fleet-sized
+    // number of distinct rejection messages.
+    if map.len() > 512 {
+        map.retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
+    }
+    match map.get_mut(message) {
+        Some((window_start, suppressed)) if now.duration_since(*window_start) < WINDOW => {
+            *suppressed += 1;
+        }
+        Some((window_start, suppressed)) => {
+            if *suppressed > 0 {
+                log::warn!(
+                    "subc attach: route bind rejected ({code}): {message} (repeated {}x in last 60s)",
+                    *suppressed
+                );
+            } else {
+                log::warn!("subc attach: route bind rejected ({code}): {message}");
+            }
+            *window_start = now;
+            *suppressed = 0;
+        }
+        None => {
+            log::warn!("subc attach: route bind rejected ({code}): {message}");
+            map.insert(message.to_string(), (now, 0));
+        }
+    }
 }
 
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
