@@ -321,7 +321,11 @@ fn memory_rollup_metrics(
     actor_entries: Option<Vec<(cortexkit_paths::ProjectRootId, Arc<AppContext>)>>,
 ) -> Value {
     let Some(entries) = actor_entries else {
-        return json!({ "status": "busy" });
+        return json!({
+            "status": "busy",
+            "allocator_slack_bytes": 0,
+            "allocator_slack_measured": false,
+        });
     };
     let mut roots = std::collections::BTreeMap::new();
     for (root_id, ctx) in entries {
@@ -352,6 +356,10 @@ fn memory_rollup_metrics(
         "roots_omitted": snapshot.roots_omitted,
         "roots_omitted_bytes": snapshot.roots_omitted_bytes,
         "rss_bytes": snapshot.process.rss_bytes,
+        // Zero means either measured zero slack or unavailable allocator counters;
+        // the sibling boolean disambiguates "no slack" from "unmeasurable".
+        "allocator_slack_bytes": snapshot.process.allocator.retained_slack_bytes.unwrap_or(0),
+        "allocator_slack_measured": snapshot.process.allocator.retained_slack_bytes.is_some(),
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
@@ -726,6 +734,19 @@ mod tests {
         assert_eq!(memory.get("roots_total").and_then(Value::as_u64), Some(0));
         assert!(memory.get("total_attributed_bytes").is_some());
         assert!(memory.get("rss_bytes").is_some());
+        assert!(memory
+            .get("allocator_slack_bytes")
+            .is_some_and(Value::is_u64));
+        assert!(memory
+            .get("allocator_slack_measured")
+            .is_some_and(Value::is_boolean));
+        if memory
+            .get("allocator_slack_measured")
+            .and_then(Value::as_bool)
+            .is_some_and(|measured| !measured)
+        {
+            assert_eq!(memory["allocator_slack_bytes"], 0);
+        }
         // Lifecycle audit counters ride the same probe so operator drill-downs
         // and fleet leak checks read one surface.
         let runtime = metrics.get("runtime").expect("runtime counters present");
@@ -737,7 +758,49 @@ mod tests {
         }
         assert_eq!(runtime["spawned_lsp_children"].as_u64(), Some(1));
         assert_eq!(runtime["lsp_children_with_deleted_cwd"].as_u64(), Some(0));
+
+        let busy_memory = memory_rollup_metrics(None);
+        assert_eq!(busy_memory["allocator_slack_bytes"].as_u64(), Some(0));
+        assert_eq!(
+            busy_memory["allocator_slack_measured"].as_bool(),
+            Some(false)
+        );
         registry.untrack(std::process::id());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_allocator_relief_smoke_keeps_health_fields_present() {
+        let mut allocation = vec![0u8; 32 * 1024 * 1024];
+        for byte in allocation.iter_mut().step_by(4096) {
+            *byte = 1;
+        }
+        std::hint::black_box(&allocation);
+        drop(allocation);
+        let _relief = crate::memory::relieve_allocator_pressure();
+
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let app = crate::context::App::default_shared();
+        let report = build_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let memory = report
+            .metrics
+            .expect("health metrics present")
+            .get("memory")
+            .cloned()
+            .expect("memory rollup present");
+        assert!(memory["allocator_slack_bytes"].is_u64());
+        assert!(memory["allocator_slack_measured"].is_boolean());
     }
 
     #[test]

@@ -684,11 +684,11 @@ fn allocator_pressure_relief_after_idle_sweep(
         return None;
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     {
         Some(crate::memory::relieve_allocator_pressure())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
     {
         None
     }
@@ -2280,9 +2280,9 @@ where
     // the sleep_until arm below only exists to wake an otherwise-idle loop.
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
-    // Rate-limit stamp for opportunistic macOS allocator slack relief (checked
-    // on the maintenance tick; policy shared with standalone via memory.rs).
-    #[cfg(target_os = "macos")]
+    // Rate-limit stamp for opportunistic allocator slack relief (checked on the
+    // maintenance tick; policy shared with standalone via memory.rs).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut last_slack_relief: Option<std::time::Instant> = None;
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
@@ -2853,7 +2853,7 @@ where
                 // resident for the process lifetime (5.1 GB RSS over ~600 MB
                 // live). Slack threshold + spacing live in memory.rs; the pass
                 // itself runs on a detached thread.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     let now_std = std::time::Instant::now();
                     if crate::memory::spawn_allocator_slack_relief_if_due(
