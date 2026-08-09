@@ -236,6 +236,11 @@ impl InspectManager {
     }
 
     #[doc(hidden)]
+    pub fn inspect_pool_for_test(&self) -> Arc<rayon::ThreadPool> {
+        Arc::clone(&self.pool)
+    }
+
+    #[doc(hidden)]
     pub fn automatic_tier2_schedule_count_for_test(&self) -> u64 {
         self.automatic_tier2_schedule_count.load(Ordering::SeqCst)
     }
@@ -378,7 +383,7 @@ impl InspectManager {
 
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
-        pool.spawn(move || {
+        pool.spawn_fifo(move || {
             let _permit = permit;
             let result = manager.tier2_run_with_reuse_job_result(job);
             manager.route_tier2_reuse_completion(result);
@@ -478,7 +483,7 @@ impl InspectManager {
         let categories_for_worker = submission.newly_queued_categories.clone();
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
-        pool.spawn(move || {
+        pool.spawn_fifo(move || {
             let _permit = permit;
             for category in categories_for_worker {
                 let result = manager.tier2_run_with_reuse_result(snapshot.clone(), category, None);
@@ -917,7 +922,7 @@ impl InspectManager {
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
-        pool.spawn(move || {
+        pool.spawn_fifo(move || {
             let result = manager.tier2_run_with_reuse_job_result_catching(job, options);
             manager.route_tier2_reuse_completion(result);
         });

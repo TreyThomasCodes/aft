@@ -15,7 +15,9 @@ pub mod scanners;
 pub mod tier2_scheduler;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
-pub use dispatch::{DispatchHandles, InspectWorker};
+pub use dispatch::{
+    inspect_pool_size_for_test, inspect_pool_thread_count_for_test, DispatchHandles, InspectWorker,
+};
 pub(crate) use entry_points::resolve_entry_points;
 pub use freshness::{contribution_is_fresh, verify_contribution_file, ContributionFreshness};
 pub use job::{

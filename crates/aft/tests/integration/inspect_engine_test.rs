@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use aft::cache_freshness;
 use aft::config::Config;
 use aft::inspect::{
-    contribution_is_fresh, verify_contribution_file, ContributionFreshness, FileContribution,
-    InspectCache, InspectCategory, InspectManager, InspectResult, InspectScanSuccess,
-    InspectSnapshot, InspectWorker, JobKey, JobOutcome, JobScope,
+    contribution_is_fresh, inspect_pool_size_for_test, inspect_pool_thread_count_for_test,
+    verify_contribution_file, ContributionFreshness, FileContribution, InspectCache,
+    InspectCategory, InspectManager, InspectResult, InspectScanSuccess, InspectSnapshot,
+    InspectWorker, JobKey, JobOutcome, JobScope,
 };
 use aft::parser::SymbolCache;
 use serde_json::json;
@@ -79,6 +80,43 @@ fn wait_for_worker_count(worker_count: &AtomicUsize, expected: usize, timeout: D
         );
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn wait_for_flag(flag: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    flag.load(Ordering::SeqCst)
+}
+
+fn interleaving_worker(
+    large_root: PathBuf,
+    large_started: Arc<AtomicBool>,
+    large_finished: Arc<AtomicBool>,
+    small_finished: Arc<AtomicBool>,
+) -> InspectWorker {
+    Arc::new(move |job| {
+        let started = Instant::now();
+        let is_large = job.project_root == large_root;
+        if is_large {
+            large_started.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(800));
+            large_finished.store(true, Ordering::SeqCst);
+        } else {
+            thread::sleep(Duration::from_millis(25));
+            small_finished.store(true, Ordering::SeqCst);
+        }
+        InspectResult::success(
+            &job,
+            InspectScanSuccess {
+                scanned_files: job.scope_files.clone(),
+                contributions: Vec::new(),
+                aggregate: json!({"count": job.scope_files.len()}),
+            },
+            started.elapsed(),
+        )
+    })
 }
 
 #[test]
@@ -213,6 +251,134 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
     assert!(matches!(second, JobOutcome::Fresh { .. }));
     assert_eq!(first.payload().unwrap()["count"], 7);
     assert_eq!(second.payload().unwrap()["count"], 7);
+}
+
+#[test]
+fn inspect_engine_roots_share_bounded_named_thread_pool() {
+    let (_first_temp, first_root, _first_file) = fixture_project();
+    let (_second_temp, second_root, _second_file) = fixture_project();
+    let worker_count = Arc::new(AtomicUsize::new(0));
+    let first_manager = Arc::new(InspectManager::with_worker(
+        test_worker(Arc::clone(&worker_count), Duration::from_millis(150), 1),
+        Duration::from_secs(2),
+    ));
+    let second_manager = Arc::new(InspectManager::with_worker(
+        test_worker(Arc::clone(&worker_count), Duration::from_millis(150), 2),
+        Duration::from_secs(2),
+    ));
+
+    let first_pool = first_manager.inspect_pool_for_test();
+    let second_pool = second_manager.inspect_pool_for_test();
+    assert!(
+        Arc::ptr_eq(&first_pool, &second_pool),
+        "inspect roots must submit to one process-wide rayon pool"
+    );
+    let pool_size = inspect_pool_size_for_test();
+
+    let first_snapshot = snapshot(&first_root, &first_root.join(".aft-cache/inspect"));
+    let second_snapshot = snapshot(&second_root, &second_root.join(".aft-cache/inspect"));
+    let first_scope = JobScope::for_project(first_root.clone());
+    let second_scope = JobScope::for_project(second_root.clone());
+    let first_manager_for_thread = Arc::clone(&first_manager);
+    let first = thread::spawn(move || {
+        first_manager_for_thread.submit_category(
+            first_snapshot,
+            InspectCategory::DeadCode,
+            first_scope,
+        )
+    });
+    let second_manager_for_thread = Arc::clone(&second_manager);
+    let second = thread::spawn(move || {
+        second_manager_for_thread.submit_category(
+            second_snapshot,
+            InspectCategory::DeadCode,
+            second_scope,
+        )
+    });
+
+    wait_for_worker_count(worker_count.as_ref(), 2, Duration::from_secs(2));
+    let named_threads = inspect_pool_thread_count_for_test();
+    assert!(
+        named_threads > 0,
+        "running scans must start named inspect workers"
+    );
+    assert!(
+        named_threads <= pool_size,
+        "named inspect workers ({named_threads}) must stay within the shared pool size ({pool_size})"
+    );
+    assert!(matches!(
+        first.join().expect("first scan"),
+        JobOutcome::Fresh { .. }
+    ));
+    assert!(matches!(
+        second.join().expect("second scan"),
+        JobOutcome::Fresh { .. }
+    ));
+}
+
+#[test]
+fn inspect_engine_small_root_interleaves_with_large_scan() {
+    let (_large_temp, large_root, _large_file) = fixture_project();
+    let (_small_temp, small_root, _small_file) = fixture_project();
+    let pool_size = inspect_pool_size_for_test();
+    let large_started = Arc::new(AtomicBool::new(false));
+    let large_finished = Arc::new(AtomicBool::new(false));
+    let small_finished = Arc::new(AtomicBool::new(false));
+    let worker = interleaving_worker(
+        large_root.clone(),
+        Arc::clone(&large_started),
+        Arc::clone(&large_finished),
+        Arc::clone(&small_finished),
+    );
+    let large_manager = Arc::new(InspectManager::with_worker(
+        Arc::clone(&worker),
+        Duration::from_secs(10),
+    ));
+    let small_manager = Arc::new(InspectManager::with_worker(worker, Duration::from_secs(10)));
+
+    let large_snapshot = snapshot(&large_root, &large_root.join(".aft-cache/inspect"));
+    let large_scope = JobScope::for_project(large_root.clone());
+    let large_manager_for_thread = Arc::clone(&large_manager);
+    let large = thread::spawn(move || {
+        large_manager_for_thread.submit_category(
+            large_snapshot,
+            InspectCategory::Todos,
+            large_scope,
+        )
+    });
+    assert!(
+        wait_for_flag(large_started.as_ref(), Duration::from_secs(2)),
+        "large scan did not start"
+    );
+
+    let small_snapshot = snapshot(&small_root, &small_root.join(".aft-cache/inspect"));
+    let small_scope = JobScope::for_project(small_root.clone());
+    let small_manager_for_thread = Arc::clone(&small_manager);
+    let small = thread::spawn(move || {
+        small_manager_for_thread.submit_category(
+            small_snapshot,
+            InspectCategory::Todos,
+            small_scope,
+        )
+    });
+    let small_completed_before_timeout =
+        wait_for_flag(small_finished.as_ref(), Duration::from_secs(5));
+    let large_finished_when_small_completed = large_finished.load(Ordering::SeqCst);
+    let large_result = large.join().expect("large scan");
+    let small_result = small.join().expect("small scan");
+
+    assert!(
+        small_completed_before_timeout,
+        "small root did not complete within the interleaving budget"
+    );
+    if pool_size > 1 {
+        assert!(
+            !large_finished_when_small_completed,
+            "small root waited for the large scan to finish (pool_size={pool_size})"
+        );
+    }
+    assert!(matches!(large_result, JobOutcome::Fresh { .. }));
+    assert!(matches!(small_result, JobOutcome::Fresh { .. }));
 }
 
 #[test]
