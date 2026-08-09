@@ -6883,7 +6883,16 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
         Some(subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. }) => tools,
         other => panic!("expected first provider role to be ToolProvider, got {other:?}"),
     };
-    assert_eq!(tools.len(), 21, "expected 21 manifest tools");
+    let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
+        "../../src/subc_tool_schemas.json"
+    ))
+    .expect("embedded subc tool schemas should be a JSON object")
+    .len();
+    assert_eq!(
+        tools.len(),
+        schema_count,
+        "manifest tool count must match embedded schema key count"
+    );
     for tool in tools {
         assert!(
             tool.description

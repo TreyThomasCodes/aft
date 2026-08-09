@@ -89,7 +89,7 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     )
 }
 
-pub(super) fn command_lane(command: &str) -> Lane {
+pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
     match command {
         "ping"
         | "version"
@@ -108,12 +108,12 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "glob"
         | "grep"
         | "git_conflicts"
-        | "ast_search" => Lane::PureRead,
+        | "ast_search" => Some(Lane::PureRead),
 
         // Lazy reads mutate parser/terminal/url caches on a miss, but are still
         // classified onto the reader pool; install races are handled at the
         // individual cache sites.
-        "bash_status" | "outline" | "zoom" => Lane::PureRead,
+        "bash_status" | "outline" | "zoom" => Some(Lane::PureRead),
 
         "status"
         | "inspect"
@@ -122,10 +122,12 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "lsp_hover"
         | "lsp_goto_definition"
         | "lsp_find_references"
-        | "lsp_prepare_rename" => Lane::SerialLspStatus,
+        | "lsp_prepare_rename" => Some(Lane::SerialLspStatus),
 
         "semantic_search" | "search" | "callgraph" | "callers" | "impact" | "call_tree"
-        | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => Lane::HeavyInit,
+        | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => {
+            Some(Lane::HeavyInit)
+        }
 
         "bash"
         | "bash_abort_inflight"
@@ -141,28 +143,38 @@ pub(super) fn command_lane(command: &str) -> Lane {
         | "checkpoint"
         | "restore_checkpoint"
         | "write"
+        | "apply_patch"
         | "delete_file"
+        | "delete"
         | "move_file"
+        | "move"
         | "edit"
         | "edit_symbol"
         | "edit_match"
         | "batch"
         | "add_import"
+        | "import"
         | "remove_import"
         | "organize_imports"
         | "configure"
+        | "refactor"
         | "move_symbol"
         | "extract_function"
         | "inline_symbol"
         | "ast_replace"
+        | "safety"
         | "lsp_rename"
         | "list_filters"
         | "trust_filter_project"
         | "untrust_filter_project"
-        | "snapshot" => Lane::Mutating,
+        | "snapshot" => Some(Lane::Mutating),
 
-        _ => Lane::Mutating,
+        _ => None,
     }
+}
+
+pub(super) fn command_lane(command: &str) -> Lane {
+    command_lane_explicit(command).unwrap_or(Lane::Mutating)
 }
 
 static SUBC_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
@@ -270,9 +282,10 @@ pub(super) fn control_flags() -> Flags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::subc_translate::supports_tool;
+    use std::collections::{HashMap, HashSet};
 
-    const CORE_TOOLS: [&str; 21] = [
+    const CORE_TOOLS: &[&str] = &[
         "status",
         "bash",
         "read",
@@ -295,6 +308,10 @@ mod tests {
         "refactor",
         "safety",
     ];
+
+    /// Tools listed here deliberately skip translation; adding one is a reviewed
+    /// decision because it weakens the registration guard's translation check.
+    const TRANSLATION_EXEMPT: &[&str] = &[];
 
     fn is_bare_placeholder_schema(schema: &Value) -> bool {
         schema == &json!({ "type": "object" })
@@ -354,6 +371,58 @@ mod tests {
             status.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
             "status schema must forbid additionalProperties"
+        );
+    }
+
+    #[test]
+    fn embedded_subc_tools_are_registered_across_all_rust_surfaces() {
+        let schema_names: HashSet<&str> = SUBC_TOOL_SCHEMAS.keys().map(String::as_str).collect();
+        let core_names: HashSet<&str> = CORE_TOOLS.iter().copied().collect();
+        assert_eq!(
+            CORE_TOOLS.len(),
+            schema_names.len(),
+            "CORE_TOOLS count must match embedded schema key count"
+        );
+        assert_eq!(
+            core_names, schema_names,
+            "CORE_TOOLS must exactly match embedded schema keys"
+        );
+
+        let manifest = build_manifest();
+        let tools = match manifest.provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+            _ => panic!("expected ToolProvider"),
+        };
+        let manifest_names: HashSet<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        for name in schema_names {
+            assert!(
+                is_subc_agent_core_tool(name),
+                "tool {name:?} is missing from is_subc_agent_core_tool in crates/aft/src/subc/manifest.rs"
+            );
+            assert!(
+                manifest_names.contains(name),
+                "tool {name:?} is missing from build_manifest in crates/aft/src/subc/manifest.rs"
+            );
+            assert!(
+                command_lane_explicit(name).is_some(),
+                "tool {name:?} is missing an explicit command_lane arm in crates/aft/src/subc/manifest.rs"
+            );
+            if !TRANSLATION_EXEMPT.contains(&name) {
+                assert!(
+                    supports_tool(name),
+                    "tool {name:?} is missing from supports_tool in crates/aft/src/subc_translate.rs"
+                );
+            }
+        }
+
+        // BARE_TOOL_ORDER is TypeScript-only; the embedded schema map is its
+        // generated Rust-side artifact, so the manifest count is the Rust
+        // denominator check for this derived guard.
+        assert_eq!(
+            SUBC_TOOL_SCHEMAS.len(),
+            tools.len(),
+            "registration guard denominator must match manifest tool count"
         );
     }
 
