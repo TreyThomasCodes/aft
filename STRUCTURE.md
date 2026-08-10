@@ -35,7 +35,7 @@ opencode-aft/
 **`crates/aft/`:**
 - Purpose: Keep the Rust execution engine, stdin/stdout protocol binary, and shared analysis logic together.
 - Contains: `src/` Rust modules, `tests/` integration suites, `crates/aft/tests/fixtures/` test fixtures, `tests/helpers/` test utilities, `crates/aft/tests/lsp/` LSP integration tests
-- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/runtime_drain.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, `crates/aft/src/subc/mod.rs`, `crates/aft/src/subc/`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/memory.rs`, `crates/aft/src/logging.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/executor/`, `crates/aft/src/bash_background/`, `crates/aft/src/bash_rewrite/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/legacy_partitions.rs`, `crates/aft/src/cold_build_limiter.rs`, `crates/aft/src/sandbox_spawn.rs`, `crates/aft/src/sandbox_profile.rs`, `crates/aft/src/cli/sandbox_launch.rs`, `crates/aft/tests/integration/`
+- Key files: `crates/aft/src/main.rs`, `crates/aft/src/lib.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/runtime_drain.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, `crates/aft/src/subc/mod.rs`, `crates/aft/src/subc/`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/memory.rs`, `crates/aft/src/logging.rs`, `crates/aft/src/commands/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, `crates/aft/src/hashline/`, `crates/aft/src/executor/`, `crates/aft/src/bash_background/`, `crates/aft/src/bash_rewrite/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/cache_freshness.rs`, `crates/aft/src/fs_lock.rs`, `crates/aft/src/legacy_partitions.rs`, `crates/aft/src/cold_build_limiter.rs`, `crates/aft/src/sandbox_spawn.rs`, `crates/aft/src/sandbox_profile.rs`, `crates/aft/src/cli/sandbox_launch.rs`, `crates/aft/tests/integration/`
 
 **`crates/aft-tokenizer/`:**
 - Purpose: Ship a standalone tokenizer for Claude API token counting.
@@ -96,6 +96,11 @@ opencode-aft/
 - Purpose: Implement patch parsing, sequence matching, fuzzy hunk matching, and update execution.
 - Contains: Mod, parser, sequence matcher, and update chunk appliers
 - Key files: `crates/aft/src/patch/mod.rs`, `crates/aft/src/patch/parser.rs`, `crates/aft/src/patch/matcher.rs`, `crates/aft/src/patch/apply.rs`
+
+**`crates/aft/src/hashline/`:**
+- Purpose: Provide seed-zero xxHash32 digest calculation, tag normalization, and oracle parity verification for hashline editing.
+- Contains: Pure-Rust xxHash32 digest calculator, tag normalizer, and hashline oracle parity corpus fixtures.
+- Key files: `crates/aft/src/hashline/mod.rs`, `crates/aft/src/hashline/oracle/mod.rs`, `crates/aft/src/hashline/oracle/xxhash32.rs`, `crates/aft/src/hashline/oracle/fixtures.jsonl`
 
 **`crates/aft/src/subc/`:**
 - Purpose: Connect to and authenticate with the subconscious daemon.
@@ -172,7 +177,7 @@ opencode-aft/
 
 **Files:** Use capability-oriented filenames. Put Rust command handlers in snake_case files such as `crates/aft/src/commands/move_symbol.rs`. Put TypeScript tool groups in concise nouns such as `packages/opencode-plugin/src/tools/navigation.ts`. Use `.test.ts` for plugin tests and `_test.rs` for Rust tests.
 
-**Directories:** Use lower-case descriptive directories. Group related runtime code under `packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`, `crates/aft/src/commands/`, `crates/aft/src/lsp/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, and `crates/aft/src/inspect/`.
+**Directories:** Use lower-case descriptive directories. Group related runtime code under `packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`, `crates/aft/src/commands/`, `crates/aft/src/lsp/`, `crates/aft/src/compress/`, `crates/aft/src/imports/`, `crates/aft/src/inspect/`, and `crates/aft/src/hashline/`.
 
 ## Where to Add New Code
 
@@ -193,6 +198,8 @@ opencode-aft/
 **New Rust command handler:** `crates/aft/src/commands/[command_name].rs` -- expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
 
 **New patch parser/matching code:** `crates/aft/src/patch/[module].rs` -- implement parsing or sequence matching logic and expose it via `crates/aft/src/patch/mod.rs`.
+
+**New hashline oracle test fixture or vector:** `crates/aft/src/hashline/oracle/` -- add fixtures to `fixtures.jsonl` or test vectors to `xxhash32_vectors.rs`.
 
 **New shared Rust engine code:** `crates/aft/src/[domain].rs` -- keep reusable parser, formatter, import, search, or analysis logic outside command handlers.
 
