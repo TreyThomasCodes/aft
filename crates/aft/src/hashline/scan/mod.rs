@@ -845,6 +845,8 @@ fn capture_path_once(path: &Path, request: &ScanRequest) -> Result<Snapshot, Cap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use serde_json::Value;
     use std::io::Cursor;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -941,5 +943,133 @@ mod tests {
         assert_eq!(capture.snapshot.total_lines, 2);
         assert_eq!(capture.snapshot.provenance.labels["reader"], "test");
         assert_eq!(capture.snapshot.capture_provenance.byte_len, Some(7));
+    }
+
+    #[test]
+    fn oracle_corpus_byte_model_rows() {
+        // This test covers LF, CRLF, mixed-terminator, BOM, empty-input,
+        // missing-final-newline, Unicode, and trailing-whitespace cases,
+        // including the expected-rejection version of each. Tests for
+        // BOF/EOF addressing, one-line and empty-boundary inputs, blocks,
+        // repairs, registers, and known deviations stay in their respective
+        // test groups.
+        const OWNED: &[&str] = &[
+            "lf",
+            "lf-rejection",
+            "crlf",
+            "crlf-rejection",
+            "mixed-terminators",
+            "mixed-terminators-rejection",
+            "bom",
+            "bom-rejection",
+            "empty",
+            "empty-rejection",
+            "missing-final-newline",
+            "missing-final-newline-rejection",
+            "unicode",
+            "unicode-rejection",
+            "trailing-whitespace",
+            "trailing-whitespace-rejection",
+        ];
+        const DEFERRED: &[&str] = &[
+            "bof",
+            "bof-rejection",
+            "eof",
+            "eof-rejection",
+            "eof-relative",
+            "eof-relative-rejection",
+            "one-line",
+            "one-line-rejection",
+            "empty-boundary",
+            "empty-boundary-rejection",
+            "block",
+            "block-rejection",
+            "repair",
+            "repair-negative-control",
+            "registered-deviation",
+            "registered-deviation-negative-control",
+            "named-register",
+            "anonymous-register",
+            "cross-file-register",
+            "register-overflow",
+        ];
+
+        let mut consumed = 0;
+        let mut deferred = 0;
+        for line in include_str!("../oracle/fixtures.jsonl").lines() {
+            let row: Value = serde_json::from_str(line).expect("oracle fixture JSON must parse");
+            let category = row["fixture_category"]
+                .as_str()
+                .expect("oracle fixture category must be a string");
+            if !OWNED.contains(&category) {
+                assert!(
+                    DEFERRED.contains(&category),
+                    "new oracle category {category:?} needs an explicit slice owner"
+                );
+                deferred += 1;
+                continue;
+            }
+            consumed += 1;
+
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(row["initial_base64"].as_str().unwrap())
+                .expect("oracle fixture initial_base64 must decode");
+            let snapshot = scan_bytes(&bytes);
+            let expected_tag = row["snapshot_tag"].as_str().unwrap();
+            assert_eq!(snapshot.tag, expected_tag, "fixture {}", row["id"]);
+            assert_eq!(snapshot.tag, tag_for(&bytes), "fixture {}", row["id"]);
+
+            let family = category.strip_suffix("-rejection").unwrap_or(category);
+            let expected_terminators: Vec<TerminatorKind> = match family {
+                "lf" | "unicode" => vec![TerminatorKind::Lf; 3],
+                "bom" => vec![TerminatorKind::Lf; 2],
+                "crlf" => vec![TerminatorKind::CrLf; 3],
+                "mixed-terminators" => vec![
+                    TerminatorKind::Lf,
+                    TerminatorKind::CrLf,
+                    TerminatorKind::None,
+                ],
+                "empty" => Vec::new(),
+                "missing-final-newline" => vec![TerminatorKind::Lf, TerminatorKind::None],
+                "trailing-whitespace" => vec![TerminatorKind::Lf, TerminatorKind::Lf],
+                _ => unreachable!("owned category must have a byte-model shape"),
+            };
+            let records: Vec<&RawLineRecord> = snapshot.records.values().collect();
+            assert_eq!(
+                records.len(),
+                expected_terminators.len(),
+                "fixture {}",
+                row["id"]
+            );
+            assert_eq!(
+                snapshot.total_lines,
+                expected_terminators.len(),
+                "fixture {}",
+                row["id"]
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.terminator)
+                    .collect::<Vec<_>>(),
+                expected_terminators,
+                "fixture {}",
+                row["id"]
+            );
+            let reconstructed: Vec<u8> = records
+                .iter()
+                .flat_map(|record| record.to_bytes())
+                .collect();
+            assert_eq!(reconstructed, bytes, "fixture {}", row["id"]);
+        }
+
+        assert_eq!(
+            consumed, 64,
+            "the owned byte-model corpus must remain complete"
+        );
+        assert_eq!(
+            deferred, 64,
+            "the deferred corpus rows must remain explicitly classified"
+        );
     }
 }
