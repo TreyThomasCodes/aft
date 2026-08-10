@@ -196,6 +196,141 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 84, column 48",
+      "line": 84,
+      "column": 48,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 106, column 43",
+      "line": 106,
+      "column": 43,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 356, column 29",
+      "line": 356,
+      "column": 29,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 407, column 23",
+      "line": 407,
+      "column": 23,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 408, column 29",
+      "line": 408,
+      "column": 29,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 562, column 33",
+      "line": 562,
+      "column": 33,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 569, column 28",
+      "line": 569,
+      "column": 28,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 776, column 14",
+      "line": 776,
+      "column": 14,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 795, column 48",
+      "line": 795,
+      "column": 48,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/mod.rs",
+      "location": "line 806, column 61",
+      "line": 806,
+      "column": 61,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/schema.rs",
+      "location": "line 61, column 14",
+      "line": 61,
+      "column": 14,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/schema.rs",
+      "location": "line 119, column 23",
+      "line": 119,
+      "column": 23,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/transport.rs",
+      "location": "line 108, column 18",
+      "line": 108,
+      "column": 18,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/transport.rs",
+      "location": "line 342, column 14",
+      "line": 342,
+      "column": 14,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/hashline/integration/transport.rs",
+      "location": "line 422, column 42",
+      "line": 422,
+      "column": 42,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
       "path": "crates/aft/src/subc/manifest.rs",
       "location": "line 355, column 53",
       "line": 355,
