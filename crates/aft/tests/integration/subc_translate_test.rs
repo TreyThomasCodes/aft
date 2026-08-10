@@ -140,6 +140,7 @@ fn assert_case(dir: &Path) -> Option<String> {
     let ctx = TranslateContext {
         diagnostics_on_edit: input.diagnostics_on_edit.unwrap_or(false),
         preview: false,
+        effective_hashline: false,
     };
     let agent_args = expand_project_root_tokens(input.agent_args, &project_root);
     let actual =
@@ -502,4 +503,47 @@ fn edit_sentinel_item_alongside_real_match_applies_batch() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn effective_hashline_edit_routes_before_legacy_translation() {
+    let translated = subc_translate_with_context(
+        "edit",
+        &json!({ "patch": "[src/main.ts#ABCD]\nPUT 1\nconst value = 2;\n" }),
+        Path::new("/project"),
+        TranslateContext {
+            diagnostics_on_edit: false,
+            preview: true,
+            effective_hashline: true,
+        },
+    )
+    .expect("hashline patch should translate");
+
+    assert_eq!(translated.command, "hashline_edit");
+    assert_eq!(
+        Value::Object(translated.args),
+        json!({
+            "patch": "[src/main.ts#ABCD]\nPUT 1\nconst value = 2;\n",
+            "preview": true,
+        })
+    );
+}
+
+#[test]
+fn effective_hashline_edit_rejects_every_legacy_key_with_hashline_steering() {
+    let error = subc_translate_with_context(
+        "edit",
+        &json!({ "filePath": "src/main.ts", "oldString": "1", "newString": "2" }),
+        Path::new("/project"),
+        TranslateContext {
+            diagnostics_on_edit: false,
+            preview: false,
+            effective_hashline: true,
+        },
+    )
+    .expect_err("legacy edit shape must not reach legacy translation");
+
+    assert_eq!(error.code, "hashline_parse_error");
+    assert!(error.message.contains("hashline patch"));
+    assert!(!error.message.contains("requires exactly one edit mode"));
 }

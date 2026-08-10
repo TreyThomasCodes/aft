@@ -79,7 +79,7 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
-import { buildOpenCodeToolMap } from "./tool-registration.js";
+import { buildOpenCodeToolMap, openCodeEditSlotSurvives } from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
@@ -649,6 +649,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     client: input.client,
     plugin: (input as { plugin?: PluginContext["plugin"] }).plugin,
     config: aftConfig,
+    hashlineEffective: aftConfig.edit_mode === "hashline" && openCodeEditSlotSurvives(aftConfig),
     storageDir: configOverrides.storage_dir as string,
     isProjectEnabled,
   };
@@ -1022,6 +1023,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
+  const editSlotSurvives = registeredTools.has("edit");
+  pool.setConfigureOverride("edit_slot_survives", editSlotSurvives);
   const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer can steer to it (vs the grep tool). The pool holds

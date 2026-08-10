@@ -136,6 +136,145 @@ fn tool_call_matches_direct_spine_envelopes() {
 }
 
 #[test]
+fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
+    let project = tempfile::tempdir().expect("hashline temp project");
+    let root = std::fs::canonicalize(project.path()).expect("canonical project");
+    let file = root.join("hashline.txt");
+    fs::write(&file, "alpha\nbeta\n").expect("write hashline fixture");
+    let mut aft = AftProcess::spawn();
+
+    let configure = |aft: &mut AftProcess, id: &str, edit_mode: &str| {
+        send_json(
+            aft,
+            json!({
+                "id": id,
+                "command": "configure",
+                "session_id": SESSION_ID,
+                "project_root": root,
+                "harness": "opencode",
+                "edit_slot_survives": true,
+                "config": [{
+                    "tier": "project",
+                    "source": root.join(".cortexkit/aft.jsonc"),
+                    "doc": json!({
+                        "edit_mode": edit_mode,
+                        "search_index": false,
+                        "semantic_search": false
+                    }).to_string()
+                }]
+            }),
+        )
+    };
+    assert!(
+        configure(&mut aft, "hashline-configure-on", "hashline")["success"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+
+    let read = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-read",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "read",
+            "arguments": { "filePath": file }
+        }),
+    );
+    assert!(read["success"].as_bool().unwrap_or(false), "{read:#}");
+    let tag = read["hashline_tag"]
+        .as_str()
+        .expect("tool-call read must carry a hashline tag");
+    assert!(read["text"].as_str().unwrap_or_default().starts_with('['));
+
+    let patch = format!("*** Begin Patch\n[hashline.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
+    let edit = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-edit",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": { "patch": patch }
+        }),
+    );
+    assert!(edit["success"].as_bool().unwrap_or(false), "{edit:#}");
+    assert_eq!(fs::read(&file).unwrap(), b"omega\nbeta\n");
+    assert!(edit["op_id"].as_str().is_some());
+
+    let legacy_rejection = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-legacy-rejection",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "filePath": file,
+                "oldString": "omega",
+                "newString": "legacy"
+            }
+        }),
+    );
+    assert_eq!(legacy_rejection["code"], "hashline_parse_error");
+
+    let undo = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-undo",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "safety",
+            "arguments": { "op": "undo" }
+        }),
+    );
+    assert!(undo["success"].as_bool().unwrap_or(false), "{undo:#}");
+    assert_eq!(fs::read(&file).unwrap(), b"alpha\nbeta\n");
+
+    assert!(
+        configure(&mut aft, "hashline-configure-off", "default")["success"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    let default_read = send_json(
+        &mut aft,
+        json!({
+            "id": "default-read",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "read",
+            "arguments": { "filePath": file }
+        }),
+    );
+    assert!(default_read.get("hashline_tag").is_none());
+    assert!(default_read["text"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("1: alpha"));
+    let default_edit = send_json(
+        &mut aft,
+        json!({
+            "id": "default-edit",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "filePath": file,
+                "oldString": "alpha",
+                "newString": "default"
+            }
+        }),
+    );
+    assert!(
+        default_edit["success"].as_bool().unwrap_or(false),
+        "{default_edit:#}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"default\nbeta\n");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn known_tool_translate_errors_surface_as_invalid_request() {
     let mut aft = AftProcess::spawn();
     for (label, name, arguments, expected_message) in [
@@ -487,6 +626,7 @@ fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) 
         TranslateContext {
             diagnostics_on_edit: false,
             preview: false,
+            effective_hashline: false,
         },
     )
     .unwrap_or_else(|error| panic!("translate {tool} failed: {}", error.message));

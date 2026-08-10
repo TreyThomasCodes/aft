@@ -15,6 +15,8 @@ pub struct GrepRule;
 pub struct RgRule;
 pub struct FindRule;
 pub struct CatRule;
+pub struct HeadRule;
+pub struct TailRule;
 pub struct CatAppendRule;
 pub struct SedRule;
 pub struct LsRule;
@@ -194,6 +196,104 @@ impl RewriteRule for CatRule {
     }
 }
 
+impl RewriteRule for HeadRule {
+    fn name(&self) -> &'static str {
+        "head"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = head_tail_read_request(command, "head") else {
+            return decline("head", "head.decline", "unsupported head shape");
+        };
+        let path = params
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let lines = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        if !effective_hashline_session(ctx, session_id)
+            || !path_is_safe(ctx, path, true)
+            || !head_tail_shape_is_faithful(ctx, path, lines, false)
+        {
+            return decline(
+                "head",
+                "head.decline",
+                "head requires an effective hashline session and a faithful text-read shape",
+            );
+        }
+        accept(
+            "head",
+            "head.accept",
+            "dc.head.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+        )
+    }
+}
+
+impl RewriteRule for TailRule {
+    fn name(&self) -> &'static str {
+        "tail"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = head_tail_read_request(command, "tail") else {
+            return decline("tail", "tail.decline", "unsupported tail shape");
+        };
+        let path = params
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let lines = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        if !effective_hashline_session(ctx, session_id)
+            || !path_is_safe(ctx, path, true)
+            || !head_tail_shape_is_faithful(ctx, path, lines, true)
+        {
+            return decline(
+                "tail",
+                "tail.decline",
+                "tail requires an effective hashline session and a faithful text-read shape",
+            );
+        }
+        accept(
+            "tail",
+            "tail.accept",
+            "dc.tail.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+        )
+    }
+}
+
 impl RewriteRule for CatAppendRule {
     fn name(&self) -> &'static str {
         "cat_append"
@@ -355,6 +455,8 @@ fn decline(
         "rg" => "dc.rg.decline.v1",
         "find" => "dc.find.decline.v1",
         "cat" => "dc.cat.decline.v1",
+        "head" => "dc.head.decline.v1",
+        "tail" => "dc.tail.decline.v1",
         "cat_append" => "dc.cat_append.decline.v1",
         "sed" => "dc.sed.decline.v1",
         "ls" => "dc.ls.decline.v1",
@@ -372,10 +474,37 @@ fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRe
     let mut params = request.params.clone();
     let root = grep_project_root(ctx);
     if matches!(tool, "read" | "edit_match") {
-        if let Some(file) = params.get("file").and_then(Value::as_str) {
-            let path = Path::new(file);
+        if let Some(file) = params
+            .get("file")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            if tool == "read" && matches!(request.rule_id, "cat" | "head" | "tail") {
+                params["_hashline_requested_path"] = Value::String(file.clone());
+                params["_hashline_bash_read_kind"] = Value::String(request.rule_id.to_string());
+                if let Some(lines) = request.params.get("limit").and_then(Value::as_u64) {
+                    params["_hashline_bash_read_lines"] = Value::from(lines);
+                }
+            }
+            let path = Path::new(&file);
             if path.is_relative() {
                 params["file"] = Value::String(root.join(path).display().to_string());
+            }
+            if tool == "read" && request.rule_id == "tail" {
+                if let Some(path) = params.get("file").and_then(Value::as_str) {
+                    if let Some(total_lines) = text_file_line_count(Path::new(path)) {
+                        if total_lines > 0 {
+                            let lines = request
+                                .params
+                                .get("limit")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(10) as usize;
+                            params["start_line"] =
+                                Value::from(total_lines.saturating_sub(lines).saturating_add(1));
+                            params["end_line"] = Value::from(total_lines);
+                        }
+                    }
+                }
             }
         }
     }
@@ -533,6 +662,70 @@ fn read_shape_is_faithful(ctx: &AppContext, path: &str) -> bool {
     text.lines().all(|line| line.len() <= 2_000)
 }
 
+fn effective_hashline_session(ctx: &AppContext, session_id: Option<&str>) -> bool {
+    let root = ctx
+        .canonical_cache_root_opt()
+        .unwrap_or_else(|| grep_project_root(ctx));
+    ctx.hashline_bindings()
+        .capture(
+            root,
+            session_id.unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+        )
+        .is_some_and(|binding| binding.effective())
+}
+
+fn head_tail_shape_is_faithful(ctx: &AppContext, path: &str, lines: usize, tail: bool) -> bool {
+    let root = grep_project_root(ctx);
+    let candidate = if Path::new(path).is_absolute() {
+        Path::new(path).to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let Ok(metadata) = std::fs::metadata(&candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(candidate) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let records = text.lines().collect::<Vec<_>>();
+    let selected: Box<dyn Iterator<Item = &&str>> = if tail {
+        Box::new(records.iter().skip(records.len().saturating_sub(lines)))
+    } else {
+        Box::new(records.iter().take(lines))
+    };
+    let mut displayed_bytes = 0_usize;
+    for record in selected {
+        if record.len() > 2_000 {
+            return false;
+        }
+        displayed_bytes = displayed_bytes
+            .saturating_add(record.len())
+            .saturating_add(16);
+        if displayed_bytes > 50 * 1024 {
+            return false;
+        }
+    }
+    true
+}
+
+fn text_file_line_count(path: &Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    std::str::from_utf8(&bytes).ok()?;
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    Some(
+        bytes.iter().filter(|byte| **byte == b'\n').count()
+            + usize::from(bytes.last() != Some(&b'\n')),
+    )
+}
+
 fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
     let root = grep_project_root(ctx);
     let candidate = if Path::new(path).is_absolute() {
@@ -675,6 +868,32 @@ fn cat_read_request(command: &str) -> Option<Value> {
     Some(json!({ "file": parsed.args[1] }))
 }
 
+fn head_tail_read_request(command: &str, command_name: &str) -> Option<Value> {
+    let parsed = parse(command)?;
+    if parsed.appends_to.is_some()
+        || parsed.heredoc.is_some()
+        || parsed.args.first()? != command_name
+    {
+        return None;
+    }
+
+    let (lines, file) = match parsed.args.as_slice() {
+        [_command, file] => (10_u64, file.as_str()),
+        [_command, flag, count, file] if flag == "-n" => {
+            (count.parse::<u64>().ok()?, file.as_str())
+        }
+        [_command, compact, file] => {
+            let count = compact.strip_prefix('-')?.parse::<u64>().ok()?;
+            (count, file.as_str())
+        }
+        _ => return None,
+    };
+    if lines == 0 {
+        return None;
+    }
+    Some(json!({ "file": file, "limit": lines }))
+}
+
 fn append_request(command: &str) -> Option<Value> {
     let parsed = parse(command)?;
     let file = parsed.appends_to.clone()?;
@@ -798,7 +1017,12 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{find_request, should_suppress_grep_footer};
+    use super::{find_request, should_suppress_grep_footer, HeadRule, TailRule};
+    use crate::bash_rewrite::{RewriteDecision, RewriteRule};
+    use crate::config::Config;
+    use crate::context::{default_language_provider_factory, AppContext};
+    use crate::hashline::integration::RegistrationRequest;
+    use crate::protocol::DEFAULT_SESSION_ID;
 
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -910,5 +1134,48 @@ mod tests {
         // resolves as the project root, silently searching the wrong scope.
         assert_eq!(find_request(r#"find / -name "*.rs""#), None);
         assert_eq!(find_request(r#"find // -name "*.rs""#), None);
+    }
+
+    #[test]
+    fn head_and_tail_rewrites_are_hashline_only_and_tail_keeps_absolute_numbering() {
+        let dir = fixture();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::write(root.join("src/app.ts"), "one\ntwo\nthree\nfour\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                experimental_bash_rewrite: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(matches!(
+            HeadRule.decide("head -2 src/app.ts", "head-off", None, &ctx),
+            RewriteDecision::Decline(_)
+        ));
+        assert!(matches!(
+            TailRule.decide("tail -2 src/app.ts", "tail-off", None, &ctx),
+            RewriteDecision::Decline(_)
+        ));
+
+        ctx.hashline_bindings().register(
+            &root,
+            DEFAULT_SESSION_ID.to_string(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        let RewriteDecision::Accept(request) =
+            TailRule.decide("tail -2 src/app.ts", "tail-on", None, &ctx)
+        else {
+            panic!("effective hashline tail should rewrite");
+        };
+        let response = TailRule.execute(&request, &ctx);
+        assert!(response.success, "{}", response.data);
+        let content = response.data["content"].as_str().unwrap();
+        assert!(content.starts_with("[src/app.ts#"), "{content}");
+        assert!(content.contains("3:three\n4:four\n"), "{content}");
     }
 }

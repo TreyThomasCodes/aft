@@ -1728,6 +1728,15 @@ async fn teardown_installed_route(
         }
     }
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        let session_still_routed = routes
+            .values()
+            .any(|route| route.root == identity.root && route.session == identity.session);
+        if !session_still_routed {
+            if let Some(ctx) = executor.actor_context(&identity.root) {
+                ctx.hashline_bindings()
+                    .teardown(identity.root.as_path(), &identity.session);
+            }
+        }
         if migrated > 0 {
             log::debug!(
                 "subc attach: migrated {migrated} retry-buffered reliable Push frame(s) from route {} into detach replay",

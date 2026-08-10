@@ -113,6 +113,66 @@ describe("hoisted tool adapters", () => {
     expect(batchStartLineVariants.some((variant) => variant.type === "string")).toBe(true);
   });
 
+  test("hashline edit exposes patch and runs preflight, preview, then apply", async () => {
+    const root = await tempRoot();
+    let editCalls = 0;
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command) => {
+      if (command === "hashline_preflight") {
+        return {
+          success: true,
+          affected_paths: [join(root, "src.ts")],
+          affected_rel_paths: ["src.ts"],
+          mv_destinations: [],
+          text: "Preflight ready.",
+        };
+      }
+      expect(command).toBe("edit");
+      editCalls += 1;
+      return editCalls === 1
+        ? { success: true, preview: true, text: "Preview ready." }
+        : {
+            success: true,
+            filePath: "src.ts",
+            text: "1 of 1 files applied",
+            metadata: { diff: "Index: src.ts\n", files: [] },
+          };
+    });
+    registerHoistedTools(
+      api,
+      makePluginContext(bridge, {
+        config: { edit_mode: "hashline" },
+        hashlineEffective: true,
+      }),
+      {
+        hoistRead: false,
+        hoistWrite: false,
+        hoistEdit: true,
+        hoistGrep: false,
+        restrictToProjectRoot: true,
+      },
+    );
+
+    const editSchema = tools.get("edit")!.parameters as {
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+    expect(Object.keys(editSchema.properties ?? {})).toEqual(["patch"]);
+    expect(editSchema.required).toEqual(["patch"]);
+    const result = (await executeTool(
+      tools.get("edit")!,
+      { patch: "*** Begin Patch\n[src.ts#ABCD]\nPUT 1:\n+after\n*** End Patch" },
+      makeExtContext(root, "hashline-session"),
+    )) as { content: Array<{ text: string }> };
+
+    expect(calls.map((call) => [call.params.name, call.params.preview === true])).toEqual([
+      ["hashline_preflight", false],
+      ["edit", true],
+      ["edit", false],
+    ]);
+    expect(result.content[0].text).toContain("1 of 1 files applied");
+  });
+
   test("read maps offset/limit to inclusive start_line/end_line and appends footer", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((_command, params) => ({

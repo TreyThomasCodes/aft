@@ -146,6 +146,11 @@ impl HashlineBinding {
         &mut self.registers
     }
 
+    /// Borrow both session stores for one atomic request pipeline.
+    pub fn stores_mut(&mut self) -> (&mut SnapshotStore, &mut RegisterStore) {
+        (&mut self.snapshots, &mut self.registers)
+    }
+
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }

@@ -106,6 +106,14 @@ function buildSchema(): Record<string, unknown> {
           "Master switch for AFT. Set false in user config to disable AFT everywhere, or in project config to disable it only for that project. Project config can set this because turning AFT off is trust-safe.",
       },
 
+      edit_mode: {
+        type: "string",
+        enum: ["default", "hashline"],
+        default: "default",
+        description:
+          "Select the edit/read surface. Hashline mode renders tagged reads and changes edit arguments to exactly { patch }.",
+      },
+
       format_on_edit: {
         type: "boolean",
         default: false,

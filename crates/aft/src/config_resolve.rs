@@ -53,11 +53,29 @@ pub struct DroppedKey {
     pub reason: String,
 }
 
+/// A non-fatal config issue reported back to the caller during configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWarning {
+    pub code: &'static str,
+    pub key: &'static str,
+    pub tier: String,
+    pub value: String,
+    pub message: String,
+}
+
+/// Diagnostics produced while resetting an existing runtime config.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveDiagnostics {
+    pub dropped: Vec<DroppedKey>,
+    pub warnings: Vec<ConfigWarning>,
+}
+
 /// Fully resolved core config plus trust-boundary diagnostics.
 #[derive(Debug, Clone)]
 pub struct ResolveResult {
     pub config: Config,
     pub dropped: Vec<DroppedKey>,
+    pub warnings: Vec<ConfigWarning>,
 }
 
 /// Strict raw shape for aft.jsonc. This mirrors the TypeScript Zod schema, not
@@ -73,6 +91,7 @@ pub struct RawAftConfig {
     /// into `Config`; when this is false the plugin returns before launching the
     /// Rust process.
     pub enabled: Option<bool>,
+    pub edit_mode: Option<RawEditMode>,
     pub format_on_edit: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
     pub formatter_timeout_secs: Option<u32>,
@@ -101,6 +120,27 @@ pub struct RawAftConfig {
     pub semantic: Option<RawSemantic>,
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawEditMode {
+    Default,
+    Hashline,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for RawEditMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "default" => Self::Default,
+            "hashline" => Self::Hashline,
+            _ => Self::Unknown(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -422,11 +462,21 @@ pub struct RawSandbox {
 pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
+    let mut warnings = Vec::new();
 
     for tier in tiers {
         let Some(raw) = parse_tier(tier) else {
             continue;
         };
+        if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
+            warnings.push(ConfigWarning {
+                code: "invalid_edit_mode",
+                key: "edit_mode",
+                tier: tier.tier.clone(),
+                value: value.clone(),
+                message: format!("Unknown edit_mode value {value:?}; falling back to \"default\""),
+            });
+        }
 
         if tier.tier == "user" {
             merge_trusted_config(&mut merged, raw);
@@ -438,7 +488,11 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
 
     let mut config = Config::default();
     apply_resolved_config(&merged, &mut config);
-    ResolveResult { config, dropped }
+    ResolveResult {
+        config,
+        dropped,
+        warnings,
+    }
 }
 
 /// Resolve raw config tiers into the core-domain config and RESET it onto an
@@ -470,13 +524,23 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
 /// subc RouteBind sends only `config:[tiers]`, never the flat process-state
 /// params, so they stay at default for every subc bind regardless.
 pub fn resolve_config_onto(tiers: &[ConfigTier], base: &mut Config) -> Vec<DroppedKey> {
+    resolve_config_onto_with_diagnostics(tiers, base).dropped
+}
+
+/// Reset a runtime config while retaining both trust-boundary drops and
+/// non-fatal value warnings for the configure response.
+pub fn resolve_config_onto_with_diagnostics(
+    tiers: &[ConfigTier],
+    base: &mut Config,
+) -> ResolveDiagnostics {
     let ResolveResult {
         mut config,
         dropped,
+        warnings,
     } = resolve_config(tiers);
     carry_process_state(base, &mut config);
     *base = config;
-    dropped
+    ResolveDiagnostics { dropped, warnings }
 }
 
 /// Carry the process-state (non-`RawAftConfig`) fields from `base` onto a
@@ -534,6 +598,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.enabled.is_some() {
         base.enabled = override_config.enabled;
+    }
+    if override_config.edit_mode.is_some() {
+        base.edit_mode = override_config.edit_mode;
     }
     if override_config.format_on_edit.is_some() {
         base.format_on_edit = override_config.format_on_edit;
@@ -616,6 +683,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     // Project-safe shallow top-level fields.
     if project.enabled.is_some() {
         base.enabled = project.enabled;
+    }
+    if project.edit_mode.is_some() {
+        base.edit_mode = project.edit_mode;
     }
     if project.format_on_edit.is_some() {
         base.format_on_edit = project.format_on_edit;
@@ -1004,6 +1074,7 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
 /// fully resolved from the tiers. Process-state fields on `config` are never
 /// touched (they are not part of `RawAftConfig`).
 fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
+    config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
     }
@@ -1710,6 +1781,39 @@ mod tests {
         assert!(!result.config.experimental_bash_background);
         assert!(!result.config.bash_long_running_reminder_enabled);
         assert_eq!(result.config.bash_long_running_reminder_interval_ms, 123000);
+    }
+
+    #[test]
+    fn edit_mode_resolves_at_user_and_project_tiers_with_project_precedence() {
+        let hashline = resolve_config(&[
+            tier("user", r#"{"edit_mode":"default"}"#),
+            tier("project", r#"{"edit_mode":"hashline"}"#),
+        ]);
+        assert!(hashline.config.hashline_enabled);
+        assert!(hashline.dropped.is_empty());
+
+        let default = resolve_config(&[
+            tier("user", r#"{"edit_mode":"hashline"}"#),
+            tier("project", r#"{"edit_mode":"default"}"#),
+        ]);
+        assert!(!default.config.hashline_enabled);
+        assert!(default.dropped.is_empty());
+    }
+
+    #[test]
+    fn unknown_edit_mode_warns_and_falls_back_without_dropping_valid_keys() {
+        let result = resolve_config(&[tier(
+            "project",
+            r#"{"edit_mode":"future","format_on_edit":true}"#,
+        )]);
+
+        assert!(!result.config.hashline_enabled);
+        assert!(result.config.format_on_edit);
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].code, "invalid_edit_mode");
+        assert_eq!(result.warnings[0].key, "edit_mode");
+        assert_eq!(result.warnings[0].tier, "project");
+        assert_eq!(result.warnings[0].value, "future");
     }
 
     #[test]

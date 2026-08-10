@@ -168,6 +168,9 @@ pub struct Config {
     pub type_checker_timeout_secs: u32,
     /// Whether to auto-format files after edits (default: true).
     pub format_on_edit: bool,
+    /// Whether the hashline edit/read surface is enabled for eligible sessions.
+    /// Resolved from the public `edit_mode` enum in aft.jsonc.
+    pub hashline_enabled: bool,
     /// Whether to auto-validate files after edits (default: false).
     /// When "syntax", only tree-sitter parse check. When "full", runs type checker.
     pub validate_on_edit: Option<String>,
@@ -279,6 +282,7 @@ impl Default for Config {
             // context for the next edit/patch. Agents that want formatting opt in
             // via `format_on_edit: true`.
             format_on_edit: false,
+            hashline_enabled: false,
             validate_on_edit: None,
             formatter: HashMap::new(),
             checker: HashMap::new(),

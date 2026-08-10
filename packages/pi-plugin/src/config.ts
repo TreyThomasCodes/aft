@@ -188,6 +188,8 @@ export interface AftConfig {
   $schema?: string;
   /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
   enabled?: boolean;
+  /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
+  edit_mode?: "default" | "hashline";
   format_on_edit?: boolean;
   /** Maximum formatter subprocess wallclock seconds. Bounded 1..=600. Default 10. */
   formatter_timeout_secs?: number;
@@ -526,6 +528,8 @@ export const AftConfigSchema = z.preprocess(
       $schema: z.string().optional(),
       /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
       enabled: z.boolean().optional(),
+      /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
+      edit_mode: z.enum(["default", "hashline"]).optional(),
       /**
        * Whether to auto-format files after edits. Default: false — formatting can
        * reflow the file under the agent and stale the next edit's context. Opt in
@@ -636,6 +640,7 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
   const overrides: Record<string, unknown> = {};
 
+  if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
   if (config.formatter_timeout_secs !== undefined)
     overrides.formatter_timeout_secs = config.formatter_timeout_secs;
@@ -970,11 +975,23 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
 }
 
 function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
+  let configForParsing = rawConfig;
+  if (
+    Object.hasOwn(rawConfig, "edit_mode") &&
+    rawConfig.edit_mode !== "default" &&
+    rawConfig.edit_mode !== "hashline"
+  ) {
+    warn(
+      `Unknown edit_mode value ${JSON.stringify(rawConfig.edit_mode)}; falling back to "default"`,
+    );
+    configForParsing = { ...rawConfig, edit_mode: "default" };
+  }
+
   const partialConfig: Record<string, unknown> = {};
   const invalidSections: string[] = [];
 
-  for (const key of Object.keys(rawConfig)) {
-    const sectionResult = AftConfigSchema.safeParse({ [key]: rawConfig[key] });
+  for (const key of Object.keys(configForParsing)) {
+    const sectionResult = AftConfigSchema.safeParse({ [key]: configForParsing[key] });
     if (sectionResult.success) {
       const parsed = sectionResult.data as Record<string, unknown>;
       if (parsed[key] !== undefined) {
@@ -1168,6 +1185,7 @@ function getProjectLspStrippedKeys(lsp?: LspConfig): string[] {
  */
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "enabled",
+  "edit_mode",
   "tool_surface",
   // (Pi schema does not currently expose `hoist_builtin_tools`; if added, mark safe.)
   "format_on_edit",

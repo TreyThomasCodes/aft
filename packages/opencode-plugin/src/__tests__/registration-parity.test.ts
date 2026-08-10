@@ -13,7 +13,7 @@ import {
 import type { PluginContext as PiContext } from "../../../../packages/pi-plugin/src/types.js";
 import type { AftConfig as OpenCodeConfig } from "../config.js";
 import { buildSubcToolSchemas, SUBC_BARE_TOOL_NAMES } from "../subc-tool-schemas.js";
-import { buildOpenCodeToolMap } from "../tool-registration.js";
+import { buildOpenCodeToolMap, openCodeEditSlotSurvives } from "../tool-registration.js";
 import type { PluginContext as OpenCodeContext } from "../types.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -429,5 +429,70 @@ describe("v0.49 canonical path and subc inventories", () => {
       [...pi.entries()].map(([name, definition]) => [name, schemaForPi(definition)]),
     );
     assertRows(piSchemas, "Pi", (row) => row.tool);
+  });
+});
+
+describe("hashline edit schema selection", () => {
+  test("both hosts expose exactly patch under the surviving edit slot", () => {
+    const config = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: true,
+      edit_mode: "hashline",
+    };
+
+    const openCodeContext = stubContext(config) as OpenCodeContext;
+    openCodeContext.hashlineEffective = true;
+    const openCode = buildOpenCodeToolMap(openCodeContext, config as OpenCodeConfig) as Record<
+      string,
+      { args: Record<string, unknown> }
+    >;
+    const openCodeSchema = schemaForOpenCode(openCode.edit);
+    expect(Object.keys(openCodeSchema.properties as JsonObject)).toEqual(["patch"]);
+    expect(openCodeSchema.required).toEqual(["patch"]);
+
+    const piContext = stubContext(config) as PiContext;
+    piContext.hashlineEffective = true;
+    const piTools = new Map<string, PiToolDefinition>();
+    const pi = {
+      registerTool(definition: PiToolDefinition) {
+        piTools.set(definition.name, definition);
+      },
+    } as unknown as ExtensionAPI;
+    registerPiToolSurface(pi, piContext, resolvePiToolSurface(config as PiConfig));
+    const piSchema = schemaForPi(piTools.get("edit") as PiToolDefinition);
+    expect(Object.keys(piSchema.properties as JsonObject)).toEqual(["patch"]);
+    expect(piSchema.required).toEqual(["patch"]);
+    expect(piSchema.additionalProperties).toBe(false);
+
+    const governed = JSON.parse(
+      readFileSync(
+        new URL("../../../../crates/aft/src/hashline_edit_schemas.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { arms: { hashline: { schema: JsonObject } } };
+    const governedSchema = canonicalizeSchema("edit", governed.arms.hashline.schema);
+    expect(canonicalizeSchema("edit", openCodeSchema)).toEqual(governedSchema);
+    expect(canonicalizeSchema("edit", piSchema)).toEqual(governedSchema);
+  });
+
+  test("default schema stays legacy and final surface controls edit-slot eligibility", () => {
+    const legacy = openCodeTools(profileConfigs["REG-V049-OC-REC"]) as Record<
+      string,
+      { args: Record<string, unknown> }
+    >;
+    expect(Object.keys(schemaForOpenCode(legacy.edit).properties as JsonObject)).toContain(
+      "filePath",
+    );
+    expect(openCodeEditSlotSurvives({ tool_surface: "recommended" })).toBe(true);
+    expect(openCodeEditSlotSurvives({ tool_surface: "minimal", edit_mode: "hashline" })).toBe(
+      false,
+    );
+    expect(
+      openCodeEditSlotSurvives({
+        tool_surface: "recommended",
+        edit_mode: "hashline",
+        disabled_tools: ["edit"],
+      }),
+    ).toBe(false);
   });
 });

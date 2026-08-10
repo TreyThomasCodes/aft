@@ -604,7 +604,67 @@ ${backupBehavior}
 - Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.`;
 }
 
+function createHashlineEditTool(ctx: PluginContext): ToolDefinition {
+  return {
+    description:
+      "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string of one or more `[path#TAG]` sections with PUT/CUT/REM/MV operations. Paths and tags come from section headers; obtain tags from tagged reads. Server-owned preview control is outside this schema.",
+    args: {
+      patch: z
+        .string()
+        .min(1)
+        .describe(
+          "Hashline patch text with one or more [path#TAG] sections and PUT/CUT/REM/MV operations",
+        ),
+    },
+    execute: async (args, context): Promise<ToolResult> => {
+      const patch = args.patch as string;
+      const projectRoot = await resolveProjectRoot(ctx, context);
+      const rawArgs = { patch };
+      const preflight = await callToolCall(ctx, context, "hashline_preflight", rawArgs);
+      if (preflight.success === false) throw toolErrorFromResponse("edit", preflight);
+
+      const permissionPatterns = [
+        ...coerceStringArray(preflight.affected_paths),
+        ...coerceStringArray(preflight.affected_rel_paths),
+        ...coerceStringArray(preflight.mv_destinations),
+      ].filter((value, index, all) => all.indexOf(value) === index);
+      for (const target of [
+        ...coerceStringArray(preflight.affected_paths),
+        ...coerceStringArray(preflight.mv_destinations),
+      ]) {
+        const absolute = resolvePathFromProjectRoot(projectRoot, target);
+        const denial = await assertExternalDirectoryPermission(ctx, context, absolute);
+        if (denial) return permissionDeniedResponse(denial);
+      }
+
+      const denial = await askEditPermission(context, permissionPatterns, {
+        surface: "hashline",
+      });
+      if (denial) return permissionDeniedResponse(denial);
+
+      const preview = await callToolCall(ctx, context, "edit", rawArgs, { preview: true });
+      if (preview.success === false) throw toolErrorFromResponse("edit", preview);
+
+      const data = await callToolCall(ctx, context, "edit", rawArgs);
+      if (data.success === false) throw toolErrorFromResponse("edit", data);
+      const firstPath =
+        typeof data.filePath === "string"
+          ? resolvePathFromProjectRoot(projectRoot, data.filePath)
+          : "";
+      return {
+        output: data.text,
+        title: firstPath ? relativeToWorktree(firstPath, projectRoot) : "edit",
+        metadata:
+          data.metadata && typeof data.metadata === "object"
+            ? (data.metadata as Record<string, unknown>)
+            : {},
+      };
+    },
+  };
+}
+
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
+  if (ctx.hashlineEffective === true) return createHashlineEditTool(ctx);
   return {
     description: getEditDescription(ctx, writeToolName),
     args: {
@@ -1096,7 +1156,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     }
   }
 
-  return prepareToolMap(tools);
+  return prepareToolMap(tools, ctx.hashlineEffective === true ? new Set(["edit"]) : undefined);
 }
 
 /**

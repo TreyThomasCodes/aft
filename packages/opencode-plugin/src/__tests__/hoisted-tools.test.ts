@@ -51,7 +51,13 @@ function createPluginContext(
   pool: BridgePool,
   config: PluginContext["config"] = {} as PluginContext["config"],
 ): PluginContext {
-  return { pool, client: createMockClient(), config, storageDir: "/tmp/aft-test" };
+  return {
+    pool,
+    client: createMockClient(),
+    config,
+    hashlineEffective: config.edit_mode === "hashline",
+    storageDir: "/tmp/aft-test",
+  };
 }
 
 /** Mock SDK ToolContext for test execute calls. */
@@ -794,6 +800,55 @@ describe("Hoisted tool execute handlers", () => {
 
     const diff = askCalls.find((call) => call.permission === "edit")?.metadata?.diff as string;
     expect(diff).toBe(previewDiff);
+  });
+
+  test("hashline edit runs preflight, preview permission, then apply", async () => {
+    tmpDir = await makeTempDir();
+    const askCalls: Array<Record<string, unknown>> = [];
+    sdkCtx = { ...createMockSdkContext(tmpDir), ask: recordingAsk(askCalls) } as ToolContext;
+    const patch = "*** Begin Patch\n[src.ts#ABCD]\nPUT 1:\n+after\n*** End Patch";
+    const previewDiff = "Index: src.ts\n--- src.ts\n+++ src.ts\n";
+
+    const { calls, tools } = createMockHoistedHarness(
+      async (command, _params, options) => {
+        if (command === "hashline_preflight") {
+          return {
+            success: true,
+            affected_paths: [resolve(tmpDir as string, "src.ts")],
+            affected_rel_paths: ["src.ts"],
+            mv_destinations: [],
+            text: "Preflight ready.",
+          };
+        }
+        expect(command).toBe("edit");
+        if (options?.preview) {
+          return {
+            success: true,
+            preview: true,
+            text: "Preview ready.",
+            metadata: { diff: previewDiff },
+          };
+        }
+        return {
+          success: true,
+          filePath: "src.ts",
+          text: "1 of 1 files applied",
+          metadata: { diff: previewDiff, files: [] },
+        };
+      },
+      { edit_mode: "hashline" },
+    );
+
+    const result = await tools.edit.execute({ patch }, sdkCtx);
+
+    expect(calls.map((call) => [call.command, call.options?.preview === true])).toEqual([
+      ["hashline_preflight", false],
+      ["edit", true],
+      ["edit", false],
+    ]);
+    expect(askCalls.find((call) => call.permission === "edit")?.patterns).toContain("src.ts");
+    expect(askCalls.find((call) => call.permission === "edit")?.metadata?.surface).toBe("hashline");
+    expect(result.output).toBe("1 of 1 files applied");
   });
 
   test("edit symbol approval ask uses the Rust preview diff", async () => {

@@ -13,6 +13,8 @@ import type { AftConfig } from "./config.js";
 export interface PluginContext {
   pool: AftTransportPool;
   config: AftConfig;
+  /** Whether hashline edit/read mode is active for this plugin registration. */
+  hashlineEffective?: boolean;
   /** Absolute path to AFT's data storage dir (e.g. ~/.local/share/cortexkit/aft). */
   storageDir: string;
 }

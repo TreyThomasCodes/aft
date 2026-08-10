@@ -1823,8 +1823,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(tiers) => tiers,
         Err(error) => return Response::error(&req.id, "invalid_request", error),
     };
-    let config_dropped_keys: Vec<crate::config_resolve::DroppedKey> =
-        crate::config_resolve::resolve_config_onto(&tiers, &mut next_config);
+    let config_diagnostics =
+        crate::config_resolve::resolve_config_onto_with_diagnostics(&tiers, &mut next_config);
+    let config_dropped_keys = config_diagnostics.dropped;
+    let mut configure_warnings = config_diagnostics
+        .warnings
+        .into_iter()
+        .map(|warning| {
+            json!({
+                "code": warning.code,
+                "key": warning.key,
+                "tier": warning.tier,
+                "value": warning.value,
+                "message": warning.message,
+            })
+        })
+        .collect::<Vec<_>>();
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
     // relocation posture). The original guard existed to stop UNTRUSTED *project*
@@ -1848,6 +1862,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         next_config.aft_search_registered = v;
     }
+    let edit_slot_survives = match params.get("edit_slot_survives") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "configure: edit_slot_survives must be a boolean",
+            );
+        }
+        None => true,
+    };
     if let Some(v) = params.get("bash_permissions").and_then(|v| v.as_bool()) {
         next_config.bash_permissions = v;
     }
@@ -1999,6 +2024,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
+        let registration = ctx.hashline_bindings().register(
+            &canonical_cache_root,
+            req.session().to_string(),
+            crate::hashline::integration::RegistrationRequest {
+                configured_enabled: next_config.hashline_enabled,
+                edit_slot_survives,
+            },
+        );
+        if let Some(downgrade) = registration.downgrade {
+            configure_warnings.push(json!({
+                "code": downgrade.code,
+                "reason": downgrade.reason,
+                "message": "Hashline mode was downgraded because the edit tool is not registered for this session",
+            }));
+        }
         let first_session_bind = ctx.note_configure_session_binding(
             canonical_cache_root.clone(),
             req.session().to_string(),
@@ -2051,7 +2091,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             json!({
                 "project_root": root_path.display().to_string(),
-                "warnings": [],
+                "warnings": configure_warnings,
                 "warnings_pending": false,
                 "search_index_cache_reused": search_index_cache_reused,
                 "artifact_owner": artifact_owner_status
@@ -2210,6 +2250,21 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.advance_semantic_fingerprint_generation();
     }
     ctx.set_config(next_config.clone());
+    let registration = ctx.hashline_bindings().register(
+        &canonical_cache_root,
+        req.session().to_string(),
+        crate::hashline::integration::RegistrationRequest {
+            configured_enabled: next_config.hashline_enabled,
+            edit_slot_survives,
+        },
+    );
+    if let Some(downgrade) = registration.downgrade {
+        configure_warnings.push(json!({
+            "code": downgrade.code,
+            "reason": downgrade.reason,
+            "message": "Hashline mode was downgraded because the edit tool is not registered for this session",
+        }));
+    }
     crate::logging::sync_storage_root(ctx.storage_dir());
     ctx.set_harness(harness.clone());
     {
@@ -2458,7 +2513,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         json!({
             "project_root": root_path.display().to_string(),
-            "warnings": [],
+            "warnings": configure_warnings,
             "warnings_pending": warnings_pending,
             "search_index_cache_reused": search_index_cache_reused,
             "artifact_owner": artifact_owner_status
@@ -4006,7 +4061,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::ffi::OsString;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -4018,8 +4073,8 @@ mod tests {
     use super::{
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
-        external_ignore_watch_paths, install_project_watcher_with, parse_lsp_paths_extra,
-        reset_configure_artifact_load_attempts_for_test,
+        external_ignore_watch_paths, handle_configure, install_project_watcher_with,
+        parse_lsp_paths_extra, reset_configure_artifact_load_attempts_for_test,
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
@@ -4310,6 +4365,55 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, doc).unwrap();
+    }
+
+    #[test]
+    fn configure_registers_effective_hashline_and_reports_edit_slot_downgrade() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = test_context();
+        let base_params = json!({
+            "project_root": canonical_root,
+            "harness": "opencode",
+            "config": [project_tier(json!({
+                "edit_mode": "hashline",
+                "search_index": false,
+                "semantic_search": false
+            }))]
+        });
+        let mut downgraded_params = base_params.clone();
+        downgraded_params["edit_slot_survives"] = Value::Bool(false);
+        let downgraded = handle_configure(
+            &configure_request_with_session(downgraded_params, "hashline-session"),
+            &ctx,
+        );
+        assert!(downgraded.success, "{}", downgraded.data);
+        assert!(downgraded.data["warnings"]
+            .as_array()
+            .is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning["code"] == "hashline_downgraded"
+                        && warning["reason"] == "edit_not_registered"
+                })
+            }));
+        assert!(!ctx
+            .hashline_bindings()
+            .peek(&canonical_root, "hashline-session")
+            .unwrap()
+            .effective());
+
+        let mut enabled_params = base_params;
+        enabled_params["edit_slot_survives"] = Value::Bool(true);
+        let enabled = handle_configure(
+            &configure_request_with_session(enabled_params, "hashline-session"),
+            &ctx,
+        );
+        assert!(enabled.success, "{}", enabled.data);
+        assert!(ctx
+            .hashline_bindings()
+            .peek(&canonical_root, "hashline-session")
+            .unwrap()
+            .effective());
     }
 
     fn init_git_fixture(root: &std::path::Path) {

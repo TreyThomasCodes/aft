@@ -626,13 +626,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   }
   pool.setConfigureOverride("harness", "pi");
+  const surface = resolvePiToolSurface(config);
+  pool.setConfigureOverride("edit_slot_survives", surface.hoistEdit);
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager
   // warmup spawn below so even the first bridge configures with the flag.
   // `resolveToolSurface` is pure; `.semantic` is the same predicate the tool
   // registration uses (ok("aft_search") && semantic_search === true).
-  pool.setConfigureOverride("aft_search_registered", resolvePiToolSurface(config).semantic);
-  const ctx: PluginContext = { pool, config, storageDir };
+  pool.setConfigureOverride("aft_search_registered", surface.semantic);
+  const ctx: PluginContext = {
+    pool,
+    config,
+    hashlineEffective: config.edit_mode === "hashline" && surface.hoistEdit,
+    storageDir,
+  };
 
   // Settle the ONNX runtime download promise (started above) and patch the
   // resolved path into the pool's configure overrides. Bridges spawned AFTER
@@ -731,8 +738,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       storageDir,
     );
   }
-
-  const surface = resolvePiToolSurface(config);
 
   registerPiToolSurface(pi, ctx, surface);
 

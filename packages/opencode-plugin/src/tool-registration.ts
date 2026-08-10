@@ -17,6 +17,15 @@ import type { PluginContext } from "./types.js";
 
 const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"] as const;
 
+/** Returns true when bare `edit` remains available after surface, hoisting, and disable filters. */
+export function openCodeEditSlotSurvives(config: AftConfig): boolean {
+  return (
+    (config.tool_surface ?? "recommended") !== "minimal" &&
+    config.hoist_builtin_tools !== false &&
+    !(config.disabled_tools ?? []).includes("edit")
+  );
+}
+
 /**
  * Build the exact OpenCode registration map without starting a bridge.
  *

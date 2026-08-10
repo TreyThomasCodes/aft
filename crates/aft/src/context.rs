@@ -1485,6 +1485,7 @@ pub struct AppContext {
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
     configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
+    hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     artifact_cache_key_derivations: AtomicU64,
@@ -1831,6 +1832,7 @@ impl AppContext {
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
+            hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
@@ -3032,6 +3034,11 @@ impl AppContext {
     /// Access the backup store.
     pub fn backup(&self) -> &parking_lot::Mutex<BackupStore> {
         &self.backup
+    }
+
+    /// Session-scoped hashline bindings installed by successful configure calls.
+    pub fn hashline_bindings(&self) -> &crate::hashline::integration::BindingRegistry {
+        &self.hashline_bindings
     }
 
     /// Access the checkpoint store.

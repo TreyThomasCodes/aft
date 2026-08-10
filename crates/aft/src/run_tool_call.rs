@@ -159,9 +159,21 @@ pub fn run_tool_call(
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
     let sanitized_args = strip_agent_preview_arg_owned(args);
+    let binding_root = app_ctx
+        .canonical_cache_root_opt()
+        .unwrap_or_else(|| ctx.project_root.clone());
+    let binding_guard = app_ctx.hashline_bindings().capture(
+        binding_root,
+        ctx.session_id
+            .as_deref()
+            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+    );
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
+        effective_hashline: crate::hashline::integration::effective_for_capture(
+            binding_guard.as_ref(),
+        ),
     };
     let (command, translated_args) = if crate::subc_translate::supports_tool(bare_name) {
         match crate::subc_translate::subc_translate_owned_with_context(

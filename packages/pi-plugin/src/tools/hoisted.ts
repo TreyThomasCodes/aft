@@ -313,6 +313,23 @@ const EditParams = Type.Object({
   ),
 });
 
+const HashlineEditParams = Type.Object(
+  {
+    patch: Type.String({
+      minLength: 1,
+      description:
+        "Hashline patch text with one or more [path#TAG] sections and PUT/CUT/REM/MV operations",
+    }),
+  },
+  { additionalProperties: false },
+);
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
 const GrepParams = Type.Object({
   pattern: Type.String({ description: "Regex pattern to search for" }),
   path: Type.Optional(
@@ -602,7 +619,51 @@ export function registerHoistedTools(
     );
   }
 
-  if (surface.hoistEdit) {
+  if (surface.hoistEdit && ctx.hashlineEffective === true) {
+    pi.registerTool<typeof HashlineEditParams, FileMutationDetails>({
+      name: "edit",
+      label: "edit",
+      description:
+        "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string of one or more `[path#TAG]` sections with PUT/CUT/REM/MV operations. Paths and tags come from section headers; obtain tags from tagged reads. Server-owned preview control is outside this schema.",
+      promptSnippet: "Apply a tagged hashline patch through the edit tool",
+      promptGuidelines: [
+        "Read a file to obtain its current hashline tag before editing it.",
+        "Pass exactly one patch string; paths and tags belong in patch section headers.",
+      ],
+      parameters: HashlineEditParams,
+      async execute(
+        _toolCallId: string,
+        params: Static<typeof HashlineEditParams>,
+        _signal,
+        _onUpdate,
+        extCtx,
+      ) {
+        const bridge = bridgeFor(ctx, extCtx.cwd);
+        const rawArgs = { patch: params.patch };
+        const preflight = await callToolCall(bridge, "hashline_preflight", rawArgs, extCtx);
+        if (preflight.success === false) throw toolErrorFromResponse("edit", preflight);
+        for (const target of [
+          ...stringList(preflight.affected_paths),
+          ...stringList(preflight.mv_destinations),
+        ]) {
+          await assertExternalDirectoryPermission(
+            extCtx,
+            await resolvePathArg(extCtx.cwd, target),
+            {
+              restrictToProjectRoot: surface.restrictToProjectRoot,
+            },
+          );
+        }
+        const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
+        if (preview.success === false) throw toolErrorFromResponse("edit", preview);
+        const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+        if (response.success === false) throw toolErrorFromResponse("edit", response);
+        return buildMutationResult(response);
+      },
+    });
+  }
+
+  if (surface.hoistEdit && ctx.hashlineEffective !== true) {
     pi.registerTool<typeof EditParams, FileMutationDetails>(
       withPathAliasPreparation({
         name: "edit",

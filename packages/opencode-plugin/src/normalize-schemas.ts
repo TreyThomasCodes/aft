@@ -94,11 +94,16 @@ function preserveDisplayFilePathAlias(
   }
 }
 
-function prepareToolMap(tools: Record<string, ToolDefinition>): Record<string, ToolDefinition> {
+function prepareToolMap(
+  tools: Record<string, ToolDefinition>,
+  passthroughToolNames: ReadonlySet<string> = new Set(),
+): Record<string, ToolDefinition> {
   for (const [toolName, def] of Object.entries(tools)) {
     const execute = def.execute;
     def.execute = (async (args, context) => {
-      const prepared = prepareOpenCodeArguments(toolName, args);
+      const prepared = passthroughToolNames.has(toolName)
+        ? (args as Record<string, unknown>)
+        : prepareOpenCodeArguments(toolName, args);
       preserveDisplayFilePathAlias(toolName, args, prepared);
       return execute(prepared, context);
     }) as ToolDefinition["execute"];

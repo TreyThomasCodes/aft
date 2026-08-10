@@ -14,6 +14,7 @@ use image::codecs::{gif::GifEncoder, jpeg::JpegEncoder, png::PngEncoder, webp::W
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageDecoder, ImageEncoder};
+use serde_json::Value;
 
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -719,6 +720,204 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
+    let mut response = handle_read_legacy(req, ctx);
+    if !response.success
+        || response
+            .data
+            .get("content")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return response;
+    }
+
+    let binding_root = ctx
+        .canonical_cache_root_opt()
+        .or_else(|| ctx.config().project_root.clone());
+    let Some(binding_root) = binding_root else {
+        return response;
+    };
+    let Some(guard) = ctx
+        .hashline_bindings()
+        .capture(binding_root, req.session().to_string())
+    else {
+        return response;
+    };
+    if !guard.effective() {
+        return response;
+    }
+
+    let Some(file) = req.params.get("file").and_then(Value::as_str) else {
+        return response;
+    };
+    let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+        Ok(path) => path,
+        Err(_) => return response,
+    };
+    let requested_path = req
+        .params
+        .get("_hashline_requested_path")
+        .and_then(Value::as_str)
+        .unwrap_or(file)
+        .to_string();
+    let bash_kind = req
+        .params
+        .get("_hashline_bash_read_kind")
+        .and_then(Value::as_str)
+        .and_then(|kind| match kind {
+            "cat" => Some(crate::hashline::snapshot::BashReadKind::Cat),
+            "head" => Some(crate::hashline::snapshot::BashReadKind::Head {
+                lines: req
+                    .params
+                    .get("_hashline_bash_read_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10) as usize,
+            }),
+            "tail" => Some(crate::hashline::snapshot::BashReadKind::Tail {
+                lines: req
+                    .params
+                    .get("_hashline_bash_read_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10) as usize,
+            }),
+            _ => None,
+        });
+    let selection = read_selection(req, &response);
+    let publication = guard.with_binding_mut(|binding| {
+        if let Some(kind) = bash_kind {
+            crate::hashline::snapshot::capture_bash_rewrite_read(
+                binding.snapshots_mut(),
+                &path,
+                requested_path.clone(),
+                kind,
+                ctx.config().experimental_bash_rewrite,
+                true,
+                true,
+            )
+        } else {
+            crate::hashline::snapshot::capture_taggable_read(
+                binding.snapshots_mut(),
+                &path,
+                requested_path.clone(),
+                selection,
+            )
+        }
+    });
+    let Ok(publication) = publication else {
+        return response;
+    };
+
+    if let Some(data) = response.data.as_object_mut() {
+        match publication {
+            crate::hashline::snapshot::ReadPublication::Tagged {
+                snapshot,
+                rendering,
+            } => {
+                let first_line = rendering.rendered_lines.iter().next().copied().unwrap_or(1);
+                let last_line = rendering
+                    .rendered_lines
+                    .iter()
+                    .next_back()
+                    .copied()
+                    .unwrap_or(first_line);
+                data.insert("content".into(), Value::String(rendering.text));
+                data.insert(
+                    "requested_path".into(),
+                    Value::String(rendering.requested_path),
+                );
+                data.insert("hashline_tag".into(), Value::String(rendering.tag));
+                data.insert(
+                    "lines_read".into(),
+                    Value::from(rendering.rendered_lines.len()),
+                );
+                data.insert("start_line".into(), Value::from(first_line));
+                data.insert("end_line".into(), Value::from(last_line));
+                data.insert("total_lines".into(), Value::from(snapshot.total_lines));
+            }
+            crate::hashline::snapshot::ReadPublication::Tagless { rendering, reason } => {
+                if !rendering.text.is_empty() {
+                    data.insert("content".into(), Value::String(rendering.text));
+                }
+                data.insert(
+                    "requested_path".into(),
+                    Value::String(rendering.requested_path),
+                );
+                data.insert(
+                    "hashline_tag_unavailable_reason".into(),
+                    Value::String(reason.to_string()),
+                );
+                if matches!(
+                    reason,
+                    crate::hashline::snapshot::UntaggableReason::Oversize { .. }
+                ) {
+                    let content = data
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    data.insert(
+                        "content".into(),
+                        Value::String(format!("{content}[hashline tag unavailable: {reason}]\n")),
+                    );
+                }
+            }
+        }
+    }
+    response
+}
+
+fn read_selection(
+    req: &RawRequest,
+    response: &Response,
+) -> crate::hashline::snapshot::ReadSelection {
+    if let Some(kind) = req
+        .params
+        .get("_hashline_bash_read_kind")
+        .and_then(Value::as_str)
+    {
+        let lines = req
+            .params
+            .get("_hashline_bash_read_lines")
+            .and_then(Value::as_u64)
+            .unwrap_or(10) as usize;
+        return match kind {
+            "cat" => crate::hashline::snapshot::ReadSelection::WholeFile,
+            "head" => crate::hashline::snapshot::ReadSelection::Head(lines),
+            "tail" => crate::hashline::snapshot::ReadSelection::Tail(lines),
+            _ => crate::hashline::snapshot::ReadSelection::WholeFile,
+        };
+    }
+
+    let start = req
+        .params
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as usize;
+    let explicit_end = req.params.get("end_line").and_then(Value::as_u64);
+    if req.params.get("start_line").is_some() || explicit_end.is_some() {
+        let limit = req
+            .params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_LIMIT as u64) as usize;
+        let end = explicit_end
+            .map(|value| value as usize)
+            .unwrap_or_else(|| start.saturating_add(limit).saturating_sub(1));
+        return crate::hashline::snapshot::ReadSelection::Range { start, end };
+    }
+
+    if response.data.get("total_lines").and_then(Value::as_u64) == Some(0) {
+        crate::hashline::snapshot::ReadSelection::WholeFile
+    } else {
+        crate::hashline::snapshot::ReadSelection::Head(
+            req.params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_LIMIT as u64) as usize,
+        )
+    }
+}
+
+fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -1588,5 +1787,80 @@ mod tests {
             !text.contains("File is large"),
             "ranged read must not carry the soft note, got: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hashline_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::config::Config;
+    use crate::context::{default_language_provider_factory, AppContext};
+    use crate::hashline::integration::RegistrationRequest;
+    use crate::protocol::{RawRequest, DEFAULT_SESSION_ID};
+
+    fn context(root: &Path) -> AppContext {
+        AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn request_for(path: &Path) -> RawRequest {
+        RawRequest {
+            id: "hashline-read-test".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": path.to_string_lossy() }),
+        }
+    }
+
+    #[test]
+    fn unregistered_read_is_byte_identical_to_legacy_rendering() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("fixture write");
+        let ctx = context(temp.path());
+        let req = request_for(&path);
+
+        let legacy = handle_read_legacy(&req, &ctx);
+        let wrapped = handle_read(&req, &ctx);
+        assert_eq!(wrapped.success, legacy.success);
+        assert_eq!(wrapped.data, legacy.data);
+    }
+
+    #[test]
+    fn effective_hashline_read_mints_snapshot_and_preserves_requested_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical_root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let path = canonical_root.join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("fixture write");
+        let ctx = context(&canonical_root);
+        let registration = ctx.hashline_bindings().register(
+            &canonical_root,
+            DEFAULT_SESSION_ID.to_string(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        assert!(registration.effective);
+
+        let mut req = request_for(&path);
+        req.params["_hashline_requested_path"] = Value::String("sample.txt".to_string());
+        let response = handle_read(&req, &ctx);
+        assert!(response.success);
+        assert_eq!(response.data["requested_path"], "sample.txt");
+        let content = response.data["content"].as_str().expect("tagged content");
+        assert!(content.starts_with("[sample.txt#"), "{content}");
+        assert!(content.contains("1:alpha\n2:beta\n"), "{content}");
+        assert!(response.data["hashline_tag"]
+            .as_str()
+            .is_some_and(|tag| tag.len() == 4));
     }
 }

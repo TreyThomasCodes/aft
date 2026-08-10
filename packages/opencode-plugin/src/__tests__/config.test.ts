@@ -83,6 +83,38 @@ describe("loadAftConfig", () => {
     expect(config.enabled ?? true).toBe(true);
   });
 
+  test("edit_mode uses ordinary project-over-user precedence", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ edit_mode: "hashline" }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ edit_mode: "default" }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect((JSON.parse(result.stdout) as { edit_mode?: string }).edit_mode).toBe("default");
+  });
+
+  test("unknown edit_mode warns, falls back to default, and preserves valid keys", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ edit_mode: "hashline" }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ edit_mode: "future", format_on_edit: true }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    const loaded = JSON.parse(result.stdout) as { edit_mode?: string; format_on_edit?: boolean };
+
+    expect(loaded.edit_mode).toBe("default");
+    expect(loaded.format_on_edit).toBe(true);
+    expect(result.stderr).toContain("edit_mode");
+  });
+
   test("project enabled false overrides user enabled true", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));

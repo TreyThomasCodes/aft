@@ -17,6 +17,7 @@ pub struct Translated {
 pub struct TranslateContext {
     pub diagnostics_on_edit: bool,
     pub preview: bool,
+    pub effective_hashline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +900,33 @@ pub fn subc_translate_owned_with_context(
     project_root: &Path,
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
+    if bare_name == "edit" && ctx.effective_hashline {
+        return crate::hashline::integration::translate_gate_on_edit(&agent_args)
+            .map(|translation| {
+                let mut args = translation
+                    .to_native_args()
+                    .as_object()
+                    .cloned()
+                    .expect("hashline native arguments are always an object");
+                if ctx.preview {
+                    args.insert("preview".to_string(), Value::Bool(true));
+                }
+                Translated {
+                    command: translation.command.to_string(),
+                    args,
+                }
+            })
+            .map_err(|rejection| TranslateError {
+                code: rejection.code.as_str(),
+                message: format!(
+                    "{} at {}: {}\n{}",
+                    rejection.code.as_str(),
+                    rejection.stage.as_str(),
+                    rejection.message,
+                    rejection.steering
+                ),
+            });
+    }
     let agent_args = normalize_path_arguments(bare_name, agent_args)?;
     match bare_name {
         "bash" => translate_bash(agent_args, project_root),

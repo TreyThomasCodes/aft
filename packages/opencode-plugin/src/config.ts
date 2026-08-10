@@ -277,6 +277,8 @@ export const AftConfigSchema = z.preprocess(
        * AFT off is not a privilege escalation.
        */
       enabled: z.boolean().optional(),
+      /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
+      edit_mode: z.enum(["default", "hashline"]).optional(),
       /**
        * Whether to auto-format files after edits. Default: false — formatting can
        * reflow the file under the agent and stale the next edit's context. Opt in
@@ -491,6 +493,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   const overrides: Record<string, unknown> = {};
 
   // Edit-pipeline behavior — overridable per-project.
+  if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
   if (config.formatter_timeout_secs !== undefined)
     overrides.formatter_timeout_secs = config.formatter_timeout_secs;
@@ -956,7 +959,19 @@ export function migrateAftConfigFile(
 // ---------------------------------------------------------------------------
 
 function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | null {
-  const fullResult = AftConfigSchema.safeParse(rawConfig);
+  let configForParsing = rawConfig;
+  if (
+    Object.hasOwn(rawConfig, "edit_mode") &&
+    rawConfig.edit_mode !== "default" &&
+    rawConfig.edit_mode !== "hashline"
+  ) {
+    warn(
+      `Unknown edit_mode value ${JSON.stringify(rawConfig.edit_mode)}; falling back to "default"`,
+    );
+    configForParsing = { ...rawConfig, edit_mode: "default" };
+  }
+
+  const fullResult = AftConfigSchema.safeParse(configForParsing);
   if (fullResult.success) {
     return fullResult.data;
   }
@@ -964,8 +979,8 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
   const partialConfig: Record<string, unknown> = {};
   const invalidSections: string[] = [];
 
-  for (const key of Object.keys(rawConfig)) {
-    const sectionResult = AftConfigSchema.safeParse({ [key]: rawConfig[key] });
+  for (const key of Object.keys(configForParsing)) {
+    const sectionResult = AftConfigSchema.safeParse({ [key]: configForParsing[key] });
     if (sectionResult.success) {
       const parsed = sectionResult.data as Record<string, unknown>;
       if (parsed[key] !== undefined) {
@@ -1263,6 +1278,7 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
  */
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "enabled",
+  "edit_mode",
   "tool_surface",
   "hoist_builtin_tools",
   "format_on_edit",

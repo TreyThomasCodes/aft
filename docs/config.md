@@ -21,6 +21,10 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
   // config can set true to re-enable over a user-level false.
   "enabled": true,
 
+  // Edit/read surface: "default" (default) or "hashline". User and project
+  // tiers both accept this key; ordinary project-over-user precedence applies.
+  "edit_mode": "default",
+
   // Replace the host harness's built-in tools (read/write/edit/apply_patch/grep/etc.)
   // with AFT-enhanced versions. Default: true. Set to false to use aft_ prefix on all
   // tools instead — useful when you want to keep the harness defaults and access AFT
@@ -226,6 +230,14 @@ AFT auto-detects the formatter and checker from project config files (`biome.jso
 (biome, oxfmt, prettier, tsc, pyright) are discovered in
 `node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
 if auto-detection picks the wrong tool or you want to pin a specific formatter.
+
+### Hashline edit mode
+
+Set `edit_mode` to `"hashline"` to make `edit` accept exactly `{ "patch": "..." }` and to render text reads with snapshot tags used by those patches. Other tools, including `write` and `apply_patch`, keep their existing schemas and behavior. The setting defaults to `"default"`; it is accepted in both user and project config, with ordinary project-over-user precedence. An unknown value emits a configure warning and falls back to `"default"`.
+
+A hashline mutation starts only after every affected path has a backup record. If backup registration cannot complete, the edit fails before any file is changed.
+
+Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
 
 ## Native command sandbox
 

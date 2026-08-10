@@ -1,0 +1,108 @@
+{
+  "tool": "edit",
+  "dual_mode": true,
+  "selection": "session_effective_hashline",
+  "arms": {
+    "legacy": {
+      "arm": "legacy",
+      "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "description": "Path to the file to edit (absolute or relative to project root)",
+            "type": "string"
+          },
+          "symbol": {
+            "description": "Named symbol to replace (function, class, type)",
+            "type": "string"
+          },
+          "content": {
+            "description": "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+            "type": "string"
+          },
+          "appendContent": {
+            "description": "Text to append to the end of path; creates the file if needed",
+            "type": "string"
+          },
+          "edits": {
+            "description": "Batch edits — non-empty array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "oldString": {
+                  "description": "Text to find for a batch find/replace edit",
+                  "type": "string"
+                },
+                "newString": {
+                  "description": "Replacement text for a batch find/replace edit",
+                  "type": "string"
+                },
+                "replaceAll": {
+                  "description": "Replace every occurrence for this batch item",
+                  "type": "boolean"
+                },
+                "occurrence": {
+                  "description": "1-based occurrence for this batch item (1 = first match)",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "startLine": {
+                  "description": "1-based start line for a batch line-range edit",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "endLine": {
+                  "description": "1-based end line for a batch line-range edit",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "content": {
+                  "description": "Replacement text for a batch line-range edit",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "filePath"
+        ],
+        "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone."
+      },
+      "supports_tool": true,
+      "hoisted": true,
+      "lane": "mutation",
+      "command": "edit"
+    },
+    "hashline": {
+      "arm": "hashline",
+      "description": "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string of one or more `[path#TAG]` sections with PUT/CUT/REM/MV operations. Paths and tags come from section headers; obtain tags from tagged reads. Server-owned preview control is outside this schema.",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "patch": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Hashline patch text with one or more [path#TAG] sections and PUT/CUT/REM/MV operations"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "description": "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string of one or more `[path#TAG]` sections with PUT/CUT/REM/MV operations. Paths and tags come from section headers; obtain tags from tagged reads. Server-owned preview control is outside this schema."
+      },
+      "supports_tool": true,
+      "hoisted": true,
+      "lane": "mutation",
+      "command": "hashline_edit",
+      "preflight_command": "hashline_preflight"
+    }
+  },
+  "invariant": "a session never exposes both edit schemas"
+}

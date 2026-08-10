@@ -947,6 +947,13 @@ fn format_write_response(data: &Value) -> String {
 
 // Mirrors packages/opencode-plugin/src/tools/hoisted.ts createEditTool.
 fn format_edit_response(data: &Value) -> String {
+    if data.get("hashline").and_then(Value::as_bool) == Some(true) {
+        return data
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
     let mut result = format_edit_summary(data);
 
     if let Some(note) = format_glob_skip_reasons_note(data.get("format_skip_reasons")) {

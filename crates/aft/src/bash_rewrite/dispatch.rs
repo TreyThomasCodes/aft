@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash_rewrite::catalog::ControlRole;
 use crate::bash_rewrite::rules::{
-    CatAppendRule, CatRule, FindRule, GrepRule, LsRule, RgRule, SedRule,
+    CatAppendRule, CatRule, FindRule, GrepRule, HeadRule, LsRule, RgRule, SedRule, TailRule,
 };
 use crate::bash_rewrite::RewriteRule;
 use crate::context::AppContext;
@@ -101,11 +101,13 @@ pub fn dispatch_for_request(
         return None;
     }
 
-    let rules: [&dyn RewriteRule; 7] = [
+    let rules: [&dyn RewriteRule; 9] = [
         &GrepRule,
         &RgRule,
         &FindRule,
         &CatRule,
+        &HeadRule,
+        &TailRule,
         &CatAppendRule,
         &SedRule,
         &LsRule,
