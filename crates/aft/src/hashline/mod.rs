@@ -3,3 +3,4 @@
 pub mod oracle;
 pub mod scan;
 pub mod snapshot;
+pub mod syntax;
