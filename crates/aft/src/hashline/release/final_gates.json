@@ -1,0 +1,37 @@
+{
+  "id": "hashline-final-gates",
+  "owner": "slice-9-performance-release-gates",
+  "gates": [
+    {
+      "id": "rust-test-gate",
+      "command": "bash scripts/rust-test-gate.sh",
+      "pre": ["cargo fmt --all"]
+    },
+    {
+      "id": "typescript-suites",
+      "command": "bun test",
+      "notes": "Workspace TypeScript unit suites via bun."
+    },
+    {
+      "id": "governed-schema-and-manifest-audit",
+      "command": "bun scripts/audit-v049-agent-surface.ts",
+      "notes": "Byte-pins governed surfaces including dual-mode edit schema arms once registration artifacts land."
+    },
+    {
+      "id": "windows-path-and-crlf-ci",
+      "command": "cargo test -p agent-file-tools --lib hashline::release::windows_path_crlf -- --test-threads=1",
+      "authoritative_runner": "GitHub Actions unit-windows-cargo / unit-windows-check",
+      "notes": "Path separators and CRLF terminator identity are locked by release tests; Windows CI is the authoritative host."
+    },
+    {
+      "id": "fence-check",
+      "command": "cargo test -p agent-file-tools --lib hashline::release::manifests -- --test-threads=1",
+      "notes": "Ownership uniqueness and nonintersecting fence manifests."
+    },
+    {
+      "id": "a13-performance",
+      "command": "cargo test -p agent-file-tools --release --lib hashline::release::performance -- --test-threads=1",
+      "noise_policy": "crates/aft/src/hashline/release/noise_policy.json"
+    }
+  ]
+}

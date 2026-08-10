@@ -1,0 +1,32 @@
+{
+  "id": "hashline-a13-noise-policy",
+  "pinned_runner": {
+    "command": "cargo test -p agent-file-tools --release --lib hashline::release -- --test-threads=1",
+    "profile": "release",
+    "test_threads": 1,
+    "serial": true,
+    "rationale": "A13 medians are wall-clock samples calibrated on an optimized binary. Parallel lib-test noise must not share the process (--test-threads=1). Debug libtest still runs the method as a smoke check but does not enforce the 1 ms / 10% ceilings; the pinned runner is --release."
+  },
+  "sampling": {
+    "warmups": 3,
+    "timed_repetitions": 10,
+    "aggregate": "median",
+    "clock": "std::time::Instant"
+  },
+  "thresholds": {
+    "tag_compute_median_max_ns": 1000000,
+    "read_render_regression_max_ratio": 0.10
+  },
+  "noise_controls": {
+    "black_box_inputs_and_outputs": true,
+    "discard_warmup_samples": true,
+    "single_threaded_only": true,
+    "retry_once_on_threshold_miss": true,
+    "retry_rationale": "A single overloaded sample window (shared CI host, thermal throttle) may inflate one median. Exactly one full re-sample is permitted; a second miss fails the gate."
+  },
+  "fixture": {
+    "size_bytes": 1048576,
+    "sha256": "38c34d93ad6a2080be2f49dfed60acd747278a0a1cf4b81dedda07c512fd1fe6",
+    "generator": "deterministic_line_pattern_v1"
+  }
+}

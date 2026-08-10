@@ -1,0 +1,91 @@
+{
+  "campaign": "hashline-edit-surface-refire4",
+  "rule": "Every acceptance row A1-A18 and FINAL_GATES has exactly one owning slice. Prerequisites may implement supporting infrastructure but do not share ownership.",
+  "rows": {
+    "A1": {
+      "title": "ORACLE CORPUS",
+      "owner": "slice-4-parser-lookup-verification",
+      "prerequisites": ["slice-1-oracle-hash-parity"]
+    },
+    "A2": {
+      "title": "BYTE MODEL",
+      "owner": "slice-2-scanner-byte-model",
+      "prerequisites": ["slice-1-oracle-hash-parity"],
+      "notes": "Slice 1 closes the hash-vector subset; slice 2 owns the remaining byte-model fixtures and the A2 row."
+    },
+    "A3": {
+      "title": "RENDERING AND ELIGIBILITY",
+      "owner": "slice-3-snapshots-residency"
+    },
+    "A4": {
+      "title": "REQUIRED-TAG GUARDS",
+      "owner": "slice-4-parser-lookup-verification",
+      "prerequisites": ["slice-8-registration-transports"],
+      "notes": "Engine rejection fixtures and stage mapping live in syntax; registration canaries are exercised through slice 8 transports but ownership stays with the engine registry."
+    },
+    "A5": {
+      "title": "TAG LIFECYCLE",
+      "owner": "slice-5-apply-repair-registers"
+    },
+    "A6": {
+      "title": "RESIDENCY AND EVICTION",
+      "owner": "slice-3-snapshots-residency",
+      "prerequisites": ["slice-5-apply-repair-registers"],
+      "notes": "Snapshot residency and eviction-history rows are owned here; register-bound rows are prerequisites implemented in slice 5."
+    },
+    "A7": {
+      "title": "REGISTRATION MATRIX",
+      "owner": "slice-8-registration-transports"
+    },
+    "A8": {
+      "title": "TRANSACTIONS AND MV",
+      "owner": "slice-6-transactions-mv-preview"
+    },
+    "A9": {
+      "title": "STALE RECOVERY",
+      "owner": "slice-7-remap-recovery"
+    },
+    "A10": {
+      "title": "PREVIEW",
+      "owner": "slice-6-transactions-mv-preview"
+    },
+    "A11": {
+      "title": "ARM FLIP",
+      "owner": "slice-8-registration-transports"
+    },
+    "A12": {
+      "title": "BASELINE DRIFT",
+      "owner": "slice-6-transactions-mv-preview"
+    },
+    "A13": {
+      "title": "PERFORMANCE AND HEALTH",
+      "owner": "slice-9-performance-release-gates"
+    },
+    "A14": {
+      "title": "HOST DISPLAY",
+      "owner": "slice-8-registration-transports"
+    },
+    "A16": {
+      "title": "EVICTION-HISTORY TRANSITION",
+      "owner": "slice-3-snapshots-residency"
+    },
+    "A17": {
+      "title": "BACKUP-UNAVAILABLE",
+      "owner": "slice-6-transactions-mv-preview"
+    },
+    "A18": {
+      "title": "STAGE DISCRIMINATION",
+      "owner": "slice-4-parser-lookup-verification"
+    },
+    "FINAL_GATES": {
+      "title": "RELEASE TRAIN GATES",
+      "owner": "slice-9-performance-release-gates",
+      "gates": [
+        "rust-test-gate",
+        "typescript-suites",
+        "governed-schema-and-manifest-audit",
+        "windows-path-and-crlf-ci"
+      ]
+    }
+  }
+}

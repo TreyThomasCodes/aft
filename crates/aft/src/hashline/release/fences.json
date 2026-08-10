@@ -1,0 +1,42 @@
+{
+  "campaign": "hashline-edit-surface-refire4",
+  "rule": "Every slice file fence is disjoint. Globs are repo-root relative. The shared crates/aft/src/hashline/mod.rs may receive a single sanctioned pub mod line per slice and is excluded from exclusive fences.",
+  "slices": [
+    {
+      "id": "slice-1-oracle-hash-parity",
+      "fence": ["crates/aft/src/hashline/oracle/**"]
+    },
+    {
+      "id": "slice-2-scanner-byte-model",
+      "fence": ["crates/aft/src/hashline/scan/**"]
+    },
+    {
+      "id": "slice-3-snapshots-residency",
+      "fence": ["crates/aft/src/hashline/snapshot/**"]
+    },
+    {
+      "id": "slice-4-parser-lookup-verification",
+      "fence": ["crates/aft/src/hashline/syntax/**"]
+    },
+    {
+      "id": "slice-5-apply-repair-registers",
+      "fence": ["crates/aft/src/hashline/apply/**"]
+    },
+    {
+      "id": "slice-6-transactions-mv-preview",
+      "fence": ["crates/aft/src/hashline/transaction/**"]
+    },
+    {
+      "id": "slice-7-remap-recovery",
+      "fence": ["crates/aft/src/hashline/recovery/**"]
+    },
+    {
+      "id": "slice-8-registration-transports",
+      "fence": ["crates/aft/src/hashline/integration/**"]
+    },
+    {
+      "id": "slice-9-performance-release-gates",
+      "fence": ["crates/aft/src/hashline/release/**"]
+    }
+  ]
+}
