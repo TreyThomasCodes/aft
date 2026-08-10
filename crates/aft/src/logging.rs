@@ -568,7 +568,7 @@ struct ToolCallPerfSample {
 
 #[derive(Clone, Copy, Default)]
 struct ToolCallPerfSummary {
-    count: usize,
+    window: usize,
     p50_total_ms: u64,
     max_total_ms: u64,
     p50_queue_ms: u64,
@@ -831,7 +831,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
     };
     let sample = sample.unwrap_or_default();
     crate::slog_info!(
-        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} toolcall={{count:{},p50_total_ms:{},max_total_ms:{},p50_queue_ms:{},max_queue_ms:{}}} file_log_dropped={}",
+        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} {} file_log_dropped={}",
         watcher_ingested,
         watcher_paths,
         watcher_dropped,
@@ -846,11 +846,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
         completed_maintenance,
         format_optional_ms(sample.interactive_oldest_ms),
         format_optional_ms(sample.maintenance_oldest_ms),
-        tool_calls.count,
-        tool_calls.p50_total_ms,
-        tool_calls.max_total_ms,
-        tool_calls.p50_queue_ms,
-        tool_calls.max_queue_ms,
+        format_tool_call_summary(new_tool_calls, tool_calls),
         file_lines_dropped,
     );
 }
@@ -879,12 +875,23 @@ fn summarize_tool_calls(samples: &VecDeque<ToolCallPerfSample>) -> ToolCallPerfS
     queues.sort_unstable();
     let median_index = (samples.len() - 1) / 2;
     ToolCallPerfSummary {
-        count: samples.len(),
+        window: samples.len(),
         p50_total_ms: totals[median_index],
         max_total_ms: totals[totals.len() - 1],
         p50_queue_ms: queues[median_index],
         max_queue_ms: queues[queues.len() - 1],
     }
+}
+
+fn format_tool_call_summary(new_tool_calls: u64, summary: ToolCallPerfSummary) -> String {
+    format!(
+        "toolcall={{new:{new_tool_calls},window:{},p50_total_ms:{},max_total_ms:{},p50_queue_ms:{},max_queue_ms:{}}}",
+        summary.window,
+        summary.p50_total_ms,
+        summary.max_total_ms,
+        summary.p50_queue_ms,
+        summary.max_queue_ms,
+    )
 }
 
 fn format_optional_ms(value: Option<u64>) -> String {
@@ -1056,10 +1063,28 @@ mod tests {
 
         let summary = summarize_tool_calls(&samples);
 
-        assert_eq!(summary.count, 4);
+        assert_eq!(summary.window, 4);
         assert_eq!(summary.p50_total_ms, 5);
         assert_eq!(summary.max_total_ms, 9);
         assert_eq!(summary.p50_queue_ms, 2);
         assert_eq!(summary.max_queue_ms, 5);
+    }
+
+    #[test]
+    fn tool_call_tick_labels_interval_count_and_rolling_window() {
+        let samples = VecDeque::from([ToolCallPerfSample {
+            total_ms: 3_000,
+            queue_ms: 2_900,
+        }]);
+        let summary = summarize_tool_calls(&samples);
+
+        assert_eq!(
+            format_tool_call_summary(1, summary),
+            "toolcall={new:1,window:1,p50_total_ms:3000,max_total_ms:3000,p50_queue_ms:2900,max_queue_ms:2900}"
+        );
+        assert_eq!(
+            format_tool_call_summary(0, summary),
+            "toolcall={new:0,window:1,p50_total_ms:3000,max_total_ms:3000,p50_queue_ms:2900,max_queue_ms:2900}"
+        );
     }
 }
