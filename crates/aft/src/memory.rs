@@ -85,6 +85,7 @@ pub struct RootMemorySnapshot {
     pub trigram: MemoryEstimate,
     pub symbols: MemoryEstimate,
     pub callgraph: MemoryEstimate,
+    pub callgraph_projection: MemoryEstimate,
     pub inspect: MemoryEstimate,
     pub bash: MemoryEstimate,
     pub lsp: MemoryEstimate,
@@ -97,6 +98,7 @@ impl RootMemorySnapshot {
         trigram: MemoryEstimate,
         symbols: MemoryEstimate,
         callgraph: MemoryEstimate,
+        callgraph_projection: MemoryEstimate,
         inspect: MemoryEstimate,
         bash: MemoryEstimate,
         lsp: MemoryEstimate,
@@ -107,6 +109,7 @@ impl RootMemorySnapshot {
             &trigram,
             &symbols,
             &callgraph,
+            &callgraph_projection,
             &inspect,
             &bash,
             &lsp,
@@ -128,6 +131,7 @@ impl RootMemorySnapshot {
             trigram,
             symbols,
             callgraph,
+            callgraph_projection,
             inspect,
             bash,
             lsp,
@@ -149,12 +153,13 @@ impl RootMemorySnapshot {
             .count()
     }
 
-    fn estimates(&self) -> [&MemoryEstimate; 8] {
+    fn estimates(&self) -> [&MemoryEstimate; 9] {
         [
             &self.semantic,
             &self.trigram,
             &self.symbols,
             &self.callgraph,
+            &self.callgraph_projection,
             &self.inspect,
             &self.bash,
             &self.lsp,
@@ -387,6 +392,7 @@ mod snapshot_cap_tests {
         let estimate = MemoryEstimate::estimated;
         RootMemorySnapshot::new(
             estimate(bytes),
+            estimate(0),
             estimate(0),
             estimate(0),
             estimate(0),

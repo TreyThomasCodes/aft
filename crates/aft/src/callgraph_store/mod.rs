@@ -381,8 +381,8 @@ mod write_amplification_tests {
         assert_eq!(stats.refreshed_own_files, 0);
         assert_eq!(
             after - before,
-            2,
-            "only files and backend freshness rows update"
+            3,
+            "files, backend freshness, and the durable projection revision update"
         );
 
         fs::write(&source, "\nexport function main() { return 1; }\n\n").unwrap();
@@ -449,6 +449,7 @@ thread_local! {
 
 mod dead_code_projection;
 pub use dead_code_projection::project_dead_code_snapshot;
+pub(crate) use dead_code_projection::project_dead_code_snapshot_with_revision;
 #[cfg(test)]
 pub(crate) use dead_code_projection::set_projection_before_open_observer;
 
@@ -2630,6 +2631,19 @@ impl CallGraphStore {
         &self.sqlite_path
     }
 
+    /// The generation file named by the publication pointer when this store opened.
+    pub(crate) fn projection_generation(&self) -> Option<&str> {
+        self.generation.as_deref()
+    }
+
+    /// Read the durable revision that changes in the same transaction as graph writes.
+    pub(crate) fn projection_write_revision(&self) -> Result<Option<u64>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        projection_write_revision(&conn)
+    }
+
     /// Whether this store is reading from a legacy harness partition because
     /// the root-keyed store has not published a generation yet.
     pub fn is_legacy_fallback(&self) -> bool {
@@ -2898,6 +2912,7 @@ impl CallGraphStore {
             chunk_size,
         )?;
         set_meta_ready(&tx, true)?;
+        bump_projection_write_revision(&tx)?;
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
         phase!("sqlite_insert", t);
@@ -3185,6 +3200,7 @@ impl CallGraphStore {
         insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
         profile.method_dispatch += started.elapsed();
 
+        bump_projection_write_revision(&tx)?;
         let started = Instant::now();
         commit_incremental_if_current(tx)?;
         self.record_commit(total_changes_before, &conn);
@@ -3226,6 +3242,7 @@ impl CallGraphStore {
             )?;
             marked.push(rel_path);
         }
+        bump_projection_write_revision(&tx)?;
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
         marked.sort();
@@ -3714,6 +3731,14 @@ impl ReadonlyCallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         self.inner.sqlite_path()
+    }
+
+    pub(crate) fn projection_generation(&self) -> Option<&str> {
+        self.inner.projection_generation()
+    }
+
+    pub(crate) fn projection_write_revision(&self) -> Result<Option<u64>> {
+        self.inner.projection_write_revision()
     }
 
     /// Report the open generation handle. SQLite-owned allocations are measured
@@ -5967,6 +5992,43 @@ fn insert_meta(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('fingerprint', ?1)",
         params![schema_fingerprint()],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(k, v) VALUES('projection_write_revision', '0')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Return the durable revision paired atomically with graph mutations. Stores
+/// created by older binaries lack the revision row, so callers cannot detect
+/// in-place graph changes and must not cache their snapshots.
+fn projection_write_revision(conn: &Connection) -> Result<Option<u64>> {
+    let revision: Option<String> = conn
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'projection_write_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .map(|revision| {
+            revision.parse::<u64>().map_err(|error| {
+                CallGraphStoreError::Unavailable(format!(
+                    "callgraph projection write revision is invalid: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Advance the projection revision inside the graph mutation transaction so a
+/// cached snapshot never survives an in-place refresh.
+fn bump_projection_write_revision(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "INSERT INTO meta(k, v) VALUES('projection_write_revision', '1')
+         ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
+        [],
     )?;
     Ok(())
 }

@@ -17,8 +17,8 @@ use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::symbols::SymbolKind;
 
 use super::{
-    database_ready, lang_from_label, CallGraphStoreError, Result, BACKEND_TREESITTER,
-    PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
+    database_ready, lang_from_label, projection_write_revision, CallGraphStoreError, Result,
+    BACKEND_TREESITTER, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
 };
 
 #[cfg(test)]
@@ -40,6 +40,14 @@ fn notify_projection_before_open_observer(db_path: &Path) {
 fn notify_projection_before_open_observer(_db_path: &Path) {}
 
 pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
+    project_dead_code_snapshot_with_revision(db_path).map(|(_, snapshot)| snapshot)
+}
+
+/// Project the dead-code graph and read its durable write revision from one
+/// read transaction so a cache identity always describes the returned snapshot.
+pub(crate) fn project_dead_code_snapshot_with_revision(
+    db_path: &Path,
+) -> Result<(Option<u64>, CallgraphSnapshot)> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -48,35 +56,39 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
     }
 
     notify_projection_before_open_observer(db_path);
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(Duration::from_millis(5_000))?;
-    if !database_ready(&conn).unwrap_or(false) {
+    let tx = conn.transaction()?;
+    if !database_ready(&tx).unwrap_or(false) {
         return Err(CallGraphStoreError::Unavailable(
             "database is missing, stale, or mid-build".to_string(),
         ));
     }
+    let write_revision = projection_write_revision(&tx)?;
 
-    let project_root = project_root_from_backend_state(&conn)?;
-    if stale_backend_file_count(&conn, &project_root)? > 0 {
+    let project_root = project_root_from_backend_state(&tx)?;
+    if stale_backend_file_count(&tx, &project_root)? > 0 {
         return Err(CallGraphStoreError::Unavailable(
             "callgraph has stale files pending refresh".to_string(),
         ));
     }
     let mut paths = SnapshotPathResolver::new(&project_root);
-    let files = project_files_from_store(&conn, &mut paths)?;
-    let exported_symbols = exported_symbols_from_store(&conn, &mut paths)?;
-    let outbound_calls = outbound_calls_from_store(&conn, &mut paths)?;
+    let files = project_files_from_store(&tx, &mut paths)?;
+    let exported_symbols = exported_symbols_from_store(&tx, &mut paths)?;
+    let outbound_calls = outbound_calls_from_store(&tx, &mut paths)?;
     let entry_points = entry_points_for_files(&project_root, &files);
-    let entry_point_symbols = entry_point_symbols_from_store(&conn, &mut paths)?;
-
-    Ok(CallgraphSnapshot {
+    let entry_point_symbols = entry_point_symbols_from_store(&tx, &mut paths)?;
+    let snapshot = CallgraphSnapshot {
         generated_at: Some(SystemTime::now()),
         files,
         exported_symbols,
         outbound_calls,
         entry_points,
         entry_point_symbols,
-    })
+    };
+    tx.commit()?;
+
+    Ok((write_revision, snapshot))
 }
 
 fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {

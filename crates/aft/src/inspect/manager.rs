@@ -22,8 +22,11 @@ use super::oxc_engine::{
     ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
+#[cfg(test)]
+use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
-    project_dead_code_snapshot, CallGraphStore, CallGraphStoreError, ReadonlyCallGraphStore,
+    project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError,
+    ReadonlyCallGraphStore,
 };
 use crate::cold_build_limiter;
 
@@ -45,6 +48,25 @@ struct CachedContributionFreshness {
 struct InspectCacheIdentity {
     sqlite_path: PathBuf,
     project_root: PathBuf,
+}
+
+/// A published generation names an immutable cold build; the durable revision
+/// distinguishes the cheap in-place refreshes of that generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallgraphProjectionIdentity {
+    project_root: PathBuf,
+    generation: Option<String>,
+    /// Only legacy stores lack a generation label, so their concrete database
+    /// path keeps fallback stores distinct without weakening generation checks.
+    legacy_sqlite_path: Option<PathBuf>,
+    write_revision: u64,
+}
+
+#[derive(Debug)]
+struct CachedCallgraphProjection {
+    identity: CallgraphProjectionIdentity,
+    snapshot: Arc<CallgraphSnapshot>,
+    estimated_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +148,9 @@ pub struct InspectManager {
     in_flight: Mutex<HashMap<JobKey, Vec<Waiter>>>,
     in_flight_changed: Condvar,
     caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+    /// One root-scoped dead-code graph projection. It is cleared with the
+    /// manager's other idle artifacts rather than on a separate timer.
+    callgraph_projection: Mutex<Option<CachedCallgraphProjection>>,
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
@@ -176,6 +201,7 @@ impl InspectManager {
             in_flight: Mutex::new(HashMap::new()),
             in_flight_changed: Condvar::new(),
             caches: Mutex::new(HashMap::new()),
+            callgraph_projection: Mutex::new(None),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
             next_job_id: AtomicU64::new(1),
@@ -509,6 +535,7 @@ impl InspectManager {
         if let Ok(mut caches) = self.caches.lock() {
             caches.clear();
         }
+        self.clear_callgraph_projection();
         if let Ok(mut facts) = self.oxc_facts_cache.lock() {
             *facts = OxcFactsCache::new();
         }
@@ -547,6 +574,71 @@ impl InspectManager {
             .count("oxc_fact_entries", facts_entries)
             .count_u64("memory_aggregates", memory_aggregates)
             .gap("oxc_fact_bytes")
+    }
+
+    /// Estimate the resident full-graph projection used by dead-code scans.
+    /// The slot belongs to this root's manager and is dropped on idle eviction.
+    pub fn callgraph_projection_estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let projection = match self.callgraph_projection.try_lock() {
+            Ok(projection) => projection,
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        let bytes = projection
+            .as_ref()
+            .map(|projection| projection.estimated_bytes)
+            .unwrap_or(0);
+        crate::memory::MemoryEstimate::estimated(bytes)
+            .count(
+                "callgraph_projection_snapshots",
+                usize::from(projection.is_some()),
+            )
+            .count_u64("callgraph_projection_snapshot_bytes", bytes)
+    }
+
+    fn cached_callgraph_projection(
+        &self,
+        identity: &CallgraphProjectionIdentity,
+    ) -> Option<Arc<CallgraphSnapshot>> {
+        let projection = self.callgraph_projection.lock().ok()?;
+        projection
+            .as_ref()
+            .filter(|cached| cached.identity == *identity)
+            .map(|cached| Arc::clone(&cached.snapshot))
+    }
+
+    fn cache_callgraph_projection(
+        &self,
+        identity: CallgraphProjectionIdentity,
+        snapshot: Arc<CallgraphSnapshot>,
+    ) {
+        let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
+        if let Ok(mut cached) = self.callgraph_projection.lock() {
+            *cached = Some(CachedCallgraphProjection {
+                identity,
+                snapshot,
+                estimated_bytes,
+            });
+        }
+    }
+
+    fn clear_callgraph_projection(&self) {
+        if let Ok(mut cached) = self.callgraph_projection.lock() {
+            cached.take();
+        }
+    }
+
+    fn build_tier2_callgraph_snapshot_with_refresh(
+        &self,
+        job: &InspectJob,
+        allow_cold_build: bool,
+        refresh_paths: &[PathBuf],
+    ) -> Option<Arc<CallgraphSnapshot>> {
+        build_tier2_callgraph_snapshot_with_refresh_inner(
+            job,
+            allow_cold_build,
+            refresh_paths,
+            Some(self),
+        )
     }
 
     /// Whether completed scan results are waiting in the channel. Used by the
@@ -1428,7 +1520,7 @@ impl InspectManager {
                 && scan_job.callgraph_snapshot.is_none()
             {
                 let snapshot_started = Instant::now();
-                scan_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
+                scan_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
                     &scan_job,
                     options.allow_callgraph_cold_build,
                     &callgraph_refresh_files,
@@ -1537,11 +1629,12 @@ impl InspectManager {
                     && rescan_job.callgraph_snapshot.is_none()
                 {
                     let snapshot_started = Instant::now();
-                    rescan_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
-                        &rescan_job,
-                        options.allow_callgraph_cold_build,
-                        &callgraph_refresh_files,
-                    );
+                    rescan_job.callgraph_snapshot = self
+                        .build_tier2_callgraph_snapshot_with_refresh(
+                            &rescan_job,
+                            options.allow_callgraph_cold_build,
+                            &callgraph_refresh_files,
+                        );
                     phases.snapshot += snapshot_started.elapsed();
                 }
                 let scan_started = Instant::now();
@@ -1603,7 +1696,7 @@ impl InspectManager {
             && aggregate_job.callgraph_snapshot.is_none()
         {
             let snapshot_started = Instant::now();
-            aggregate_job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(
+            aggregate_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
                 &aggregate_job,
                 options.allow_callgraph_cold_build,
                 &callgraph_refresh_files,
@@ -2155,13 +2248,23 @@ fn build_tier2_callgraph_snapshot(
     job: &InspectJob,
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
-    build_tier2_callgraph_snapshot_with_refresh(job, allow_cold_build, &[])
+    build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, &[], None)
 }
 
+#[cfg(test)]
 fn build_tier2_callgraph_snapshot_with_refresh(
     job: &InspectJob,
     allow_cold_build: bool,
     refresh_paths: &[PathBuf],
+) -> Option<Arc<CallgraphSnapshot>> {
+    build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, refresh_paths, None)
+}
+
+fn build_tier2_callgraph_snapshot_with_refresh_inner(
+    job: &InspectJob,
+    allow_cold_build: bool,
+    refresh_paths: &[PathBuf],
+    projection_cache: Option<&InspectManager>,
 ) -> Option<Arc<CallgraphSnapshot>> {
     let started = Instant::now();
     if !job.config.callgraph_store {
@@ -2191,6 +2294,38 @@ fn build_tier2_callgraph_snapshot_with_refresh(
                 Self::ReadOnly(store) => store.sqlite_path(),
                 Self::Writable(store) => store.sqlite_path(),
             }
+        }
+
+        fn projection_identity(
+            &self,
+            project_root: &Path,
+            write_revision: u64,
+        ) -> CallgraphProjectionIdentity {
+            let generation = match self {
+                Self::ReadOnly(store) => store.projection_generation(),
+                Self::Writable(store) => store.projection_generation(),
+            }
+            .map(str::to_owned);
+            let legacy_sqlite_path = generation
+                .is_none()
+                .then(|| self.sqlite_path().to_path_buf());
+            CallgraphProjectionIdentity {
+                project_root: project_root.to_path_buf(),
+                generation,
+                legacy_sqlite_path,
+                write_revision,
+            }
+        }
+
+        fn current_projection_identity(
+            &self,
+            project_root: &Path,
+        ) -> Result<Option<CallgraphProjectionIdentity>, CallGraphStoreError> {
+            let write_revision = match self {
+                Self::ReadOnly(store) => store.projection_write_revision()?,
+                Self::Writable(store) => store.projection_write_revision()?,
+            };
+            Ok(write_revision.map(|revision| self.projection_identity(project_root, revision)))
         }
     }
 
@@ -2283,20 +2418,11 @@ fn build_tier2_callgraph_snapshot_with_refresh(
             ProjectionStore::Writable(store)
         };
 
-        let snapshot = match project_dead_code_snapshot(projection_store.sqlite_path()) {
-            Ok(snapshot) => snapshot,
-            Err(CallGraphStoreError::Unavailable(message)) => {
-                crate::slog_info!(
-                    "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
-                    callgraph_dir.display(),
-                    message,
-                    index + 1 < callgraph_dirs.len()
-                );
-                continue;
-            }
+        let cache_identity = match projection_store.current_projection_identity(&job.project_root) {
+            Ok(identity) => identity,
             Err(error) => {
                 crate::slog_warn!(
-                    "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
+                    "tier2 dead_code: failed to read callgraph projection identity at {}: {}; trying fallback={}",
                     callgraph_dir.display(),
                     error,
                     index + 1 < callgraph_dirs.len()
@@ -2304,6 +2430,52 @@ fn build_tier2_callgraph_snapshot_with_refresh(
                 continue;
             }
         };
+        if let (Some(cache), Some(identity)) = (projection_cache, cache_identity.as_ref()) {
+            // The pointer names immutable cold-build generations, while the durable
+            // revision advances in the same SQLite transaction as every in-place
+            // graph mutation. Equal identities therefore prove identical store
+            // bytes for dead-code projection: this cache is exact, not heuristic.
+            if let Some(snapshot) = cache.cached_callgraph_projection(identity) {
+                return Some(snapshot);
+            }
+        } else if cache_identity.is_none() {
+            // Stores from older binaries lack a durable revision, so keeping an
+            // earlier snapshot would make an in-place refresh indistinguishable.
+            if let Some(cache) = projection_cache {
+                cache.clear_callgraph_projection();
+            }
+        }
+
+        let (write_revision, snapshot) = match project_dead_code_snapshot_with_revision(
+            projection_store.sqlite_path(),
+        ) {
+            Ok(projected) => projected,
+            Err(CallGraphStoreError::Unavailable(message)) => {
+                crate::slog_info!(
+                        "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
+                        callgraph_dir.display(),
+                        message,
+                        index + 1 < callgraph_dirs.len()
+                    );
+                continue;
+            }
+            Err(error) => {
+                crate::slog_warn!(
+                        "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
+                        callgraph_dir.display(),
+                        error,
+                        index + 1 < callgraph_dirs.len()
+                    );
+                continue;
+            }
+        };
+        let snapshot = Arc::new(snapshot);
+        if let (Some(cache), Some(write_revision)) = (projection_cache, write_revision) {
+            cache.cache_callgraph_projection(
+                projection_store.projection_identity(&job.project_root, write_revision),
+                Arc::clone(&snapshot),
+            );
+        }
 
         if index > 0 {
             crate::slog_info!(
@@ -2322,7 +2494,7 @@ fn build_tier2_callgraph_snapshot_with_refresh(
             started.elapsed().as_millis()
         );
 
-        return Some(Arc::new(snapshot));
+        return Some(snapshot);
     }
 
     crate::slog_info!(
@@ -2330,6 +2502,58 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         job.inspect_dir.display()
     );
     None
+}
+
+fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {
+    let files = snapshot.files.iter().fold(0u64, |bytes, path| {
+        bytes
+            .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+            .saturating_add(crate::memory::path_bytes(path))
+    });
+    let exports = snapshot
+        .exported_symbols
+        .iter()
+        .fold(0u64, |bytes, export| {
+            bytes
+                .saturating_add(std::mem::size_of::<super::job::CallgraphExport>() as u64)
+                .saturating_add(crate::memory::path_bytes(&export.file))
+                .saturating_add(crate::memory::usize_to_u64(export.symbol.len()))
+                .saturating_add(crate::memory::usize_to_u64(export.kind.len()))
+        });
+    let calls = snapshot.outbound_calls.iter().fold(0u64, |bytes, call| {
+        bytes
+            .saturating_add(std::mem::size_of::<super::job::CallgraphOutboundCall>() as u64)
+            .saturating_add(crate::memory::path_bytes(&call.caller_file))
+            .saturating_add(crate::memory::usize_to_u64(call.caller_symbol.len()))
+            .saturating_add(crate::memory::usize_to_u64(call.target.len()))
+            .saturating_add(crate::memory::usize_to_u64(call.provenance.len()))
+    });
+    let entry_points = snapshot.entry_points.iter().fold(0u64, |bytes, path| {
+        bytes
+            .saturating_add(std::mem::size_of::<PathBuf>() as u64)
+            .saturating_add(crate::memory::path_bytes(path))
+    });
+    let entry_point_symbols =
+        snapshot
+            .entry_point_symbols
+            .iter()
+            .fold(0u64, |bytes, (path, symbols)| {
+                let symbols_bytes = symbols.iter().fold(0u64, |bytes, symbol| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<String>() as u64)
+                        .saturating_add(crate::memory::usize_to_u64(symbol.len()))
+                });
+                bytes
+                    .saturating_add(std::mem::size_of::<(PathBuf, BTreeSet<String>)>() as u64)
+                    .saturating_add(crate::memory::path_bytes(path))
+                    .saturating_add(symbols_bytes)
+            });
+    (std::mem::size_of::<CallgraphSnapshot>() as u64)
+        .saturating_add(files)
+        .saturating_add(exports)
+        .saturating_add(calls)
+        .saturating_add(entry_points)
+        .saturating_add(entry_point_symbols)
 }
 
 fn callgraph_store_dir_from_inspect_dir(
@@ -3620,6 +3844,54 @@ mod guard_tests {
         dir
     }
 
+    struct ProjectionObserverReset;
+
+    impl Drop for ProjectionObserverReset {
+        fn drop(&mut self) {
+            crate::callgraph_store::set_projection_before_open_observer(None);
+        }
+    }
+
+    fn count_projections() -> (Arc<std::sync::atomic::AtomicUsize>, ProjectionObserverReset) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        crate::callgraph_store::set_projection_before_open_observer(Some(Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+        (count, ProjectionObserverReset)
+    }
+
+    fn write_projection_cache_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("fixture file parent"))
+            .expect("create fixture parent");
+        std::fs::write(path, contents).expect("write fixture file");
+    }
+
+    fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        write_projection_cache_file(
+            &root.join("src/main.ts"),
+            "import { firstTarget } from './target';\nexport function main() { firstTarget(); }\n",
+        );
+        write_projection_cache_file(
+            &root.join("src/target.ts"),
+            "export function firstTarget() {}\n",
+        );
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (store, _) = CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files)
+            .expect("publish initial generation");
+        drop(store);
+        let mut job = snapshot_job(&root, &inspect_dir, true);
+        job.callgraph_writer = false;
+        (dir, root, inspect_dir, job)
+    }
+
     #[test]
     fn scoped_filter_recomputes_top_preview_from_scoped_items() {
         let project_root = PathBuf::from("/project");
@@ -4157,6 +4429,186 @@ export function bannerUnused() {}
 
         assert_eq!(snapshot.files.len(), 3);
         assert_eq!(snapshot.exported_symbols.len(), 3);
+    }
+
+    #[test]
+    fn generation_keyed_projection_cache_reuses_unchanged_snapshot() {
+        let (_dir, _root, _inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("first projection");
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("cached projection");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged generation and write revision must reuse the projected Arc"
+        );
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two dead-code scans without a callgraph mutation must project once"
+        );
+        let memory = manager.callgraph_projection_estimated_memory();
+        assert_eq!(
+            memory.counts["callgraph_projection_snapshots"], 1,
+            "the resident projection must be attributed to the root"
+        );
+        assert!(
+            memory.estimated_bytes.unwrap_or_default() > 0,
+            "a populated projection must report an estimated residency"
+        );
+    }
+
+    #[test]
+    fn projection_cache_invalidates_on_in_place_refresh_for_readonly_scans() {
+        let (_dir, root, inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+        let target = root.join("src/target.ts");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
+
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("initial projection");
+        let writer = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
+            .expect("open writer")
+            .expect("ready writer");
+        let revision_before = writer
+            .projection_write_revision()
+            .expect("read initial revision")
+            .expect("new stores write a projection revision");
+        write_projection_cache_file(&target, "export function secondTarget() {}\n");
+        writer
+            .refresh_files(&[target])
+            .expect("refresh changed target");
+        let revision_after = writer
+            .projection_write_revision()
+            .expect("read refreshed revision")
+            .expect("refreshed stores retain a projection revision");
+        assert!(
+            revision_after > revision_before,
+            "the in-place refresh must advance the durable cache identity"
+        );
+        drop(writer);
+
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("refreshed readonly projection");
+        assert!(
+            !first
+                .exported_symbols
+                .iter()
+                .any(|export| export.symbol == "secondTarget"),
+            "the initial snapshot must not already contain the refreshed export"
+        );
+        assert!(
+            second
+                .exported_symbols
+                .iter()
+                .any(|export| export.symbol == "secondTarget"),
+            "the readonly scan must expose graph data from the refreshed store"
+        );
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an in-place refresh must force the next scan to re-project"
+        );
+    }
+
+    #[test]
+    fn projection_cache_invalidates_when_cold_build_publishes_new_generation() {
+        let (_dir, root, inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+        let target = root.join("src/target.ts");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
+
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("initial projection");
+        let before = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone())
+            .expect("open initial reader")
+            .expect("initial reader");
+        let revision_before = before
+            .projection_write_revision()
+            .expect("read initial revision")
+            .expect("new stores write a projection revision");
+        drop(before);
+        write_projection_cache_file(&target, "export function coldBuildTarget() {}\n");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (published, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files)
+                .expect("publish replacement generation");
+        let revision_after = published
+            .projection_write_revision()
+            .expect("read replacement revision")
+            .expect("replacement stores write a projection revision");
+        assert_eq!(
+            revision_after, revision_before,
+            "cold builds begin with the same revision, so this assertion exercises the generation half of the cache identity"
+        );
+        drop(published);
+
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("replacement projection");
+        assert!(
+            !first
+                .exported_symbols
+                .iter()
+                .any(|export| export.symbol == "coldBuildTarget"),
+            "the initial snapshot must not already contain the replacement export"
+        );
+        assert!(
+            second
+                .exported_symbols
+                .iter()
+                .any(|export| export.symbol == "coldBuildTarget"),
+            "the next scan must expose the generation published by the cold build"
+        );
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a new pointer generation must force the next scan to re-project"
+        );
+    }
+
+    #[test]
+    fn idle_eviction_drops_generation_keyed_projection_cache() {
+        let (_dir, _root, _inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("initial projection");
+        manager.evict_idle_caches();
+        assert_eq!(
+            manager.callgraph_projection_estimated_memory().counts
+                ["callgraph_projection_snapshots"],
+            0,
+            "idle artifact eviction must release the root projection slot"
+        );
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .expect("reloaded projection");
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "eviction must drop the previous projection Arc"
+        );
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next scan after idle eviction must reload the projection"
+        );
     }
 
     #[test]

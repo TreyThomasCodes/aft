@@ -6204,6 +6204,7 @@ impl AppContext {
                 }),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
+        let callgraph_projection = self.inspect_manager.callgraph_projection_estimated_memory();
         let inspect = self.inspect_manager.estimated_memory();
         let bash = self.bash_background.estimated_memory();
         let lsp = self
@@ -6222,6 +6223,7 @@ impl AppContext {
             trigram,
             symbols,
             callgraph,
+            callgraph_projection,
             inspect,
             bash,
             lsp,
