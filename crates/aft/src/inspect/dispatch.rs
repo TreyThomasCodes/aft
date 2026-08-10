@@ -138,8 +138,44 @@ fn dispatch_category(job: InspectJob) -> InspectResult {
 }
 
 fn default_pool_size() -> usize {
+    // Dev-only override for reproducing thread-regime-dependent behaviour
+    // (glibc allocates arenas per contending thread, so pool width changes
+    // fragmentation). Not a tuning surface and deliberately undocumented.
+    resolve_pool_size(std::env::var("AFT_INSPECT_POOL_THREADS").ok().as_deref())
+}
+
+/// Split from the env read so the parsing and clamping are testable without
+/// mutating process-global state: `INSPECT_POOL` is a `LazyLock`, and any
+/// concurrent test that builds an `InspectManager` would otherwise capture
+/// whatever width the env happened to hold.
+fn resolve_pool_size(override_value: Option<&str>) -> usize {
+    if let Some(threads) = override_value.and_then(|value| value.parse::<usize>().ok()) {
+        return threads.clamp(1, 512);
+    }
+
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
         .min(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_pool_size;
+
+    #[test]
+    fn pool_thread_override_wins_and_clamps() {
+        assert_eq!(resolve_pool_size(Some("17")), 17);
+        assert_eq!(resolve_pool_size(Some("0")), 1);
+        assert_eq!(resolve_pool_size(Some("100000")), 512);
+    }
+
+    #[test]
+    fn pool_thread_override_ignores_absent_and_unparseable_values() {
+        let derived = resolve_pool_size(None);
+
+        assert_eq!(resolve_pool_size(Some("wide")), derived);
+        assert_eq!(resolve_pool_size(Some("-4")), derived);
+        assert_eq!(resolve_pool_size(Some("")), derived);
+    }
 }
