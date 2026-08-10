@@ -11,9 +11,9 @@
 //! poll). Signal handlers must finish quickly. Graceful shutdown still
 //! happens on the natural stdin-closed exit path via `LspManager::shutdown_all`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +25,15 @@ pub struct LspChildHealth {
 
 #[derive(Clone, Default)]
 pub struct LspChildRegistry {
-    inner: Arc<Mutex<HashSet<u32>>>,
+    // A child is registered with the project root that owns it. Maintenance
+    // checks only these known roots for reclaim markers, avoiding directory
+    // scans while still covering servers rooted below a task worktree.
+    inner: Arc<Mutex<HashMap<u32, Option<PathBuf>>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapSignal {
+    Sigterm,
 }
 
 impl LspChildRegistry {
@@ -35,8 +43,16 @@ impl LspChildRegistry {
 
     /// Track a newly-spawned LSP child PID.
     pub fn track(&self, pid: u32) {
-        if let Ok(mut set) = self.inner.lock() {
-            set.insert(pid);
+        self.track_in_root(pid, None);
+    }
+
+    /// Track a child under the project root that owns its language server.
+    ///
+    /// The root is retained solely for reclaim-marker checks; it is not used
+    /// for process cwd inspection or normal shutdown.
+    pub fn track_in_root(&self, pid: u32, root: Option<&Path>) {
+        if let Ok(mut children) = self.inner.lock() {
+            children.insert(pid, root.map(Path::to_path_buf));
         }
     }
 
@@ -45,27 +61,49 @@ impl LspChildRegistry {
     /// SIGTERM spawn→track race: if cleanup starts concurrently, it blocks
     /// until the just-spawned child is present in the tracked set.
     pub fn spawn_tracked(&self, command: &mut Command) -> io::Result<Child> {
-        let mut set = self
+        self.spawn_tracked_in_root(command, None)
+    }
+
+    /// Spawn and register a child with the project root eligible for reclaim
+    /// marker reaping.
+    pub fn spawn_tracked_in_root(
+        &self,
+        command: &mut Command,
+        root: Option<&Path>,
+    ) -> io::Result<Child> {
+        let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
         let child = command.spawn()?;
-        set.insert(child.id());
+        children.insert(child.id(), root.map(Path::to_path_buf));
         Ok(child)
     }
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).
     pub fn untrack(&self, pid: u32) {
-        if let Ok(mut set) = self.inner.lock() {
-            set.remove(&pid);
+        if let Ok(mut children) = self.inner.lock() {
+            children.remove(&pid);
         }
     }
 
     /// Snapshot of currently-tracked PIDs.
     pub fn pids(&self) -> Vec<u32> {
+        self.tracked_children()
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    fn tracked_children(&self) -> Vec<(u32, Option<PathBuf>)> {
         self.inner
             .lock()
-            .map(|set| set.iter().copied().collect())
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|(pid, root)| (*pid, root.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -82,7 +120,7 @@ impl LspChildRegistry {
             .inner
             .try_lock()
             .ok()?
-            .iter()
+            .keys()
             .copied()
             .collect::<Vec<_>>();
         Some(health_for_pids(pids))
@@ -92,12 +130,36 @@ impl LspChildRegistry {
     /// This is a crash/leak backstop; ordinary root teardown still drops the
     /// owning `LspClient` and performs its normal process-group cleanup.
     pub fn reap_children_with_gone_cwd(&self) -> usize {
+        self.reap_children_using(false, |pid, _| kill_child_process_group(pid))
+    }
+
+    /// Kill and untrack children with a deleted cwd or a reclaimed project root.
+    ///
+    /// Alfonso leaves `<worktree>.reclaimed` beside a settled worktree before
+    /// removing its directory. Checking the root registered at spawn time lets
+    /// this periodic sweep release the analyzer immediately instead of waiting
+    /// for the idle-root TTL or for the directory itself to disappear.
+    pub fn reap_children_with_gone_cwd_or_reclaimed_root(&self) -> usize {
+        self.reap_children_using(true, |pid, _| kill_child_process_group(pid))
+    }
+
+    fn reap_children_using<Terminate>(
+        &self,
+        include_reclaimed_roots: bool,
+        mut terminate: Terminate,
+    ) -> usize
+    where
+        Terminate: FnMut(u32, ReapSignal) -> bool,
+    {
         let mut reaped = 0;
-        for pid in self.pids() {
-            if !matches!(child_cwd_state(pid), ChildCwdState::Gone) {
+        for (pid, root) in self.tracked_children() {
+            let has_gone_cwd = matches!(child_cwd_state(pid), ChildCwdState::Gone);
+            let has_reclaimed_root =
+                include_reclaimed_roots && root.as_deref().is_some_and(root_has_reclaim_marker);
+            if !has_gone_cwd && !has_reclaimed_root {
                 continue;
             }
-            if kill_child_process_group(pid) {
+            if terminate(pid, ReapSignal::Sigterm) {
                 self.untrack(pid);
                 reaped += 1;
             }
@@ -157,6 +219,17 @@ impl LspChildRegistry {
         }
         killed
     }
+}
+
+/// Return the sibling marker path written when a worktree is reclaimed.
+pub fn reclaim_marker_path(root: &Path) -> PathBuf {
+    let mut marker = root.as_os_str().to_os_string();
+    marker.push(".reclaimed");
+    PathBuf::from(marker)
+}
+
+fn root_has_reclaim_marker(root: &Path) -> bool {
+    reclaim_marker_path(root).is_file()
 }
 
 fn health_for_pids(pids: Vec<u32>) -> LspChildHealth {
@@ -538,5 +611,51 @@ mod tests {
             wait_until_not_running(grandchild_pid, Duration::from_secs(5)),
             "grandchild must stop after killpg (this was the npm-wrapper orphan bug)"
         );
+    }
+
+    #[test]
+    fn maintenance_reaps_child_at_existing_reclaimed_worktree() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let worktree = parent.path().join("task-worktree");
+        std::fs::create_dir(&worktree).expect("create worktree");
+        std::fs::write(reclaim_marker_path(&worktree), "settled\n").expect("write reclaim marker");
+
+        let registry = LspChildRegistry::new();
+        registry.track_in_root(42, Some(&worktree));
+        let mut signals = Vec::new();
+        let reaped = registry.reap_children_using(true, |pid, signal| {
+            signals.push((pid, signal));
+            true
+        });
+
+        assert!(
+            worktree.is_dir(),
+            "the marker must reap an existing worktree"
+        );
+        assert_eq!(reaped, 1);
+        assert_eq!(signals, vec![(42, ReapSignal::Sigterm)]);
+        assert!(registry.pids().is_empty(), "reaped child must be untracked");
+    }
+
+    #[test]
+    fn maintenance_keeps_child_when_existing_worktree_has_no_reclaim_marker() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let worktree = parent.path().join("active-worktree");
+        std::fs::create_dir(&worktree).expect("create worktree");
+
+        let registry = LspChildRegistry::new();
+        registry.track_in_root(42, Some(&worktree));
+        let mut signals = Vec::new();
+        let reaped = registry.reap_children_using(true, |pid, signal| {
+            signals.push((pid, signal));
+            true
+        });
+
+        assert_eq!(reaped, 0);
+        assert!(
+            signals.is_empty(),
+            "active worktrees must not receive SIGTERM"
+        );
+        assert_eq!(registry.pids(), vec![42]);
     }
 }

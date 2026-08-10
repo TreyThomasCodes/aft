@@ -1,8 +1,22 @@
 use std::path::{Path, PathBuf};
 
+use globset::Glob;
+
 use crate::lsp::registry::ServerKind;
 
 pub fn find_workspace_root<S>(file_path: &Path, markers: &[S]) -> Option<PathBuf>
+where
+    S: AsRef<str>,
+{
+    find_workspace_root_within(file_path, markers, None)
+}
+
+/// Find a marker root without walking above an optional session project root.
+pub fn find_workspace_root_within<S>(
+    file_path: &Path,
+    markers: &[S],
+    project_root: Option<&Path>,
+) -> Option<PathBuf>
 where
     S: AsRef<str>,
 {
@@ -27,8 +41,22 @@ where
         resolved_path.parent()?.to_path_buf()
     };
 
+    let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    if project_root
+        .as_ref()
+        .is_some_and(|boundary| !start_dir.starts_with(boundary))
+    {
+        return None;
+    }
+
     let mut current = Some(start_dir.as_path());
     while let Some(dir) = current {
+        if project_root
+            .as_ref()
+            .is_some_and(|boundary| !dir.starts_with(boundary))
+        {
+            break;
+        }
         if markers
             .iter()
             .any(|marker| dir.join(marker.as_ref()).exists())
@@ -36,10 +64,124 @@ where
             return Some(dir.to_path_buf());
         }
 
+        if project_root.as_deref() == Some(dir) {
+            break;
+        }
         current = dir.parent();
     }
 
     None
+}
+
+/// Find the Cargo workspace that owns `file_path`.
+///
+/// Rust Analyzer loads the complete Cargo workspace supplied by the client. A
+/// member crate's manifest is therefore not a suitable server root: opening a
+/// second member would otherwise start another full-workspace analyzer. The
+/// optional project root bounds the walk so an enclosing checkout cannot claim
+/// a nested session as one of its workspaces.
+pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    let resolved_path = crate::inspect::job::canonicalize_normalized(file_path);
+    let start_dir = if resolved_path.is_dir() {
+        resolved_path
+    } else {
+        resolved_path.parent()?.to_path_buf()
+    };
+    let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+
+    if project_root
+        .as_ref()
+        .is_some_and(|boundary| !start_dir.starts_with(boundary))
+    {
+        return None;
+    }
+
+    let crate_root = nearest_cargo_manifest_dir(&start_dir, project_root.as_deref())?;
+    let mut current = Some(crate_root.as_path());
+    while let Some(dir) = current {
+        if project_root
+            .as_ref()
+            .is_some_and(|boundary| !dir.starts_with(boundary))
+        {
+            break;
+        }
+        if cargo_workspace_contains_crate(dir, &crate_root) {
+            return Some(crate::inspect::job::canonicalize_normalized(dir));
+        }
+        if project_root.as_deref() == Some(dir) {
+            break;
+        }
+        current = dir.parent();
+    }
+
+    None
+}
+
+fn nearest_cargo_manifest_dir(start_dir: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        if project_root.is_some_and(|boundary| !dir.starts_with(boundary)) {
+            break;
+        }
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if project_root == Some(dir) {
+            break;
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(manifest) = contents.parse::<toml::Value>() else {
+        return false;
+    };
+    let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) else {
+        return false;
+    };
+
+    if workspace_root == crate_root {
+        return true;
+    }
+
+    let Ok(crate_relative_path) = crate_root.strip_prefix(workspace_root) else {
+        return false;
+    };
+    if workspace
+        .get("exclude")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|patterns| {
+            patterns
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|pattern| cargo_member_pattern_matches(pattern, crate_relative_path))
+        })
+    {
+        return false;
+    }
+
+    match workspace.get("members").and_then(toml::Value::as_array) {
+        Some(patterns) => patterns
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .any(|pattern| cargo_member_pattern_matches(pattern, crate_relative_path)),
+        // Cargo permits a package to be colocated with a `[workspace]` table
+        // without listing the package in `members`. Prefer the nearest ancestor
+        // manifest that defines a workspace because it still describes the
+        // broader Cargo workspace for the analyzer.
+        None => true,
+    }
+}
+
+fn cargo_member_pattern_matches(pattern: &str, crate_relative_path: &Path) -> bool {
+    Glob::new(pattern.trim())
+        .map(|glob| glob.compile_matcher().is_match(crate_relative_path))
+        .unwrap_or(false)
 }
 
 /// Composite key for caching server instances.
@@ -57,7 +199,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{find_workspace_root, ServerKey};
+    use super::{
+        find_rust_workspace_root, find_workspace_root, find_workspace_root_within, ServerKey,
+    };
     use crate::inspect::job::canonicalize_normalized;
     use crate::lsp::registry::ServerKind;
 
@@ -197,5 +341,100 @@ mod tests {
         // test fails on Windows CI while passing locally on macOS.
         let expected = canonicalize_normalized(&root);
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn rust_workspace_root_prefers_owning_workspace_over_member_manifest() {
+        let temp_dir = tempdir().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        let crate_root = workspace.join("crates").join("member");
+        let source = crate_root.join("src").join("lib.rs");
+
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_root.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+
+        assert_eq!(
+            find_rust_workspace_root(&source, Some(&workspace)),
+            Some(canonicalize_normalized(&workspace))
+        );
+    }
+
+    #[test]
+    fn rust_workspace_root_keeps_crate_excluded_from_parent_workspace_standalone() {
+        let temp_dir = tempdir().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        let member_root = workspace.join("crates").join("member");
+        let standalone_root = workspace.join("tools").join("standalone");
+        let source = standalone_root.join("src").join("lib.rs");
+
+        fs::create_dir_all(member_root.join("src")).unwrap();
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            member_root.join("Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            standalone_root.join("Cargo.toml"),
+            "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+
+        assert_eq!(
+            find_rust_workspace_root(&source, Some(&workspace)),
+            None,
+            "the parent workspace does not list this crate"
+        );
+    }
+
+    #[test]
+    fn rust_workspace_root_does_not_walk_above_project_root() {
+        let temp_dir = tempdir().unwrap();
+        let outer_workspace = temp_dir.path().join("outer-workspace");
+        let project_root = outer_workspace.join("nested-project");
+        let crate_root = project_root.join("crate");
+        let source = crate_root.join("src").join("lib.rs");
+
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(
+            outer_workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"nested-project/crate\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_root.join("Cargo.toml"),
+            "[package]\nname = \"nested\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(&source, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let loose_source = project_root.join("loose.rs");
+        fs::write(&loose_source, "pub fn loose() {}\n").unwrap();
+
+        assert_eq!(
+            find_rust_workspace_root(&source, Some(&project_root)),
+            None,
+            "the enclosing workspace belongs to a different session root"
+        );
+        assert_eq!(
+            find_workspace_root_within(&loose_source, &["Cargo.toml"], Some(&project_root)),
+            None,
+            "marker lookup must not cross the session project root"
+        );
     }
 }

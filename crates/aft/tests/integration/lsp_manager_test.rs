@@ -46,6 +46,49 @@ fn rust_fixture_files() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (temp_dir, main_rs, lib_rs)
 }
 
+fn rust_workspace_member_files() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let temp_dir = tempdir().unwrap();
+    let workspace = temp_dir.path().join("workspace");
+    let first_crate = workspace.join("crates").join("first");
+    let second_crate = workspace.join("crates").join("second");
+    let first_source = first_crate.join("src").join("lib.rs");
+    let second_source = second_crate.join("src").join("lib.rs");
+
+    fs::create_dir_all(first_source.parent().unwrap()).unwrap();
+    fs::create_dir_all(second_source.parent().unwrap()).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/first\", \"crates/second\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (crate_root, name) in [(&first_crate, "first"), (&second_crate, "second")] {
+        fs::write(
+            crate_root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+    }
+    fs::write(&first_source, "pub fn first() {}\n").unwrap();
+    fs::write(&second_source, "pub fn second() {}\n").unwrap();
+
+    (temp_dir, workspace, first_source, second_source)
+}
+
+fn canonicalize_lsp_root(path: &std::path::Path) -> PathBuf {
+    let canonical = fs::canonicalize(path).expect("canonicalize test root");
+    #[cfg(windows)]
+    {
+        let display = canonical.to_string_lossy();
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    canonical
+}
+
 fn collect_notification(manager: &mut LspManager, method: &str) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -249,6 +292,11 @@ fn test_manager_spawns_server_on_first_touch() {
     let keys = manager.ensure_server_for_file_default(&main_rs);
 
     assert_eq!(keys.len(), 1);
+    assert_eq!(
+        keys[0].root,
+        canonicalize_lsp_root(main_rs.parent().unwrap().parent().unwrap()),
+        "a single-crate repository remains rooted at its own manifest"
+    );
     assert_eq!(manager.active_client_count(), 1);
     let client = manager
         .client_for_file_default(&main_rs)
@@ -269,6 +317,23 @@ fn test_manager_reuses_existing_server() {
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_eq!(first[0], second[0]);
+    assert_eq!(manager.active_client_count(), 1);
+}
+
+#[test]
+fn rust_workspace_members_share_one_analyzer_root() {
+    let (_temp_dir, workspace, first_source, second_source) = rust_workspace_member_files();
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+
+    let first = manager.ensure_server_for_file_default(&first_source);
+    let second = manager.ensure_server_for_file_default(&second_source);
+
+    let expected_root = canonicalize_lsp_root(&workspace);
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_eq!(first[0], second[0]);
+    assert_eq!(first[0].root, expected_root);
     assert_eq!(manager.active_client_count(), 1);
 }
 

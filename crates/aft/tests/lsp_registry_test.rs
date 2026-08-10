@@ -32,6 +32,43 @@ fn test_deepest_root_wins_in_monorepo() {
 }
 
 #[test]
+fn test_rust_server_keeps_crate_outside_parent_workspace_at_its_manifest() {
+    let temp_dir = tempdir().unwrap();
+    let workspace_root = temp_dir.path().join("workspace");
+    let workspace_member = workspace_root.join("crates").join("member");
+    let standalone_crate = workspace_root.join("tools").join("standalone");
+    let source = standalone_crate.join("src").join("lib.rs");
+
+    fs::create_dir_all(workspace_member.join("src")).unwrap();
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(
+        workspace_root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/member\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (crate_root, name) in [
+        (&workspace_member, "member"),
+        (&standalone_crate, "standalone"),
+    ] {
+        fs::write(
+            crate_root.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+    }
+    fs::write(&source, "pub fn standalone() {}\n").unwrap();
+
+    let rust = servers_for_file(&source, &Config::default())
+        .into_iter()
+        .find(|server| server.kind == ServerKind::Rust)
+        .expect("Rust server definition");
+    assert_eq!(
+        rust.workspace_root_for_file_with_project_root(&source, Some(&workspace_root)),
+        Some(canonicalize_like_product(&standalone_crate))
+    );
+}
+
+#[test]
 fn test_typescript_root_with_tsconfig() {
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("web");

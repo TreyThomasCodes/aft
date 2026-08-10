@@ -154,6 +154,29 @@ impl LspClient {
         event_tx: Sender<LspEvent>,
         child_registry: LspChildRegistry,
     ) -> io::Result<Self> {
+        Self::spawn_with_reclaim_root(
+            kind,
+            root,
+            binary,
+            args,
+            env,
+            event_tx,
+            child_registry,
+            None,
+        )
+    }
+
+    /// Spawn a language server and associate it with a reclaim-marker root.
+    pub(crate) fn spawn_with_reclaim_root(
+        kind: ServerKind,
+        root: PathBuf,
+        binary: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+        event_tx: Sender<LspEvent>,
+        child_registry: LspChildRegistry,
+        reclaim_root: Option<&Path>,
+    ) -> io::Result<Self> {
         #[cfg(windows)]
         let mut command = if is_windows_batch_file(binary) {
             let mut command = Command::new("cmd.exe");
@@ -206,7 +229,7 @@ impl LspClient {
             });
         }
 
-        let mut child = child_registry.spawn_tracked(&mut command)?;
+        let mut child = child_registry.spawn_tracked_in_root(&mut command, reclaim_root)?;
         let child_pid = child.id();
 
         let stdout = child

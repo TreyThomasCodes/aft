@@ -30,8 +30,12 @@ use crate::slog_error;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 
-fn server_key_for_definition(def: &ServerDef, file_path: &Path) -> Option<ServerKey> {
-    def.workspace_root_for_file(file_path)
+fn server_key_for_definition(
+    def: &ServerDef,
+    file_path: &Path,
+    config: &Config,
+) -> Option<ServerKey> {
+    def.workspace_root_for_file_with_project_root(file_path, config.project_root.as_deref())
         .map(|root| ServerKey {
             kind: def.kind.clone(),
             root,
@@ -388,7 +392,7 @@ impl LspManager {
     fn running_server_keys_for_file(&self, file_path: &Path, config: &Config) -> Vec<ServerKey> {
         servers_for_file(file_path, config)
             .into_iter()
-            .filter_map(|def| server_key_for_definition(&def, file_path))
+            .filter_map(|def| server_key_for_definition(&def, file_path, config))
             .filter(|key| self.clients.contains_key(key))
             .collect()
     }
@@ -412,7 +416,7 @@ impl LspManager {
             let server_id = def.kind.id_str().to_string();
             let server_name = def.name.to_string();
 
-            let Some(key) = server_key_for_definition(&def, file_path) else {
+            let Some(key) = server_key_for_definition(&def, file_path, config) else {
                 outcomes.attempts.push(ServerAttempt {
                     server_id,
                     server_name,
@@ -1975,7 +1979,18 @@ impl LspManager {
             merged_env.insert(key.clone(), value.clone());
         }
 
-        let mut client = LspClient::spawn(
+        // A server may use a nested language workspace, but the reclaim marker
+        // belongs to the configured session project. Only register that broader
+        // root when it contains the server root; otherwise retain the server root
+        // so an unrelated configuration path cannot reap this child.
+        let reclaim_root = config
+            .project_root
+            .as_deref()
+            .map(crate::inspect::job::canonicalize_normalized)
+            .filter(|project_root| root.starts_with(project_root))
+            .unwrap_or_else(|| root.to_path_buf());
+
+        let mut client = LspClient::spawn_with_reclaim_root(
             def.kind.clone(),
             root.to_path_buf(),
             &binary,
@@ -1983,6 +1998,7 @@ impl LspManager {
             &merged_env,
             self.event_tx.clone(),
             self.child_registry.clone(),
+            Some(&reclaim_root),
         )?;
         if let Err(err) = client.initialize(root, def.initialization_options.clone()) {
             wait_for_stderr_tail(&mut client);
@@ -2039,7 +2055,7 @@ impl LspManager {
 
     fn server_key_for_file(&self, file_path: &Path, config: &Config) -> Option<ServerKey> {
         for def in servers_for_file(file_path, config) {
-            let key = server_key_for_definition(&def, file_path)?;
+            let key = server_key_for_definition(&def, file_path, config)?;
             if self.clients.contains_key(&key) {
                 return Some(key);
             }

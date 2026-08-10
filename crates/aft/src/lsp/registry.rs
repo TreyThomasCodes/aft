@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::config::{Config, UserServerDef};
-use crate::lsp::roots::find_workspace_root;
+use crate::lsp::roots::{
+    find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
+};
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -195,13 +197,37 @@ pub struct ServerDef {
 impl ServerDef {
     /// Return the workspace root this server should use for a file.
     pub fn workspace_root_for_file(&self, file_path: &Path) -> Option<PathBuf> {
+        self.workspace_root_for_file_with_project_root(file_path, None)
+    }
+
+    /// Return the workspace root for a file without searching above `project_root`.
+    ///
+    /// Rust Analyzer indexes the full Cargo workspace passed to it. Resolve Rust
+    /// member crates to their owning workspace before the generic nearest-marker
+    /// fallback so sibling members share a single analyzer. Other languages keep
+    /// their established priority-marker behavior unchanged.
+    pub fn workspace_root_for_file_with_project_root(
+        &self,
+        file_path: &Path,
+        project_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        if self.kind == ServerKind::Rust {
+            if let Some(root) = find_rust_workspace_root(file_path, project_root) {
+                return Some(root);
+            }
+        }
+
         for marker in &self.priority_root_markers {
             if let Some(root) = find_workspace_root(file_path, &[marker.as_str()]) {
                 return Some(root);
             }
         }
 
-        find_workspace_root(file_path, &self.root_markers)
+        if self.kind == ServerKind::Rust {
+            find_workspace_root_within(file_path, &self.root_markers, project_root)
+        } else {
+            find_workspace_root(file_path, &self.root_markers)
+        }
     }
 
     /// Check if this server handles a given file extension.

@@ -2811,10 +2811,10 @@ where
                 crate::logging::maybe_sweep_logs();
                 let reaped_lsp_children = shared_app
                     .lsp_child_registry()
-                    .reap_children_with_gone_cwd();
+                    .reap_children_with_gone_cwd_or_reclaimed_root();
                 if reaped_lsp_children > 0 {
                     log::warn!(
-                        "subc attach: reaped {reaped_lsp_children} LSP child process group(s) whose cwd no longer exists"
+                        "subc attach: reaped {reaped_lsp_children} LSP child process group(s) with a deleted cwd or reclaimed root"
                     );
                 }
                 let reap = reap_idle_roots(
