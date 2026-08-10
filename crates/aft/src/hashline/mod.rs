@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod oracle;
+pub mod recovery;
 pub mod scan;
 pub mod snapshot;
 pub mod syntax;
