@@ -50,7 +50,7 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: ~60 command-specific request parsing and response generation modules
-- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
+- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/hashline.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
 
 **`crates/aft/src/compress/`:**
 - Purpose: Provide tiered output compression for hoisted bash commands.
@@ -68,9 +68,9 @@ opencode-aft/
 - Key files: `crates/aft/src/inspect/scanners/dead_code.rs`, `crates/aft/src/inspect/scanners/unused_exports.rs`, `crates/aft/src/inspect/scanners/duplicates.rs`, `crates/aft/src/inspect/scanners/cycles.rs`, `crates/aft/src/inspect/scanners/metrics.rs`, `crates/aft/src/inspect/scanners/todos.rs`, `crates/aft/src/inspect/entry_points.rs`, `crates/aft/src/inspect/frameworks.rs`, `crates/aft/src/inspect/generated.rs`, `crates/aft/src/inspect/job.rs`, `crates/aft/src/inspect/oxc_engine/graph.rs`, `crates/aft/src/inspect/tier2_scheduler.rs`
 
 **`crates/aft/src/lsp/`:**
-- Purpose: Keep LSP client, transport, registry, and diagnostics state separate from command handlers.
-- Contains: LSP lifecycle modules and supporting types
-- Key files: `crates/aft/src/lsp/manager.rs`, `crates/aft/src/lsp/client.rs`, `crates/aft/src/lsp/diagnostics.rs`
+- Purpose: Keep LSP client, transport, registry, workspace root resolution, child process lifecycle, and diagnostics state separate from command handlers.
+- Contains: LSP lifecycle modules, workspace root discovery (deduplicating analyzer roots to Cargo workspace manifests), child process registry (with sibling `.reclaimed` worktree reaping), and supporting types
+- Key files: `crates/aft/src/lsp/manager.rs`, `crates/aft/src/lsp/client.rs`, `crates/aft/src/lsp/diagnostics.rs`, `crates/aft/src/lsp/roots.rs`, `crates/aft/src/lsp/child_registry.rs`
 
 **`crates/aft/src/executor/`:**
 - Purpose: Orchestrate background maintenance, interactive tools, and job queues.
@@ -98,9 +98,9 @@ opencode-aft/
 - Key files: `crates/aft/src/patch/mod.rs`, `crates/aft/src/patch/parser.rs`, `crates/aft/src/patch/matcher.rs`, `crates/aft/src/patch/apply.rs`
 
 **`crates/aft/src/hashline/`:**
-- Purpose: Provide seed-zero xxHash32 digest calculation, tag normalization, and oracle parity verification for hashline editing.
-- Contains: Pure-Rust xxHash32 digest calculator, tag normalizer, and hashline oracle parity corpus fixtures.
-- Key files: `crates/aft/src/hashline/mod.rs`, `crates/aft/src/hashline/oracle/mod.rs`, `crates/aft/src/hashline/oracle/xxhash32.rs`, `crates/aft/src/hashline/oracle/fixtures.jsonl`
+- Purpose: Provide byte scanning, line-tag snapshot stores, parser verification, apply repair, two-phase transactions, remap recovery, session registration, release performance gates, and seed-zero xxHash32 oracle calculation for hashline editing.
+- Contains: Byte scanner (`scan/`), snapshot rendering store (`snapshot/`), syntax parser and address verifier (`syntax/`), PUT/CUT/REM apply, boundary/indent repair, and register store (`apply/`), Phase 1/2 transaction engine with rollback protection (`transaction/`), exact-verbatim remap recovery (`recovery/`), session binding and transport integration (`integration/`), release gates and performance ceilings (`release/`), and pure-Rust xxHash32 digest calculator and oracle parity fixtures (`oracle/`).
+- Key files: `crates/aft/src/hashline/mod.rs`, `crates/aft/src/hashline/scan/mod.rs`, `crates/aft/src/hashline/snapshot/mod.rs`, `crates/aft/src/hashline/syntax/mod.rs`, `crates/aft/src/hashline/apply/mod.rs`, `crates/aft/src/hashline/transaction/mod.rs`, `crates/aft/src/hashline/recovery/mod.rs`, `crates/aft/src/hashline/integration/mod.rs`, `crates/aft/src/hashline/release/mod.rs`, `crates/aft/src/hashline/oracle/mod.rs`
 
 **`crates/aft/src/subc/`:**
 - Purpose: Connect to and authenticate with the subconscious daemon.
@@ -198,6 +198,8 @@ opencode-aft/
 **New Rust command handler:** `crates/aft/src/commands/[command_name].rs` -- expose the handler from `crates/aft/src/commands/mod.rs` and dispatch it from `crates/aft/src/main.rs`.
 
 **New patch parser/matching code:** `crates/aft/src/patch/[module].rs` -- implement parsing or sequence matching logic and expose it via `crates/aft/src/patch/mod.rs`.
+
+**New hashline apply repair or register rule:** `crates/aft/src/hashline/apply/` -- implement apply operations, repair logic, or register storage.
 
 **New hashline oracle test fixture or vector:** `crates/aft/src/hashline/oracle/` -- add fixtures to `fixtures.jsonl` or test vectors to `xxhash32_vectors.rs`.
 
