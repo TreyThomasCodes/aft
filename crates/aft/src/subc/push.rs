@@ -442,7 +442,7 @@ pub(super) fn emit_bg_event_wakes(
     for channel in pending_channels {
         if let Some(sub) = bg_subs.get(&channel) {
             if try_send_bg_stream_data(writer_tx, metrics, channel, sub) == PushSendOutcome::Sent {
-                metrics.record_bg_nudge_sent(&sub.root, &sub.session, channel);
+                metrics.record_bg_nudge_enqueued(&sub.root, &sub.session, channel);
             }
         } else {
             stale_channels.push(channel);

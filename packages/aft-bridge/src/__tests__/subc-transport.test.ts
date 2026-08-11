@@ -1125,6 +1125,16 @@ describe("SubcTransport bg_events subscription (S3)", () => {
       root: pool.getBridge(TEST_PROJECT_ROOT).getCwd(),
       session: "sess-1",
     });
+    client.subscriptions[0]?.emit();
+    expect(nudges.length).toBe(3);
+    expect(
+      lifecycleLogs.filter((entry) => entry.message.includes("nudge received")),
+    ).toEqual([
+      {
+        message: "subc bg_events: nudge received channel=2@2 count=1",
+        meta: { sessionId: "sess-1" },
+      },
+    ]);
   });
 
   test("is idempotent — one subscription per session even across many tool calls", async () => {

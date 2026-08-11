@@ -119,6 +119,25 @@ impl FakeDaemonDemux {
     }
 }
 
+struct FakeBgClientSubscription {
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    received: usize,
+}
+
+impl FakeBgClientSubscription {
+    fn receive(&mut self, frame: &Frame) {
+        assert!(is_expected_bg_event_stream_data(
+            frame,
+            self.channel,
+            self.corr
+        ));
+        assert_eq!(frame.header.epoch, self.epoch, "unexpected client epoch");
+        self.received += 1;
+    }
+}
+
 #[test]
 fn fake_daemon_mints_epochs_and_drops_stale_frames_in_both_directions() {
     let mut consumer = FakeDaemonDemux::default();
@@ -5090,15 +5109,36 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
-    send_route_bind_with_session(&mut stream, 7, 70, &root1, "session-1").await;
+    let provider_channel = 245;
+    send_route_bind_with_session(&mut stream, provider_channel, 70, &root1, "session-1").await;
     expect_route_bind_ack(&mut stream, 70).await;
 
-    send_bg_events_subscribe(&mut stream, 7, 700).await;
+    let mut consumer_demux = FakeDaemonDemux::default();
+    let consumer_channel = 2;
+    let consumer_epoch = consumer_demux.grant(consumer_channel);
+    let mut provider_demux = FakeDaemonDemux::default();
+    let provider_epoch = provider_demux.grant(provider_channel);
+    let mut client_subscription = FakeBgClientSubscription {
+        channel: consumer_channel,
+        epoch: consumer_epoch,
+        corr: 700,
+        received: 0,
+    };
+    send_client_bg_events_subscribe(
+        &mut stream,
+        &consumer_demux,
+        consumer_channel,
+        consumer_epoch,
+        provider_channel,
+        provider_epoch,
+        700,
+    )
+    .await;
     send_tool_call(&mut stream, 1, 701, "echo", json!({ "case": "fast" })).await;
     let route_usable = read_tool_response_allowing_bg_events(
         &mut stream,
         701,
-        7,
+        provider_channel,
         700,
         "route usable while bg_events is subscribed",
     )
@@ -5107,7 +5147,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
 
     drain_bg_events_for(
         &mut stream,
-        7,
+        provider_channel,
         700,
         Duration::from_millis(800),
         "optimistic bg_events subscribe seed",
@@ -5125,7 +5165,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     let (start_responses, mut early_bg_events) = collect_tool_responses_allowing_bg_events(
         &mut stream,
         HashSet::from([710, 711, 712]),
-        7,
+        provider_channel,
         700,
         "bg_events burst bash start responses",
     )
@@ -5149,7 +5189,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         early_bg_events.push(
             wait_for_bg_event(
                 &mut stream,
-                7,
+                provider_channel,
                 700,
                 Duration::from_secs(30),
                 "completion wake",
@@ -5157,13 +5197,26 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
             .await,
         );
     }
+    // Initial subscription frames were consumed before the tasks began, so each
+    // remaining event comes from a task completion. Rewrite each provider frame
+    // for the consumer route and require the subscription to accept at least one.
+    for (_, provider_frame) in &early_bg_events {
+        let client_frame = provider_demux
+            .rewrite(provider_frame, consumer_channel, consumer_epoch)
+            .expect("daemon should relay provider nudge to subscribed client route");
+        client_subscription.receive(&client_frame);
+    }
+    assert!(
+        client_subscription.received > 0,
+        "subscribed client did not receive a module bg_events nudge"
+    );
     assert_bg_events_are_coalesced(&early_bg_events);
     if early_bg_events.len() == 1 {
-        let elapsed = early_bg_events[0].elapsed();
+        let elapsed = early_bg_events[0].0.elapsed();
         if elapsed < Duration::from_millis(150) {
             assert_no_bg_event_for(
                 &mut stream,
-                7,
+                provider_channel,
                 700,
                 Duration::from_millis(150).saturating_sub(elapsed),
                 "second bg_events nudge in the same tick",
@@ -5172,16 +5225,17 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         }
     }
 
-    wait_for_bg_event(
+    let _ = wait_for_bg_event(
         &mut stream,
-        7,
+        provider_channel,
         700,
         Duration::from_secs(2),
         "re-armed bg_events wake before ack",
     )
     .await;
 
-    let drained = drain_bg_completions_until(&mut stream, 1, 7300, &task_ids, 7, 700).await;
+    let drained =
+        drain_bg_completions_until(&mut stream, 1, 7300, &task_ids, provider_channel, 700).await;
     let drained_ids: HashSet<String> = drained["bg_completions"]
         .as_array()
         .expect("drained bg_completions")
@@ -5211,7 +5265,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     let ack = read_tool_response_allowing_bg_events(
         &mut stream,
         7400,
-        7,
+        provider_channel,
         700,
         "bg completion ack response",
     )
@@ -5220,7 +5274,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
 
     drain_bg_events_for(
         &mut stream,
-        7,
+        provider_channel,
         700,
         Duration::from_millis(1200),
         "bg_events clear grace after ack",
@@ -5228,15 +5282,15 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     .await;
     assert_no_bg_event_for(
         &mut stream,
-        7,
+        provider_channel,
         700,
         Duration::from_millis(700),
         "bg_events quiet after ack clear",
     )
     .await;
 
-    send_bg_events_cancel(&mut stream, 7, 700).await;
-    expect_bg_events_stream_end(&mut stream, 7, 700).await;
+    send_bg_events_cancel(&mut stream, provider_channel, 700).await;
+    expect_bg_events_stream_end(&mut stream, provider_channel, 700).await;
 
     send_bash_background(
         &mut stream,
@@ -5244,18 +5298,30 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         "sleep 1; printf 'bg-events-after-cancel\n'",
     )
     .await;
-    let after_cancel_start =
-        read_tool_response_rejecting_bg_events(&mut stream, 7500, 7, 700, "post-cancel bash start")
-            .await;
+    let after_cancel_start = read_tool_response_rejecting_bg_events(
+        &mut stream,
+        7500,
+        provider_channel,
+        700,
+        "post-cancel bash start",
+    )
+    .await;
     let after_cancel_task = after_cancel_start["task_id"]
         .as_str()
         .expect("post-cancel task_id")
         .to_string();
-    wait_for_bash_completion_without_bg_event(&mut stream, 1, 7501, &after_cancel_task, 7, 700)
-        .await;
+    wait_for_bash_completion_without_bg_event(
+        &mut stream,
+        1,
+        7501,
+        &after_cancel_task,
+        provider_channel,
+        700,
+    )
+    .await;
     assert_no_bg_event_for(
         &mut stream,
-        7,
+        provider_channel,
         700,
         Duration::from_millis(700),
         "bg_events quiet after cancel",
@@ -7567,6 +7633,31 @@ async fn send_bg_events_subscribe(stream: &mut tokio::net::TcpStream, channel: u
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn send_client_bg_events_subscribe(
+    stream: &mut tokio::net::TcpStream,
+    consumer_demux: &FakeDaemonDemux,
+    consumer_channel: u16,
+    consumer_epoch: u32,
+    provider_channel: u16,
+    provider_epoch: u32,
+    corr: u64,
+) {
+    let client_frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        consumer_channel,
+        consumer_epoch,
+        corr,
+        serde_json::to_vec(&json!({ "op": "bg_events" })).expect("client bg_events body"),
+    )
+    .expect("client bg_events subscribe frame");
+    let provider_frame = consumer_demux
+        .rewrite(&client_frame, provider_channel, provider_epoch)
+        .expect("daemon should relay client subscription to provider route");
+    send_frame(stream, provider_frame).await;
+}
+
 async fn send_bg_events_cancel(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64) {
     send_frame(
         stream,
@@ -7750,16 +7841,16 @@ async fn collect_tool_responses_allowing_bg_events(
     bg_channel: u16,
     bg_corr: u64,
     label: &str,
-) -> (HashMap<u64, Value>, Vec<Instant>) {
+) -> (HashMap<u64, Value>, Vec<(Instant, Frame)>) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut responses = HashMap::new();
-    let mut bg_event_times = Vec::new();
+    let mut bg_events = Vec::new();
     while responses.len() < expected_corrs.len() {
         let frame = read_any_frame_until(stream, deadline, label)
             .await
             .unwrap_or_else(|| panic!("timed out waiting for {label}"));
         if is_expected_bg_event_stream_data(&frame, bg_channel, bg_corr) {
-            bg_event_times.push(Instant::now());
+            bg_events.push((Instant::now(), frame));
             continue;
         }
         assert_no_bg_events_terminal(&frame, bg_channel, bg_corr, label);
@@ -7771,14 +7862,14 @@ async fn collect_tool_responses_allowing_bg_events(
             other => panic!("unexpected frame while waiting for {label}: {other:?}"),
         }
     }
-    (responses, bg_event_times)
+    (responses, bg_events)
 }
 
-fn assert_bg_events_are_coalesced(event_times: &[Instant]) {
-    for pair in event_times.windows(2) {
+fn assert_bg_events_are_coalesced(events: &[(Instant, Frame)]) {
+    for pair in events.windows(2) {
         assert!(
-            pair[1].duration_since(pair[0]) >= Duration::from_millis(150),
-            "bg_events StreamData frames should be coalesced per tick: {event_times:?}"
+            pair[1].0.duration_since(pair[0].0) >= Duration::from_millis(150),
+            "bg_events StreamData frames should be coalesced per tick"
         );
     }
 }
@@ -7789,14 +7880,14 @@ async fn wait_for_bg_event(
     corr: u64,
     timeout: Duration,
     label: &str,
-) -> Instant {
+) -> (Instant, Frame) {
     let deadline = Instant::now() + timeout;
     loop {
         let frame = read_any_frame_until(stream, deadline, label)
             .await
             .unwrap_or_else(|| panic!("timed out waiting for {label}"));
         if is_expected_bg_event_stream_data(&frame, channel, corr) {
-            return Instant::now();
+            return (Instant::now(), frame);
         }
         assert_no_bg_events_terminal(&frame, channel, corr, label);
         match frame.header.ty {

@@ -134,7 +134,7 @@ const BG_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
 enum BgEventKind {
     ArmHit,
     ArmMiss,
-    NudgeSent,
+    NudgeEnqueued,
     SubscriptionInstalled,
     SubscriptionEnded,
 }
@@ -292,8 +292,8 @@ impl DispatchPathMetrics {
         self.bg_event_count_60s(BgEventKind::ArmMiss)
     }
 
-    fn bg_nudges_sent_60s_total(&self) -> u64 {
-        self.bg_event_count_60s(BgEventKind::NudgeSent)
+    fn bg_nudges_enqueued_60s_total(&self) -> u64 {
+        self.bg_event_count_60s(BgEventKind::NudgeEnqueued)
     }
 
     pub(super) fn record_bg_arm_hit(
@@ -332,17 +332,17 @@ impl DispatchPathMetrics {
         }
     }
 
-    pub(super) fn record_bg_nudge_sent(
+    pub(super) fn record_bg_nudge_enqueued(
         &self,
         root: &ProjectRootId,
         session: &str,
         channel: RouteChannel,
     ) {
         if let Some(suppressed) =
-            self.record_bg_event_at(root, session, BgEventKind::NudgeSent, Instant::now())
+            self.record_bg_event_at(root, session, BgEventKind::NudgeEnqueued, Instant::now())
         {
             emit_bg_observability_info(format!(
-                "subc bg wake: nudge sent root={} session={} channel={} suppressed={suppressed}",
+                "subc bg wake: nudge enqueued root={} session={} channel={} suppressed={suppressed}",
                 root.as_path().display(),
                 session,
                 channel
@@ -735,7 +735,7 @@ pub(super) fn build_health_report(
                 "open_routes": shared_app.open_route_count(),
                 "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
                 "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
-                "bg_nudges_sent_60s_total": dispatch_path_metrics.bg_nudges_sent_60s_total(),
+                "bg_nudges_enqueued_60s_total": dispatch_path_metrics.bg_nudges_enqueued_60s_total(),
                 "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
                 "spawned_lsp_children": lsp_children.map(|health| health.spawned),
                 "lsp_children_with_deleted_cwd": lsp_children.map(|health| health.cwd_gone),
@@ -818,19 +818,25 @@ mod tests {
         let cold_runtime = &cold_metrics["runtime"];
         assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
         assert_eq!(cold_runtime["bg_wake_pending"].as_u64(), Some(0));
-        assert_eq!(cold_runtime["bg_nudges_sent_60s_total"].as_u64(), Some(0));
+        assert_eq!(
+            cold_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
+            Some(0)
+        );
         assert_eq!(cold_runtime["bg_arm_misses_60s_total"].as_u64(), Some(0));
 
         metrics.record_bg_runtime(2, 1);
         metrics.record_bg_arm_miss(&root, "missing-session", 2);
-        metrics.record_bg_nudge_sent(&root, "live-session", channel);
+        metrics.record_bg_nudge_enqueued(&root, "live-session", channel);
 
         let hot = build_health_report(&executor, &HashMap::new(), &metrics, &app);
         let hot_metrics = hot.metrics.expect("hot health metrics");
         let hot_runtime = &hot_metrics["runtime"];
         assert_eq!(hot_runtime["bg_subscriptions"].as_u64(), Some(2));
         assert_eq!(hot_runtime["bg_wake_pending"].as_u64(), Some(1));
-        assert_eq!(hot_runtime["bg_nudges_sent_60s_total"].as_u64(), Some(1));
+        assert_eq!(
+            hot_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
+            Some(1)
+        );
         assert_eq!(hot_runtime["bg_arm_misses_60s_total"].as_u64(), Some(1));
     }
 

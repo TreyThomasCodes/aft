@@ -306,6 +306,7 @@ class BgSubscription {
     string,
     { lastEmittedAt: number; suppressed: number }
   >();
+  private nudgeReceiptLogState: { lastEmittedAt: number; count: number } | null = null;
 
   constructor(
     private readonly identity: BindIdentity,
@@ -353,6 +354,20 @@ class BgSubscription {
 
   private routeId(route: RouteHandle): string {
     return `${route.channel}@${route.epoch}`;
+  }
+
+  private recordNudgeReceipt(routeId: string): void {
+    const now = Date.now();
+    const state = this.nudgeReceiptLogState;
+    if (state && now - state.lastEmittedAt < BG_LIFECYCLE_LOG_INTERVAL_MS) {
+      state.count += 1;
+      return;
+    }
+    const count = (state?.count ?? 0) + 1;
+    this.nudgeReceiptLogState = { lastEmittedAt: now, count: 0 };
+    log(`subc bg_events: nudge received channel=${routeId} count=${count}`, {
+      sessionId: this.identity.session,
+    });
   }
 
   private errorText(error: unknown): string {
@@ -448,12 +463,15 @@ class BgSubscription {
       }
 
       const subscribedAt = Date.now();
+      const routeId = this.routeId(route);
       try {
         const sub = client.subscribe(route, { op: "bg_events" }, () => {
-          if (!this.stopped && this.isCurrent()) this.onNudge();
+          if (!this.stopped && this.isCurrent()) {
+            this.recordNudgeReceipt(routeId);
+            this.onNudge();
+          }
         });
         this.current = sub;
-        const routeId = this.routeId(route);
         this.info("subscription-open", `subscription open channel=${routeId}`);
         if (reconnecting) {
           this.info(
