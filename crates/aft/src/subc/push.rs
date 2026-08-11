@@ -473,15 +473,17 @@ pub(super) fn arm_bg_wake(
 pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
     root_id: &ProjectRootId,
     empty_bg_sessions: &[(String, u64)],
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
 ) {
     for (session, epoch_at_submit) in empty_bg_sessions {
         let key = (root_id.clone(), session.clone());
         if bg_wake_epoch.get(&key).copied() == Some(*epoch_at_submit) {
-            if let Some(channel) = bg_sub_by_session.get(&key).copied() {
-                bg_wake_pending.remove(&channel);
+            if let Some(channels) = bg_sub_by_session.get(&key) {
+                for channel in channels {
+                    bg_wake_pending.remove(channel);
+                }
             }
         }
     }
@@ -819,24 +821,20 @@ fn process_reliable_push_frame(
 
 fn arm_completed_bg_wake(
     metrics: &DispatchPathMetrics,
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     root: ProjectRootId,
     session: String,
 ) {
-    if let Some(channel) = bg_sub_by_session
-        .get(&(root.clone(), session.clone()))
-        .copied()
-    {
-        arm_bg_wake(
-            root,
-            session,
-            channel,
-            bg_wake_pending,
-            bg_wake_epoch,
-            metrics,
-        );
+    if let Some(channels) = bg_sub_by_session.get(&(root.clone(), session.clone())) {
+        *bg_wake_epoch
+            .entry((root.clone(), session.clone()))
+            .or_default() += 1;
+        for channel in channels {
+            metrics.record_bg_arm_hit(&root, &session, *channel);
+            bg_wake_pending.insert(*channel);
+        }
     } else {
         let live_root_subscriptions = bg_sub_by_session
             .keys()
@@ -856,7 +854,7 @@ fn process_reliable_push_and_arm_bg_wake(
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     completed_tasks: &mut CompletedTaskIds,
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     root: ProjectRootId,
@@ -895,7 +893,7 @@ pub(super) fn drain_reliable_push_turn(
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     completed_tasks: &mut CompletedTaskIds,
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
@@ -1999,6 +1997,72 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_session_subscriptions_emit_each_route_correlation() {
+        let (_root_dir, root) = test_root("subc-bg-duplicate-session-root");
+        let session = "shared-session".to_string();
+        let key = (root.clone(), session.clone());
+        let route_a = route_key(17, 1);
+        let route_b = route_key(23, 4);
+        let metrics = DispatchPathMetrics::new();
+        let mut bg_sub_by_session =
+            HashMap::from([(key.clone(), HashSet::from([route_a, route_b]))]);
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+
+        arm_completed_bg_wake(
+            &metrics,
+            &bg_sub_by_session,
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+            root.clone(),
+            session.clone(),
+        );
+        assert_eq!(bg_wake_pending, HashSet::from([route_a, route_b]));
+        assert_eq!(bg_wake_epoch.get(&key).copied(), Some(1));
+
+        let bg_subs = HashMap::from([
+            (
+                route_a,
+                BgSub {
+                    corr: 1701,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: session.clone(),
+                },
+            ),
+            (
+                route_b,
+                BgSub {
+                    corr: 2304,
+                    ver: PROTOCOL_VERSION,
+                    flags: control_flags(),
+                    root: root.clone(),
+                    session: session.clone(),
+                },
+            ),
+        ]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+        emit_bg_event_wakes(&writer_tx, &metrics, &bg_subs, &mut bg_wake_pending);
+        let emitted: HashSet<_> = [
+            writer_rx.try_recv().expect("first duplicate-session wake"),
+            writer_rx.try_recv().expect("second duplicate-session wake"),
+        ]
+        .into_iter()
+        .map(|frame| {
+            (
+                route_key(frame.header.channel, frame.header.epoch),
+                frame.header.corr,
+            )
+        })
+        .collect();
+        assert_eq!(emitted, HashSet::from([(route_a, 1701), (route_b, 2304)]));
+
+        remove_bg_subscription_index(&mut bg_sub_by_session, route_b, None);
+        assert_eq!(bg_sub_by_session.get(&key), Some(&HashSet::from([route_a])));
+    }
+
+    #[test]
     fn stale_maintenance_epoch_does_not_clear_newer_bg_wake() {
         let (_root_dir, root) = test_root("subc-bg-wake-stale-root");
         let session = "session-1".to_string();
@@ -2006,7 +2070,7 @@ mod tests {
         let channel = route_key(8, 1);
         let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
-        bg_sub_by_session.insert(key.clone(), channel);
+        bg_sub_by_session.insert(key.clone(), HashSet::from([channel]));
         let mut bg_wake_pending = HashSet::new();
         let mut bg_wake_epoch = HashMap::new();
 
@@ -2048,7 +2112,7 @@ mod tests {
         let channel = route_key(9, 1);
         let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
-        bg_sub_by_session.insert(key.clone(), channel);
+        bg_sub_by_session.insert(key.clone(), HashSet::from([channel]));
         let mut bg_wake_pending = HashSet::new();
         let mut bg_wake_epoch = HashMap::new();
 

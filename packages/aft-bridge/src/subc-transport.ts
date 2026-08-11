@@ -83,6 +83,8 @@ export interface SubcClientLike {
     onEvent: (event: Uint8Array) => void,
   ): SubcSubscriptionLike;
   closeRouteChannel(route: RouteHandle, opts?: { drain?: boolean }): Promise<void>;
+  /** Cumulative frames discarded because their route epoch did not match the client's current handle. */
+  readonly droppedIngressFrames?: number;
   close(): void;
 }
 
@@ -107,6 +109,7 @@ const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
  */
 const BG_STABLE_MS = 5_000;
 const BG_LIFECYCLE_LOG_INTERVAL_MS = 60_000;
+const BG_DISPATCH_PROBE_INTERVAL_MS = 60_000;
 
 /**
  * Session fallback when a tool runtime carries no session id, mirroring the Rust
@@ -157,6 +160,8 @@ export interface SubcTransportPoolOptions {
   onBgEventsNudge?: (projectRoot: string, session: string) => void;
   /** Test seam: backoff sleeper for the bg resubscribe loop (default real timer). */
   bgBackoffSleep?: (ms: number) => Promise<void>;
+  /** Test-only polling interval for detecting frames silently discarded with a stale route epoch. */
+  bgDispatchProbeIntervalMs?: number;
   /** Optional lifecycle registry used for root tracking; omit it to retain legacy behavior. */
   lifecycleRegistry?: LifecycleRegistry;
   /** Configuration-shaped alias used by construction sites that group lifecycle seams. */
@@ -318,6 +323,7 @@ class BgSubscription {
     private readonly canAttach: () => boolean,
     private readonly onRootAttachFailure: (error: unknown) => boolean,
     private readonly onDormant: () => void,
+    private readonly dispatchProbeIntervalMs: number,
     readonly nudgeRef?: BgNudgeRef,
     private readonly isCurrent: () => boolean = () => true,
   ) {
@@ -372,6 +378,25 @@ class BgSubscription {
 
   private errorText(error: unknown): string {
     return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  }
+
+  private startDispatchProbe(client: SubcClientLike, routeId: string): () => void {
+    const initial = client.droppedIngressFrames;
+    if (typeof initial !== "number") return () => undefined;
+
+    let previous = initial;
+    const timer = setInterval(() => {
+      const total = client.droppedIngressFrames;
+      if (typeof total !== "number" || total <= previous) return;
+      const delta = total - previous;
+      previous = total;
+      this.info(
+        "dispatch-epoch-drop",
+        `client ingress epoch drops scope=client observed_while_channel=${routeId} delta=${delta} total=${total}`,
+      );
+    }, this.dispatchProbeIntervalMs);
+    timer.unref?.();
+    return () => clearInterval(timer);
   }
 
   private async run(): Promise<void> {
@@ -464,6 +489,7 @@ class BgSubscription {
 
       const subscribedAt = Date.now();
       const routeId = this.routeId(route);
+      let stopDispatchProbe = (): void => undefined;
       try {
         const sub = client.subscribe(route, { op: "bg_events" }, () => {
           if (!this.stopped && this.isCurrent()) {
@@ -472,6 +498,7 @@ class BgSubscription {
           }
         });
         this.current = sub;
+        stopDispatchProbe = this.startDispatchProbe(client, routeId);
         this.info("subscription-open", `subscription open channel=${routeId}`);
         if (reconnecting) {
           this.info(
@@ -510,6 +537,7 @@ class BgSubscription {
         if (Date.now() - subscribedAt >= BG_STABLE_MS) backoffAttempt = 0;
         beginReconnect();
       } finally {
+        stopDispatchProbe();
         this.current = null;
         safeCloseRoute(client, route);
       }
@@ -818,6 +846,7 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
   private readonly onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
   private readonly bgBackoffSleep: (ms: number) => Promise<void>;
+  private readonly bgDispatchProbeIntervalMs: number;
   private readonly lifecycleDemandCheck?: (
     root: CanonicalRootPath,
     poolId: ConcretePoolId,
@@ -860,6 +889,8 @@ export class SubcTransportPool implements AftTransportPool {
     this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
     this.bgBackoffSleep =
       options.bgBackoffSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.bgDispatchProbeIntervalMs =
+      options.bgDispatchProbeIntervalMs ?? BG_DISPATCH_PROBE_INTERVAL_MS;
     const lifecycle = options.lifecycle;
     const demandCheck =
       options.lifecycleDemandCheck ?? options.demandCheck ?? lifecycle?.demandCheck;
@@ -1622,6 +1653,7 @@ export class SubcTransportPool implements AftTransportPool {
         return true;
       },
       clearDormantSubscription,
+      this.bgDispatchProbeIntervalMs,
       nudgeRef,
       () =>
         this.isCurrentSession(record.identityKey, record) &&

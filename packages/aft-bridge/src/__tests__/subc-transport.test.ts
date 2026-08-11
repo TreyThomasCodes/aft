@@ -81,6 +81,7 @@ class FakeClient implements SubcClientLike {
   subscriptions: FakeSubscription[] = [];
   closedRoutes: number[] = [];
   closed = 0;
+  droppedIngressFrames = 0;
   nextChannel = 1;
   subscriptionUnsubscribeGate: Promise<void> | null = null;
   /** When set, routeOpen awaits this gate before resolving (race control). */
@@ -1127,14 +1128,34 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     });
     client.subscriptions[0]?.emit();
     expect(nudges.length).toBe(3);
-    expect(
-      lifecycleLogs.filter((entry) => entry.message.includes("nudge received")),
-    ).toEqual([
+    expect(lifecycleLogs.filter((entry) => entry.message.includes("nudge received"))).toEqual([
       {
         message: "subc bg_events: nudge received channel=2@2 count=1",
         meta: { sessionId: "sess-1" },
       },
     ]);
+  });
+
+  test("logs subc-client epoch-guard drops while a quiet subscription remains open", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      onBgEventsNudge: () => undefined,
+      bgBackoffSleep: async () => undefined,
+      bgDispatchProbeIntervalMs: 1,
+    });
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("epoch-drop", "read", {});
+    await tick();
+    client.droppedIngressFrames = 2;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      "subc bg_events: client ingress epoch drops scope=client observed_while_channel=2@2 delta=2 total=2",
+    );
+    await pool.shutdown();
   });
 
   test("is idempotent — one subscription per session even across many tool calls", async () => {

@@ -67,6 +67,66 @@ maybeDescribe(describeName, () => {
     });
   }, 90_000);
 
+  test("two client records retain matched bg_events routing when the newest closes", async () => {
+    await withRig(async ({ rig, pools }) => {
+      const nudgesA: Array<{ root: string; session: string; at: number }> = [];
+      const nudgesB: Array<{ root: string; session: string; at: number }> = [];
+      const poolA = await createPool(prepared, rig, pools, nudgesA);
+      const poolB = await createPool(prepared, rig, pools, nudgesB);
+      const bridgeA = poolA.getBridge(rig.projectDir);
+      const bridgeB = poolB.getBridge(rig.projectDir);
+      const session = `duplicate-record-${Date.now()}`;
+
+      assertToolSuccess(
+        await bridgeA.toolCall(session, "read", { filePath: "seed.txt" }),
+        "client A warm read",
+      );
+      await waitFor(
+        () => nudgesA.some((nudge) => nudge.session === session),
+        8_000,
+        "client A subscription seed",
+      );
+      assertToolSuccess(
+        await bridgeB.toolCall(session, "read", { filePath: "seed.txt" }),
+        "client B warm read",
+      );
+      await waitFor(
+        () => nudgesB.some((nudge) => nudge.session === session),
+        8_000,
+        "client B subscription seed",
+      );
+
+      // The newest subscriber closes while the older client record stays live. A
+      // scalar last-writer-wins index loses the older route here, even though its
+      // subscription and client pending entry both remain open.
+      await poolB.shutdown();
+      await sleep(500);
+
+      await waitForQuiet(
+        () => nudgesA.filter((nudge) => nudge.session === session).length,
+        750,
+        8_000,
+        "surviving client subscription",
+      );
+      const aBefore = nudgesA.filter((nudge) => nudge.session === session).length;
+      const spawned = await bridgeA.toolCall(session, "bash", {
+        command: "sleep 1; echo duplicate-record-bg-ok",
+        background: true,
+      });
+      assertToolSuccess(spawned, "duplicate-record background bash spawn");
+      const taskId = taskIdFrom(spawned);
+
+      await waitFor(
+        () => nudgesA.filter((nudge) => nudge.session === session).length > aBefore,
+        12_000,
+        "surviving client matched bg_events nudge",
+      );
+      const drain = await waitForCompletion(bridgeA, session, taskId, 8_000);
+      expect(JSON.stringify(drain)).toContain("duplicate-record-bg-ok");
+      await bridgeA.send("bash_ack_completions", { session_id: session, task_ids: [taskId] });
+    });
+  }, 60_000);
+
   test("multi-root sessions on one daemon stay isolated", async () => {
     await withRig(async ({ rig, pools, nudges }) => {
       const rootA = rig.projectDir;
@@ -245,6 +305,28 @@ async function waitFor(
     await sleep(200);
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+async function waitForQuiet(
+  count: () => number,
+  quietMs: number,
+  timeoutMs: number,
+  label: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let previous = count();
+  let unchangedSince = Date.now();
+  while (Date.now() < deadline) {
+    await sleep(100);
+    const current = count();
+    if (current !== previous) {
+      previous = current;
+      unchangedSince = Date.now();
+    } else if (Date.now() - unchangedSince >= quietMs) {
+      return;
+    }
+  }
+  throw new Error(`timed out waiting for ${label} to stay quiet for ${quietMs}ms`);
 }
 
 function formatRestartCount(runtime: AftModuleRuntime): string {

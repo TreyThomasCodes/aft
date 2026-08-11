@@ -408,6 +408,10 @@ struct BgSub {
     session: String,
 }
 
+// A session can be observed by multiple long-lived consumer records. Retain
+// every route so each wake uses the correlation captured by that route's BgSub.
+type BgSubsBySession = HashMap<(ProjectRootId, String), HashSet<RouteChannel>>;
+
 struct MaintenanceCompletion {
     root_id: ProjectRootId,
     kind: MaintenanceDrainKind,
@@ -495,7 +499,7 @@ impl RootMeta {
 fn due_maintenance_jobs(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: Option<&Executor>,
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &HashSet<RouteChannel>,
     budget: usize,
     pending_bind_roots: &HashSet<ProjectRootId>,
@@ -541,8 +545,11 @@ fn due_maintenance_jobs(
             let executor_actor_context =
                 executor.and_then(|executor| executor.actor_context(&root_id));
             let root_has_pending_bg_wake =
-                bg_sub_by_session.iter().any(|((sub_root, _), channel)| {
-                    sub_root == &root_id && bg_wake_pending.contains(channel)
+                bg_sub_by_session.iter().any(|((sub_root, _), channels)| {
+                    sub_root == &root_id
+                        && channels
+                            .iter()
+                            .any(|channel| bg_wake_pending.contains(channel))
                 });
             let kinds_with_work: Vec<MaintenanceDrainKind> = match executor_actor_context {
                 Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
@@ -1005,7 +1012,7 @@ fn purge_deleted_root_residents(
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
@@ -1020,7 +1027,8 @@ fn purge_deleted_root_residents(
     stale_routes.extend(
         bg_sub_by_session
             .iter()
-            .filter_map(|((root, _), route)| (root == root_id).then_some(*route)),
+            .filter(|((root, _), _)| root == root_id)
+            .flat_map(|(_, routes)| routes.iter().copied()),
     );
     stale_routes.extend(
         pending_bash_asks
@@ -1059,7 +1067,7 @@ fn submit_due_maintenance_jobs(
     executor: &Arc<Executor>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
-    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &HashSet<RouteChannel>,
     bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
@@ -1604,18 +1612,37 @@ fn insert_route_channel(
         .insert(channel);
 }
 
+fn insert_bg_subscription_index(
+    bg_sub_by_session: &mut BgSubsBySession,
+    root: ProjectRootId,
+    session: String,
+    channel: RouteChannel,
+) {
+    bg_sub_by_session
+        .entry((root, session))
+        .or_default()
+        .insert(channel);
+}
+
 fn remove_bg_subscription_index(
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     channel: RouteChannel,
     identity: Option<&RouteIdentity>,
 ) {
     if let Some(identity) = identity {
         let key = (identity.root.clone(), identity.session.clone());
-        if bg_sub_by_session.get(&key).copied() == Some(channel) {
+        let remove_key = bg_sub_by_session.get_mut(&key).is_some_and(|channels| {
+            channels.remove(&channel);
+            channels.is_empty()
+        });
+        if remove_key {
             bg_sub_by_session.remove(&key);
         }
     } else {
-        bg_sub_by_session.retain(|_, mapped_channel| *mapped_channel != channel);
+        bg_sub_by_session.retain(|_, channels| {
+            channels.remove(&channel);
+            !channels.is_empty()
+        });
     }
 }
 
@@ -1645,7 +1672,7 @@ async fn end_bg_subscription(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     channel: RouteChannel,
     identity: Option<&RouteIdentity>,
@@ -1672,7 +1699,7 @@ async fn teardown_installed_route(
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -2326,7 +2353,7 @@ where
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
-    let mut bg_sub_by_session: HashMap<(ProjectRootId, String), RouteChannel> = HashMap::new();
+    let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
@@ -3486,7 +3513,7 @@ async fn handle_control_request(
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
@@ -3936,7 +3963,7 @@ async fn handle_tool_call(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     next_bash_ask_corr: &mut u64,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
-    bg_sub_by_session: &mut HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
@@ -4027,7 +4054,12 @@ async fn handle_tool_call(
                 session: identity.session.clone(),
             },
         );
-        bg_sub_by_session.insert((identity.root.clone(), identity.session.clone()), route_id);
+        insert_bg_subscription_index(
+            bg_sub_by_session,
+            identity.root.clone(),
+            identity.session.clone(),
+            route_id,
+        );
         metrics.record_bg_subscription_installed(&identity.root, &identity.session, route_id);
         push::arm_bg_wake(
             identity.root.clone(),
@@ -5454,8 +5486,10 @@ mod tests {
                 session: "deleted-route".to_string(),
             },
         )]);
-        let mut bg_sub_by_session =
-            HashMap::from([((root.clone(), "deleted-route".to_string()), route)]);
+        let mut bg_sub_by_session = HashMap::from([(
+            (root.clone(), "deleted-route".to_string()),
+            HashSet::from([route]),
+        )]);
         let mut bg_wake_pending = HashSet::from([route]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
@@ -6288,7 +6322,8 @@ mod tests {
         let session = "idle-session".to_string();
         let channel = route_key(17, 1);
         let metrics = DispatchPathMetrics::new();
-        let bg_sub_by_session = HashMap::from([((root.clone(), session.clone()), channel)]);
+        let bg_sub_by_session =
+            HashMap::from([((root.clone(), session.clone()), HashSet::from([channel]))]);
         let mut bg_wake_pending = HashSet::new();
 
         let (idle_tick_jobs, deferred) = due_maintenance_jobs(
