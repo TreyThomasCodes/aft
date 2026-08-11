@@ -2378,7 +2378,7 @@ mod windows_server_key_tests {
                 .into_iter()
                 .find(|def| def.kind.id_str() == "custom-ts")
                 .expect("custom server definition");
-            server_key_for_definition(&def, path).expect("custom server root")
+            server_key_for_definition(&def, path, &config).expect("custom server root")
         };
 
         let key_material = |key: &crate::lsp::roots::ServerKey| {
