@@ -61,7 +61,7 @@ import type {
 export interface SubcSubscriptionLike {
   /** Cancel the subscription (sends Cancel; idempotent); the provider unwinds with StreamEnd. */
   unsubscribe(): void;
-  /** Resolves on StreamEnd (intentional close); REJECTS on Error / route GOODBYE / socket drop. */
+  /** Resolves on provider StreamEnd or unsubscribe; rejects on Error / route GOODBYE / socket drop. */
   readonly closed: Promise<void>;
 }
 
@@ -106,6 +106,7 @@ const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
  * (otherwise a permanently-failing route resubscribes in a 100ms hot loop). (B-#2.)
  */
 const BG_STABLE_MS = 5_000;
+const BG_LIFECYCLE_LOG_INTERVAL_MS = 60_000;
 
 /**
  * Session fallback when a tool runtime carries no session id, mirroring the Rust
@@ -289,25 +290,22 @@ function identityKey(identity: BindIdentity): IdentityKey {
 }
 
 /**
- * One session's held-open bg_events subscription with its OWN reconnect driver.
+ * One session's held-open bg_events subscription with its own reconnect driver.
  *
- * The idle-stranding fix (Oracle bg_fc2d4119 #3): the resubscribe loop is
- * INDEPENDENT of tool calls. When the subscription's `closed` promise rejects (a
- * socket drop / route GOODBYE / Error), the loop itself reconnects (via the pool's
- * shared single-flight client) and resubscribes — it never waits for a future tool
- * call. So an idle agent (no tool traffic) whose connection drops is still woken
- * for a completion that landed while disconnected (the durable Rust registry holds
- * it until acked; resubscribe + the immediate forced-drain replay it).
- *
- * The loop is a single sequential async task (only one attempt in flight at a
- * time). `stopped`, the captured root-generation check, and one instance per
- * identity prevent duplicate or stale subscriptions.
+ * The reconnect loop is independent of tool calls, including provider StreamEnd:
+ * the module emits StreamEnd when a route is replaced, so only `stop()` proves
+ * that a clean end was requested by this consumer. Reopening the dedicated route
+ * also forces an outbox drain, recovering completions queued while disconnected.
  */
 class BgSubscription {
   private stopped = false;
   /** The live subscription handle, read by stop() to wake the loop's `await closed`. */
   private current: SubcSubscriptionLike | null = null;
   private readonly loop: Promise<void>;
+  private readonly lifecycleLogState = new Map<
+    string,
+    { lastEmittedAt: number; suppressed: number }
+  >();
 
   constructor(
     private readonly identity: BindIdentity,
@@ -327,11 +325,8 @@ class BgSubscription {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    // Wake a live `await sub.closed` so the loop unwinds via its StreamEnd path,
-    // where the `finally` is the SOLE owner of closeRouteChannel (so the channel
-    // is closed exactly once, never double-closed by stop() + the loop). If the
-    // loop is between routeOpen and subscribe, its post-subscribe `stopped`
-    // re-check (or the pre-subscribe check) closes/returns instead.
+    // Wake a live `await sub.closed`; the loop's `finally` remains the sole
+    // owner of closeRouteChannel, avoiding a double close from stop() + run().
     const sub = this.current;
     if (sub) {
       try {
@@ -343,30 +338,87 @@ class BgSubscription {
     await this.loop.catch(() => undefined);
   }
 
+  private info(kind: string, message: string): void {
+    const now = Date.now();
+    const state = this.lifecycleLogState.get(kind);
+    if (state && now - state.lastEmittedAt < BG_LIFECYCLE_LOG_INTERVAL_MS) {
+      state.suppressed += 1;
+      return;
+    }
+    const suppressed = state?.suppressed ?? 0;
+    this.lifecycleLogState.set(kind, { lastEmittedAt: now, suppressed: 0 });
+    const suffix = suppressed > 0 ? ` suppressed=${suppressed}` : "";
+    log(`subc bg_events: ${message}${suffix}`, { sessionId: this.identity.session });
+  }
+
+  private routeId(route: RouteHandle): string {
+    return `${route.channel}@${route.epoch}`;
+  }
+
+  private errorText(error: unknown): string {
+    return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  }
+
   private async run(): Promise<void> {
-    let attempt = 0;
+    let backoffAttempt = 0;
+    let reconnectAttempt = 0;
+    let reconnecting = false;
+
+    const beginReconnect = (): void => {
+      reconnecting = true;
+      reconnectAttempt = reconnectAttempt === 0 ? 1 : reconnectAttempt + 1;
+    };
+    const giveUp = (reason: string): void => {
+      this.info(
+        "reconnect-gave-up",
+        `reconnect gave-up attempt=${reconnectAttempt} reason=${reason}`,
+      );
+    };
+
     while (!this.stopped) {
-      if (!this.isCurrent()) return;
+      if (!this.isCurrent()) {
+        if (reconnecting) giveUp("stale-session");
+        return;
+      }
       if (!this.canAttach()) {
+        if (reconnecting) giveUp("root-dormant");
         this.onDormant();
         return;
       }
+      if (reconnecting) {
+        this.info("reconnect-attempt", `reconnect attempt=${reconnectAttempt}`);
+      }
+
       let client: SubcClientLike;
       try {
         client = await this.acquireClient();
-      } catch {
-        await this.backoff(attempt++);
+      } catch (err) {
+        if (!reconnecting) beginReconnect();
+        this.info(
+          "reconnect-error",
+          `reconnect error attempt=${reconnectAttempt} error=${this.errorText(err)}`,
+        );
+        await this.backoff(backoffAttempt++);
+        if (reconnecting) reconnectAttempt += 1;
         continue;
       }
-      if (this.stopped || !this.isCurrent()) return;
+      if (this.stopped) {
+        if (reconnecting) giveUp("stopped");
+        return;
+      }
+      if (!this.isCurrent()) {
+        if (reconnecting) giveUp("stale-session");
+        return;
+      }
       if (!this.canAttach()) {
+        if (reconnecting) giveUp("root-dormant");
         this.onDormant();
         return;
       }
 
       let route: RouteHandle;
       try {
-        // A second dedicated route isolates bg_events from the tool route's
+        // A dedicated route keeps bg_events independent of the tool route's
         // credit window while preserving the client's connection-bound handle.
         route = await client.routeOpen(
           { kind: "tool_provider", module_id: AFT_MODULE_ID },
@@ -375,61 +427,78 @@ class BgSubscription {
         );
       } catch (err) {
         if (this.isCurrent() && this.onRootAttachFailure(err)) {
+          if (reconnecting) giveUp("root-dormant");
           this.onDormant();
           return;
         }
-        // routeOpen failed. If it signals a dead CONNECTION, drop the shared
-        // client so the next `acquireClient` reconnects fresh — the idle-stranding
-        // fix (B-#1): `acquireClient` returns the cached client, so without this an
-        // idle bg loop would resubscribe forever onto the same dead socket.
         if (isConsumerReconnectTransient(err)) this.dropClient(client);
-        await this.backoff(attempt++);
+        if (!reconnecting) beginReconnect();
+        this.info(
+          "reconnect-error",
+          `reconnect error attempt=${reconnectAttempt} error=${this.errorText(err)}`,
+        );
+        await this.backoff(backoffAttempt++);
+        if (reconnecting) reconnectAttempt += 1;
         continue;
       }
       if (this.stopped || !this.isCurrent()) {
         safeCloseRoute(client, route);
+        if (reconnecting) giveUp(this.stopped ? "stopped" : "stale-session");
         return;
       }
 
-      // Route lifetime: the `finally` guarantees closeRouteChannel on every exit
-      // path from here (StreamEnd return, drop+resubscribe, stopped) so the
-      // dedicated route never leaks (B-#2).
       const subscribedAt = Date.now();
       try {
         const sub = client.subscribe(route, { op: "bg_events" }, () => {
           if (!this.stopped && this.isCurrent()) this.onNudge();
         });
         this.current = sub;
-        // stop() may have fired between the pre-subscribe check and here; self-
-        // unsubscribe so the await below resolves immediately (avoids a stop()
-        // that hangs awaiting a subscription nobody woke).
+        const routeId = this.routeId(route);
+        this.info("subscription-open", `subscription open channel=${routeId}`);
+        if (reconnecting) {
+          this.info(
+            "reconnect-success",
+            `reconnect success attempt=${reconnectAttempt} channel=${routeId}`,
+          );
+          reconnecting = false;
+          reconnectAttempt = 0;
+        }
+
+        // stop() may have fired between routeOpen and subscribe. Unsubscribe so
+        // the held `closed` promise resolves and the route can unwind.
         if (this.stopped) sub.unsubscribe();
 
-        // Immediate forced-drain replay: a completion that landed while we were
-        // disconnected is recovered now (resubscribe == the outbox replay trigger).
+        // A reconnect may have missed completions, so force a drain after every
+        // successful subscribe to replay anything queued while the stream was down.
         if (!this.stopped && this.isCurrent()) this.onNudge();
 
         await sub.closed;
-        // StreamEnd = an intentional close (our unsubscribe or module teardown).
-        // Do NOT resubscribe.
-        return;
+        this.info("stream-end", `stream ended channel=${routeId}`);
+        if (this.stopped) {
+          giveUp("stopped");
+          return;
+        }
+        // Provider StreamEnd is also emitted for route replacement; without an
+        // explicit local stop it must reopen rather than strand an idle session.
+        beginReconnect();
       } catch (err) {
-        // Dropped (socket death / route GOODBYE / Error). Resubscribe — this is
-        // the independent reconnect driver that fixes idle-stranding.
-        if (this.stopped) return;
-        // A dead-connection drop must replace the client (B-#1); a route-only
-        // GOODBYE keeps the client and just re-opens a fresh route.
+        const routeId = this.routeId(route);
+        this.info("stream-error", `stream error channel=${routeId} error=${this.errorText(err)}`);
+        if (this.stopped) {
+          giveUp("stopped");
+          return;
+        }
         if (isConsumerReconnectTransient(err)) this.dropClient(client);
-        // Reset backoff ONLY if the subscription was stable before dropping;
-        // otherwise a permanently-failing route would resubscribe in a 100ms hot
-        // loop and never reach the cap (B-#2).
-        if (Date.now() - subscribedAt >= BG_STABLE_MS) attempt = 0;
+        if (Date.now() - subscribedAt >= BG_STABLE_MS) backoffAttempt = 0;
+        beginReconnect();
       } finally {
         this.current = null;
         safeCloseRoute(client, route);
       }
-      await this.backoff(attempt++);
+      await this.backoff(backoffAttempt++);
     }
+
+    if (reconnecting) giveUp("stopped");
   }
 
   private async backoff(attempt: number): Promise<void> {

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   type BindIdentity,
   type RouteHandle,
@@ -8,6 +8,8 @@ import {
   SubcCallError,
   SubcError,
 } from "@cortexkit/subc-client";
+import { getActiveLogger, setActiveLogger } from "../active-logger.js";
+import type { Logger, LogMeta } from "../logger.js";
 import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
 import { TEST_OTHER_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
@@ -46,7 +48,7 @@ class FakeSubscription {
     this.rejectClosed(new SocketClosedError("subc socket closed"));
   }
 
-  /** Simulate an intentional StreamEnd — the loop should NOT resubscribe. */
+  /** Simulate a provider StreamEnd — the loop should resubscribe unless locally stopped. */
   end(): void {
     this.resolveClosed();
   }
@@ -1060,6 +1062,23 @@ describe("SubcTransport.send", () => {
 });
 
 describe("SubcTransport bg_events subscription (S3)", () => {
+  let previousLogger: Logger | undefined;
+  let lifecycleLogs: Array<{ message: string; meta?: LogMeta }>;
+
+  beforeEach(() => {
+    previousLogger = getActiveLogger();
+    lifecycleLogs = [];
+    setActiveLogger({
+      log: (message, meta) => lifecycleLogs.push({ message, meta }),
+      warn: () => undefined,
+      error: () => undefined,
+    });
+  });
+
+  afterEach(() => {
+    setActiveLogger(previousLogger as Logger);
+  });
+
   function bgPool(client: FakeClient): {
     pool: SubcTransportPool;
     nudges: { root: string; session: string }[];
@@ -1173,6 +1192,15 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     // The resubscribe fired another forced-drain replay (recovers a completion
     // that landed while disconnected).
     expect(nudges.length).toBe(2);
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      "subc bg_events: stream error channel=2@2 error=Error: subscription dropped",
+    );
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      "subc bg_events: reconnect attempt=1",
+    );
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      "subc bg_events: reconnect success attempt=1 channel=3@3",
+    );
   });
 
   test("B-#1: a TRANSIENT subscription drop replaces the dead client before resubscribe", async () => {
@@ -1225,17 +1253,28 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     expect(client.subscriptions.length).toBe(2);
   });
 
-  test("StreamEnd (intentional close) does NOT resubscribe", async () => {
+  test("provider StreamEnd resubscribes and logs lifecycle while the session remains live", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const { pool } = bgPool(client);
 
     await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
-    client.subscriptions[0]?.end(); // StreamEnd
+    expect(lifecycleLogs[0]).toEqual({
+      message: "subc bg_events: subscription open channel=2@2",
+      meta: { sessionId: "sess-1" },
+    });
+
+    client.subscriptions[0]?.end();
     await tick();
     await tick();
 
-    expect(client.subscriptions.length).toBe(1); // no resubscribe on a clean end
+    expect(client.subscriptions.length).toBe(2);
+    expect(lifecycleLogs.map((entry) => entry.message)).toEqual([
+      "subc bg_events: subscription open channel=2@2",
+      "subc bg_events: stream ended channel=2@2",
+      "subc bg_events: reconnect attempt=1",
+      "subc bg_events: reconnect success attempt=1 channel=3@3",
+    ]);
   });
 
   test("closeSession stops the subscription and closes both routes", async () => {
@@ -1249,6 +1288,9 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     expect(client.subscriptions[0]?.unsubscribed).toBe(1);
     // Both the bg route and the tool route were closed.
     expect(client.closedRoutes.length).toBe(2);
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      "subc bg_events: reconnect gave-up attempt=0 reason=stopped",
+    );
   });
 
   test("no bg subscription is opened when onBgEventsNudge is not configured", async () => {

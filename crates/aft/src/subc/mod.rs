@@ -399,11 +399,13 @@ struct RetainedSessionIdentity {
     trust: BindTrust,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BgSub {
     corr: u64,
     ver: u8,
     flags: Flags,
+    root: ProjectRootId,
+    session: String,
 }
 
 struct MaintenanceCompletion {
@@ -1007,6 +1009,7 @@ fn purge_deleted_root_residents(
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    metrics: &DispatchPathMetrics,
 ) {
     let mut stale_routes = root_channels.get(root_id).cloned().unwrap_or_default();
     stale_routes.extend(
@@ -1033,7 +1036,9 @@ fn purge_deleted_root_residents(
             cancel.token.cancel();
         }
         retry_buffer.remove(&route);
-        bg_subs.remove(&route);
+        if let Some(sub) = bg_subs.remove(&route) {
+            metrics.record_bg_subscription_ended(&sub.root, &sub.session, route, "root-reclaim");
+        }
         bg_wake_pending.remove(&route);
     }
     root_channels.remove(root_id);
@@ -1644,10 +1649,12 @@ async fn end_bg_subscription(
     bg_wake_pending: &mut HashSet<RouteChannel>,
     channel: RouteChannel,
     identity: Option<&RouteIdentity>,
+    cause: &str,
 ) -> Result<(), SubcError> {
     if let Some(sub) = bg_subs.remove(&channel) {
         bg_wake_pending.remove(&channel);
         remove_bg_subscription_index(bg_sub_by_session, channel, identity);
+        metrics.record_bg_subscription_ended(&sub.root, &sub.session, channel, cause);
         push::send_reliable_bg_stream_end(writer_tx, metrics, channel, &sub).await?;
     }
     Ok(())
@@ -1676,6 +1683,11 @@ async fn teardown_installed_route(
     shutdown: &Arc<Notify>,
 ) -> Result<(), SubcError> {
     remove_installed_route(installed_route_epochs, channel);
+    let bg_end_cause = match cancellation_reason {
+        "Goodbye" => "goodbye",
+        "higher-epoch RouteBind" => "higher-epoch",
+        other => other,
+    };
     end_bg_subscription(
         tx,
         metrics,
@@ -1684,6 +1696,7 @@ async fn teardown_installed_route(
         bg_wake_pending,
         channel,
         routes.get(&channel),
+        bg_end_cause,
     )
     .await?;
     settle_pending_bash_asks_for_route(
@@ -2643,6 +2656,7 @@ where
                                 &mut bg_wake_pending,
                                 channel,
                                 routes.get(&channel),
+                                "cancel",
                             )
                             .await
                             {
@@ -2841,6 +2855,7 @@ where
                         &mut bg_wake_pending,
                         &mut bg_wake_epoch,
                         &mut pending_bash_asks,
+                        &dispatch_path_metrics,
                     );
                 }
                 if reap.evicted > 0 {
@@ -3755,6 +3770,7 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
+            metrics.record_bg_runtime(bg_subs.len(), bg_wake_pending.len());
             let report = build_health_report(executor, pending_binds, metrics, shared_app);
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(SubcError::Json)?;
@@ -3972,7 +3988,13 @@ async fn handle_tool_call(
             op: BgEventsOp::BgEvents
         })
     ) {
-        if let Some(old_sub) = bg_subs.get(&route_id).copied() {
+        if let Some(old_sub) = bg_subs.get(&route_id).cloned() {
+            metrics.record_bg_subscription_ended(
+                &old_sub.root,
+                &old_sub.session,
+                route_id,
+                "resubscribe",
+            );
             push::send_reliable_bg_stream_end(tx, metrics, route_id, &old_sub).await?;
         }
         if !identity.trust.allows_bash_observation() {
@@ -3983,7 +4005,15 @@ async fn handle_tool_call(
                 corr: frame.header.corr,
                 ver: frame.header.ver,
                 flags: frame.header.flags,
+                root: identity.root.clone(),
+                session: identity.session.clone(),
             };
+            metrics.record_bg_subscription_ended(
+                &identity.root,
+                &identity.session,
+                route_id,
+                "subscribe-denied",
+            );
             push::send_reliable_bg_stream_end(tx, metrics, route_id, &denied_sub).await?;
             return Ok(());
         }
@@ -3993,15 +4023,19 @@ async fn handle_tool_call(
                 corr: frame.header.corr,
                 ver: frame.header.ver,
                 flags: frame.header.flags,
+                root: identity.root.clone(),
+                session: identity.session.clone(),
             },
         );
         bg_sub_by_session.insert((identity.root.clone(), identity.session.clone()), route_id);
+        metrics.record_bg_subscription_installed(&identity.root, &identity.session, route_id);
         push::arm_bg_wake(
             identity.root.clone(),
             identity.session.clone(),
             route_id,
             bg_wake_pending,
             bg_wake_epoch,
+            metrics,
         );
         return Ok(());
     }
@@ -5410,11 +5444,22 @@ mod tests {
         let mut reclaimed_routes = ReclaimedRoutes::default();
         let mut session_identity = HashMap::new();
         let mut push_buffer = HashMap::new();
-        let mut bg_subs = HashMap::new();
-        let mut bg_sub_by_session = HashMap::new();
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_subs = HashMap::from([(
+            route,
+            BgSub {
+                corr: 77,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                root: root.clone(),
+                session: "deleted-route".to_string(),
+            },
+        )]);
+        let mut bg_sub_by_session =
+            HashMap::from([((root.clone(), "deleted-route".to_string()), route)]);
+        let mut bg_wake_pending = HashSet::from([route]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
+        health::take_bg_observability_logs_for_test();
         purge_deleted_root_residents(
             &root,
             &mut routes,
@@ -5430,6 +5475,7 @@ mod tests {
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
             &mut pending_bash_asks,
+            &metrics,
         );
 
         assert!(routes.is_empty());
@@ -5438,6 +5484,13 @@ mod tests {
         assert!(route_bash_cancels.is_empty());
         assert!(reclaimed_routes.contains(route));
         assert!(cancel_signal.is_cancelled());
+        assert_eq!(
+            health::take_bg_observability_logs_for_test(),
+            vec![format!(
+                "subc bg subscription: ended root={} session=deleted-route channel=19@3 cause=root-reclaim suppressed=0",
+                root.as_path().display()
+            )]
+        );
     }
 
     /// The control for the deleted-root reclamation above: a root whose
@@ -5928,6 +5981,7 @@ mod tests {
                 &mut bg_wake_pending,
                 &mut bg_wake_epoch,
                 &mut pending_bash_asks,
+                &metrics,
             );
         }
 
@@ -6233,6 +6287,7 @@ mod tests {
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let session = "idle-session".to_string();
         let channel = route_key(17, 1);
+        let metrics = DispatchPathMetrics::new();
         let bg_sub_by_session = HashMap::from([((root.clone(), session.clone()), channel)]);
         let mut bg_wake_pending = HashSet::new();
 
@@ -6257,6 +6312,7 @@ mod tests {
             channel,
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
+            &metrics,
         );
         let (next_tick_jobs, deferred) = due_maintenance_jobs(
             &mut live_roots,

@@ -441,7 +441,9 @@ pub(super) fn emit_bg_event_wakes(
     let mut stale_channels = Vec::new();
     for channel in pending_channels {
         if let Some(sub) = bg_subs.get(&channel) {
-            let _ = try_send_bg_stream_data(writer_tx, metrics, channel, sub);
+            if try_send_bg_stream_data(writer_tx, metrics, channel, sub) == PushSendOutcome::Sent {
+                metrics.record_bg_nudge_sent(&sub.root, &sub.session, channel);
+            }
         } else {
             stale_channels.push(channel);
         }
@@ -461,7 +463,9 @@ pub(super) fn arm_bg_wake(
     channel: RouteChannel,
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    metrics: &DispatchPathMetrics,
 ) {
+    metrics.record_bg_arm_hit(&root, &session, channel);
     *bg_wake_epoch.entry((root, session)).or_default() += 1;
     bg_wake_pending.insert(channel);
 }
@@ -813,6 +817,35 @@ fn process_reliable_push_frame(
     completed_bg_session
 }
 
+fn arm_completed_bg_wake(
+    metrics: &DispatchPathMetrics,
+    bg_sub_by_session: &HashMap<(ProjectRootId, String), RouteChannel>,
+    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    root: ProjectRootId,
+    session: String,
+) {
+    if let Some(channel) = bg_sub_by_session
+        .get(&(root.clone(), session.clone()))
+        .copied()
+    {
+        arm_bg_wake(
+            root,
+            session,
+            channel,
+            bg_wake_pending,
+            bg_wake_epoch,
+            metrics,
+        );
+    } else {
+        let live_root_subscriptions = bg_sub_by_session
+            .keys()
+            .filter(|(sub_root, _)| sub_root == &root)
+            .count();
+        metrics.record_bg_arm_miss(&root, &session, live_root_subscriptions);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_reliable_push_and_arm_bg_wake(
     writer_tx: &WriterSender,
@@ -841,12 +874,14 @@ fn process_reliable_push_and_arm_bg_wake(
         root,
         frame,
     ) {
-        if let Some(channel) = bg_sub_by_session
-            .get(&(root.clone(), session.clone()))
-            .copied()
-        {
-            arm_bg_wake(root, session, channel, bg_wake_pending, bg_wake_epoch);
-        }
+        arm_completed_bg_wake(
+            metrics,
+            bg_sub_by_session,
+            bg_wake_pending,
+            bg_wake_epoch,
+            root,
+            session,
+        );
     }
 }
 
@@ -1008,6 +1043,8 @@ mod tests {
                     corr: 41,
                     ver: PROTOCOL_VERSION,
                     flags: control_flags(),
+                    root: test_root("bg-stream-end-root").1,
+                    session: "stream-end-session".to_string(),
                 },
             )
             .await
@@ -1944,6 +1981,7 @@ mod tests {
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
         let channel = route_key(7, 1);
+        let metrics = DispatchPathMetrics::new();
         let mut bg_wake_pending = HashSet::from([channel]);
         let mut bg_wake_epoch = HashMap::from([(key.clone(), 41_u64)]);
 
@@ -1953,6 +1991,7 @@ mod tests {
             channel,
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
+            &metrics,
         );
 
         assert_eq!(bg_wake_pending, HashSet::from([channel]));
@@ -1965,6 +2004,7 @@ mod tests {
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
         let channel = route_key(8, 1);
+        let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), channel);
         let mut bg_wake_pending = HashSet::new();
@@ -1976,6 +2016,7 @@ mod tests {
             channel,
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
+            &metrics,
         );
         let epoch_at_submit = bg_wake_epoch[&key];
         arm_bg_wake(
@@ -1984,6 +2025,7 @@ mod tests {
             channel,
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
+            &metrics,
         );
 
         clear_stale_bg_wakes_for_empty_sessions(
@@ -2004,6 +2046,7 @@ mod tests {
         let session = "session-1".to_string();
         let key = (root.clone(), session.clone());
         let channel = route_key(9, 1);
+        let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), channel);
         let mut bg_wake_pending = HashSet::new();
@@ -2015,6 +2058,7 @@ mod tests {
             channel,
             &mut bg_wake_pending,
             &mut bg_wake_epoch,
+            &metrics,
         );
         let epoch_at_submit = bg_wake_epoch[&key];
 
@@ -2027,5 +2071,34 @@ mod tests {
         );
 
         assert!(!bg_wake_pending.contains(&channel));
+    }
+
+    #[test]
+    fn completed_bg_wake_without_subscription_records_rate_and_miss_log() {
+        let (_root_dir, root) = test_root("subc-bg-wake-miss-root");
+        let metrics = DispatchPathMetrics::new();
+        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_epoch = HashMap::new();
+        super::super::health::take_bg_observability_logs_for_test();
+
+        arm_completed_bg_wake(
+            &metrics,
+            &HashMap::new(),
+            &mut bg_wake_pending,
+            &mut bg_wake_epoch,
+            root.clone(),
+            "session-without-subscription".to_string(),
+        );
+
+        assert_eq!(metrics.bg_arm_misses_60s_total(), 1);
+        assert!(bg_wake_pending.is_empty());
+        assert!(bg_wake_epoch.is_empty());
+        assert_eq!(
+            super::super::health::take_bg_observability_logs_for_test(),
+            vec![format!(
+                "subc bg wake: arm MISS root={} session=session-without-subscription live_root_subscriptions=0 suppressed=0",
+                root.as_path().display()
+            )]
+        );
     }
 }

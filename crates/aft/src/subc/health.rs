@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     json, Arc, AtomicBool, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport,
-    HealthStatus, Instant, Ordering, PendingBind, RootHealthSnapshot, RouteChannel, Value,
-    DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+    HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot, RouteChannel,
+    StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
 use crate::context::{App, AppContext, RootHealthState};
 use crate::executor::BindBlockerSnapshot;
@@ -128,6 +128,46 @@ impl ReapMetrics {
     }
 }
 
+const BG_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BgEventKind {
+    ArmHit,
+    ArmMiss,
+    NudgeSent,
+    SubscriptionInstalled,
+    SubscriptionEnded,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct BgEventKey {
+    root: ProjectRootId,
+    session: String,
+    kind: BgEventKind,
+}
+
+struct BgEventRecord {
+    window_start: Instant,
+    event_count: u64,
+    suppressed: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BG_OBSERVABILITY_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn emit_bg_observability_info(line: String) {
+    log::info!("{line}");
+    #[cfg(test)]
+    BG_OBSERVABILITY_TEST_LOGS.with(|logs| logs.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+pub(super) fn take_bg_observability_logs_for_test() -> Vec<String> {
+    BG_OBSERVABILITY_TEST_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+}
+
 pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -141,6 +181,9 @@ pub(super) struct DispatchPathMetrics {
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
+    bg_subscriptions: AtomicUsize,
+    bg_wake_pending: AtomicUsize,
+    bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     reap: ReapMetrics,
 }
 
@@ -159,6 +202,9 @@ impl DispatchPathMetrics {
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
+            bg_subscriptions: AtomicUsize::new(0),
+            bg_wake_pending: AtomicUsize::new(0),
+            bg_events: StdMutex::new(HashMap::new()),
             reap: ReapMetrics::new(),
         }
     }
@@ -178,6 +224,173 @@ impl DispatchPathMetrics {
             .map(duration_millis_u64)
             .unwrap_or(0);
         self.reap.record(last_sweep_ms, census);
+    }
+
+    pub(super) fn record_bg_runtime(&self, subscriptions: usize, wake_pending: usize) {
+        self.bg_subscriptions
+            .store(subscriptions, Ordering::Relaxed);
+        self.bg_wake_pending.store(wake_pending, Ordering::Relaxed);
+    }
+
+    fn record_bg_event_at(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        kind: BgEventKind,
+        now: Instant,
+    ) -> Option<u64> {
+        let Ok(mut events) = self.bg_events.lock() else {
+            return None;
+        };
+        let key = BgEventKey {
+            root: root.clone(),
+            session: session.to_string(),
+            kind,
+        };
+        if let Some(record) = events.get_mut(&key) {
+            if now.saturating_duration_since(record.window_start) < BG_OBSERVABILITY_INTERVAL {
+                record.event_count = record.event_count.saturating_add(1);
+                record.suppressed = record.suppressed.saturating_add(1);
+                return None;
+            }
+            let suppressed = record.suppressed;
+            *record = BgEventRecord {
+                window_start: now,
+                event_count: 1,
+                suppressed: 0,
+            };
+            return Some(suppressed);
+        }
+        events.insert(
+            key,
+            BgEventRecord {
+                window_start: now,
+                event_count: 1,
+                suppressed: 0,
+            },
+        );
+        Some(0)
+    }
+
+    fn bg_event_count_60s(&self, kind: BgEventKind) -> u64 {
+        let Ok(events) = self.bg_events.try_lock() else {
+            return 0;
+        };
+        let now = Instant::now();
+        events
+            .iter()
+            .filter(|(key, record)| {
+                key.kind == kind
+                    && now.saturating_duration_since(record.window_start)
+                        < BG_OBSERVABILITY_INTERVAL
+            })
+            .map(|(_, record)| record.event_count)
+            .sum()
+    }
+
+    pub(super) fn bg_arm_misses_60s_total(&self) -> u64 {
+        self.bg_event_count_60s(BgEventKind::ArmMiss)
+    }
+
+    fn bg_nudges_sent_60s_total(&self) -> u64 {
+        self.bg_event_count_60s(BgEventKind::NudgeSent)
+    }
+
+    pub(super) fn record_bg_arm_hit(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        channel: RouteChannel,
+    ) {
+        if let Some(suppressed) =
+            self.record_bg_event_at(root, session, BgEventKind::ArmHit, Instant::now())
+        {
+            emit_bg_observability_info(format!(
+                "subc bg wake: arm HIT root={} session={} channel={} suppressed={suppressed}",
+                root.as_path().display(),
+                session,
+                channel
+            ));
+        }
+    }
+
+    pub(super) fn record_bg_arm_miss(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        live_root_subscriptions: usize,
+    ) {
+        if let Some(suppressed) =
+            self.record_bg_event_at(root, session, BgEventKind::ArmMiss, Instant::now())
+        {
+            emit_bg_observability_info(format!(
+                "subc bg wake: arm MISS root={} session={} live_root_subscriptions={} suppressed={suppressed}",
+                root.as_path().display(),
+                session,
+                live_root_subscriptions
+            ));
+        }
+    }
+
+    pub(super) fn record_bg_nudge_sent(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        channel: RouteChannel,
+    ) {
+        if let Some(suppressed) =
+            self.record_bg_event_at(root, session, BgEventKind::NudgeSent, Instant::now())
+        {
+            emit_bg_observability_info(format!(
+                "subc bg wake: nudge sent root={} session={} channel={} suppressed={suppressed}",
+                root.as_path().display(),
+                session,
+                channel
+            ));
+        }
+    }
+
+    pub(super) fn record_bg_subscription_installed(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        channel: RouteChannel,
+    ) {
+        if let Some(suppressed) = self.record_bg_event_at(
+            root,
+            session,
+            BgEventKind::SubscriptionInstalled,
+            Instant::now(),
+        ) {
+            emit_bg_observability_info(format!(
+                "subc bg subscription: installed root={} session={} channel={} cause=subscribe suppressed={suppressed}",
+                root.as_path().display(),
+                session,
+                channel
+            ));
+        }
+    }
+
+    pub(super) fn record_bg_subscription_ended(
+        &self,
+        root: &ProjectRootId,
+        session: &str,
+        channel: RouteChannel,
+        cause: &str,
+    ) {
+        if let Some(suppressed) = self.record_bg_event_at(
+            root,
+            session,
+            BgEventKind::SubscriptionEnded,
+            Instant::now(),
+        ) {
+            emit_bg_observability_info(format!(
+                "subc bg subscription: ended root={} session={} channel={} cause={cause} suppressed={suppressed}",
+                root.as_path().display(),
+                session,
+                channel
+            ));
+        }
     }
 
     fn reap_snapshot(&self) -> Value {
@@ -520,6 +733,10 @@ pub(super) fn build_health_report(
                 "live_watchers": shared_app.watcher_count(),
                 "live_actor_roots": shared_app.actor_root_count(),
                 "open_routes": shared_app.open_route_count(),
+                "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
+                "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
+                "bg_nudges_sent_60s_total": dispatch_path_metrics.bg_nudges_sent_60s_total(),
+                "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
                 "spawned_lsp_children": lsp_children.map(|health| health.spawned),
                 "lsp_children_with_deleted_cwd": lsp_children.map(|health| health.cwd_gone),
             },
@@ -538,6 +755,84 @@ mod tests {
     use super::super::{Lane, Response};
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bg_observability_rate_limit_reports_suppressed_count_and_lifecycle_lines() {
+        let (_dir, root) = test_root("health-bg-observability-rate");
+        let metrics = DispatchPathMetrics::new();
+        let now = Instant::now();
+        let session = "bg-health-session";
+
+        assert_eq!(
+            metrics.record_bg_event_at(&root, session, BgEventKind::ArmHit, now),
+            Some(0)
+        );
+        assert_eq!(
+            metrics.record_bg_event_at(
+                &root,
+                session,
+                BgEventKind::ArmHit,
+                now + Duration::from_secs(1),
+            ),
+            None
+        );
+        assert_eq!(
+            metrics.record_bg_event_at(
+                &root,
+                session,
+                BgEventKind::ArmHit,
+                now + BG_OBSERVABILITY_INTERVAL,
+            ),
+            Some(1)
+        );
+
+        take_bg_observability_logs_for_test();
+        let channel = super::super::route_key(21, 3);
+        metrics.record_bg_subscription_installed(&root, session, channel);
+        metrics.record_bg_subscription_ended(&root, session, channel, "goodbye");
+        assert_eq!(
+            take_bg_observability_logs_for_test(),
+            vec![
+                format!(
+                    "subc bg subscription: installed root={} session=bg-health-session channel=21@3 cause=subscribe suppressed=0",
+                    root.as_path().display()
+                ),
+                format!(
+                    "subc bg subscription: ended root={} session=bg-health-session channel=21@3 cause=goodbye suppressed=0",
+                    root.as_path().display()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bg_runtime_health_fields_are_always_present() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let (_dir, root) = test_root("health-bg-runtime-fields");
+        let channel = super::super::route_key(22, 4);
+
+        let cold = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let cold_metrics = cold.metrics.expect("cold health metrics");
+        let cold_runtime = &cold_metrics["runtime"];
+        assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_wake_pending"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_nudges_sent_60s_total"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_arm_misses_60s_total"].as_u64(), Some(0));
+
+        metrics.record_bg_runtime(2, 1);
+        metrics.record_bg_arm_miss(&root, "missing-session", 2);
+        metrics.record_bg_nudge_sent(&root, "live-session", channel);
+
+        let hot = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let hot_metrics = hot.metrics.expect("hot health metrics");
+        let hot_runtime = &hot_metrics["runtime"];
+        assert_eq!(hot_runtime["bg_subscriptions"].as_u64(), Some(2));
+        assert_eq!(hot_runtime["bg_wake_pending"].as_u64(), Some(1));
+        assert_eq!(hot_runtime["bg_nudges_sent_60s_total"].as_u64(), Some(1));
+        assert_eq!(hot_runtime["bg_arm_misses_60s_total"].as_u64(), Some(1));
+    }
 
     #[test]
     fn pending_bind_breadcrumb_names_every_blocker_class() {
