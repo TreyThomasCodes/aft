@@ -633,6 +633,32 @@ describe("Pi background notifications", () => {
 });
 
 describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("coalesces concurrent multi-record nudge fan-in at handler entry", async () => {
+    let releaseDrain!: () => void;
+    const drainGate = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") await drainGate;
+      return { success: true, bg_completions: [] };
+    });
+    const { ctx } = harness(send);
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage: mock(() => {}) },
+    };
+
+    const first = handleSubcBgEventsNudge(drainCtx);
+    const duplicate = handleSubcBgEventsNudge(drainCtx);
+
+    expect(duplicate).toBe(first);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_drain_completions")).toHaveLength(1);
+    releaseDrain();
+    await Promise.all([first, duplicate]);
+  });
+
   test("a forced drain during the ack window does not double-deliver", async () => {
     // Pi delivery (sendUserMessage) is synchronous; the in-flight window is the
     // ack round-trip. Hold the ack open, fire a subc nudge force-drain in that

@@ -954,6 +954,33 @@ describe("OpenCode background notifications", () => {
 });
 
 describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("coalesces concurrent multi-record nudge fan-in at handler entry", async () => {
+    let releaseDrain!: () => void;
+    const drainGate = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") await drainGate;
+      return { success: true, bg_completions: [] };
+    });
+    const { ctx } = harness(send);
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(mock(async () => {})),
+    };
+
+    const first = handleSubcBgEventsNudge(drainCtx);
+    const duplicate = handleSubcBgEventsNudge(drainCtx);
+
+    expect(duplicate).toBe(first);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_drain_completions")).toHaveLength(1);
+    releaseDrain();
+    await Promise.all([first, duplicate]);
+    expect(findTraceEvent("subc_bg_nudge_delivery")?.cause).toBe("handler-entry");
+  });
+
   test("a forced drain DURING in-flight delivery does not double-deliver", async () => {
     // Set up: a tracked completion is pending. A wake fires and its promptAsync
     // is held open (delivery in flight). While it's in flight, a subc bg_events

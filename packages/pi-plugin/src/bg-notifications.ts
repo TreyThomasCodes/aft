@@ -3,7 +3,7 @@ import {
   type BgNudgeRef,
   resolveBridgeForNudge,
 } from "@cortexkit/aft-bridge";
-import { sessionWarn } from "./logger.js";
+import { sessionLog, sessionWarn } from "./logger.js";
 import type { PluginContext } from "./types.js";
 
 export interface BgCompletion {
@@ -131,6 +131,9 @@ const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
 const LOG_PREFIX = "[aft-pi] bg-notifications:";
+const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
+const subcNudgesInFlight = new Map<string, Promise<void>>();
+const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
 
 interface DrainContext {
   ctx: PluginContext;
@@ -448,7 +451,32 @@ export async function handleTurnEndBgCompletions(
  * module to re-arm and nudge forever. See the OpenCode twin for the full
  * rationale.
  */
-export async function handleSubcBgEventsNudge(
+export function handleSubcBgEventsNudge(
+  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+): Promise<void> {
+  const sessionID = drainContext.sessionID ?? DEFAULT_SESSION_ID;
+  const key = `${drainContext.directory}\u0000${sessionID}`;
+  const inFlight = subcNudgesInFlight.get(key);
+  if (inFlight) {
+    logSubcNudgeLifecycle(
+      drainContext,
+      "coalesced-in-flight",
+      "nudge coalesced cause=handler-already-in-flight",
+    );
+    return inFlight;
+  }
+
+  logSubcNudgeLifecycle(drainContext, "handler-entry", "nudge handler entered");
+  const handling = handleSubcBgEventsNudgeOnce(drainContext);
+  subcNudgesInFlight.set(key, handling);
+  const clear = (): void => {
+    if (subcNudgesInFlight.get(key) === handling) subcNudgesInFlight.delete(key);
+  };
+  void handling.then(clear, clear);
+  return handling;
+}
+
+async function handleSubcBgEventsNudgeOnce(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
   // Resolve before touching session state. A stale nudge must be a terminal,
@@ -456,6 +484,25 @@ export async function handleSubcBgEventsNudge(
   bridgeForDrain(drainContext);
   stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
   await triggerWakeIfPending(drainContext, false, true, true);
+}
+
+function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message: string): void {
+  const sessionID = drainContext.sessionID ?? DEFAULT_SESSION_ID;
+  const key = `${kind}\u0000${drainContext.directory}\u0000${sessionID}`;
+  const now = Date.now();
+  const state = subcNudgeLogState.get(key);
+  if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
+    state.suppressed += 1;
+    return;
+  }
+  const suppressed = state?.suppressed ?? 0;
+  subcNudgeLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
+  sessionLog(sessionID, `${LOG_PREFIX} ${message}`, {
+    event: "subc_bg_nudge_delivery",
+    cause: kind,
+    canonical_root: drainContext.directory,
+    suppressed,
+  });
 }
 
 async function triggerWakeIfPending(
@@ -589,6 +636,8 @@ export function __resetBgNotificationStateForTests(): void {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
   }
   sessionBgStates.clear();
+  subcNudgesInFlight.clear();
+  subcNudgeLogState.clear();
 }
 
 function bridgeForDrain(drainContext: DrainContext): AftProjectTransport {

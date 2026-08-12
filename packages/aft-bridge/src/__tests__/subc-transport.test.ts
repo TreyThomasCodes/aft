@@ -1136,6 +1136,79 @@ describe("SubcTransport bg_events subscription (S3)", () => {
     ]);
   });
 
+  test("falls back to the root/session handler when generation provenance is unavailable", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const nudges: Array<{ root: string; session: string }> = [];
+    const refs: unknown[] = [];
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      onBgEventsNudge: (root, session) => nudges.push({ root, session }),
+      onBgEventsNudgeRef: (ref) => refs.push(ref),
+      bgBackoffSleep: async () => undefined,
+    });
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
+    await tick();
+    // The first tool call triggers a setup replay; assert only the emitted wake below.
+    nudges.length = 0;
+    client.subscriptions[0]?.emit();
+
+    expect(nudges).toEqual([
+      {
+        root: pool.getBridge(TEST_PROJECT_ROOT).getCwd(),
+        session: "sess-1",
+      },
+    ]);
+    expect(refs).toHaveLength(0);
+    expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+      `subc bg_events: nudge dispatch fallback=root-session-handler cause=generation-provenance-unavailable root=${pool.getBridge(TEST_PROJECT_ROOT).getCwd()}`,
+    );
+    await pool.shutdown();
+  });
+
+  test("delivers a nudge carried by a superseded record to the current session record", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const { pool, nudges } = bgPool(client);
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
+    await tick();
+    // The first tool call triggers a setup replay; assert only the emitted wake below.
+    nudges.length = 0;
+
+    const internals = pool as unknown as {
+      sessions: Map<
+        string,
+        {
+          bgSub: { stop(): Promise<void> } | null;
+          closed: boolean;
+        }
+      >;
+    };
+    const [key, carryingRecord] = [...internals.sessions.entries()][0]!;
+    const carryingSubscription = carryingRecord.bgSub;
+    const currentRecord = { ...carryingRecord, bgSub: null, closed: false };
+    internals.sessions.set(key, currentRecord);
+
+    try {
+      client.subscriptions[0]?.emit();
+
+      expect(nudges).toEqual([
+        {
+          root: pool.getBridge(TEST_PROJECT_ROOT).getCwd(),
+          session: "sess-1",
+        },
+      ]);
+      expect(lifecycleLogs.map((entry) => entry.message)).toContain(
+        `subc bg_events: nudge forwarding cause=superseded-carrying-record root=${pool.getBridge(TEST_PROJECT_ROOT).getCwd()}`,
+      );
+    } finally {
+      await carryingSubscription?.stop();
+      await pool.shutdown();
+    }
+  });
+
   test("logs subc-client epoch-guard drops while a quiet subscription remains open", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
     const pool = new SubcTransportPool({

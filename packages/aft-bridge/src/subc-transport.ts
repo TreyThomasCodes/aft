@@ -492,10 +492,21 @@ class BgSubscription {
       let stopDispatchProbe = (): void => undefined;
       try {
         const sub = client.subscribe(route, { op: "bg_events" }, () => {
-          if (!this.stopped && this.isCurrent()) {
-            this.recordNudgeReceipt(routeId);
-            this.onNudge();
+          if (this.stopped) {
+            this.info(
+              "nudge-drop-stopped",
+              `nudge dropped cause=subscription-stopped channel=${routeId}`,
+            );
+            return;
           }
+          this.recordNudgeReceipt(routeId);
+          if (!this.isCurrent()) {
+            this.info(
+              "nudge-stale-carrier",
+              `nudge carried by stale subscription; checking current session channel=${routeId}`,
+            );
+          }
+          this.onNudge();
         });
         this.current = sub;
         stopDispatchProbe = this.startDispatchProbe(client, routeId);
@@ -876,6 +887,10 @@ export class SubcTransportPool implements AftTransportPool {
   /** Concrete per-root facades, including their captured root generation. */
   private readonly transports = new Map<CanonicalRootPath, SubcTransport>();
   private readonly generationRejections = new Set<string>();
+  private readonly nudgeDeliveryLogState = new Map<
+    string,
+    { lastEmittedAt: number; suppressed: number }
+  >();
   private readonly pendingRootCleanups = new Set<Promise<unknown>>();
   private shuttingDown = false;
 
@@ -1311,6 +1326,37 @@ export class SubcTransportPool implements AftTransportPool {
     return this.sessions.get(key) === record && !record.closed;
   }
 
+  private currentSessionForNudge(identity: BindIdentity): SessionRecord | null {
+    const current = this.sessions.get(identityKey(identity));
+    return current && !current.closed ? current : null;
+  }
+
+  private nudgeRefFor(record: SessionRecord): BgNudgeRef | undefined {
+    const poolId = this.currentPoolId();
+    const generation = record.generation;
+    if (poolId === undefined || generation === undefined) return undefined;
+    return {
+      canonicalRoot: record.canonicalRoot,
+      session: record.identity.session,
+      concretePoolId: poolId,
+      generation,
+    };
+  }
+
+  private logNudgeDelivery(kind: string, record: SessionRecord, message: string): void {
+    const key = `${kind}\u0000${record.identityKey}`;
+    const now = Date.now();
+    const state = this.nudgeDeliveryLogState.get(key);
+    if (state && now - state.lastEmittedAt < BG_LIFECYCLE_LOG_INTERVAL_MS) {
+      state.suppressed += 1;
+      return;
+    }
+    const suppressed = state?.suppressed ?? 0;
+    this.nudgeDeliveryLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
+    const suffix = suppressed > 0 ? ` suppressed=${suppressed}` : "";
+    log(`subc bg_events: ${message}${suffix}`, { sessionId: record.identity.session });
+  }
+
   private removeIndexMembership(record: SessionRecord): void {
     const keys = this.rootIndex.get(record.canonicalRoot);
     if (!keys) return;
@@ -1619,21 +1665,49 @@ export class SubcTransportPool implements AftTransportPool {
     if (!this.rootCanAttach(record.canonicalRoot)) return;
     if (record.bgSub) return;
 
-    const poolId = this.currentPoolId();
-    const generation = record.generation;
-    const nudgeRef =
-      poolId !== undefined && generation !== undefined
-        ? ({
-            canonicalRoot: record.canonicalRoot,
-            session: identity.session,
-            concretePoolId: poolId,
-            generation,
-          } satisfies BgNudgeRef)
-        : undefined;
+    const nudgeRef = this.nudgeRefFor(record);
     const onNudge = (): void => {
-      if (!this.isCurrentSession(record.identityKey, record)) return;
-      this.onBgEventsNudge?.(identity.project_root, identity.session);
-      if (nudgeRef) this.onBgEventsNudgeRef?.(nudgeRef);
+      const currentRecord = this.currentSessionForNudge(identity);
+      if (!currentRecord) {
+        this.logNudgeDelivery(
+          "drop-no-current-session",
+          record,
+          `nudge dropped cause=no-current-session root=${record.canonicalRoot}`,
+        );
+        return;
+      }
+      if (currentRecord !== record) {
+        this.logNudgeDelivery(
+          "forward-superseded-carrier",
+          currentRecord,
+          `nudge forwarding cause=superseded-carrying-record root=${currentRecord.canonicalRoot}`,
+        );
+      }
+
+      const currentRef = this.nudgeRefFor(currentRecord);
+      let delivered = false;
+      if (currentRef && this.onBgEventsNudgeRef) {
+        this.onBgEventsNudgeRef(currentRef);
+        delivered = true;
+      }
+      if (this.onBgEventsNudge) {
+        if (!currentRef && this.onBgEventsNudgeRef) {
+          this.logNudgeDelivery(
+            "fallback-missing-generation",
+            currentRecord,
+            `nudge dispatch fallback=root-session-handler cause=generation-provenance-unavailable root=${currentRecord.canonicalRoot}`,
+          );
+        }
+        this.onBgEventsNudge(currentRecord.identity.project_root, currentRecord.identity.session);
+        delivered = true;
+      }
+      if (delivered) return;
+
+      this.logNudgeDelivery(
+        "drop-no-compatible-handler",
+        currentRecord,
+        `nudge dropped cause=generation-provenance-unavailable-and-root-session-handler-unwired root=${currentRecord.canonicalRoot}`,
+      );
     };
     let sub: BgSubscription | null = null;
     const clearDormantSubscription = (): void => {

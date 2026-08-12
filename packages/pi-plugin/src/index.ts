@@ -599,6 +599,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     poolOptions,
     configOverrides,
     subcConnectionFile: config.subc?.connection_file,
+    // Reaping-disabled pools have no root generation, so their nudges cannot carry
+    // BgNudgeRef provenance. Keep the root/session callback wired as the delivery
+    // path for those pools; bg-notifications coalesces it with provenance callbacks.
+    onBgEventsNudge: (directory, sessionID) => {
+      void handleSubcBgEventsNudge({
+        ctx,
+        directory,
+        sessionID,
+        runtime: pi,
+      }).catch((err) => {
+        warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    },
     onBgEventsNudgeRef: (ref) => {
       void handleSubcBgEventsNudge({
         ctx,
