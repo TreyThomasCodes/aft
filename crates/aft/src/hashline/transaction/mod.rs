@@ -1256,8 +1256,10 @@ mod tests {
     use super::*;
     use crate::backup::BackupPolicy;
     use crate::hashline::scan::scan_bytes;
+    use crate::hashline::snapshot::{capture_taggable_read, ReadPublication, ReadSelection};
     use crate::hashline::syntax::{
-        parse_address, resolve_address, PutOperation, PutSource, RegisterRef, ResolvedAddress,
+        parse_address, resolve_address, resolve_snapshot, PutOperation, PutSource, RegisterRef,
+        ResolvedAddress,
     };
 
     const SESSION: &str = "hashline-tx-test";
@@ -1332,6 +1334,79 @@ mod tests {
             resolved,
             mv_destination: None,
         }
+    }
+
+    fn put_after_reads(
+        selections: impl IntoIterator<Item = ReadSelection>,
+    ) -> Result<Vec<u8>, HashlineRejection> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reread.txt");
+        let original = b"one\ntwo\nthree\nfour\n";
+        write_file(&path, original);
+
+        let mut snapshots = SnapshotStore::new();
+        let mut tag = None;
+        for selection in selections {
+            let publication =
+                capture_taggable_read(&mut snapshots, &path, "reread.txt", selection).unwrap();
+            let ReadPublication::Tagged { snapshot, .. } = publication else {
+                panic!("fixture read must publish a tagged snapshot");
+            };
+            tag.get_or_insert(snapshot.tag);
+        }
+
+        let snapshot = resolve_snapshot(
+            &mut snapshots,
+            &path,
+            tag.as_deref().expect("at least one read selection"),
+        )?;
+        let baseline = Baseline::from_bytes(original.to_vec());
+        let operations = vec![put_text("2", &["TWO"])];
+        let resolved = vec![resolve_one(&snapshot, &operations[0])];
+        let sections = [section_put(
+            &path,
+            "reread.txt",
+            &baseline,
+            &snapshot,
+            &operations,
+            &resolved,
+        )];
+        let session_registers = RegisterStore::new();
+        let plan = plan_transaction(&sections, &session_registers, true)?;
+        let mut backups = backup_store(&temp.path().join("backups"));
+        let mut execution_registers = RegisterStore::new();
+        let mut execution = ctx(
+            &mut backups,
+            &mut snapshots,
+            &mut execution_registers,
+            true,
+            None,
+        );
+        let envelope = execute_transaction(plan, &mut execution);
+        assert!(envelope.success);
+        assert!(envelope.complete);
+        Ok(fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn two_ranged_reads_of_one_version_then_put_applies() {
+        let bytes = put_after_reads([ReadSelection::range(1, 2), ReadSelection::range(3, 4)])
+            .expect("same-version ranged reads must resolve");
+        assert_eq!(bytes, b"one\nTWO\nthree\nfour\n");
+    }
+
+    #[test]
+    fn ranged_then_whole_read_of_one_version_then_put_applies() {
+        let bytes = put_after_reads([ReadSelection::range(2, 2), ReadSelection::WholeFile])
+            .expect("same-version ranged and whole reads must resolve");
+        assert_eq!(bytes, b"one\nTWO\nthree\nfour\n");
+    }
+
+    #[test]
+    fn second_read_without_intervening_mutation_does_not_enter_refusal_loop() {
+        let bytes = put_after_reads([ReadSelection::range(1, 1), ReadSelection::range(2, 2)])
+            .expect("a second read of unchanged content must leave the tag editable");
+        assert_eq!(bytes, b"one\nTWO\nthree\nfour\n");
     }
 
     /// A8: Phase 1 is mutation-free; Phase 2 is patch-ordered with honest envelopes.

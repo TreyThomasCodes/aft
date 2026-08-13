@@ -260,11 +260,12 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
             "read the current file with the tagged read surface, then include its four-hex tag"
         }
         (
-            HashlineRejectionCode::UnknownTag
-            | HashlineRejectionCode::EvictedTag
-            | HashlineRejectionCode::AmbiguousTag,
+            HashlineRejectionCode::UnknownTag | HashlineRejectionCode::EvictedTag,
             RejectionStage::Resolution,
         ) => "re-read the current tagged content before editing",
+        (HashlineRejectionCode::AmbiguousTag, RejectionStage::Resolution) => {
+            "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
+        }
         (HashlineRejectionCode::AmbiguousTag, RejectionStage::Recovery) => {
             "re-address the current tagged content; the stale span has multiple verbatim landings"
         }
@@ -1175,7 +1176,7 @@ pub fn resolve_snapshot(
             ),
             SnapshotLookupError::AmbiguousTag => HashlineRejection::resolution(
                 HashlineRejectionCode::AmbiguousTag,
-                "the four-hex tag identifies non-equivalent retained snapshots",
+                "the four-hex tag collides across different normalized file content",
             ),
         })
 }
@@ -1428,16 +1429,24 @@ mod tests {
         assert_eq!(unknown.stage, RejectionStage::Resolution);
 
         let path = PathBuf::from("/same-tag");
-        let first = snapshot(b"one\ntwo\n", [1]);
-        let second = snapshot(b"other\ntwo\n", [1]);
+        let first = snapshot(b"shared\none\n", [1]);
+        let mut collision = snapshot(b"shared\nother\n", [1]);
         let tag = first.tag.clone();
-        let mut collision = second;
         collision.tag = tag.clone();
         store.publish(&path, first);
         store.publish(&path, collision);
         let ambiguous = resolve_snapshot(&mut store, &path, &tag).expect_err("collision");
+        assert_eq!(store.snapshot_count(), 2);
+        assert_eq!(
+            store.lookup_state(&path, &tag),
+            crate::hashline::snapshot::SnapshotLookup::Ambiguous
+        );
         assert_eq!(ambiguous.code, HashlineRejectionCode::AmbiguousTag);
         assert_eq!(ambiguous.stage, RejectionStage::Resolution);
+        assert_eq!(
+            ambiguous.steering,
+            "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
+        );
     }
 
     #[test]

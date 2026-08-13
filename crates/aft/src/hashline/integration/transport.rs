@@ -708,7 +708,7 @@ pub fn rejection_transport_registry() -> Vec<RejectionTransportContract> {
         row(
             AmbiguousTag,
             Resolution,
-            "re-read the current tagged content before editing",
+            "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag",
         ),
         row(
             AmbiguousTag,

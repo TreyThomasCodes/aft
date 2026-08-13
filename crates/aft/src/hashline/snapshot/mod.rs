@@ -32,7 +32,8 @@ pub const MAX_RENDER_LINE_LENGTH: usize = 2_000;
 pub const MAX_SNAPSHOT_PATHS: usize = 30;
 /// Maximum number of versions retained for one canonical path.
 pub const MAX_VERSIONS_PER_PATH: usize = 4;
-/// Maximum retained raw-record payload across one session.
+/// Maximum snapshot residency across one session, including exact normalized
+/// content identities and retained raw records.
 pub const MAX_SNAPSHOT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum bounded history of handles removed by residency eviction.
 pub const MAX_EVICTION_RECORDS: usize = 256;
@@ -314,8 +315,21 @@ impl EvictionRecord {
 #[derive(Clone, Debug)]
 struct StoredSnapshot {
     snapshot: Snapshot,
+    normalized_bytes: Vec<u8>,
     inserted_at: u64,
     last_used: u64,
+}
+
+impl StoredSnapshot {
+    fn residency_bytes(&self) -> usize {
+        self.snapshot
+            .residency_bytes()
+            .saturating_add(self.normalized_bytes.len())
+    }
+
+    fn has_same_normalized_content(&self, tag: &str, normalized_bytes: &[u8]) -> bool {
+        fold_tag(&self.snapshot.tag) == fold_tag(tag) && self.normalized_bytes == normalized_bytes
+    }
 }
 
 /// The outcome of publishing one snapshot into a bounded store.
@@ -328,6 +342,8 @@ pub enum PublishStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishOutcome {
     pub status: PublishStatus,
+    /// The evidence exposed by this publication. The resident store may hold a
+    /// merged superset after coalescing another read of the same content.
     pub snapshot: Option<Snapshot>,
     pub evicted: Vec<EvictionRecord>,
 }
@@ -360,7 +376,14 @@ impl SnapshotLookupError {
     }
 
     pub const fn steering(&self) -> &'static str {
-        "re-read the current tagged content before editing"
+        match self {
+            Self::AmbiguousTag => {
+                "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
+            }
+            Self::UnknownTag | Self::EvictedTag => {
+                "re-read the current tagged content before editing"
+            }
+        }
     }
 }
 
@@ -430,12 +453,40 @@ impl SnapshotStore {
     /// resident entry, create history, or perturb recency.
     pub fn publish(&mut self, path: impl AsRef<Path>, snapshot: Snapshot) -> PublishOutcome {
         let path = canonical_key(path.as_ref());
-        // The scanner keeps normalized bytes as a useful capture artifact, but
-        // residency only needs the tag and verification records. Dropping that
-        // transient hash buffer before insertion keeps the session budget real.
-        let snapshot = snapshot_for_residency(&snapshot);
-        let retained_bytes = snapshot.residency_bytes();
-        if snapshot.byte_count > MAX_FILE_READ_BYTES || retained_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+        let mut published_snapshot = snapshot;
+        let normalized_bytes = std::mem::take(&mut published_snapshot.normalized_bytes);
+
+        // The four-hex handle is deliberately lossy. Exact normalized bytes are
+        // retained separately so only byte-identical content coalesces; a real
+        // tag collision remains represented by distinct resident versions.
+        let coalesced = self.paths.get(&path).and_then(|versions| {
+            versions
+                .iter()
+                .position(|version| {
+                    version.has_same_normalized_content(&published_snapshot.tag, &normalized_bytes)
+                })
+                .map(|index| {
+                    (
+                        index,
+                        merge_snapshot_evidence(&versions[index].snapshot, &published_snapshot),
+                    )
+                })
+        });
+        let retained_bytes = coalesced.as_ref().map_or_else(
+            || {
+                published_snapshot
+                    .residency_bytes()
+                    .saturating_add(normalized_bytes.len())
+            },
+            |(_, merged)| {
+                merged
+                    .residency_bytes()
+                    .saturating_add(normalized_bytes.len())
+            },
+        );
+        if published_snapshot.byte_count > MAX_FILE_READ_BYTES
+            || retained_bytes > MAX_SNAPSHOT_TOTAL_BYTES
+        {
             return PublishOutcome {
                 status: PublishStatus::Oversize {
                     retained_bytes,
@@ -449,6 +500,35 @@ impl SnapshotStore {
         let mut evicted = Vec::new();
         self.bump_clock();
         let now = self.clock;
+
+        if let Some((index, merged)) = coalesced {
+            let previous_bytes = self.paths[&path][index].residency_bytes();
+            self.remove_history(&EvictionRecord::new(&path, &published_snapshot.tag));
+            let version = &mut self
+                .paths
+                .get_mut(&path)
+                .expect("coalesced snapshot path remains resident")[index];
+            version.snapshot = merged;
+            version.last_used = now;
+            let merged_bytes = version.residency_bytes();
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(merged_bytes);
+
+            while self.total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+                let Some((oldest_path, oldest_index)) = self.least_recent_version() else {
+                    break;
+                };
+                evicted.push(self.remove_version_for_eviction(&oldest_path, oldest_index));
+            }
+
+            return PublishOutcome {
+                status: PublishStatus::Stored,
+                snapshot: Some(published_snapshot),
+                evicted,
+            };
+        }
 
         if !self.paths.contains_key(&path) && self.paths.len() >= MAX_SNAPSHOT_PATHS {
             if let Some(oldest_path) = self.least_recent_path() {
@@ -469,13 +549,14 @@ impl SnapshotStore {
             }
         }
 
-        self.remove_history(&EvictionRecord::new(&path, &snapshot.tag));
+        self.remove_history(&EvictionRecord::new(&path, &published_snapshot.tag));
         self.total_bytes = self.total_bytes.saturating_add(retained_bytes);
         self.paths
             .entry(path.clone())
             .or_default()
             .push(StoredSnapshot {
-                snapshot: snapshot.clone(),
+                snapshot: published_snapshot.clone(),
+                normalized_bytes,
                 inserted_at: now,
                 last_used: now,
             });
@@ -489,7 +570,7 @@ impl SnapshotStore {
 
         PublishOutcome {
             status: PublishStatus::Stored,
-            snapshot: Some(snapshot),
+            snapshot: Some(published_snapshot),
             evicted,
         }
     }
@@ -542,14 +623,16 @@ impl SnapshotStore {
             };
         }
 
-        let first = versions[indices[0]].snapshot.clone();
+        let first_index = indices[0];
+        let first_content = &versions[first_index].normalized_bytes;
         if indices
             .iter()
             .skip(1)
-            .any(|index| !equivalent_snapshots(&first, &versions[*index].snapshot))
+            .any(|index| versions[*index].normalized_bytes != *first_content)
         {
             return Err(SnapshotLookupError::AmbiguousTag);
         }
+        let resolved = versions[first_index].snapshot.clone();
 
         self.bump_clock();
         let now = self.clock;
@@ -560,7 +643,7 @@ impl SnapshotStore {
         for index in indices {
             versions[index].last_used = now;
         }
-        Ok(first)
+        Ok(resolved)
     }
 
     pub fn resolve(
@@ -581,11 +664,9 @@ impl SnapshotStore {
                 SnapshotLookup::Unknown
             };
         };
-        let candidates: Vec<&Snapshot> = versions
+        let candidates: Vec<&StoredSnapshot> = versions
             .iter()
-            .filter_map(|version| {
-                (fold_tag(&version.snapshot.tag) == folded).then_some(&version.snapshot)
-            })
+            .filter(|version| fold_tag(&version.snapshot.tag) == folded)
             .collect();
         if candidates.is_empty() {
             return if self.history_contains(&path, &folded) {
@@ -598,11 +679,11 @@ impl SnapshotStore {
         if candidates
             .iter()
             .skip(1)
-            .any(|candidate| !equivalent_snapshots(first, candidate))
+            .any(|candidate| candidate.normalized_bytes != first.normalized_bytes)
         {
             SnapshotLookup::Ambiguous
         } else {
-            SnapshotLookup::Found(first.clone())
+            SnapshotLookup::Found(first.snapshot.clone())
         }
     }
 
@@ -618,12 +699,9 @@ impl SnapshotStore {
         let Some(versions) = self.paths.remove(&path) else {
             return false;
         };
-        self.total_bytes = self.total_bytes.saturating_sub(
-            versions
-                .iter()
-                .map(|version| version.snapshot.residency_bytes())
-                .sum(),
-        );
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(versions.iter().map(StoredSnapshot::residency_bytes).sum());
         true
     }
 
@@ -702,9 +780,7 @@ impl SnapshotStore {
             let versions = self.paths.get_mut(path).expect("version path exists");
             let removed = versions.remove(index);
             let record = EvictionRecord::new(path, &removed.snapshot.tag);
-            self.total_bytes = self
-                .total_bytes
-                .saturating_sub(removed.snapshot.residency_bytes());
+            self.total_bytes = self.total_bytes.saturating_sub(removed.residency_bytes());
             (record, versions.is_empty())
         };
         if should_remove_path {
@@ -720,9 +796,7 @@ impl SnapshotStore {
         };
         let mut records = Vec::with_capacity(versions.len());
         for version in versions {
-            self.total_bytes = self
-                .total_bytes
-                .saturating_sub(version.snapshot.residency_bytes());
+            self.total_bytes = self.total_bytes.saturating_sub(version.residency_bytes());
             let record = EvictionRecord::new(path, &version.snapshot.tag);
             self.record_eviction(record.clone());
             records.push(record);
@@ -750,10 +824,49 @@ impl SnapshotStore {
     }
 }
 
-/// Two candidates with the same path and tag can safely collapse only when all
-/// verification-relevant retained evidence agrees. Capture provenance is not in
-/// this comparison: reading identical bytes twice must not make a handle
-/// ambiguous merely because metadata timestamps differ.
+fn merge_snapshot_evidence(existing: &Snapshot, incoming: &Snapshot) -> Snapshot {
+    let mut merged = existing.clone();
+    merged.records.extend(incoming.records.clone());
+    merged
+        .retained_lines
+        .extend(incoming.retained_lines.clone());
+    merged
+        .coverage
+        .requested_lines
+        .extend(incoming.coverage.requested_lines.iter().copied());
+    merged.coverage.retain_all |= incoming.coverage.retain_all;
+    merged
+        .coverage
+        .retained_lines
+        .extend(incoming.coverage.retained_lines.iter().copied());
+    merged
+        .coverage
+        .seen_lines
+        .extend(incoming.coverage.seen_lines.iter().copied());
+    merged.coverage.scanned_line_count = merged
+        .coverage
+        .scanned_line_count
+        .max(incoming.coverage.scanned_line_count);
+    merged.coverage.total_lines = merged
+        .coverage
+        .total_lines
+        .max(incoming.coverage.total_lines);
+    merged.coverage.byte_count = merged.coverage.byte_count.max(incoming.coverage.byte_count);
+    merged.coverage.eof_observed |= incoming.coverage.eof_observed;
+    merged.boundary.empty_file |= incoming.boundary.empty_file;
+    merged.boundary.bof_observed |= incoming.boundary.bof_observed;
+    merged.boundary.eof_observed |= incoming.boundary.eof_observed;
+    merged.boundary.first_seen = merged.coverage.seen_lines.iter().next().copied();
+    merged.boundary.last_seen = merged.coverage.seen_lines.iter().next_back().copied();
+    merged.total_lines = merged.total_lines.max(incoming.total_lines);
+    merged.byte_count = merged.byte_count.max(incoming.byte_count);
+    merged.provenance = incoming.provenance.clone();
+    merged.capture_provenance = incoming.capture_provenance.clone();
+    merged
+}
+
+/// Compares two fully resolved snapshot views. Exact normalized-content
+/// coalescing happens during publication, so this only compares retained evidence.
 pub fn equivalent_snapshots(left: &Snapshot, right: &Snapshot) -> bool {
     left.records == right.records
         && left.coverage.retained_lines == right.coverage.retained_lines
@@ -766,9 +879,8 @@ pub fn equivalent_snapshots(left: &Snapshot, right: &Snapshot) -> bool {
 }
 
 impl Snapshot {
-    /// Count the raw records that are retained and therefore consume snapshot
-    /// residency. The full-file hash is computed during capture but does not
-    /// need a second copy in the bounded payload accounting.
+    /// Count retained raw-record bytes. The store adds the exact normalized
+    /// content identity when enforcing the total residency budget.
     pub fn residency_bytes(&self) -> usize {
         self.records
             .values()
@@ -1017,13 +1129,17 @@ pub fn capture_taggable_read_with_options(
         render_tagged_snapshot_with_options(&selected_snapshot, requested_path.clone(), options);
     let published_snapshot =
         snapshot_for_lines(&selected_snapshot, &candidate_rendering.rendered_lines);
-    let outcome = store.publish(canonical_path, published_snapshot.clone());
-    if outcome.oversize() {
+    let outcome = store.publish(canonical_path, published_snapshot);
+    if let PublishStatus::Oversize {
+        retained_bytes,
+        limit,
+    } = outcome.status
+    {
         return Ok(ReadPublication::Tagless {
             rendering: render_tagless_snapshot(&selected_snapshot, requested_path),
             reason: UntaggableReason::Oversize {
-                bytes: selected_snapshot.residency_bytes() as u64,
-                limit: MAX_SNAPSHOT_TOTAL_BYTES as u64,
+                bytes: retained_bytes as u64,
+                limit: limit as u64,
             },
         });
     }
@@ -1033,7 +1149,7 @@ pub fn capture_taggable_read_with_options(
     // domain was scanned but left unseen.
     let published_snapshot = outcome
         .snapshot
-        .expect("a non-oversize publication has a resident snapshot");
+        .expect("a non-oversize publication exposes its accepted snapshot");
     Ok(ReadPublication::Tagged {
         snapshot: published_snapshot,
         rendering: candidate_rendering,
@@ -1117,7 +1233,7 @@ pub fn publish_edit_response_snapshot(
     }
     let selected_snapshot = outcome
         .snapshot
-        .expect("a non-oversize publication has a resident snapshot");
+        .expect("a non-oversize publication exposes its accepted snapshot");
     let rendering = render_tagged_snapshot(&selected_snapshot, requested_path.clone());
     EditResponseSnapshot {
         snapshot: Some(selected_snapshot),
@@ -1160,12 +1276,6 @@ impl EditResponseSnapshot {
 /// without turning the handle into an evicted handle.
 pub fn invalidate_removed_source(store: &mut SnapshotStore, source: impl AsRef<Path>) -> bool {
     store.invalidate_path(source)
-}
-
-fn snapshot_for_residency(snapshot: &Snapshot) -> Snapshot {
-    let mut resident = snapshot.clone();
-    resident.normalized_bytes.clear();
-    resident
 }
 
 fn snapshot_for_lines(snapshot: &Snapshot, lines: &BTreeSet<usize>) -> Snapshot {
@@ -1311,6 +1421,24 @@ mod tests {
         assert!(equivalent_snapshots(&left, &right));
         left.records.get_mut(&1).unwrap().content = b"changed".to_vec();
         assert!(!equivalent_snapshots(&left, &right));
+    }
+
+    #[test]
+    fn coalescing_uses_normalized_content_not_retained_window_equality() {
+        let mut store = SnapshotStore::new();
+        let path = PathBuf::from("/tmp/normalized-content.txt");
+        let first = snapshot(b"one \ntwo\n", [1]);
+        let second = snapshot(b"one\t\ntwo\n", [2]);
+        let tag = first.tag.clone();
+
+        store.publish(&path, first);
+        store.publish(&path, second);
+
+        assert_eq!(store.snapshot_count(), 1);
+        let resolved = store
+            .lookup(&path, &tag)
+            .expect("normalized content matches");
+        assert_eq!(resolved.coverage.seen_lines, BTreeSet::from([1, 2]));
     }
 
     #[test]
@@ -1490,6 +1618,32 @@ mod tests {
             Err(SnapshotLookupError::EvictedTag)
         );
         assert!(store.lookup(&path, &tags[1]).is_ok());
+    }
+
+    #[test]
+    fn same_content_publications_coalesce_before_version_eviction() {
+        let mut store = SnapshotStore::new();
+        let path = PathBuf::from("/tmp/coalesced-version.txt");
+        let bytes = b"one\ntwo\nthree\nfour\nfive\nsix\n";
+        let mut tag = None;
+
+        for line in 1..=(MAX_VERSIONS_PER_PATH + 2) {
+            let current = snapshot(bytes, [line]);
+            tag.get_or_insert(current.tag.clone());
+            let outcome = store.publish(&path, current);
+            assert!(outcome.stored());
+            assert!(outcome.evicted.is_empty());
+        }
+
+        assert_eq!(store.snapshot_count(), 1);
+        assert_eq!(store.eviction_history_len(), 0);
+        let resolved = store
+            .lookup(&path, tag.as_deref().unwrap())
+            .expect("coalesced version remains resident");
+        assert_eq!(
+            resolved.coverage.seen_lines,
+            BTreeSet::from([1, 2, 3, 4, 5, 6])
+        );
     }
 
     #[test]

@@ -731,7 +731,8 @@ MV dest/b.rs";
             })
             .expect("ambiguous recovery");
         assert_ne!(amb_res.steering, amb_rec.steering);
-        assert!(amb_res.steering.contains("re-read"));
+        assert!(amb_res.steering.contains("non-hashline"));
+        assert!(amb_res.steering.contains("re-reading preserves"));
         assert!(amb_rec.steering.contains("re-address"));
 
         // Both stale stages with opposite steering.
