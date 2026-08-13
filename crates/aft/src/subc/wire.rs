@@ -1,6 +1,8 @@
 //! Frame encoding and writer-queue helpers used by the subc transport edge.
 
+#[cfg(test)]
 use serde::ser::{SerializeMap, SerializeStruct};
+#[cfg(test)]
 use serde::{Serialize, Serializer};
 
 use super::{
@@ -365,11 +367,13 @@ pub(super) async fn send_frame(
 
 /// Borrowed flat response matching the standalone NDJSON shape without cloning
 /// the response id or any structured data values.
+#[cfg(test)]
 struct FlatToolResponse<'a> {
     response: &'a crate::protocol::Response,
     text: &'a str,
 }
 
+#[cfg(test)]
 impl Serialize for FlatToolResponse<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -408,6 +412,7 @@ impl Serialize for FlatToolResponse<'_> {
     }
 }
 
+#[cfg(test)]
 struct ToolResponseEnvelope<'a> {
     result: &'a ToolCallResult,
     /// First-party binds get the full flat response in `structuredContent`
@@ -419,20 +424,20 @@ struct ToolResponseEnvelope<'a> {
 // `content`, once inside `structuredContent` — and for reads the raw `content`
 // data field rides along a third time, so a read body crosses the connection
 // roughly 3x. This is deliberate, not an oversight: the bridge re-lifts
-// `structuredContent` to reconstruct the flat response, and dropping the
-// duplicate is a forward-incompatible wire change (`reliftReply` rejects a
-// reply without `structuredContent.text`, so a module-first rollout breaks
-// every installed plugin). Collapsing it safely means emitting both shapes,
-// waiting for plugins to update, then dropping one behind a version floor.
-// The bridge now accepts replies that omit `structuredContent.text`, and the module may omit that field after the minimum supported plugin version includes this compatibility behavior.
+// `structuredContent` to reconstruct the flat response. The bridge's
+// `reliftReply` now tolerates omission of `structuredContent.text`, but AFT
+// still emits it until every supported plugin version includes that fallback.
+// Only then can the duplicate be dropped behind the plugin version floor.
 //
 // Measured on a live daemon: the largest real frames were ~200 KB, with zero
 // egress-write time, writer queue depth 1, never full, and no reserve
 // timeouts — the amplification costs nothing observable. Revisit if
-// `egress_write` on tool-call phase traces becomes nonzero, if the writer
-// queue starts backing up, or if typical frames grow well past a few hundred
-// KB; at that point the two-step migration earns its risk.
+// If `egress_write` becomes nonzero, the writer queue backs up, or typical
+// frames grow well past a few hundred KB, the duplicate content is costly
+// enough to justify dropping `structuredContent.text` after the plugin floor
+// makes that omission compatible.
 
+#[cfg(test)]
 impl Serialize for ToolResponseEnvelope<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -461,11 +466,90 @@ impl Serialize for ToolResponseEnvelope<'_> {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct TextContent<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     text: &'a str,
+}
+
+fn serialize_tool_response_body(
+    result: &ToolCallResult,
+    include_structured: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let data_capacity = result
+        .response
+        .data
+        .as_object()
+        .and_then(|data| {
+            ["content", "output", "preview_diff"]
+                .into_iter()
+                .find_map(|key| data.get(key).and_then(Value::as_str).map(str::len))
+        })
+        .unwrap_or(0);
+    let capacity = result
+        .text
+        .len()
+        .saturating_add(include_structured.then_some(data_capacity).unwrap_or(0))
+        .saturating_add(include_structured.then_some(result.text.len()).unwrap_or(0))
+        .saturating_add(512);
+    let mut body = Vec::with_capacity(capacity);
+
+    body.extend_from_slice(b"{\"content\":[{\"type\":\"text\",\"text\":");
+    let encoded_text_start = body.len();
+    serde_json::to_writer(&mut body, &result.text)?;
+    let encoded_text_end = body.len();
+    body.extend_from_slice(b"}],\"isError\":");
+    body.extend_from_slice(if result.response.success {
+        b"false"
+    } else {
+        b"true"
+    });
+
+    if include_structured {
+        body.extend_from_slice(b",\"structuredContent\":{\"id\":");
+        let data = result.response.data.as_object();
+        match data.and_then(|data| data.get("id")) {
+            Some(value) => serde_json::to_writer(&mut body, value)?,
+            None => serde_json::to_writer(&mut body, &result.response.id)?,
+        }
+        body.extend_from_slice(b",\"success\":");
+        match data.and_then(|data| data.get("success")) {
+            Some(value) => serde_json::to_writer(&mut body, value)?,
+            None => body.extend_from_slice(if result.response.success {
+                b"true"
+            } else {
+                b"false"
+            }),
+        }
+
+        let mut has_text = false;
+        if let Some(data) = data {
+            for (key, value) in data {
+                match key.as_str() {
+                    "id" | "success" => continue,
+                    "text" => has_text = true,
+                    _ => {}
+                }
+                body.push(b',');
+                serde_json::to_writer(&mut body, key)?;
+                body.push(b':');
+                if key == "text" || value.as_str() == Some(result.text.as_str()) {
+                    body.extend_from_within(encoded_text_start..encoded_text_end);
+                } else {
+                    serde_json::to_writer(&mut body, value)?;
+                }
+            }
+        }
+        if !has_text {
+            body.extend_from_slice(b",\"text\":");
+            body.extend_from_within(encoded_text_start..encoded_text_end);
+        }
+        body.push(b'}');
+    }
+    body.push(b'}');
+    Ok(body)
 }
 
 pub(super) fn build_tool_response_frame(
@@ -492,11 +576,7 @@ pub(super) fn build_tool_response_frame(
     // for model input when present — feeding the model a raw JSON dump with
     // the rendered text buried inside it, at a multiple of the token cost.
     let include_structured = !matches!(trust, BindTrust::Untrusted);
-    let body = serde_json::to_vec(&ToolResponseEnvelope {
-        result,
-        include_structured,
-    })
-    .map_err(SubcError::Json)?;
+    let body = serialize_tool_response_body(result, include_structured).map_err(SubcError::Json)?;
 
     Frame::build_with_version(
         ver,
@@ -747,6 +827,184 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "control send guard should be bounded"
         );
+    }
+
+    fn legacy_tool_response_body(result: &ToolCallResult, include_structured: bool) -> Vec<u8> {
+        serde_json::to_vec(&ToolResponseEnvelope {
+            result,
+            include_structured,
+        })
+        .expect("serialize legacy tool response envelope")
+    }
+
+    fn assert_tool_response_frame_matches_legacy(result: &ToolCallResult, trust: BindTrust) {
+        let include_structured = !matches!(trust, BindTrust::Untrusted);
+        let legacy = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            control_flags(),
+            7,
+            3,
+            42,
+            legacy_tool_response_body(result, include_structured),
+        )
+        .expect("build legacy tool response frame");
+        let optimized = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(7, 3),
+            42,
+            control_flags(),
+            result,
+            trust,
+        )
+        .expect("build optimized tool response frame");
+        assert_eq!(optimized.header.encode(), legacy.header.encode());
+        assert_eq!(optimized.body, legacy.body);
+    }
+
+    fn production_shape_result(tool: &str, payload_bytes: usize) -> ToolCallResult {
+        let payload = "x".repeat(payload_bytes);
+        let response = match tool {
+            "read" => Response::success(
+                "subc-7-42",
+                json!({
+                    "content": payload,
+                    "path": "/workspace/src/fixture.rs",
+                    "start_line": 1,
+                    "end_line": payload_bytes / 40 + 1,
+                    "total_lines": payload_bytes / 40 + 1,
+                    "truncated": false,
+                }),
+            ),
+            "edit" => Response::success(
+                "subc-7-42",
+                json!({
+                    "path": "/workspace/src/fixture.rs",
+                    "edits_applied": 1,
+                    "diff": { "additions": 12, "deletions": 8 },
+                    "preview_diff": payload,
+                }),
+            ),
+            "bash" => Response::success(
+                "subc-7-42",
+                json!({
+                    "output": payload,
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "status": "completed",
+                }),
+            ),
+            _ => unreachable!("production-shape probe tool"),
+        };
+        let text = crate::subc_format::format_response_with_context(
+            tool,
+            &response,
+            &crate::subc_format::FormatContext::default(),
+        );
+        ToolCallResult { text, response }
+    }
+
+    #[test]
+    fn optimized_tool_response_body_matches_legacy_wire_at_production_shapes() {
+        for tool in ["read", "edit", "bash"] {
+            for payload_bytes in [1_024, 10 * 1_024, 50 * 1_024] {
+                let result = production_shape_result(tool, payload_bytes);
+                for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
+                    assert_tool_response_frame_matches_legacy(&result, trust);
+                }
+            }
+        }
+
+        let result = ToolCallResult {
+            text: r#"replacement text with \"escapes\"
+"#
+            .to_string(),
+            response: Response::success(
+                "outer-id",
+                json!({
+                    "id": "data-id",
+                    "success": false,
+                    "text": "ignored source text",
+                    "nested": [null, true, -7, "replacement text with \"escapes\"\n"],
+                }),
+            ),
+        };
+        assert_tool_response_frame_matches_legacy(&result, BindTrust::FirstParty);
+    }
+
+    fn median_duration(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn time_envelope_builds(
+        results: &[ToolCallResult],
+        weights: &[usize],
+        legacy: bool,
+        iterations: usize,
+    ) -> Duration {
+        let started = Instant::now();
+        for _ in 0..iterations {
+            for (result, &weight) in results.iter().zip(weights) {
+                for _ in 0..weight {
+                    let body = if legacy {
+                        legacy_tool_response_body(std::hint::black_box(result), true)
+                    } else {
+                        serialize_tool_response_body(std::hint::black_box(result), true)
+                            .expect("serialize optimized tool response envelope")
+                    };
+                    std::hint::black_box(body);
+                }
+            }
+        }
+        started.elapsed()
+    }
+
+    #[test]
+    #[ignore = "manual release-mode serving-plane performance probe"]
+    fn tool_response_envelope_perf_probe() {
+        let shapes = [
+            ("read", 1_024),
+            ("read", 10 * 1_024),
+            ("read", 50 * 1_024),
+            ("edit", 1_024),
+            ("edit", 10 * 1_024),
+            ("edit", 50 * 1_024),
+            ("bash", 1_024),
+            ("bash", 10 * 1_024),
+            ("bash", 50 * 1_024),
+        ];
+        // A 100-call production mix dominated by read/edit/bash, with periodic
+        // 50 KiB responses and most calls in the 1-10 KiB range.
+        let weights = [20, 15, 5, 15, 10, 5, 15, 10, 5];
+        let results: Vec<_> = shapes
+            .iter()
+            .map(|&(tool, payload_bytes)| production_shape_result(tool, payload_bytes))
+            .collect();
+        for result in &results {
+            assert_eq!(
+                serialize_tool_response_body(result, true).unwrap(),
+                legacy_tool_response_body(result, true)
+            );
+        }
+
+        let iterations = 40;
+        let calls_per_sample = iterations * weights.iter().sum::<usize>();
+        let mut legacy_samples = Vec::new();
+        let mut optimized_samples = Vec::new();
+        for _ in 0..7 {
+            legacy_samples.push(time_envelope_builds(&results, &weights, true, iterations));
+            optimized_samples.push(time_envelope_builds(&results, &weights, false, iterations));
+        }
+        let legacy = median_duration(&mut legacy_samples);
+        let optimized = median_duration(&mut optimized_samples);
+        let legacy_us = legacy.as_secs_f64() * 1_000_000.0 / calls_per_sample as f64;
+        let optimized_us = optimized.as_secs_f64() * 1_000_000.0 / calls_per_sample as f64;
+        let saved_percent = (legacy_us - optimized_us) / legacy_us * 100.0;
+        eprintln!(
+            "trusted mixed tool-response envelope: before={legacy_us:.3} us/call after={optimized_us:.3} us/call saved={saved_percent:.1}%; 7 run medians, {calls_per_sample} calls/run"
+        );
+        assert!(optimized < legacy, "optimized envelope regressed");
     }
 
     #[test]
