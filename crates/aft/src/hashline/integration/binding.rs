@@ -276,23 +276,35 @@ impl BindingRegistry {
         request: RegistrationRequest,
     ) -> RegistrationOutcome {
         let key = SessionKey::new(root.as_ref().to_path_buf(), session_id.into());
+        self.register_key(key, request, || {})
+    }
+
+    fn register_key(
+        &self,
+        key: SessionKey,
+        request: RegistrationRequest,
+        after_existing_read: impl FnOnce(),
+    ) -> RegistrationOutcome {
         let effective = request.effective();
         let downgrade = request
             .should_downgrade()
             .then_some(DowngradeWarning::EDIT_NOT_REGISTERED);
 
-        // Drain outside the registry map lock so concurrent captures can finish.
-        let existing = {
-            let state = self.lock();
-            state.bindings.get(&key).cloned()
-        };
+        // Serialize the existing-value read, comparison, and binding update. A
+        // guard may finish while this lock is held because guard release only
+        // takes the binding lock and signals the drain condition variable.
+        let mut state = self.lock();
+        let existing = state.bindings.get(&key).cloned();
+        let previous_effective = existing.as_ref().map(|binding| {
+            binding
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .effective()
+        });
+        after_existing_read();
 
         let (stores_cleared, stores_preserved) = if let Some(existing) = existing {
-            let previous_effective = {
-                let binding = existing.lock().unwrap_or_else(|p| p.into_inner());
-                binding.effective()
-            };
-            if previous_effective != effective {
+            if previous_effective != Some(effective) {
                 self.drain_in_flight(&existing);
                 {
                     let mut binding = existing.lock().unwrap_or_else(|p| p.into_inner());
@@ -301,8 +313,6 @@ impl BindingRegistry {
                     binding.effective = effective;
                     binding.clear_stores();
                 }
-                // Replace the map entry with the same Arc so captures still resolve.
-                let mut state = self.lock();
                 state.bindings.insert(key, existing);
                 (true, false)
             } else {
@@ -312,13 +322,11 @@ impl BindingRegistry {
                     binding.edit_slot_survives = request.edit_slot_survives;
                     // effective unchanged; stores preserved.
                 }
-                let mut state = self.lock();
                 state.bindings.insert(key, existing);
                 (false, true)
             }
         } else {
             let binding = Arc::new(Mutex::new(HashlineBinding::new(key.clone(), request)));
-            let mut state = self.lock();
             state.bindings.insert(key, binding);
             (false, false)
         };
@@ -418,4 +426,103 @@ impl BindingRegistryInner {
 /// Effective mode for a request: unregistered sessions are always off.
 pub fn effective_for_capture(guard: Option<&BindingGuard>) -> bool {
     guard.map(|g| g.effective()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hashline::scan::scan_bytes;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn concurrent_same_session_registration_serializes_read_compare_write() {
+        let registry = Arc::new(BindingRegistry::new());
+        let key = SessionKey::new("/tmp/hashline-register-race", "shared-session");
+        registry.register(
+            &key.root,
+            key.session_id.clone(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        registry
+            .peek(&key.root, key.session_id.clone())
+            .expect("initial binding")
+            .with_binding_mut(|binding| {
+                binding
+                    .snapshots_mut()
+                    .publish("race.rs", scan_bytes(b"before race\n"));
+            });
+
+        let (first_read_tx, first_read_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_registry = Arc::clone(&registry);
+        let first_key = key.clone();
+        let first = thread::spawn(move || {
+            first_registry.register_key(
+                first_key,
+                RegistrationRequest {
+                    configured_enabled: false,
+                    edit_slot_survives: true,
+                },
+                || {
+                    first_read_tx.send(()).expect("signal first read");
+                    release_first_rx.recv().expect("release first registration");
+                },
+            )
+        });
+
+        first_read_rx
+            .recv()
+            .expect("first registration read existing binding");
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_read_tx, second_read_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second_registry = Arc::clone(&registry);
+        let second_key = key.clone();
+        let second = thread::spawn(move || {
+            second_started_tx.send(()).expect("signal second start");
+            let outcome = second_registry.register_key(
+                second_key,
+                RegistrationRequest {
+                    configured_enabled: true,
+                    edit_slot_survives: false,
+                },
+                || second_read_tx.send(()).expect("signal second read"),
+            );
+            second_done_tx.send(outcome).expect("send second outcome");
+        });
+
+        second_started_rx
+            .recv()
+            .expect("second registration started");
+        assert!(matches!(
+            second_read_rx.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        release_first_tx
+            .send(())
+            .expect("release first registration");
+
+        let first_outcome = first.join().expect("first registration");
+        let second_outcome = second_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second registration completes after first");
+        second.join().expect("second registration");
+
+        assert!(first_outcome.stores_cleared);
+        assert!(second_outcome.stores_preserved);
+        let final_binding = registry
+            .peek(&key.root, key.session_id)
+            .expect("final binding");
+        final_binding.with_binding(|binding| {
+            assert!(binding.configured_enabled());
+            assert!(!binding.edit_slot_survives());
+            assert!(!binding.effective());
+            assert!(binding.snapshots().is_empty());
+        });
+    }
 }

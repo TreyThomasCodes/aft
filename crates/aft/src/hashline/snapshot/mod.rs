@@ -312,6 +312,14 @@ impl EvictionRecord {
     }
 }
 
+type ContentFingerprint = [u8; 32];
+
+#[derive(Clone, Debug)]
+struct EvictionHistoryEntry {
+    record: EvictionRecord,
+    content_fingerprint: ContentFingerprint,
+}
+
 #[derive(Clone, Debug)]
 struct StoredSnapshot {
     snapshot: Snapshot,
@@ -410,7 +418,7 @@ pub struct SnapshotStore {
     paths: BTreeMap<PathBuf, Vec<StoredSnapshot>>,
     total_bytes: usize,
     clock: u64,
-    eviction_history: VecDeque<(EvictionRecord, u64)>,
+    eviction_history: VecDeque<EvictionHistoryEntry>,
 }
 
 impl SnapshotStore {
@@ -503,7 +511,10 @@ impl SnapshotStore {
 
         if let Some((index, merged)) = coalesced {
             let previous_bytes = self.paths[&path][index].residency_bytes();
-            self.remove_history(&EvictionRecord::new(&path, &published_snapshot.tag));
+            self.remove_history(
+                &EvictionRecord::new(&path, &published_snapshot.tag),
+                &content_fingerprint(&normalized_bytes),
+            );
             let version = &mut self
                 .paths
                 .get_mut(&path)
@@ -549,7 +560,10 @@ impl SnapshotStore {
             }
         }
 
-        self.remove_history(&EvictionRecord::new(&path, &published_snapshot.tag));
+        self.remove_history(
+            &EvictionRecord::new(&path, &published_snapshot.tag),
+            &content_fingerprint(&normalized_bytes),
+        );
         self.total_bytes = self.total_bytes.saturating_add(retained_bytes);
         self.paths
             .entry(path.clone())
@@ -632,6 +646,9 @@ impl SnapshotStore {
         {
             return Err(SnapshotLookupError::AmbiguousTag);
         }
+        if self.history_contains_different_content(&path, &folded, first_content) {
+            return Err(SnapshotLookupError::EvictedTag);
+        }
         let resolved = versions[first_index].snapshot.clone();
 
         self.bump_clock();
@@ -682,6 +699,8 @@ impl SnapshotStore {
             .any(|candidate| candidate.normalized_bytes != first.normalized_bytes)
         {
             SnapshotLookup::Ambiguous
+        } else if self.history_contains_different_content(&path, &folded, &first.normalized_bytes) {
+            SnapshotLookup::Evicted
         } else {
             SnapshotLookup::Found(first.snapshot.clone())
         }
@@ -776,17 +795,18 @@ impl SnapshotStore {
     }
 
     fn remove_version_for_eviction(&mut self, path: &Path, index: usize) -> EvictionRecord {
-        let (record, should_remove_path) = {
+        let (record, fingerprint, should_remove_path) = {
             let versions = self.paths.get_mut(path).expect("version path exists");
             let removed = versions.remove(index);
             let record = EvictionRecord::new(path, &removed.snapshot.tag);
+            let fingerprint = content_fingerprint(&removed.normalized_bytes);
             self.total_bytes = self.total_bytes.saturating_sub(removed.residency_bytes());
-            (record, versions.is_empty())
+            (record, fingerprint, versions.is_empty())
         };
         if should_remove_path {
             self.paths.remove(path);
         }
-        self.record_eviction(record.clone());
+        self.record_eviction(record.clone(), fingerprint);
         record
     }
 
@@ -798,30 +818,57 @@ impl SnapshotStore {
         for version in versions {
             self.total_bytes = self.total_bytes.saturating_sub(version.residency_bytes());
             let record = EvictionRecord::new(path, &version.snapshot.tag);
-            self.record_eviction(record.clone());
+            let fingerprint = content_fingerprint(&version.normalized_bytes);
+            self.record_eviction(record.clone(), fingerprint);
             records.push(record);
         }
         records
     }
 
-    fn record_eviction(&mut self, record: EvictionRecord) {
-        self.remove_history(&record);
-        self.eviction_history.push_back((record, self.clock));
+    fn record_eviction(&mut self, record: EvictionRecord, content_fingerprint: ContentFingerprint) {
+        self.remove_history(&record, &content_fingerprint);
+        self.eviction_history.push_back(EvictionHistoryEntry {
+            record,
+            content_fingerprint,
+        });
         while self.eviction_history.len() > MAX_EVICTION_RECORDS {
             self.eviction_history.pop_front();
         }
     }
 
-    fn remove_history(&mut self, record: &EvictionRecord) {
-        self.eviction_history
-            .retain(|(current, _)| current != record);
+    fn remove_history(
+        &mut self,
+        record: &EvictionRecord,
+        content_fingerprint: &ContentFingerprint,
+    ) {
+        self.eviction_history.retain(|entry| {
+            entry.record != *record || entry.content_fingerprint != *content_fingerprint
+        });
     }
 
     fn history_contains(&self, path: &Path, tag: &str) -> bool {
         self.eviction_history
             .iter()
-            .any(|(record, _)| record.canonical_path == path && record.tag == tag)
+            .any(|entry| entry.record.canonical_path == path && entry.record.tag == tag)
     }
+
+    fn history_contains_different_content(
+        &self,
+        path: &Path,
+        tag: &str,
+        normalized_bytes: &[u8],
+    ) -> bool {
+        let fingerprint = content_fingerprint(normalized_bytes);
+        self.eviction_history.iter().any(|entry| {
+            entry.record.canonical_path == path
+                && entry.record.tag == tag
+                && entry.content_fingerprint != fingerprint
+        })
+    }
+}
+
+fn content_fingerprint(normalized_bytes: &[u8]) -> ContentFingerprint {
+    *blake3::hash(normalized_bytes).as_bytes()
 }
 
 fn merge_snapshot_evidence(existing: &Snapshot, incoming: &Snapshot) -> Snapshot {
@@ -1404,6 +1451,12 @@ mod tests {
             .expect("in-memory snapshot")
     }
 
+    fn snapshot_with_forced_tag(bytes: &[u8], tag: &str) -> Snapshot {
+        let mut snapshot = snapshot(bytes, [1]);
+        snapshot.tag = tag.to_string();
+        snapshot
+    }
+
     fn writable_fixture(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = root.join(name);
         fs::write(&path, bytes).expect("fixture write");
@@ -1421,6 +1474,67 @@ mod tests {
         assert!(equivalent_snapshots(&left, &right));
         left.records.get_mut(&1).unwrap().content = b"changed".to_vec();
         assert!(!equivalent_snapshots(&left, &right));
+    }
+
+    #[test]
+    fn genuine_folded_tag_collision_stays_distinct_and_preserves_evicted_history() {
+        const COLLIDING_TAG: &str = "C0DE";
+        let mut store = SnapshotStore::new();
+        let resident_path = PathBuf::from("/tmp/genuine-collision-resident.txt");
+
+        store.publish(
+            &resident_path,
+            snapshot_with_forced_tag(b"first collision content\n", COLLIDING_TAG),
+        );
+        store.publish(
+            &resident_path,
+            snapshot_with_forced_tag(b"second collision content\n", &COLLIDING_TAG.to_lowercase()),
+        );
+
+        assert_eq!(
+            store.snapshot_count(),
+            2,
+            "colliding content must not coalesce"
+        );
+        assert_eq!(
+            store.lookup(&resident_path, COLLIDING_TAG),
+            Err(SnapshotLookupError::AmbiguousTag)
+        );
+        assert!(SnapshotLookupError::AmbiguousTag
+            .steering()
+            .contains("apply_patch"));
+
+        let evicted_path = PathBuf::from("/tmp/genuine-collision-evicted.txt");
+        store.publish(
+            &evicted_path,
+            snapshot_with_forced_tag(b"evicted collision content\n", COLLIDING_TAG),
+        );
+        for index in 0..MAX_VERSIONS_PER_PATH {
+            store.publish(
+                &evicted_path,
+                snapshot_with_forced_tag(
+                    format!("filler content {index}\n").as_bytes(),
+                    &format!("F{index:03X}"),
+                ),
+            );
+        }
+        assert_eq!(
+            store.lookup(&evicted_path, COLLIDING_TAG),
+            Err(SnapshotLookupError::EvictedTag),
+            "the first colliding content must have entered eviction history"
+        );
+
+        store.publish(
+            &evicted_path,
+            snapshot_with_forced_tag(b"replacement collision content\n", COLLIDING_TAG),
+        );
+
+        assert!(store.eviction_history_contains(&evicted_path, COLLIDING_TAG));
+        assert_eq!(
+            store.lookup(&evicted_path, COLLIDING_TAG),
+            Err(SnapshotLookupError::EvictedTag),
+            "publishing different colliding content must not erase the prior eviction"
+        );
     }
 
     #[test]

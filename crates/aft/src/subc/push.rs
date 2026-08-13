@@ -437,6 +437,15 @@ pub(super) fn emit_bg_event_wakes(
     bg_subs: &HashMap<RouteChannel, BgSub>,
     bg_wake_pending: &mut HashSet<RouteChannel>,
 ) {
+    // Cross-component liveness contract: keep every armed channel pending and
+    // re-emit its nudge on each tick until the completion drain is acknowledged
+    // and maintenance clears it. `handleSubcBgEventsNudge` coalesces a nudge when
+    // a handler is already in flight, so a completion arriving during that drain
+    // needs a later Rust-side nudge; stopping re-arm-until-ack would silently lose
+    // that wake. The plugin-side in-flight dedupe lives in
+    // `packages/opencode-plugin/src/bg-notifications.ts` and
+    // `packages/pi-plugin/src/bg-notifications.ts`, in their respective
+    // `handleSubcBgEventsNudge` implementations.
     let pending_channels: Vec<RouteChannel> = bg_wake_pending.iter().copied().collect();
     let mut stale_channels = Vec::new();
     for channel in pending_channels {
