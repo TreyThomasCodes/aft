@@ -107,6 +107,20 @@ describe("RevivableTransportPool", () => {
     expect(revivedClient.closed).toBe(1);
   });
 
+  test("captures edit-slot registration once for subc-backed plugin pools", () => {
+    const initialPool = makeSubcPool(new FakeClient());
+    const owner = new RevivableTransportPool(initialPool, async () =>
+      makeSubcPool(new FakeClient()),
+    );
+
+    owner.setConfigureOverride("edit_slot_survives", true);
+
+    expect(initialPool.getEditSlotSurvives()).toBe(true);
+    expect(() => owner.setConfigureOverride("edit_slot_survives", false)).toThrow(
+      "edit_slot_survives is write-once",
+    );
+  });
+
   test("concurrent demand during revival shares one replacement instance", async () => {
     const initialClient = new FakeClient();
     const revivedClient = new FakeClient();

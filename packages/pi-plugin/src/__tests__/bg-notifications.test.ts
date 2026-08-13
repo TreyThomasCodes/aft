@@ -659,6 +659,40 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     await Promise.all([first, duplicate]);
   });
 
+  test("undefined session uses the same default key for nudge dedupe and state", async () => {
+    let releaseDrain!: () => void;
+    const drainGate = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions") await drainGate;
+      return { success: true, bg_completions: [] };
+    });
+    const { ctx } = harness(send);
+    const runtime = { sendUserMessage: mock(() => {}) };
+    const defaultNudge = handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      runtime,
+    });
+    const explicitDefaultNudge = handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "__default__",
+      runtime,
+    });
+
+    expect(explicitDefaultNudge).toBe(defaultNudge);
+    expect(sessionBgStates.has("__default__")).toBe(true);
+    expect(sessionBgStates.has("undefined")).toBe(false);
+    const drainCalls = send.mock.calls.filter((call) => call[0] === "bash_drain_completions");
+    expect(drainCalls).toHaveLength(1);
+    expect(drainCalls[0]?.[1]).toMatchObject({ session_id: "__default__" });
+
+    releaseDrain();
+    await Promise.all([defaultNudge, explicitDefaultNudge]);
+  });
+
   test("a forced drain during the ack window does not double-deliver", async () => {
     // Pi delivery (sendUserMessage) is synchronous; the in-flight window is the
     // ack round-trip. Hold the ack open, fire a subc nudge force-drain in that

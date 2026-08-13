@@ -27,6 +27,7 @@ export class RevivableTransportPool implements AftTransportPool {
   private revival: Promise<AftTransportPool> | null = null;
   private readonly transports = new Map<string, RevivableProjectTransport>();
   private readonly configureOverrides = new Map<string, unknown>();
+  private editSlotSurvivesCaptured = false;
 
   constructor(
     initialPool: AftTransportPool,
@@ -72,18 +73,37 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   setConfigureOverride(key: string, value: unknown): void {
+    if (key === "edit_slot_survives") {
+      if (typeof value !== "boolean") {
+        throw new Error("edit_slot_survives must be set once to a boolean");
+      }
+      if (this.editSlotSurvivesCaptured) {
+        throw new Error("edit_slot_survives is write-once and was already captured");
+      }
+      this.activePool.setConfigureOverride(key, value);
+      this.editSlotSurvivesCaptured = true;
+      this.configureOverrides.set(key, value);
+      return;
+    }
+
     if (value === undefined) this.configureOverrides.delete(key);
     else this.configureOverrides.set(key, value);
     this.activePool.setConfigureOverride(key, value);
   }
 
   async reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
+    const pool = await this.ensureActivePool();
+    const runtimeOverrides: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(overrides)) {
+      if (key === "edit_slot_survives") {
+        this.setConfigureOverride(key, value);
+        continue;
+      }
       if (value === undefined) this.configureOverrides.delete(key);
       else this.configureOverrides.set(key, value);
+      runtimeOverrides[key] = value;
     }
-    const pool = await this.ensureActivePool();
-    await pool.reconfigure(projectRoot, overrides);
+    await pool.reconfigure(projectRoot, runtimeOverrides);
   }
 
   async replaceBinary(path: string): Promise<string> {

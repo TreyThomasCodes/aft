@@ -145,6 +145,12 @@ interface DrainContext {
   resolvedBridge?: AftProjectTransport;
 }
 
+type ResolvedDrainContext = DrainContext & { sessionID: string };
+
+function normalizeSessionID(sessionID: string | undefined): string {
+  return sessionID && sessionID.length > 0 ? sessionID : DEFAULT_SESSION_ID;
+}
+
 /**
  * Mark a bg task's completion as consumed by an explicit bash_status wait.
  * Removes it from pendingCompletions so the next wake/in-turn drain
@@ -448,26 +454,31 @@ export async function handleTurnEndBgCompletions(
  * (re-armed until acked), so it always means "drain me now" — even for a task
  * this process never tracked (prior session / already-cleared outstanding entry),
  * which the gated drain in {@link triggerWakeIfPending} would skip, leaving the
- * module to re-arm and nudge forever. See the OpenCode twin for the full
- * rationale.
+ * module to re-arm and nudge forever. The module-side loop lives at
+ * `crates/aft/src/subc/push.rs::{emit_bg_event_wakes,clear_stale_bg_wakes_for_empty_sessions}`:
+ * it re-emits pending wakes until ack empties the queue, so coalescing a duplicate
+ * while this handler is in flight is safe. See the OpenCode twin for the full rationale.
  */
 export function handleSubcBgEventsNudge(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
-  const sessionID = drainContext.sessionID ?? DEFAULT_SESSION_ID;
-  const key = `${drainContext.directory}\u0000${sessionID}`;
+  const resolvedDrainContext: ResolvedDrainContext & { runtime: SendUserMessageRuntime } = {
+    ...drainContext,
+    sessionID: normalizeSessionID(drainContext.sessionID),
+  };
+  const key = `${resolvedDrainContext.directory}\u0000${resolvedDrainContext.sessionID}`;
   const inFlight = subcNudgesInFlight.get(key);
   if (inFlight) {
     logSubcNudgeLifecycle(
-      drainContext,
+      resolvedDrainContext,
       "coalesced-in-flight",
       "nudge coalesced cause=handler-already-in-flight",
     );
     return inFlight;
   }
 
-  logSubcNudgeLifecycle(drainContext, "handler-entry", "nudge handler entered");
-  const handling = handleSubcBgEventsNudgeOnce(drainContext);
+  logSubcNudgeLifecycle(resolvedDrainContext, "handler-entry", "nudge handler entered");
+  const handling = handleSubcBgEventsNudgeOnce(resolvedDrainContext);
   subcNudgesInFlight.set(key, handling);
   const clear = (): void => {
     if (subcNudgesInFlight.get(key) === handling) subcNudgesInFlight.delete(key);
@@ -477,7 +488,7 @@ export function handleSubcBgEventsNudge(
 }
 
 async function handleSubcBgEventsNudgeOnce(
-  drainContext: DrainContext & { runtime: SendUserMessageRuntime },
+  drainContext: ResolvedDrainContext & { runtime: SendUserMessageRuntime },
 ): Promise<void> {
   // Resolve before touching session state. A stale nudge must be a terminal,
   // side-effect-free rejection rather than a reason to create a successor.
@@ -486,9 +497,12 @@ async function handleSubcBgEventsNudgeOnce(
   await triggerWakeIfPending(drainContext, false, true, true);
 }
 
-function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message: string): void {
-  const sessionID = drainContext.sessionID ?? DEFAULT_SESSION_ID;
-  const key = `${kind}\u0000${drainContext.directory}\u0000${sessionID}`;
+function logSubcNudgeLifecycle(
+  drainContext: ResolvedDrainContext,
+  kind: string,
+  message: string,
+): void {
+  const key = `${kind}\u0000${drainContext.directory}\u0000${drainContext.sessionID}`;
   const now = Date.now();
   const state = subcNudgeLogState.get(key);
   if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
@@ -497,7 +511,7 @@ function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message
   }
   const suppressed = state?.suppressed ?? 0;
   subcNudgeLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
-  sessionLog(sessionID, `${LOG_PREFIX} ${message}`, {
+  sessionLog(drainContext.sessionID, `${LOG_PREFIX} ${message}`, {
     event: "subc_bg_nudge_delivery",
     cause: kind,
     canonical_root: drainContext.directory,

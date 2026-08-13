@@ -27,7 +27,7 @@ function writeExecutable(name: string, source: string): string {
 }
 
 describe("BinaryBridge transport regressions", () => {
-  test("hashline registration reaches configure and every NDJSON tool_call", async () => {
+  test("hashline registration is immutable and session-scoped across concurrent calls", async () => {
     const requestsPath = join(workDir, "requests.ndjson");
     const script = writeExecutable(
       "hashline-registration.js",
@@ -48,58 +48,62 @@ process.stdin.on("data", (chunk) => {
 });
 `,
     );
-    const messages: string[] = [];
+    const logs: Array<{ message: string; meta?: LogMeta }> = [];
     const logger: Logger = {
-      log: (message) => messages.push(message),
+      log: (message, meta) => logs.push({ message, meta }),
       warn: () => {},
       error: () => {},
     };
-    const bridge = new BinaryBridge(
-      script,
-      workDir,
-      { timeoutMs: 5_000, maxRestarts: 0, logger },
-      { harness: "opencode", edit_slot_survives: true },
-    );
+    const pool = new BridgePool(script, {
+      idleTimeoutMs: Infinity,
+      timeoutMs: 5_000,
+      maxRestarts: 0,
+      logger,
+    });
+    pool.setConfigureOverride("harness", "opencode");
+    pool.setConfigureOverride("edit_slot_survives", true);
 
     try {
-      await bridge.toolCall("session-a", "read", { path: "sample.ts" });
-      await bridge.toolCall("session-b", "read", { path: "sample.ts" });
+      await Promise.all([
+        pool.toolCall(workDir, { sessionID: "session-a" }, "read", { path: "sample.ts" }),
+        pool.toolCall(workDir, { sessionID: "session-b" }, "read", { path: "sample.ts" }),
+      ]);
 
       const requests = readFileSync(requestsPath, "utf8")
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as Record<string, unknown>);
-      expect(requests[0]).toMatchObject({
-        command: "configure",
-        session_id: "session-a",
-        edit_slot_survives: true,
-      });
-      expect(requests.at(-2)).toMatchObject({
-        command: "tool_call",
-        session_id: "session-a",
-        edit_slot_survives: true,
-      });
-      expect(requests.at(-1)).toMatchObject({
-        command: "tool_call",
-        session_id: "session-b",
-        edit_slot_survives: true,
-      });
+      const configure = requests.find((request) => request.command === "configure");
+      expect(configure).toMatchObject({ edit_slot_survives: true });
+      const toolCalls = requests.filter((request) => request.command === "tool_call");
+      expect(toolCalls).toHaveLength(2);
       expect(
-        messages.some((message) =>
-          message.includes(
-            "hashline registration carrier transport=ndjson phase=configure edit_slot_survives=true",
-          ),
+        toolCalls
+          .map((request) => ({
+            session_id: request.session_id,
+            edit_slot_survives: request.edit_slot_survives,
+          }))
+          .sort((left, right) => String(left.session_id).localeCompare(String(right.session_id))),
+      ).toEqual([
+        { session_id: "session-a", edit_slot_survives: true },
+        { session_id: "session-b", edit_slot_survives: true },
+      ]);
+
+      const carrierLogs = logs.filter(({ message }) =>
+        message.includes(
+          "hashline registration carrier transport=ndjson phase=tool_call edit_slot_survives=true",
         ),
-      ).toBe(true);
-      expect(
-        messages.filter((message) =>
-          message.includes(
-            "hashline registration carrier transport=ndjson phase=tool_call edit_slot_survives=true",
-          ),
-        ),
-      ).toHaveLength(1);
+      );
+      expect(carrierLogs).toHaveLength(2);
+      expect(carrierLogs.map(({ meta }) => meta?.sessionId).sort()).toEqual([
+        "session-a",
+        "session-b",
+      ]);
+      expect(() => pool.setConfigureOverride("edit_slot_survives", false)).toThrow(
+        "edit_slot_survives is write-once",
+      );
     } finally {
-      await bridge.shutdown();
+      await pool.shutdown();
     }
   });
 

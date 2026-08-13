@@ -515,9 +515,12 @@ export async function handleIdleBgCompletions(
  * `forcedDrainCompleted` is set and nothing is locally outstanding, it skips the
  * drain. A subc completion can be for a task this process never tracked (a prior
  * session, or one whose outstanding entry was already cleared), so the gated
- * drain would skip it and the module would re-arm and nudge forever. This path
- * forces an UNCONDITIONAL drain so the completion is fetched, delivered, and
- * acked (which makes the module's CLEAR fire and the nudges stop).
+ * drain would skip it and the module would re-arm and nudge forever. The
+ * module-side loop is
+ * `crates/aft/src/subc/push.rs::{emit_bg_event_wakes,clear_stale_bg_wakes_for_empty_sessions}`:
+ * it re-emits pending wakes until ack empties the queue, so coalescing a duplicate
+ * while this handler is in flight is safe. This path forces an UNCONDITIONAL drain
+ * so the completion is fetched, delivered, and acked.
  */
 export function handleSubcBgEventsNudge(
   drainContext: DrainContext & { client: unknown },

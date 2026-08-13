@@ -899,6 +899,7 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly pendingRootCleanups = new Set<Promise<unknown>>();
   private shuttingDown = false;
   private editSlotSurvives: boolean | undefined;
+  private editSlotSurvivesCaptured = false;
 
   constructor(options: SubcTransportPoolOptions) {
     this.connectionFile = options.connectionFile;
@@ -1829,7 +1830,14 @@ export class SubcTransportPool implements AftTransportPool {
    */
   setConfigureOverride(key: string, value: unknown): void {
     if (key !== "edit_slot_survives") return;
-    this.editSlotSurvives = typeof value === "boolean" ? value : undefined;
+    if (typeof value !== "boolean") {
+      throw new Error("edit_slot_survives must be set once to a boolean");
+    }
+    if (this.editSlotSurvivesCaptured) {
+      throw new Error("edit_slot_survives is write-once and was already captured");
+    }
+    this.editSlotSurvives = value;
+    this.editSlotSurvivesCaptured = true;
   }
 
   getEditSlotSurvives(): boolean | undefined {

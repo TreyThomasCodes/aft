@@ -81,6 +81,7 @@ export function prepareOpenCodeArguments(
 }
 
 const DISPLAY_FILE_PATH_TOOLS = new Set(["read", "write", "edit"]);
+const PREPARED_EXECUTORS = new WeakSet<ToolDefinition["execute"]>();
 
 /**
  * OpenCode's metadata callback closes over the host argument object, while the
@@ -107,12 +108,16 @@ function prepareToolMap(
   preparation: OpenCodeArgumentPreparation = {},
 ): Record<string, ToolDefinition> {
   for (const [toolName, def] of Object.entries(tools)) {
+    if (PREPARED_EXECUTORS.has(def.execute)) continue;
+
     const execute = def.execute;
-    def.execute = (async (args, context) => {
+    const preparedExecute = (async (args, context) => {
       const prepared = prepareOpenCodeArguments(toolName, args, preparation);
       preserveDisplayFilePathAlias(toolName, args, prepared);
       return execute(prepared, context);
     }) as ToolDefinition["execute"];
+    PREPARED_EXECUTORS.add(preparedExecute);
+    def.execute = preparedExecute;
   }
   return tools;
 }

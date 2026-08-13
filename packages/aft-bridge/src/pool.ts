@@ -135,6 +135,8 @@ export class BridgePool implements AftTransportPool {
   private readonly idleTimeoutMs: number;
   private readonly bridgeOptions: BridgeOptions;
   private readonly configOverrides: Record<string, unknown>;
+  private editSlotSurvives: boolean | undefined;
+  private editSlotSurvivesCaptured = false;
   private readonly projectConfigLoader:
     | ((projectRoot: string) => Record<string, unknown>)
     | undefined;
@@ -169,7 +171,16 @@ export class BridgePool implements AftTransportPool {
       // omitting it silently dropped the override for pooled spawns.
       childEnv: options.childEnv,
     };
-    this.configOverrides = configOverrides;
+    this.configOverrides = { ...configOverrides };
+    const initialEditSlotSurvives = this.configOverrides.edit_slot_survives;
+    delete this.configOverrides.edit_slot_survives;
+    if (initialEditSlotSurvives !== undefined) {
+      if (typeof initialEditSlotSurvives !== "boolean") {
+        throw new Error("edit_slot_survives must be a boolean");
+      }
+      this.editSlotSurvives = initialEditSlotSurvives;
+      this.editSlotSurvivesCaptured = true;
+    }
     // Reuse the existing idle-window timer for both idle eviction and binary
     // refresh checks. When idle eviction is disabled, there is no background
     // maintenance loop.
@@ -248,8 +259,15 @@ export class BridgePool implements AftTransportPool {
     // `projectConfigLoader` doc-comment on PoolOptions.
     const projectOverrides = this.loadProjectOverrides(key);
     const mergedOverrides = { ...this.configOverrides, ...projectOverrides };
+    delete mergedOverrides.edit_slot_survives;
 
-    const bridge = new BinaryBridge(this.binaryPath, key, this.bridgeOptions, mergedOverrides);
+    const bridge = new BinaryBridge(
+      this.binaryPath,
+      key,
+      this.bridgeOptions,
+      mergedOverrides,
+      this.editSlotSurvivesCaptured ? this.editSlotSurvives : undefined,
+    );
     this.bridges.set(key, { bridge, lastUsed: Date.now() });
     return bridge;
   }
@@ -396,28 +414,36 @@ export class BridgePool implements AftTransportPool {
   }
 
   /**
-   * Update or set a single configure override that will be applied to every
-   * **future** bridge spawn. Existing bridges keep their original configure
-   * payload — this method intentionally does NOT restart them, because that
-   * would discard their warm trigram/semantic/LSP/symbol-cache state. Use
-   * this for opt-in features that resolve asynchronously after plugin load
-   * (e.g. ONNX runtime download finishing in the background).
+   * Update a runtime configure override for future bridge spawns. Existing bridges
+   * keep those mutable runtime values so their warm state is not discarded.
    *
-   * `edit_slot_survives` is the exception: it is host registration state, not
-   * resolved runtime config, so live bridges receive it for later session calls.
-   * If `value === undefined`, the override key is removed.
+   * `edit_slot_survives` is host registration state instead: its first boolean
+   * value is captured separately and forwarded to every existing and future bridge.
+   * Any later write is a lifecycle error rather than a mutable config update.
    */
   setConfigureOverride(key: string, value: unknown): void {
+    if (key === "edit_slot_survives") {
+      if (typeof value !== "boolean") {
+        throw new Error("edit_slot_survives must be set once to a boolean");
+      }
+      if (this.editSlotSurvivesCaptured) {
+        throw new Error("edit_slot_survives is write-once and was already captured");
+      }
+      this.editSlotSurvives = value;
+      this.editSlotSurvivesCaptured = true;
+      for (const entry of this.bridges.values()) {
+        entry.bridge.setEditSlotSurvives(value);
+      }
+      for (const bridge of this.staleBridges) {
+        bridge.setEditSlotSurvives(value);
+      }
+      return;
+    }
+
     if (value === undefined) {
       delete this.configOverrides[key];
     } else {
       this.configOverrides[key] = value;
-    }
-    if (key === "edit_slot_survives") {
-      const registration = typeof value === "boolean" ? value : undefined;
-      for (const entry of this.bridges.values()) {
-        entry.bridge.setEditSlotSurvives(registration);
-      }
     }
   }
 

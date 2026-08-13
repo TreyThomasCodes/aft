@@ -403,6 +403,8 @@ export class BinaryBridge implements AftProjectTransport {
   private configured = false;
   private _configurePromise: Promise<void> | null = null;
   private configOverrides: Record<string, unknown>;
+  private editSlotSurvives: boolean | undefined;
+  private editSlotSurvivesCaptured = false;
   private readonly hashlineRegistrationLogState = new Map<
     string,
     { lastEmittedAt: number; suppressed: number }
@@ -446,26 +448,44 @@ export class BinaryBridge implements AftProjectTransport {
     cwd: string,
     options?: BridgeOptions,
     configOverrides?: Record<string, unknown>,
+    editSlotSurvives?: boolean,
   ) {
     this.binaryPath = binaryPath;
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     this.hangThreshold = options?.hangThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
     this.maxRestarts = options?.maxRestarts ?? 3;
+    this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     // P1 config relocation: semantic config now arrives as raw `config` tiers and
     // is resolved (incl. timeout clamping to MAX_SEMANTIC_TIMEOUT_MS) in AFT-core,
     // not here. The old bridge-side clampSemanticTimeout keyed off a flat `semantic`
     // param the plugins no longer send, so it was a dead no-op — removed. If the
     // query-embed ever needs a transport-budget race-guard it belongs at query time
     // in Rust, not as a configure-time clamp here.
-    this.configOverrides = configOverrides ?? {};
+    this.configOverrides = { ...(configOverrides ?? {}) };
+    const legacyEditSlotSurvives = this.configOverrides.edit_slot_survives;
+    delete this.configOverrides.edit_slot_survives;
+    if (legacyEditSlotSurvives !== undefined && typeof legacyEditSlotSurvives !== "boolean") {
+      throw new Error(`${this.errorPrefix} edit_slot_survives must be a boolean`);
+    }
+    if (
+      editSlotSurvives !== undefined &&
+      legacyEditSlotSurvives !== undefined &&
+      editSlotSurvives !== legacyEditSlotSurvives
+    ) {
+      throw new Error(`${this.errorPrefix} conflicting edit_slot_survives construction values`);
+    }
+    const capturedEditSlotSurvives = editSlotSurvives ?? legacyEditSlotSurvives;
+    if (typeof capturedEditSlotSurvives === "boolean") {
+      this.editSlotSurvives = capturedEditSlotSurvives;
+      this.editSlotSurvivesCaptured = true;
+    }
     this.minVersion = options?.minVersion;
     this.onVersionMismatch = options?.onVersionMismatch;
     this.onConfigureWarnings = options?.onConfigureWarnings;
     this.onBashCompletion = options?.onBashCompletion;
     this.onBashLongRunning = options?.onBashLongRunning;
     this.onBashPatternMatch = options?.onBashPatternMatch;
-    this.errorPrefix = options?.errorPrefix ?? "[aft-bridge]";
     this.logger = options?.logger;
     this.childEnv = options?.childEnv;
   }
@@ -616,18 +636,15 @@ export class BinaryBridge implements AftProjectTransport {
     this.cachedStatus = snapshot;
   }
 
-  /**
-   * Update the host registration fact without restarting an already-created bridge.
-   *
-   * Unlike asynchronously resolved runtime paths, this value is request-scoped
-   * process state: configure and each tool_call must carry the latest decision.
-   */
-  setEditSlotSurvives(value: boolean | undefined): void {
-    if (value === undefined) {
-      delete this.configOverrides.edit_slot_survives;
-    } else {
-      this.configOverrides.edit_slot_survives = value;
+  /** Capture the host registration fact once without restarting a bridge created before registration. */
+  setEditSlotSurvives(value: boolean): void {
+    if (this.editSlotSurvivesCaptured) {
+      throw new Error(
+        `${this.errorPrefix} edit_slot_survives is write-once and was already captured`,
+      );
     }
+    this.editSlotSurvives = value;
+    this.editSlotSurvivesCaptured = true;
   }
 
   private logHashlineRegistrationCarrier(
@@ -636,7 +653,7 @@ export class BinaryBridge implements AftProjectTransport {
     editSlotSurvives: boolean,
   ): void {
     const session = sessionId && sessionId.length > 0 ? sessionId : "__default__";
-    const key = `${phase}\u0000${String(editSlotSurvives)}`;
+    const key = `${phase}\u0000${session}\u0000${String(editSlotSurvives)}`;
     const now = Date.now();
     const state = this.hashlineRegistrationLogState.get(key);
     if (state && now - state.lastEmittedAt < HASHLINE_REGISTRATION_LOG_INTERVAL_MS) {
@@ -664,7 +681,19 @@ export class BinaryBridge implements AftProjectTransport {
     params: Record<string, unknown> = {},
     options?: SendOptions,
   ): Promise<Record<string, unknown>> {
-    return this.sendWithVersionMismatchRetry(command, params, options, true);
+    let dispatchParams = params;
+    if (command === "configure") {
+      dispatchParams = { ...params };
+      delete dispatchParams.edit_slot_survives;
+      const editSlotSurvives = this.editSlotSurvives;
+      if (this.editSlotSurvivesCaptured && typeof editSlotSurvives === "boolean") {
+        dispatchParams.edit_slot_survives = editSlotSurvives;
+        const sessionId =
+          typeof dispatchParams.session_id === "string" ? dispatchParams.session_id : undefined;
+        this.logHashlineRegistrationCarrier("configure", sessionId, editSlotSurvives);
+      }
+    }
+    return this.sendWithVersionMismatchRetry(command, dispatchParams, options, true);
   }
 
   /**
@@ -682,8 +711,8 @@ export class BinaryBridge implements AftProjectTransport {
   ): Promise<ToolCallResult> {
     const params: Record<string, unknown> = { name, arguments: rawArgs };
     if (sessionId) params.session_id = sessionId;
-    const editSlotSurvives = this.configOverrides.edit_slot_survives;
-    if (typeof editSlotSurvives === "boolean") {
+    const editSlotSurvives = this.editSlotSurvives;
+    if (this.editSlotSurvivesCaptured && typeof editSlotSurvives === "boolean") {
       params.edit_slot_survives = editSlotSurvives;
       this.logHashlineRegistrationCarrier("tool_call", sessionId, editSlotSurvives);
     }
@@ -772,14 +801,6 @@ export class BinaryBridge implements AftProjectTransport {
               typeof params.session_id === "string" ? (params.session_id as string) : undefined;
             this._configurePromise = (async () => {
               try {
-                const editSlotSurvives = this.configOverrides.edit_slot_survives;
-                if (typeof editSlotSurvives === "boolean") {
-                  this.logHashlineRegistrationCarrier(
-                    "configure",
-                    sessionIdForConfigure,
-                    editSlotSurvives,
-                  );
-                }
                 const configResult = await this.send(
                   "configure",
                   {

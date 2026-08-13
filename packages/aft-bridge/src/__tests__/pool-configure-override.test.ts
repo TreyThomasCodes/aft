@@ -8,9 +8,9 @@
  *   - Setting an override does NOT restart existing bridges (existing bridges
  *     keep their original configure payload — their warm trigram/semantic/LSP/
  *     symbol-cache state must survive an async ONNX download settling).
- *   - The host-owned edit-slot registration fact also updates live bridges so
- *     later sessions carry it without discarding warm state.
- *   - Setting an override to `undefined` removes it.
+ *   - The host-owned edit-slot registration fact is captured outside the mutable
+ *     override map, updates live bridges, and rejects later writes.
+ *   - Setting any other override to `undefined` removes it.
  *   - Constructor configOverrides is preserved as the baseline; setConfigureOverride
  *     layers on top without dropping unrelated keys.
  *
@@ -64,17 +64,25 @@ describe("BridgePool.setConfigureOverride", () => {
   test("edit-slot registration updates an existing bridge without restarting it", () => {
     const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
     const bridge = pool.getBridge("/project/a");
-    const bridgeConfig = bridge as unknown as {
+    const bridgeRegistration = bridge as unknown as {
+      editSlotSurvives: boolean | undefined;
+      editSlotSurvivesCaptured: boolean;
       configOverrides: Record<string, unknown>;
     };
 
-    expect(bridgeConfig.configOverrides.edit_slot_survives).toBeUndefined();
+    expect(bridgeRegistration.editSlotSurvivesCaptured).toBe(false);
 
     pool.setConfigureOverride("edit_slot_survives", true);
 
-    expect(bridgeConfig.configOverrides.edit_slot_survives).toBe(true);
+    expect(bridgeRegistration.editSlotSurvives).toBe(true);
+    expect(bridgeRegistration.editSlotSurvivesCaptured).toBe(true);
+    expect(bridgeRegistration.configOverrides.edit_slot_survives).toBeUndefined();
+    expect(pool._testGetConfigOverrides().edit_slot_survives).toBeUndefined();
     expect(pool.getBridge("/project/a")).toBe(bridge);
     expect(pool.size).toBe(1);
+    expect(() => pool.setConfigureOverride("edit_slot_survives", true)).toThrow(
+      "edit_slot_survives is write-once",
+    );
   });
 
   test("setting an override does NOT restart existing bridges (size stays the same)", () => {

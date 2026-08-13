@@ -321,11 +321,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       storage_dir: storageDir,
     },
   );
-  // Registration can race transport startup, so set the edit-slot flag before
-  // constructing the pool. The final registered-tool inventory below rechecks
-  // the same decision after disabled-tool filtering.
+  // Build tool schemas from the requested hashline setting. After disabled-tool
+  // filtering, the code below freezes whether the final edit tool supports hashline.
   const hashlineEffective = openCodeHashlineEffective(aftConfig);
-  configOverrides.edit_slot_survives = hashlineEffective;
   let lspInstallCompletion: Promise<string[] | null> | null = null;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
@@ -1066,9 +1064,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   );
   const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
-  // grep-rewrite footer can steer to it (vs the grep tool). The pool holds
-  // configOverrides by reference and bridges spawn lazily, so a late set here
-  // reaches every bridge — same pattern as `_ort_dylib_dir`/`lsp_paths_extra`.
+  // grep-rewrite footer can steer to it (vs the grep tool). The pool records
+  // runtime overrides for lazy bridge spawns, so this reaches every bridge —
+  // the same pattern used for `_ort_dylib_dir` and `lsp_paths_extra`.
   pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
   // Also expose the same surface decision to the TypeScript-side native bash
   // output finalizer, which catches leading grep/rg commands that Rust could
