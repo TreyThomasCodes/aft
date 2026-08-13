@@ -130,7 +130,7 @@ fn zoom_one_target_response(
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
         }
     };
-    let lines: Vec<String> = source.lines().map(|line| line.to_string()).collect();
+    let lines: Vec<&str> = source.lines().collect();
 
     zoom_one_symbol(
         req,
@@ -295,7 +295,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let lines: Vec<String> = source.lines().map(|l| l.to_string()).collect();
+    let lines: Vec<&str> = source.lines().collect();
 
     // Line-range mode: read arbitrary lines without requiring a symbol.
     match (start_line, end_line) {
@@ -527,7 +527,7 @@ fn zoom_batch_symbols(
     path: &Path,
     file: &str,
     source: &str,
-    lines: &[String],
+    lines: &[&str],
     symbol_names: &[String],
     context_lines: usize,
     include_callgraph: bool,
@@ -581,7 +581,7 @@ fn zoom_one_symbol(
     path: &Path,
     _file: &str,
     source: &str,
-    lines: &[String],
+    lines: &[&str],
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
@@ -669,18 +669,17 @@ fn zoom_one_symbol(
     let start = target.range.start_line as usize;
     let end = target.range.end_line as usize;
 
-    // When re-export following resolved to a different file, re-read that file's lines
+    // When re-export following resolved to a different file, re-read that file's lines.
     let resolved_file_path = std::path::Path::new(&matches[0].file);
-    let resolved_lines: Vec<String>;
-    let effective_lines: &[String] = if resolved_file_path != path {
-        resolved_lines = match std::fs::read_to_string(resolved_file_path) {
-            Ok(src) => src.lines().map(|l| l.to_string()).collect(),
-            Err(_) => lines.to_vec(),
-        };
-        &resolved_lines
+    let resolved_source = if resolved_file_path != path {
+        std::fs::read_to_string(resolved_file_path).ok()
     } else {
-        lines
+        None
     };
+    let resolved_lines = resolved_source
+        .as_deref()
+        .map(|source| source.lines().collect::<Vec<_>>());
+    let effective_lines = resolved_lines.as_deref().unwrap_or(lines);
 
     // Extract symbol body (0-based line indices)
     let content = if end < effective_lines.len() {
@@ -1012,7 +1011,7 @@ fn resolve_json_zoom(
     ctx: &AppContext,
     path: &Path,
     source: &str,
-    lines: &[String],
+    lines: &[&str],
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
@@ -1323,7 +1322,7 @@ fn render_json_zoom(
     ctx: &AppContext,
     path: &Path,
     source: &str,
-    lines: &[String],
+    lines: &[&str],
     name: &str,
     target: &Symbol,
     context_lines: usize,
@@ -1340,13 +1339,19 @@ fn render_json_zoom(
 
     let ctx_start = start.saturating_sub(context_lines);
     let context_before: Vec<String> = if ctx_start < start {
-        lines[ctx_start..start].to_vec()
+        lines[ctx_start..start]
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect()
     } else {
         vec![]
     };
     let ctx_end = (end + 1 + context_lines).min(lines.len());
     let context_after: Vec<String> = if end + 1 < lines.len() {
-        lines[(end + 1)..ctx_end].to_vec()
+        lines[(end + 1)..ctx_end]
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect()
     } else {
         vec![]
     };
