@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { parse as parsePath, resolve as resolvePath } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   type ConfigTier,
@@ -1441,6 +1442,14 @@ export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConf
   migrateAftConfigFile(paths.userConfigPath);
   migrateAftConfigFile(paths.projectConfigPath);
   return paths;
+}
+
+/** Resolve the checkout whose project config controls OpenCode's registered tool schema. */
+export function resolveOpenCodeRegistrationRoot(directory: string, worktree?: string): string {
+  if (!worktree) return directory;
+  const resolvedWorktree = resolvePath(worktree);
+  // OpenCode uses the filesystem root as a sentinel for non-Git projects.
+  return parsePath(resolvedWorktree).root === resolvedWorktree ? directory : resolvedWorktree;
 }
 
 export function buildConfigTierConfigureParams(

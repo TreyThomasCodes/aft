@@ -640,7 +640,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   pool.setConfigureOverride("harness", "pi");
   const surface = resolvePiToolSurface(config);
-  pool.setConfigureOverride("edit_slot_survives", surface.hoistEdit);
+  const hashlineEditRegistered = config.edit_mode === "hashline" && surface.hoistEdit;
+  pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager
   // warmup spawn below so even the first bridge configures with the flag.
@@ -650,7 +651,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const ctx: PluginContext = {
     pool,
     config,
-    hashlineEffective: config.edit_mode === "hashline" && surface.hoistEdit,
+    hashlineEffective: hashlineEditRegistered,
     storageDir,
   };
 

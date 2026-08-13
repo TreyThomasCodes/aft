@@ -31,6 +31,7 @@ import {
   migrateAftConfigLocations,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
+  resolveOpenCodeRegistrationRoot,
 } from "./config.js";
 import {
   drainPendingConfigParseWarnings,
@@ -79,7 +80,10 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
-import { buildOpenCodeToolMap, openCodeEditSlotSurvives } from "./tool-registration.js";
+import {
+  buildOpenCodeToolMap,
+  openCodeHashlineEditRegistered,
+} from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
@@ -243,24 +247,29 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     }
   };
 
+  // OpenCode can initialize a plugin from a nested session directory while
+  // registering one schema for the checkout. Use that checkout for project
+  // config so schema selection and the bridge's runtime project agree.
+  const registrationRoot = resolveOpenCodeRegistrationRoot(input.directory, input.worktree);
+
   // Load the AFT config before any binary or storage work. This ensures
   // `enabled: false` makes AFT do nothing except read the config file.
-  let aftConfig = loadAftConfig(input.directory);
+  let aftConfig = loadAftConfig(registrationRoot);
   if (aftConfig.enabled === false) {
-    log(`AFT disabled by config for ${input.directory}`);
+    log(`AFT disabled by config for ${registrationRoot}`);
     return { tool: {} };
   }
 
   deliverConfigMigrationWarnings(
-    input.directory,
-    migrateAftConfigLocations(input.directory, bridgeLogger).flatMap((result) => result.warnings),
+    registrationRoot,
+    migrateAftConfigLocations(registrationRoot, bridgeLogger).flatMap((result) => result.warnings),
   );
 
   // Load config: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
-  aftConfig = loadAftConfig(input.directory);
-  enqueueConfigParseWarnings(input.directory, getConfigLoadErrors());
+  aftConfig = loadAftConfig(registrationRoot);
+  enqueueConfigParseWarnings(registrationRoot, getConfigLoadErrors());
   if (aftConfig.enabled === false) {
-    log(`AFT disabled by config for ${input.directory}`);
+    log(`AFT disabled by config for ${registrationRoot}`);
     return { tool: {} };
   }
 
@@ -268,7 +277,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
   const autoUpdateAbort = new AbortController();
-  const projectEnabledCache = new Map<string, boolean>([[input.directory, true]]);
+  const projectEnabledCache = new Map<string, boolean>([[registrationRoot, true]]);
   const loggedDisabledProjects = new Set<string>();
   const isProjectEnabled = (projectRoot: string): boolean => {
     const cached = projectEnabledCache.get(projectRoot);
@@ -304,7 +313,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Do not add resolved aft.jsonc fields (format_on_edit, semantic, lsp, etc.)
   // to this flat map; flat params below are plugin-computed process state.
   const storageDir = resolveCortexKitStorageRoot();
-  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(input.directory, {
+  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(registrationRoot, {
     bash_permissions: true,
     storage_dir: storageDir,
   });
@@ -662,7 +671,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     client: input.client,
     plugin: (input as { plugin?: PluginContext["plugin"] }).plugin,
     config: aftConfig,
-    hashlineEffective: aftConfig.edit_mode === "hashline" && openCodeEditSlotSurvives(aftConfig),
+    hashlineEffective: aftConfig.edit_mode === "hashline",
     storageDir: configOverrides.storage_dir as string,
     isProjectEnabled,
   };
@@ -1036,8 +1045,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
-  const editSlotSurvives = registeredTools.has("edit");
-  pool.setConfigureOverride("edit_slot_survives", editSlotSurvives);
+  // The registration flag describes the hashline edit arm, not merely the
+  // presence of the default edit tool. A config/schema mismatch must downgrade
+  // Rust to the default surface instead of making both argument shapes fail.
+  const hashlineEditRegistered = openCodeHashlineEditRegistered(aftConfig, registeredTools);
+  pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer can steer to it (vs the grep tool). The pool holds

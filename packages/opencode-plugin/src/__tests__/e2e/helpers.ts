@@ -109,6 +109,7 @@ const GROUP_A_CONFIGURE_KEYS = new Set([
   "lsp_inflight_installs",
   "max_background_bash_tasks",
   "aft_search_registered",
+  "edit_slot_survives",
   "_ort_dylib_dir",
   "_bypass_size_limits",
 ]);
@@ -363,6 +364,9 @@ export async function createHarness(
         // principal into this isolated daemon, whose launch nonce belongs to its own AFT.
         subcConsumerIdentity: null,
       });
+      for (const [key, value] of Object.entries(configOverrides)) {
+        pool.setConfigureOverride(key, value);
+      }
       bridge = trackSubcSessions(
         pool.getBridge(tempDir),
         subcSessions,

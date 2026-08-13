@@ -30,9 +30,11 @@ afterEach(() => {
 describe.serial("OpenCode enabled config toggle", () => {
   // Explicit 30s budget: the poll below plus env-guard acquisition can exceed
   // bun's 5s default on a loaded CI runner.
-  test("disabled config returns zero tools without resolving a binary or creating a bridge pool", async () => {
+  test("worktree project config disables registration from a nested session directory", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-opencode-disabled-"));
     const projectDir = join(tempDir, "project");
+    const sessionDirectory = join(projectDir, "src", "nested");
+    mkdirSync(sessionDirectory, { recursive: true });
     mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
     writeFileSync(join(projectDir, ".cortexkit", "aft.jsonc"), '{ "enabled": false }\n');
     releaseEnv = await acquireEnv({
@@ -57,7 +59,8 @@ describe.serial("OpenCode enabled config toggle", () => {
 
     const plugin = await loadPlugin();
     const surface = (await plugin({
-      directory: projectDir,
+      directory: sessionDirectory,
+      worktree: projectDir,
       client: {},
     } as Parameters<OpenCodePlugin>[0])) as { tool?: Record<string, unknown> };
 

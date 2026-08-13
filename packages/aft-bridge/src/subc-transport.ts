@@ -776,6 +776,8 @@ class SubcTransport implements AftProjectTransport {
     this.assertCurrent();
     const { preview, timeoutMs, onProgress } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
+    const editSlotSurvives = this.pool.getEditSlotSurvives();
+    if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
@@ -893,6 +895,7 @@ export class SubcTransportPool implements AftTransportPool {
   >();
   private readonly pendingRootCleanups = new Set<Promise<unknown>>();
   private shuttingDown = false;
+  private editSlotSurvives: boolean | undefined;
 
   constructor(options: SubcTransportPoolOptions) {
     this.connectionFile = options.connectionFile;
@@ -1817,8 +1820,18 @@ export class SubcTransportPool implements AftTransportPool {
     return registry.requestProjectRootClose(registration.concretePoolId, root, generation, cause);
   }
 
-  /** No-op over subc: config is read locally by AFT (wire tiers are ignored). */
-  setConfigureOverride(_key: string, _value: unknown): void {}
+  /**
+   * Subc reads config locally, but plugin registration facts are process state
+   * and must accompany route requests because RouteBind has no such field.
+   */
+  setConfigureOverride(key: string, value: unknown): void {
+    if (key !== "edit_slot_survives") return;
+    this.editSlotSurvives = typeof value === "boolean" ? value : undefined;
+  }
+
+  getEditSlotSurvives(): boolean | undefined {
+    return this.editSlotSurvives;
+  }
 
   /** No-op over subc: the daemon owns the live module's configure lifecycle. */
   async reconfigure(_projectRoot: string, _overrides: Record<string, unknown>): Promise<void> {}

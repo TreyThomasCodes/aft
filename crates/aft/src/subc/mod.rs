@@ -4321,6 +4321,8 @@ async fn handle_tool_call(
         request_id: request_id.clone(),
         diagnostics_on_edit,
         preview: call.preview,
+        edit_slot_survives: call.edit_slot_survives,
+        report_registration_downgrade: true,
     };
     let bare_name_for_frame = bare_name.clone();
     let identity_for_run = identity.clone();
@@ -4608,6 +4610,9 @@ struct ToolCallRequest {
     name: String,
     #[serde(default)]
     arguments: Value,
+    /// Host-computed registration fact; kept outside agent-controlled arguments.
+    #[serde(default)]
+    edit_slot_survives: Option<bool>,
     /// Server-owned preview control (B1c-0): the plugin's mutation flow is
     /// preview -> permission ask -> apply. Dropping this field made "preview"
     /// calls mutate disk before the permission prompt and the subsequent

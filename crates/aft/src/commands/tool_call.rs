@@ -69,6 +69,8 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         request_id: req.id.clone(),
         diagnostics_on_edit: config.diagnostics_on_edit,
         preview,
+        edit_slot_survives: None,
+        report_registration_downgrade: false,
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);

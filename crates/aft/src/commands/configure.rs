@@ -1711,6 +1711,44 @@ fn configure_cancelled(req_id: &str) -> Option<Response> {
     None
 }
 
+pub(crate) const HASHLINE_DOWNGRADE_MESSAGE: &str =
+    "Hashline mode was downgraded because the edit tool is not registered for this session";
+
+pub(crate) fn hashline_downgrade_warning() -> Value {
+    json!({
+        "code": "hashline_downgraded",
+        "reason": "edit_not_registered",
+        "message": HASHLINE_DOWNGRADE_MESSAGE,
+    })
+}
+
+fn register_hashline_for_configure(
+    ctx: &AppContext,
+    root: &Path,
+    session: &str,
+    configured_enabled: bool,
+    edit_slot_survives: Option<bool>,
+    warnings: &mut Vec<Value>,
+) {
+    let Some(edit_slot_survives) = edit_slot_survives else {
+        if configured_enabled {
+            warnings.push(hashline_downgrade_warning());
+        }
+        return;
+    };
+    let registration = ctx.hashline_bindings().register(
+        root,
+        session.to_string(),
+        crate::hashline::integration::RegistrationRequest {
+            configured_enabled,
+            edit_slot_survives,
+        },
+    );
+    if registration.downgrade.is_some() {
+        warnings.push(hashline_downgrade_warning());
+    }
+}
+
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
@@ -1863,7 +1901,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.aft_search_registered = v;
     }
     let edit_slot_survives = match params.get("edit_slot_survives") {
-        Some(Value::Bool(value)) => *value,
+        Some(Value::Bool(value)) => Some(*value),
         Some(_) => {
             return Response::error(
                 &req.id,
@@ -1871,7 +1909,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 "configure: edit_slot_survives must be a boolean",
             );
         }
-        None => true,
+        // OpenCode and Pi have a host pruning/schema layer, so absence means
+        // no plugin registration. Direct harnesses have no such layer.
+        None if matches!(harness, Harness::Opencode | Harness::Pi) => None,
+        None => Some(true),
     };
     if let Some(v) = params.get("bash_permissions").and_then(|v| v.as_bool()) {
         next_config.bash_permissions = v;
@@ -2024,21 +2065,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
-        let registration = ctx.hashline_bindings().register(
+        register_hashline_for_configure(
+            ctx,
             &canonical_cache_root,
-            req.session().to_string(),
-            crate::hashline::integration::RegistrationRequest {
-                configured_enabled: next_config.hashline_enabled,
-                edit_slot_survives,
-            },
+            req.session(),
+            next_config.hashline_enabled,
+            edit_slot_survives,
+            &mut configure_warnings,
         );
-        if let Some(downgrade) = registration.downgrade {
-            configure_warnings.push(json!({
-                "code": downgrade.code,
-                "reason": downgrade.reason,
-                "message": "Hashline mode was downgraded because the edit tool is not registered for this session",
-            }));
-        }
         let first_session_bind = ctx.note_configure_session_binding(
             canonical_cache_root.clone(),
             req.session().to_string(),
@@ -2250,21 +2284,14 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.advance_semantic_fingerprint_generation();
     }
     ctx.set_config(next_config.clone());
-    let registration = ctx.hashline_bindings().register(
+    register_hashline_for_configure(
+        ctx,
         &canonical_cache_root,
-        req.session().to_string(),
-        crate::hashline::integration::RegistrationRequest {
-            configured_enabled: next_config.hashline_enabled,
-            edit_slot_survives,
-        },
+        req.session(),
+        next_config.hashline_enabled,
+        edit_slot_survives,
+        &mut configure_warnings,
     );
-    if let Some(downgrade) = registration.downgrade {
-        configure_warnings.push(json!({
-            "code": downgrade.code,
-            "reason": downgrade.reason,
-            "message": "Hashline mode was downgraded because the edit tool is not registered for this session",
-        }));
-    }
     crate::logging::sync_storage_root(ctx.storage_dir());
     ctx.set_harness(harness.clone());
     {

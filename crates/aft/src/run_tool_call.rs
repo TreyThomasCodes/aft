@@ -146,6 +146,64 @@ pub struct ToolCallContext {
     pub request_id: String,
     pub diagnostics_on_edit: bool,
     pub preview: bool,
+    /// Plugin-computed registration fact carried by transports whose bind
+    /// protocol cannot include configure-time process state.
+    pub edit_slot_survives: Option<bool>,
+    /// Whether configure's immediate registration-downgrade warning was discarded
+    /// by this transport and must be reported on the first tool call instead.
+    pub report_registration_downgrade: bool,
+}
+
+fn ensure_hashline_registration(
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    binding_root: &std::path::Path,
+    session: &str,
+) -> bool {
+    let edit_slot_survives = match ctx.edit_slot_survives {
+        Some(value) => value,
+        None if app_ctx.harness_opt().is_some_and(|harness| {
+            matches!(
+                harness,
+                crate::harness::Harness::Opencode | crate::harness::Harness::Pi
+            )
+        }) && app_ctx
+            .hashline_bindings()
+            .peek(binding_root, session)
+            .is_none() =>
+        {
+            false
+        }
+        None => return false,
+    };
+    let registration = app_ctx.hashline_bindings().register(
+        binding_root,
+        session.to_string(),
+        crate::hashline::integration::RegistrationRequest {
+            configured_enabled: app_ctx.config().hashline_enabled,
+            edit_slot_survives,
+        },
+    );
+    ctx.report_registration_downgrade
+        && registration.downgrade.is_some()
+        && !registration.stores_preserved
+}
+
+fn attach_hashline_downgrade(response: &mut Response) {
+    let warning = crate::commands::configure::hashline_downgrade_warning();
+    if let Some(data) = response.data.as_object_mut() {
+        match data.get_mut("warnings").and_then(Value::as_array_mut) {
+            Some(warnings) => warnings.push(warning),
+            None => {
+                data.insert("warnings".to_string(), json!([warning]));
+            }
+        }
+    }
+}
+
+fn append_hashline_downgrade_text(text: &mut String) {
+    text.push_str("\n\n");
+    text.push_str(crate::commands::configure::HASHLINE_DOWNGRADE_MESSAGE);
 }
 
 pub fn run_tool_call(
@@ -162,12 +220,12 @@ pub fn run_tool_call(
     let binding_root = app_ctx
         .canonical_cache_root_opt()
         .unwrap_or_else(|| ctx.project_root.clone());
-    let binding_guard = app_ctx.hashline_bindings().capture(
-        binding_root,
-        ctx.session_id
-            .as_deref()
-            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-    );
+    let session = ctx
+        .session_id
+        .as_deref()
+        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+    let surface_downgraded = ensure_hashline_registration(ctx, app_ctx, &binding_root, session);
+    let binding_guard = app_ctx.hashline_bindings().capture(binding_root, session);
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
@@ -189,7 +247,12 @@ pub fn run_tool_call(
                     trace.mark_execute_done();
                 }
                 let response = Response::error(ctx.request_id.clone(), err.code, err.message);
-                let result = tool_call_result_from_response(bare_name, format_context, response);
+                let result = tool_call_result_from_response(
+                    bare_name,
+                    format_context,
+                    response,
+                    surface_downgraded,
+                );
                 if let Some(trace) = phase_trace.as_mut() {
                     trace.mark_format_done();
                     trace.mark_finalize_done();
@@ -217,7 +280,12 @@ pub fn run_tool_call(
                 "invalid_request",
                 format!("failed to build request from tool call: {error}"),
             );
-            let result = tool_call_result_from_response(bare_name, format_context, response);
+            let result = tool_call_result_from_response(
+                bare_name,
+                format_context,
+                response,
+                surface_downgraded,
+            );
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_format_done();
                 trace.mark_finalize_done();
@@ -233,8 +301,14 @@ pub fn run_tool_call(
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_execute_done();
     }
-    let text =
+    if surface_downgraded {
+        attach_hashline_downgrade(&mut response);
+    }
+    let mut text =
         crate::subc_format::format_response_with_context(bare_name, &response, format_context);
+    if surface_downgraded {
+        append_hashline_downgrade_text(&mut text);
+    }
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_format_done();
     }
@@ -285,10 +359,17 @@ pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
 fn tool_call_result_from_response(
     bare_name: &str,
     format_context: &crate::subc_format::FormatContext,
-    response: Response,
+    mut response: Response,
+    surface_downgraded: bool,
 ) -> ToolCallResult {
-    let text =
+    if surface_downgraded {
+        attach_hashline_downgrade(&mut response);
+    }
+    let mut text =
         crate::subc_format::format_response_with_context(bare_name, &response, format_context);
+    if surface_downgraded {
+        append_hashline_downgrade_text(&mut text);
+    }
     ToolCallResult { text, response }
 }
 
@@ -354,6 +435,8 @@ mod tests {
                 request_id: "subc-7-42".to_string(),
                 diagnostics_on_edit: true,
                 preview,
+                edit_slot_survives: None,
+                report_registration_downgrade: false,
             }
         }
 

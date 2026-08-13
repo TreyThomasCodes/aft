@@ -275,6 +275,93 @@ fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
 }
 
 #[test]
+fn plugin_harness_without_edit_registration_fails_safe_to_default_once() {
+    let project = tempfile::tempdir().expect("unregistered plugin temp project");
+    let root = std::fs::canonicalize(project.path()).expect("canonical project");
+    let file = root.join("default.txt");
+    fs::write(&file, "alpha\nbeta\n").expect("write default fixture");
+    let mut aft = AftProcess::spawn();
+
+    let configure = send_json(
+        &mut aft,
+        json!({
+            "id": "unregistered-configure",
+            "command": "configure",
+            "session_id": SESSION_ID,
+            "project_root": root,
+            "harness": "opencode",
+            "config": [{
+                "tier": "project",
+                "source": root.join(".cortexkit/aft.jsonc"),
+                "doc": json!({
+                    "edit_mode": "hashline",
+                    "search_index": false,
+                    "semantic_search": false
+                }).to_string()
+            }]
+        }),
+    );
+    assert!(configure["success"].as_bool().unwrap_or(false));
+    assert_eq!(configure["warnings"][0]["code"], "hashline_downgraded");
+
+    let first = send_json(
+        &mut aft,
+        json!({
+            "id": "unregistered-default-first",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "path": file,
+                "edits": [{ "oldString": "alpha", "newString": "default" }]
+            }
+        }),
+    );
+    assert!(first["success"].as_bool().unwrap_or(false), "{first:#}");
+    assert!(first.get("warnings").is_none(), "{first:#}");
+    assert!(!first["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Hashline mode was downgraded"));
+
+    let second = send_json(
+        &mut aft,
+        json!({
+            "id": "unregistered-default-second",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "path": file,
+                "edits": [{ "oldString": "default", "newString": "still-default" }]
+            }
+        }),
+    );
+    assert!(second["success"].as_bool().unwrap_or(false), "{second:#}");
+    assert!(second.get("warnings").is_none(), "{second:#}");
+    assert!(!second["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Hashline mode was downgraded"));
+
+    let patch = send_json(
+        &mut aft,
+        json!({
+            "id": "unregistered-patch",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": { "patch": "[default.txt#STALE]\nPUT 1:\n+blocked" }
+        }),
+    );
+    assert!(!patch["success"].as_bool().unwrap_or(true), "{patch:#}");
+    assert_ne!(patch["code"], "hashline_parse_error");
+    assert_eq!(fs::read_to_string(file).unwrap(), "still-default\nbeta\n");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn known_tool_translate_errors_surface_as_invalid_request() {
     let mut aft = AftProcess::spawn();
     for (label, name, arguments, expected_message) in [

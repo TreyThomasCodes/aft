@@ -26,6 +26,18 @@ export function openCodeEditSlotSurvives(config: AftConfig): boolean {
   );
 }
 
+/** Return the process-state flag Rust uses to select the same edit schema arm. */
+export function openCodeHashlineEditRegistered(
+  config: AftConfig,
+  registeredTools: ReadonlySet<string>,
+): boolean {
+  return (
+    config.edit_mode === "hashline" &&
+    openCodeEditSlotSurvives(config) &&
+    registeredTools.has("edit")
+  );
+}
+
 /**
  * Build the exact OpenCode registration map without starting a bridge.
  *

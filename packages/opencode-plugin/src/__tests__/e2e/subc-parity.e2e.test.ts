@@ -6,6 +6,8 @@ import { writeFile } from "node:fs/promises";
 import { sep } from "node:path";
 import { promisify } from "node:util";
 import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
+import { buildOpenCodeToolMap, openCodeHashlineEditRegistered } from "../../tool-registration.js";
+import type { PluginContext } from "../../types.js";
 import {
   cleanupHarnesses,
   cleanupSharedSubcRig,
@@ -81,6 +83,98 @@ maybeDescribe(describeName, () => {
     harnessFactory,
     name: "subc parity: safety/undo",
   });
+
+  test("edit registration and Rust argument enforcement agree across transports", async () => {
+    const harnesses: E2EHarness[] = [];
+    const cases = [
+      { label: "default", pluginMode: "default", rustMode: "default" },
+      { label: "hashline", pluginMode: "hashline", rustMode: "hashline" },
+      { label: "stale plugin config downgrades", pluginMode: "default", rustMode: "hashline" },
+    ] as const;
+
+    try {
+      for (const transport of ["ndjson", "subc"] as const) {
+        for (const testCase of cases) {
+          const pluginConfig = { edit_mode: testCase.pluginMode } as const;
+          const surface = buildOpenCodeToolMap(
+            {
+              pool: {} as PluginContext["pool"],
+              client: {} as PluginContext["client"],
+              config: pluginConfig,
+              hashlineEffective: testCase.pluginMode === "hashline",
+              storageDir: "/tmp/aft-hashline-registration",
+            },
+            pluginConfig,
+          );
+          const registered = new Set(Object.keys(surface));
+          const editSlotSurvives = openCodeHashlineEditRegistered(pluginConfig, registered);
+          const harness = await createHarness(preparedBinary, {
+            fixtureNames: [],
+            transport,
+            tempPrefix: `aft-hashline-${transport}-`,
+            configOverrides: {
+              edit_slot_survives: editSlotSurvives,
+              config: [
+                {
+                  tier: "project",
+                  source: "/tmp/aft-hashline-registration.jsonc",
+                  doc: JSON.stringify({
+                    edit_mode: testCase.rustMode,
+                    search_index: false,
+                    semantic_search: false,
+                  }),
+                },
+              ],
+            },
+          });
+          harnesses.push(harness);
+          await writeFile(harness.path("edit.txt"), "alpha\nbeta\n");
+
+          const schemaKeys = Object.keys((surface.edit as { args: Record<string, unknown> }).args);
+          expect(schemaKeys.includes("patch"), `${transport}/${testCase.label} schema`).toBe(
+            testCase.pluginMode === "hashline",
+          );
+
+          const session = `${transport}-${testCase.label}`;
+          if (testCase.pluginMode === "hashline") {
+            const read = await harness.bridge.toolCall(session, "read", { path: "edit.txt" });
+            const tag = read.hashline_tag as string;
+            expect(tag).toBeString();
+            const patch = `*** Begin Patch\n[edit.txt#${tag}]\nPUT 1:\n+omega\n*** End Patch`;
+            const applied = await harness.bridge.toolCall(session, "edit", { patch });
+            expect(applied.success, `${transport}/${testCase.label}: ${applied.text}`).toBe(true);
+            const legacy = await harness.bridge.toolCall(session, "edit", {
+              path: "edit.txt",
+              edits: [{ oldString: "omega", newString: "legacy" }],
+            });
+            expect(legacy.code).toBe("hashline_parse_error");
+          } else {
+            const edited = await harness.bridge.toolCall(session, "edit", {
+              path: "edit.txt",
+              edits: [{ oldString: "alpha", newString: "default" }],
+            });
+            expect(edited.success, `${transport}/${testCase.label}: ${edited.text}`).toBe(true);
+            if (transport === "subc" && testCase.pluginMode !== testCase.rustMode) {
+              expect(edited.warnings).toEqual([
+                {
+                  code: "hashline_downgraded",
+                  reason: "edit_not_registered",
+                  message: expect.any(String),
+                },
+              ]);
+              expect(edited.text).toContain("Hashline mode was downgraded");
+            }
+            const patch = await harness.bridge.toolCall(session, "edit", {
+              patch: "[edit.txt#STALE]\nPUT 1:\n+blocked",
+            });
+            expect(patch.success).toBe(false);
+          }
+        }
+      }
+    } finally {
+      await cleanupHarnesses(harnesses);
+    }
+  }, 120_000);
 
   test("server-rendered text matches NDJSON for representative tool calls", async () => {
     const harnesses: E2EHarness[] = [];
