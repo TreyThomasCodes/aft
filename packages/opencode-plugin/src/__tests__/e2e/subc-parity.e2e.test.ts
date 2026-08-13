@@ -92,6 +92,7 @@ maybeDescribe(describeName, () => {
       const harness = await createHarness(preparedBinary, {
         fixtureNames: [],
         transport,
+        useTransportFactoryForNdjson: true,
         tempPrefix: `aft-hashline-plugin-${transport}-`,
         configOverrides: {
           edit_slot_survives: true,
@@ -111,6 +112,13 @@ maybeDescribe(describeName, () => {
       try {
         await writeFile(harness.path("plugin-edit.txt"), "alpha\nbeta\n");
         const sessionID = `hashline-plugin-${transport}`;
+        // Initialize the shared project transport under another session first.
+        // The tested session must therefore receive its edit-slot flag on its own
+        // tool_call instead of inheriting registration from configure.
+        const warm = await harness.bridge.toolCall(`${sessionID}-configure-owner`, "read", {
+          path: "plugin-edit.txt",
+        });
+        expect(warm.success).toBe(true);
         const read = await harness.bridge.toolCall(sessionID, "read", { path: "plugin-edit.txt" });
         const tag = read.hashline_tag as string;
         expect(tag).toBeString();
@@ -175,6 +183,7 @@ maybeDescribe(describeName, () => {
           const harness = await createHarness(preparedBinary, {
             fixtureNames: [],
             transport,
+            useTransportFactoryForNdjson: true,
             tempPrefix: `aft-hashline-${transport}-`,
             configOverrides: {
               edit_slot_survives: editSlotSurvives,
@@ -193,6 +202,12 @@ maybeDescribe(describeName, () => {
           });
           harnesses.push(harness);
           await writeFile(harness.path("edit.txt"), "alpha\nbeta\n");
+          const configureOwner = await harness.bridge.toolCall(
+            `${transport}-${testCase.label}-configure-owner`,
+            "read",
+            { path: "edit.txt" },
+          );
+          expect(configureOwner.success).toBe(true);
 
           const schemaKeys = Object.keys((surface.edit as { args: Record<string, unknown> }).args);
           expect(schemaKeys.includes("patch"), `${transport}/${testCase.label} schema`).toBe(
@@ -218,7 +233,7 @@ maybeDescribe(describeName, () => {
               edits: [{ oldString: "alpha", newString: "default" }],
             });
             expect(edited.success, `${transport}/${testCase.label}: ${edited.text}`).toBe(true);
-            if (transport === "subc" && testCase.pluginMode !== testCase.rustMode) {
+            if (testCase.pluginMode !== testCase.rustMode) {
               expect(edited.warnings).toEqual([
                 {
                   code: "hashline_downgraded",
@@ -232,6 +247,9 @@ maybeDescribe(describeName, () => {
               patch: "[edit.txt#STALE]\nPUT 1:\n+blocked",
             });
             expect(patch.success).toBe(false);
+            if (testCase.pluginMode !== testCase.rustMode) {
+              expect(patch.warnings).toBeUndefined();
+            }
           }
         }
       }

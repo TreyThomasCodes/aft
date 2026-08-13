@@ -403,6 +403,8 @@ export class BridgePool implements AftTransportPool {
    * this for opt-in features that resolve asynchronously after plugin load
    * (e.g. ONNX runtime download finishing in the background).
    *
+   * `edit_slot_survives` is the exception: it is host registration state, not
+   * resolved runtime config, so live bridges receive it for later session calls.
    * If `value === undefined`, the override key is removed.
    */
   setConfigureOverride(key: string, value: unknown): void {
@@ -410,6 +412,12 @@ export class BridgePool implements AftTransportPool {
       delete this.configOverrides[key];
     } else {
       this.configOverrides[key] = value;
+    }
+    if (key === "edit_slot_survives") {
+      const registration = typeof value === "boolean" ? value : undefined;
+      for (const entry of this.bridges.values()) {
+        entry.bridge.setEditSlotSurvives(registration);
+      }
     }
   }
 

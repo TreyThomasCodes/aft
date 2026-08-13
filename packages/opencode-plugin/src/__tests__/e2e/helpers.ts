@@ -229,6 +229,8 @@ export interface CreateHarnessOptions {
   tempPrefix?: string;
   bridgeOptions?: BridgeOptions;
   transport?: HarnessTransport;
+  /** Route standalone calls through the production transport factory and pool. */
+  useTransportFactoryForNdjson?: boolean;
   configOverrides?: Record<string, unknown>;
 }
 
@@ -320,6 +322,11 @@ export async function createHarness(
   const transport = options.transport ?? "ndjson";
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const configOverrides = { harness: "opencode", ...(options.configOverrides ?? {}) };
+  const factoryConfigOverrides = { ...configOverrides };
+  // Production revalidates edit-slot survival after building its tool list.
+  // Excluding the flag here makes factory-backed tests exercise the later
+  // BridgePool.setConfigureOverride update rather than constructor injection.
+  delete factoryConfigOverrides.edit_slot_survives;
 
   // Keep e2e projects outside both the repository and OS temp directories so
   // external-directory tests cover ordinary out-of-project paths.
@@ -351,15 +358,15 @@ export async function createHarness(
       }),
     };
 
-    if (transport === "subc") {
-      await writeSubcProjectConfig(tempDir, configOverrides);
-      const rig = await sharedSubcRigFor(preparedBinary);
+    const subcRig = transport === "subc" ? await sharedSubcRigFor(preparedBinary) : undefined;
+    if (subcRig || options.useTransportFactoryForNdjson) {
+      if (subcRig) await writeSubcProjectConfig(tempDir, configOverrides);
       pool = await createAftTransportPool({
         harness: "opencode",
         binaryPath: preparedBinary.binaryPath,
         poolOptions,
-        configOverrides,
-        subcConnectionFile: rig.connectionFile,
+        configOverrides: factoryConfigOverrides,
+        subcConnectionFile: subcRig?.connectionFile,
         // The test runner can itself be a supervised module. Never relay that ambient
         // principal into this isolated daemon, whose launch nonce belongs to its own AFT.
         subcConsumerIdentity: null,
@@ -367,13 +374,10 @@ export async function createHarness(
       for (const [key, value] of Object.entries(configOverrides)) {
         pool.setConfigureOverride(key, value);
       }
-      bridge = trackSubcSessions(
-        pool.getBridge(tempDir),
-        subcSessions,
-        tempDir,
-        rig.configHome,
-        timeoutMs,
-      );
+      const projectBridge = pool.getBridge(tempDir);
+      bridge = subcRig
+        ? trackSubcSessions(projectBridge, subcSessions, tempDir, subcRig.configHome, timeoutMs)
+        : projectBridge;
     } else {
       standaloneBridge = new BinaryBridge(
         preparedBinary.binaryPath,

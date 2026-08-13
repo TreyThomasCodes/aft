@@ -26,16 +26,17 @@ export function openCodeEditSlotSurvives(config: AftConfig): boolean {
   );
 }
 
+/** Select the hashline schema only when the host's final edit slot can survive. */
+export function openCodeHashlineEffective(config: AftConfig): boolean {
+  return config.edit_mode === "hashline" && openCodeEditSlotSurvives(config);
+}
+
 /** Return the process-state flag Rust uses to select the same edit schema arm. */
 export function openCodeHashlineEditRegistered(
   config: AftConfig,
   registeredTools: ReadonlySet<string>,
 ): boolean {
-  return (
-    config.edit_mode === "hashline" &&
-    openCodeEditSlotSurvives(config) &&
-    registeredTools.has("edit")
-  );
+  return openCodeHashlineEffective(config) && registeredTools.has("edit");
 }
 
 /**

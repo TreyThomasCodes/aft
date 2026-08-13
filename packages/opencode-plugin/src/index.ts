@@ -80,7 +80,11 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
-import { buildOpenCodeToolMap, openCodeHashlineEditRegistered } from "./tool-registration.js";
+import {
+  buildOpenCodeToolMap,
+  openCodeHashlineEditRegistered,
+  openCodeHashlineEffective,
+} from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
@@ -317,6 +321,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       storage_dir: storageDir,
     },
   );
+  // Registration can race transport startup, so set the edit-slot flag before
+  // constructing the pool. The final registered-tool inventory below rechecks
+  // the same decision after disabled-tool filtering.
+  const hashlineEffective = openCodeHashlineEffective(aftConfig);
+  configOverrides.edit_slot_survives = hashlineEffective;
   let lspInstallCompletion: Promise<string[] | null> | null = null;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
@@ -671,7 +680,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     client: input.client,
     plugin: (input as { plugin?: PluginContext["plugin"] }).plugin,
     config: aftConfig,
-    hashlineEffective: aftConfig.edit_mode === "hashline",
+    hashlineEffective,
     storageDir: configOverrides.storage_dir as string,
     isProjectEnabled,
   };
@@ -1049,7 +1058,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // presence of the default edit tool. A config/schema mismatch must downgrade
   // Rust to the default surface instead of making both argument shapes fail.
   const hashlineEditRegistered = openCodeHashlineEditRegistered(aftConfig, registeredTools);
+  ctx.hashlineEffective = hashlineEditRegistered;
   pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
+  log(
+    `hashline activation decision requested=${aftConfig.edit_mode === "hashline"} ` +
+      `edit_slot_survives=${hashlineEditRegistered} effective=${ctx.hashlineEffective}`,
+  );
   const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer can steer to it (vs the grep tool). The pool holds

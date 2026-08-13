@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
@@ -27,6 +27,82 @@ function writeExecutable(name: string, source: string): string {
 }
 
 describe("BinaryBridge transport regressions", () => {
+  test("hashline registration reaches configure and every NDJSON tool_call", async () => {
+    const requestsPath = join(workDir, "requests.ndjson");
+    const script = writeExecutable(
+      "hashline-registration.js",
+      `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    appendFileSync(${JSON.stringify(requestsPath)}, JSON.stringify(req) + "\\n");
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, text: "ok", warnings: [] }) + "\\n");
+  }
+});
+`,
+    );
+    const messages: string[] = [];
+    const logger: Logger = {
+      log: (message) => messages.push(message),
+      warn: () => {},
+      error: () => {},
+    };
+    const bridge = new BinaryBridge(
+      script,
+      workDir,
+      { timeoutMs: 5_000, maxRestarts: 0, logger },
+      { harness: "opencode", edit_slot_survives: true },
+    );
+
+    try {
+      await bridge.toolCall("session-a", "read", { path: "sample.ts" });
+      await bridge.toolCall("session-b", "read", { path: "sample.ts" });
+
+      const requests = readFileSync(requestsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(requests[0]).toMatchObject({
+        command: "configure",
+        session_id: "session-a",
+        edit_slot_survives: true,
+      });
+      expect(requests.at(-2)).toMatchObject({
+        command: "tool_call",
+        session_id: "session-a",
+        edit_slot_survives: true,
+      });
+      expect(requests.at(-1)).toMatchObject({
+        command: "tool_call",
+        session_id: "session-b",
+        edit_slot_survives: true,
+      });
+      expect(
+        messages.some((message) =>
+          message.includes(
+            "hashline registration carrier transport=ndjson phase=configure edit_slot_survives=true",
+          ),
+        ),
+      ).toBe(true);
+      expect(
+        messages.filter((message) =>
+          message.includes(
+            "hashline registration carrier transport=ndjson phase=tool_call edit_slot_survives=true",
+          ),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("stdout NDJSON decoder preserves multibyte UTF-8 split across chunks", async () => {
     const script = writeExecutable(
       "split-emoji.js",

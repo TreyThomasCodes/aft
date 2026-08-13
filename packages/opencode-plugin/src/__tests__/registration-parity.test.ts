@@ -13,7 +13,11 @@ import {
 import type { PluginContext as PiContext } from "../../../../packages/pi-plugin/src/types.js";
 import type { AftConfig as OpenCodeConfig } from "../config.js";
 import { buildSubcToolSchemas, SUBC_BARE_TOOL_NAMES } from "../subc-tool-schemas.js";
-import { buildOpenCodeToolMap, openCodeEditSlotSurvives } from "../tool-registration.js";
+import {
+  buildOpenCodeToolMap,
+  openCodeEditSlotSurvives,
+  openCodeHashlineEffective,
+} from "../tool-registration.js";
 import type { PluginContext as OpenCodeContext } from "../types.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -484,6 +488,13 @@ describe("hashline edit schema selection", () => {
       "filePath",
     );
     expect(openCodeEditSlotSurvives({ tool_surface: "recommended" })).toBe(true);
+    const hashlineConfig = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: true,
+      edit_mode: "hashline",
+    } as const;
+    expect(openCodeHashlineEffective(hashlineConfig)).toBe(true);
+    expect(openCodeHashlineEffective({ ...hashlineConfig, disabled_tools: ["edit"] })).toBe(false);
     expect(openCodeEditSlotSurvives({ tool_surface: "minimal", edit_mode: "hashline" })).toBe(
       false,
     );

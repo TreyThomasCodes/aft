@@ -21,6 +21,8 @@ const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
+const HASHLINE_REGISTRATION_LOG_INTERVAL_MS = 60_000;
+const HASHLINE_REGISTRATION_LOG_STATE_LIMIT = 256;
 const TERMINAL_BASH_STATUSES = new Set([
   "completed",
   "failed",
@@ -401,6 +403,10 @@ export class BinaryBridge implements AftProjectTransport {
   private configured = false;
   private _configurePromise: Promise<void> | null = null;
   private configOverrides: Record<string, unknown>;
+  private readonly hashlineRegistrationLogState = new Map<
+    string,
+    { lastEmittedAt: number; suppressed: number }
+  >();
   private minVersion: string | undefined;
   private onVersionMismatch: VersionMismatchCallback | undefined;
   private onConfigureWarnings:
@@ -611,6 +617,45 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   /**
+   * Update the host registration fact without restarting an already-created bridge.
+   *
+   * Unlike asynchronously resolved runtime paths, this value is request-scoped
+   * process state: configure and each tool_call must carry the latest decision.
+   */
+  setEditSlotSurvives(value: boolean | undefined): void {
+    if (value === undefined) {
+      delete this.configOverrides.edit_slot_survives;
+    } else {
+      this.configOverrides.edit_slot_survives = value;
+    }
+  }
+
+  private logHashlineRegistrationCarrier(
+    phase: "configure" | "tool_call",
+    sessionId: string | undefined,
+    editSlotSurvives: boolean,
+  ): void {
+    const session = sessionId && sessionId.length > 0 ? sessionId : "__default__";
+    const key = `${phase}\u0000${String(editSlotSurvives)}`;
+    const now = Date.now();
+    const state = this.hashlineRegistrationLogState.get(key);
+    if (state && now - state.lastEmittedAt < HASHLINE_REGISTRATION_LOG_INTERVAL_MS) {
+      state.suppressed += 1;
+      return;
+    }
+    const repeated = state && state.suppressed > 0 ? ` repeated=${state.suppressed + 1}` : "";
+    if (!state && this.hashlineRegistrationLogState.size >= HASHLINE_REGISTRATION_LOG_STATE_LIMIT) {
+      const oldest = this.hashlineRegistrationLogState.keys().next().value;
+      if (oldest !== undefined) this.hashlineRegistrationLogState.delete(oldest);
+    }
+    this.hashlineRegistrationLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
+    this.sessionLogVia(
+      sessionId,
+      `hashline registration carrier transport=ndjson phase=${phase} edit_slot_survives=${editSlotSurvives}${repeated}`,
+    );
+  }
+
+  /**
    * Send a command to the binary and return the parsed response.
    * Lazy-spawns the binary on first call.
    */
@@ -637,6 +682,11 @@ export class BinaryBridge implements AftProjectTransport {
   ): Promise<ToolCallResult> {
     const params: Record<string, unknown> = { name, arguments: rawArgs };
     if (sessionId) params.session_id = sessionId;
+    const editSlotSurvives = this.configOverrides.edit_slot_survives;
+    if (typeof editSlotSurvives === "boolean") {
+      params.edit_slot_survives = editSlotSurvives;
+      this.logHashlineRegistrationCarrier("tool_call", sessionId, editSlotSurvives);
+    }
     const { preview, ...sendOptions } = options ?? {};
     if (preview === true) params.preview = true;
     return (await this.send(
@@ -722,6 +772,14 @@ export class BinaryBridge implements AftProjectTransport {
               typeof params.session_id === "string" ? (params.session_id as string) : undefined;
             this._configurePromise = (async () => {
               try {
+                const editSlotSurvives = this.configOverrides.edit_slot_survives;
+                if (typeof editSlotSurvives === "boolean") {
+                  this.logHashlineRegistrationCarrier(
+                    "configure",
+                    sessionIdForConfigure,
+                    editSlotSurvives,
+                  );
+                }
                 const configResult = await this.send(
                   "configure",
                   {

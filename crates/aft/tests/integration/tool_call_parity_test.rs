@@ -136,6 +136,95 @@ fn tool_call_matches_direct_spine_envelopes() {
 }
 
 #[test]
+fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
+    let project = tempfile::tempdir().expect("hashline carrier temp project");
+    let root = std::fs::canonicalize(project.path()).expect("canonical project");
+    let file = root.join("hashline-carrier.txt");
+    fs::write(&file, "alpha\nbeta\n").expect("write hashline carrier fixture");
+    let mut aft = AftProcess::spawn();
+
+    let configure = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-carrier-configure",
+            "command": "configure",
+            "session_id": "configure-owner",
+            "project_root": root,
+            "harness": "opencode",
+            "edit_slot_survives": true,
+            "config": [{
+                "tier": "project",
+                "source": root.join(".cortexkit/aft.jsonc"),
+                "doc": json!({
+                    "edit_mode": "hashline",
+                    "search_index": false,
+                    "semantic_search": false
+                }).to_string()
+            }]
+        }),
+    );
+    assert!(
+        configure["success"].as_bool().unwrap_or(false),
+        "{configure:#}"
+    );
+
+    let read = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-carrier-read",
+            "command": "tool_call",
+            "session_id": "later-hashline-session",
+            "edit_slot_survives": true,
+            "name": "read",
+            "arguments": { "path": file }
+        }),
+    );
+    assert!(read["success"].as_bool().unwrap_or(false), "{read:#}");
+    assert!(read["hashline_tag"].as_str().is_some(), "{read:#}");
+    assert!(read["text"].as_str().unwrap_or_default().starts_with('['));
+
+    let downgraded = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-carrier-downgrade",
+            "command": "tool_call",
+            "session_id": "later-default-session",
+            "edit_slot_survives": false,
+            "name": "edit",
+            "arguments": {
+                "path": file,
+                "edits": [{ "oldString": "alpha", "newString": "omega" }]
+            }
+        }),
+    );
+    assert!(
+        downgraded["success"].as_bool().unwrap_or(false),
+        "{downgraded:#}"
+    );
+    assert_eq!(downgraded["warnings"][0]["code"], "hashline_downgraded");
+    assert!(downgraded["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Hashline mode was downgraded"));
+
+    let repeat = send_json(
+        &mut aft,
+        json!({
+            "id": "hashline-carrier-downgrade-repeat",
+            "command": "tool_call",
+            "session_id": "later-default-session",
+            "edit_slot_survives": false,
+            "name": "read",
+            "arguments": { "path": file }
+        }),
+    );
+    assert!(repeat["success"].as_bool().unwrap_or(false), "{repeat:#}");
+    assert!(repeat.get("warnings").is_none(), "{repeat:#}");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
     let project = tempfile::tempdir().expect("hashline temp project");
     let root = std::fs::canonicalize(project.path()).expect("canonical project");

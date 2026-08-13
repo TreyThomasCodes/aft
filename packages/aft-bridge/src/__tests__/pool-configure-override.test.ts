@@ -8,6 +8,8 @@
  *   - Setting an override does NOT restart existing bridges (existing bridges
  *     keep their original configure payload — their warm trigram/semantic/LSP/
  *     symbol-cache state must survive an async ONNX download settling).
+ *   - The host-owned edit-slot registration fact also updates live bridges so
+ *     later sessions carry it without discarding warm state.
  *   - Setting an override to `undefined` removes it.
  *   - Constructor configOverrides is preserved as the baseline; setConfigureOverride
  *     layers on top without dropping unrelated keys.
@@ -57,6 +59,22 @@ describe("BridgePool.setConfigureOverride", () => {
     expect(pool._testGetConfigOverrides()).toEqual({
       _ort_dylib_dir: "/onnx/runtime",
     });
+  });
+
+  test("edit-slot registration updates an existing bridge without restarting it", () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+    const bridge = pool.getBridge("/project/a");
+    const bridgeConfig = bridge as unknown as {
+      configOverrides: Record<string, unknown>;
+    };
+
+    expect(bridgeConfig.configOverrides.edit_slot_survives).toBeUndefined();
+
+    pool.setConfigureOverride("edit_slot_survives", true);
+
+    expect(bridgeConfig.configOverrides.edit_slot_survives).toBe(true);
+    expect(pool.getBridge("/project/a")).toBe(bridge);
+    expect(pool.size).toBe(1);
   });
 
   test("setting an override does NOT restart existing bridges (size stays the same)", () => {

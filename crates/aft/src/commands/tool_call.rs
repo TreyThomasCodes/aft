@@ -58,6 +58,18 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         .get("preview")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let edit_slot_survives = match req.params.get("edit_slot_survives") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "tool_call: edit_slot_survives must be a boolean",
+            );
+        }
+        None => None,
+    };
+    let report_registration_downgrade = edit_slot_survives.is_some();
     let config = ctx.config();
     let project_root = config
         .project_root
@@ -69,8 +81,11 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         request_id: req.id.clone(),
         diagnostics_on_edit: config.diagnostics_on_edit,
         preview,
-        edit_slot_survives: None,
-        report_registration_downgrade: false,
+        edit_slot_survives,
+        // Configure emits the warning for legacy callers that omit this flag.
+        // A later session that explicitly disables hashline has no configure
+        // response, so its first tool call emits that session's one-shot warning.
+        report_registration_downgrade,
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);
