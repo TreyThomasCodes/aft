@@ -80,10 +80,7 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
-import {
-  buildOpenCodeToolMap,
-  openCodeHashlineEditRegistered,
-} from "./tool-registration.js";
+import { buildOpenCodeToolMap, openCodeHashlineEditRegistered } from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
@@ -313,10 +310,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Do not add resolved aft.jsonc fields (format_on_edit, semantic, lsp, etc.)
   // to this flat map; flat params below are plugin-computed process state.
   const storageDir = resolveCortexKitStorageRoot();
-  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(registrationRoot, {
-    bash_permissions: true,
-    storage_dir: storageDir,
-  });
+  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(
+    registrationRoot,
+    {
+      bash_permissions: true,
+      storage_dir: storageDir,
+    },
+  );
   let lspInstallCompletion: Promise<string[] | null> | null = null;
 
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
