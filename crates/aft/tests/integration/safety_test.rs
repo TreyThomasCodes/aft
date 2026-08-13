@@ -196,6 +196,8 @@ fn test_operation_undo_restores_multiple_deleted_files() {
 
     fs::write(&file_a, "original-a").unwrap();
     fs::write(&file_b, "original-b").unwrap();
+    let file_a_key = fs::canonicalize(&file_a).unwrap();
+    let file_b_key = fs::canonicalize(&file_b).unwrap();
 
     let mut aft = AftProcess::spawn();
     let delete = serde_json::json!({
@@ -212,6 +214,19 @@ fn test_operation_undo_restores_multiple_deleted_files() {
     assert_eq!(undo["success"], true, "undo: {undo:?}");
     assert_eq!(undo["operation"], true);
     assert_eq!(undo["restored_count"], 2);
+    let restored = undo["restored"].as_array().unwrap();
+    let mut restored_paths = restored
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    restored_paths.sort_unstable();
+    let mut expected_paths = vec![file_a_key.to_str().unwrap(), file_b_key.to_str().unwrap()];
+    expected_paths.sort_unstable();
+    assert_eq!(restored_paths, expected_paths);
+    assert!(
+        restored.iter().all(|entry| entry["backup_id"].is_string()),
+        "every content restore should retain its backup id: {undo:?}"
+    );
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
     assert_eq!(fs::read_to_string(&file_b).unwrap(), "original-b");
 
@@ -358,9 +373,18 @@ fn undo_after_write_created_file_deletes_it() {
     let write_resp = aft.send(&serde_json::to_string(&write).unwrap());
     assert_eq!(write_resp["success"], true, "write: {write_resp:?}");
     assert_eq!(fs::read_to_string(&file).unwrap(), "new file\n");
+    let reported_path = fs::canonicalize(&file).unwrap();
 
     let undo = aft.send(r#"{"id":"undo-write-created","command":"undo"}"#);
     assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(undo["restored_count"], 1, "undo result: {undo:?}");
+    assert_eq!(undo["restored"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        undo["restored"][0]["path"],
+        reported_path.display().to_string(),
+        "undo should report the path it removed: {undo:?}"
+    );
+    assert!(undo["restored"][0]["backup_id"].is_string());
     assert!(!file.exists(), "created file should be removed by undo");
 
     let status = aft.shutdown();

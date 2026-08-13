@@ -845,8 +845,12 @@ impl BackupStore {
                     backup_id: entry.backup_id,
                 });
             }
-            for (key, _, _) in tombstone_targets {
+            for (key, entry, _) in tombstone_targets {
                 self.commit_restored_backup_locked(session, &key)?;
+                restored.push(RestoredFile {
+                    path: key,
+                    backup_id: entry.backup_id,
+                });
             }
             self.touch_session(session);
             drop(disk_locks);
@@ -4594,6 +4598,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.txt");
         let destination = dir.join("destination.txt");
+        let canonical_dir = fs::canonicalize(&dir).unwrap();
         fs::write(&source, "original").unwrap();
 
         let mut store = BackupStore::new();
@@ -4608,7 +4613,23 @@ mod tests {
 
         let restored = store.restore_last_operation(DEFAULT_SESSION_ID).unwrap();
         assert_eq!(restored.op_id, op_id);
-        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(restored.restored.len(), 2);
+        let restored_paths = restored
+            .restored
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            restored_paths,
+            HashSet::from([
+                canonical_dir.join("source.txt"),
+                canonical_dir.join("destination.txt")
+            ])
+        );
+        assert!(restored
+            .restored
+            .iter()
+            .all(|file| !file.backup_id.is_empty()));
         assert_eq!(fs::read_to_string(&source).unwrap(), "original");
         assert!(!destination.exists());
         let _ = fs::remove_dir_all(&dir);
