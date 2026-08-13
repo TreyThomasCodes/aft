@@ -40,7 +40,9 @@ maybeDescribe("e2e outline command", () => {
 
     expect(response.success).toBe(true);
     expect(String(response.text)).toContain("sample.ts");
-    expect(String(response.text)).toContain("E fn");
+    // Signature prefix dedup (v0.49.4): the redundant kind marker was dropped
+    // from signature lines; exported-ness shows as a bare `E` marker only where
+    // the signature itself doesn't carry `export`.
     expect(String(response.text)).toContain("funcA(input: string): string");
     expect(String(response.text)).toContain("SampleService");
   });
@@ -81,7 +83,9 @@ maybeDescribe("e2e outline command", () => {
     expect(text).toContain("Project Title");
     expect(text).toContain("Features");
     expect(text).toContain("Fast Path");
-    expect(text).toContain(" h ");
+    // Markdown outlines render heading markers (#, ##) directly since the
+    // v0.49.4 prefix dedup; the old ` h ` kind column is gone.
+    expect(text).toContain("## Features");
   });
 
   test("directory discovery respects the 200 file cap", async () => {
