@@ -1191,7 +1191,9 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // OpenCode invokes this hook with raw model arguments before applying the
       // registered schema. Normalize retired path spellings here so legacy
       // values are not stripped as unknown properties first.
-      output.args = prepareOpenCodeArguments(toolInput.tool, output.args);
+      output.args = prepareOpenCodeArguments(toolInput.tool, output.args, {
+        hashlineEffective: ctx.hashlineEffective,
+      });
       if (toolInput.sessionID) inspectTier2Idle.clear(toolInput.sessionID);
     },
     "command.execute.before": async (

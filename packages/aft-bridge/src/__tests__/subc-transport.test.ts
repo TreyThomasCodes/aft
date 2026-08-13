@@ -252,6 +252,23 @@ describe("SubcTransport.toolCall", () => {
     });
   });
 
+  test("carries plugin edit registration on native bash dispatch", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+    pool.setConfigureOverride("edit_slot_survives", true);
+
+    await pool.getBridge(TEST_PROJECT_ROOT).send("bash", {
+      session_id: "sess",
+      command: "cat build.rs",
+    });
+
+    expect(client.requests[0]?.body).toEqual({
+      name: "bash",
+      arguments: { session_id: "sess", command: "cat build.rs" },
+      edit_slot_survives: true,
+    });
+  });
+
   test("forwards an explicit direct consumer identity override to route.open", async () => {
     const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
     const pool = new SubcTransportPool({

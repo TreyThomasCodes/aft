@@ -1016,6 +1016,7 @@ fn hashline_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "read" => aft::commands::read::handle_read(&req, ctx),
         "hashline_preflight" => aft::commands::hashline::handle_preflight(&req, ctx),
         "hashline_edit" => aft::commands::hashline::handle_edit(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
         other => Response::error(
             req.id,
             "unexpected_command",
@@ -2367,6 +2368,17 @@ fn subc_bridge_hashline_preflight_and_edit_round_route_in_production() {
         "subc_bridge_hashline_preflight_and_edit_round_route_in_production",
         Duration::from_secs(30),
         drive_hashline_edit_round_daemon,
+        |_, _, _| {},
+        hashline_bridge_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_registered_hashline_bash_cat_starts_with_tag_header() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_registered_hashline_bash_cat_starts_with_tag_header",
+        Duration::from_secs(30),
+        drive_hashline_bash_cat_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
     );
@@ -7253,6 +7265,54 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
     assert_eq!(
         std::fs::read(&target).expect("read edited hashline target"),
         b"omega\nbeta\n"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    std::fs::write(root1.join("build.rs"), "fn main() {}\n")
+        .expect("write hashline bash rewrite fixture");
+
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "hashline-bash-session",
+        json!({
+            "edit_mode": "hashline",
+            "bash": { "rewrite": true, "background": false },
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let bash = call_registered_tool_response(
+        &mut stream,
+        1,
+        100,
+        "bash",
+        json!({
+            "command": "cat build.rs",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+        true,
+        "registered hashline bash cat",
+    )
+    .await;
+    assert_tool_success(&bash, "registered hashline bash cat");
+    let text = bash["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("[build.rs#"),
+        "hashline bash rewrite must start with its tagged read header: {text:?}"
     );
 
     send_connection_goodbye(&mut stream).await;

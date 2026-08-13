@@ -51,20 +51,23 @@ export function buildOpenCodeToolMap(
   onUnknownDisabled?: (name: string, available: readonly string[]) => void,
 ): Record<string, ToolDefinition> {
   const surface = config.tool_surface ?? "recommended";
-  const allTools = normalizeToolMap({
-    ...(surface !== "minimal" &&
-      (config.hoist_builtin_tools !== false ? hoistedTools(ctx) : aftPrefixedTools(ctx))),
-    ...readingTools(ctx),
-    ...(config.backup?.enabled === false ? {} : safetyTools(ctx)),
-    ...(surface !== "minimal" && importTools(ctx)),
-    ...navigationTools(ctx),
-    ...(surface !== "minimal" && astTools(ctx)),
-    ...(surface !== "minimal" && config.semantic_search === true && semanticTools(ctx)),
-    ...(inspectToolSurfaceEnabled(config) && inspectTools(ctx)),
-    ...(surface !== "minimal" && config.search_index === true && searchTools(ctx)),
-    ...refactoringTools(ctx),
-    ...(surface !== "minimal" && conflictTools(ctx)),
-  });
+  const allTools = normalizeToolMap(
+    {
+      ...(surface !== "minimal" &&
+        (config.hoist_builtin_tools !== false ? hoistedTools(ctx) : aftPrefixedTools(ctx))),
+      ...readingTools(ctx),
+      ...(config.backup?.enabled === false ? {} : safetyTools(ctx)),
+      ...(surface !== "minimal" && importTools(ctx)),
+      ...navigationTools(ctx),
+      ...(surface !== "minimal" && astTools(ctx)),
+      ...(surface !== "minimal" && config.semantic_search === true && semanticTools(ctx)),
+      ...(inspectToolSurfaceEnabled(config) && inspectTools(ctx)),
+      ...(surface !== "minimal" && config.search_index === true && searchTools(ctx)),
+      ...refactoringTools(ctx),
+      ...(surface !== "minimal" && conflictTools(ctx)),
+    },
+    { hashlineEffective: ctx.hashlineEffective },
+  );
 
   if (surface !== "all") {
     for (const name of ALL_ONLY_TOOLS) delete allTools[name];

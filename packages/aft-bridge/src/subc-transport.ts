@@ -812,9 +812,12 @@ class SubcTransport implements AftProjectTransport {
     }
     const { timeoutMs, onProgress } = this.splitOptions(options);
     const session = typeof params.session_id === "string" ? params.session_id : undefined;
+    const body: Record<string, unknown> = { name: command, arguments: params };
+    const editSlotSurvives = this.pool.getEditSlotSurvives();
+    if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     const reply = await this.pool.routeRequest(
       this.identityFor(session),
-      { name: command, arguments: params },
+      body,
       timeoutMs,
       onProgress,
       this.generation,

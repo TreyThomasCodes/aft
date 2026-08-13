@@ -2,12 +2,15 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { sep } from "node:path";
 import { promisify } from "node:util";
+import type { BridgePool } from "@cortexkit/aft-bridge";
+import type { ToolContext } from "@opencode-ai/plugin";
 import { withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { buildOpenCodeToolMap, openCodeHashlineEditRegistered } from "../../tool-registration.js";
 import type { PluginContext } from "../../types.js";
+import { noopAsk } from "../test-helpers.js";
 import {
   cleanupHarnesses,
   cleanupSharedSubcRig,
@@ -83,6 +86,67 @@ maybeDescribe(describeName, () => {
     harnessFactory,
     name: "subc parity: safety/undo",
   });
+
+  for (const transport of ["ndjson", "subc"] as const) {
+    test(`hashline edit patch survives registration and ${transport} dispatch`, async () => {
+      const harness = await createHarness(preparedBinary, {
+        fixtureNames: [],
+        transport,
+        tempPrefix: `aft-hashline-plugin-${transport}-`,
+        configOverrides: {
+          edit_slot_survives: true,
+          config: [
+            {
+              tier: "project",
+              source: "/tmp/aft-hashline-plugin.jsonc",
+              doc: JSON.stringify({
+                edit_mode: "hashline",
+                search_index: false,
+                semantic_search: false,
+              }),
+            },
+          ],
+        },
+      });
+      try {
+        await writeFile(harness.path("plugin-edit.txt"), "alpha\nbeta\n");
+        const sessionID = `hashline-plugin-${transport}`;
+        const read = await harness.bridge.toolCall(sessionID, "read", { path: "plugin-edit.txt" });
+        const tag = read.hashline_tag as string;
+        expect(tag).toBeString();
+
+        const config = { edit_mode: "hashline" } as const;
+        const pool = { getBridge: () => harness.bridge } as unknown as BridgePool;
+        const tools = buildOpenCodeToolMap(
+          {
+            pool,
+            client: {} as PluginContext["client"],
+            config,
+            hashlineEffective: true,
+            storageDir: harness.path(".aft-test-storage"),
+          },
+          config,
+        );
+        const toolContext = {
+          messageID: `hashline-plugin-${transport}`,
+          sessionID,
+          agent: "test",
+          directory: harness.tempDir,
+          worktree: harness.tempDir,
+          abort: new AbortController().signal,
+          metadata: () => {},
+          ask: noopAsk,
+        } as ToolContext;
+        const patch = `*** Begin Patch\n[plugin-edit.txt#${tag}]\nPUT 1:\n+omega\n*** End Patch`;
+
+        await tools.edit.execute({ patch }, toolContext);
+
+        expect(await readFile(harness.path("plugin-edit.txt"), "utf8")).toBe("omega\nbeta\n");
+      } finally {
+        await harness.cleanup();
+      }
+    }, 60_000);
+  }
 
   test("edit registration and Rust argument enforcement agree across transports", async () => {
     const harnesses: E2EHarness[] = [];

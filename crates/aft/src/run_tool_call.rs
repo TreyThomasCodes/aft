@@ -154,13 +154,17 @@ pub struct ToolCallContext {
     pub report_registration_downgrade: bool,
 }
 
-fn ensure_hashline_registration(
-    ctx: &ToolCallContext,
+pub(crate) fn ensure_hashline_registration(
     app_ctx: &AppContext,
-    binding_root: &std::path::Path,
+    project_root: &std::path::Path,
     session: &str,
+    edit_slot_survives: Option<bool>,
+    report_registration_downgrade: bool,
 ) -> bool {
-    let edit_slot_survives = match ctx.edit_slot_survives {
+    let binding_root = app_ctx
+        .canonical_cache_root_opt()
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let edit_slot_survives = match edit_slot_survives {
         Some(value) => value,
         None if app_ctx.harness_opt().is_some_and(|harness| {
             matches!(
@@ -169,7 +173,7 @@ fn ensure_hashline_registration(
             )
         }) && app_ctx
             .hashline_bindings()
-            .peek(binding_root, session)
+            .peek(&binding_root, session)
             .is_none() =>
         {
             false
@@ -177,14 +181,14 @@ fn ensure_hashline_registration(
         None => return false,
     };
     let registration = app_ctx.hashline_bindings().register(
-        binding_root,
+        &binding_root,
         session.to_string(),
         crate::hashline::integration::RegistrationRequest {
             configured_enabled: app_ctx.config().hashline_enabled,
             edit_slot_survives,
         },
     );
-    ctx.report_registration_downgrade
+    report_registration_downgrade
         && registration.downgrade.is_some()
         && !registration.stores_preserved
 }
@@ -224,7 +228,13 @@ pub fn run_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let surface_downgraded = ensure_hashline_registration(ctx, app_ctx, &binding_root, session);
+    let surface_downgraded = ensure_hashline_registration(
+        app_ctx,
+        &ctx.project_root,
+        session,
+        ctx.edit_slot_survives,
+        ctx.report_registration_downgrade,
+    );
     let binding_guard = app_ctx.hashline_bindings().capture(binding_root, session);
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,

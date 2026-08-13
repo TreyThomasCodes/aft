@@ -460,6 +460,7 @@ struct PendingBashAsk {
     project_root: PathBuf,
     session_id: String,
     spawn_principal: AuthenticatedPrincipal,
+    edit_slot_survives: Option<bool>,
     request_id: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -1511,6 +1512,7 @@ async fn handle_bash_elicitation_reply(
                 pending.cancel,
                 BindTrust::Untrusted,
                 pending.spawn_principal,
+                pending.edit_slot_survives,
                 Some(pending.grants),
             );
             return Ok(());
@@ -4259,6 +4261,7 @@ async fn handle_tool_call(
                     project_root: identity.project_root.clone(),
                     session_id: identity.session.clone(),
                     spawn_principal: identity.spawn_principal.clone(),
+                    edit_slot_survives: call.edit_slot_survives,
                     request_id,
                     arguments,
                     format_context,
@@ -4309,6 +4312,7 @@ async fn handle_tool_call(
             cancel,
             bind_trust,
             identity.spawn_principal.clone(),
+            call.edit_slot_survives,
             None,
         );
         return Ok(());

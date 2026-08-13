@@ -227,6 +227,7 @@ pub(super) fn submit_deferred_bash(
     cancel: BashWaitCancel,
     bind_trust: BindTrust,
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
+    edit_slot_survives: Option<bool>,
     permissions_granted: Option<Vec<String>>,
 ) {
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -254,6 +255,18 @@ pub(super) fn submit_deferred_bash(
                         &format_context_for_spawn,
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
+                        false,
+                    );
+                }
+
+                // Native bash skips the normal tool-call registration flow, so update the
+                // registration before rewriting. Rewritten reads then match ordinary reads.
+                if edit_slot_survives.is_some() {
+                    crate::run_tool_call::ensure_hashline_registration(
+                        ctx,
+                        &project_root_for_spawn,
+                        &session_for_spawn,
+                        edit_slot_survives,
                         false,
                     );
                 }

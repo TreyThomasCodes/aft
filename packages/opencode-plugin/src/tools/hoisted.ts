@@ -1156,7 +1156,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     }
   }
 
-  return prepareToolMap(tools, ctx.hashlineEffective === true ? new Set(["edit"]) : undefined);
+  return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });
 }
 
 /**
@@ -1189,5 +1189,5 @@ export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinit
     }
   }
 
-  return prepareToolMap(tools);
+  return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });
 }

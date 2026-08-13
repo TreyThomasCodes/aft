@@ -56,12 +56,20 @@ function bareToolName(toolName: string): string {
   return toolName.startsWith("aft_") ? toolName.slice(4) : toolName;
 }
 
-/** Prepare raw OpenCode arguments and retain legacy fields for old schemas. */
+export interface OpenCodeArgumentPreparation {
+  hashlineEffective?: boolean;
+}
+
+/** Prepare raw OpenCode arguments against the schema arm registered for this session. */
 export function prepareOpenCodeArguments(
   toolName: string,
   rawArguments: unknown,
+  preparation: OpenCodeArgumentPreparation = {},
 ): Record<string, unknown> {
   const bare = bareToolName(toolName);
+  if (bare === "edit" && preparation.hashlineEffective === true) {
+    return rawArguments as Record<string, unknown>;
+  }
   if (bare === "edit") {
     return prepareCanonicalEditArguments(toolName, rawArguments);
   }
@@ -96,14 +104,12 @@ function preserveDisplayFilePathAlias(
 
 function prepareToolMap(
   tools: Record<string, ToolDefinition>,
-  passthroughToolNames: ReadonlySet<string> = new Set(),
+  preparation: OpenCodeArgumentPreparation = {},
 ): Record<string, ToolDefinition> {
   for (const [toolName, def] of Object.entries(tools)) {
     const execute = def.execute;
     def.execute = (async (args, context) => {
-      const prepared = passthroughToolNames.has(toolName)
-        ? (args as Record<string, unknown>)
-        : prepareOpenCodeArguments(toolName, args);
+      const prepared = prepareOpenCodeArguments(toolName, args, preparation);
       preserveDisplayFilePathAlias(toolName, args, prepared);
       return execute(prepared, context);
     }) as ToolDefinition["execute"];
@@ -114,9 +120,10 @@ function prepareToolMap(
 /** Normalize tool definitions and attach raw-argument preparation. */
 export function normalizeToolMap(
   tools: Record<string, ToolDefinition>,
+  preparation: OpenCodeArgumentPreparation = {},
 ): Record<string, ToolDefinition> {
   for (const def of Object.values(tools)) normalizeToolArgSchemas(def);
-  return prepareToolMap(tools);
+  return prepareToolMap(tools, preparation);
 }
 
 /** Attach argument preparation without changing emitted schema metadata. */

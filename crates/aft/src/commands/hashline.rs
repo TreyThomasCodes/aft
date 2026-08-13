@@ -46,7 +46,16 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             transport_kind(ctx),
         );
     };
-    let patch_text = match crate::hashline::syntax::validate_raw_arguments(&req.params) {
+    let preview = req
+        .params
+        .get("preview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut agent_arguments = req.params.clone();
+    if let Some(arguments) = agent_arguments.as_object_mut() {
+        arguments.remove("preview");
+    }
+    let patch_text = match crate::hashline::syntax::validate_raw_arguments(&agent_arguments) {
         Ok(request) => request.patch,
         Err(rejection) => {
             return rejection_response(&req.id, &rejection, transport_kind(ctx));
@@ -156,15 +165,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             backups_enabled,
             fault: None,
         };
-        let envelope = run_transaction(
-            &inputs,
-            &register_snapshot,
-            &mut execute,
-            req.params
-                .get("preview")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        )?;
+        let envelope = run_transaction(&inputs, &register_snapshot, &mut execute, preview)?;
         let display_files = display_files_from_envelope(&envelope, &display_baselines);
         Ok((envelope, display_files))
     });
@@ -313,6 +314,45 @@ mod tests {
             ctx.backup().lock().history(DEFAULT_SESSION_ID, &path).len(),
             1
         );
+    }
+
+    #[test]
+    fn server_preview_flag_is_not_validated_as_an_agent_argument() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let path = root.join("sample.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("fixture write");
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        ctx.hashline_bindings().register(
+            &root,
+            DEFAULT_SESSION_ID.to_string(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+
+        let mut read = request("read", json!({ "file": path }));
+        read.params["_hashline_requested_path"] = Value::String("sample.txt".to_string());
+        let read_response = crate::commands::read::handle_read(&read, &ctx);
+        let tag = read_response.data["hashline_tag"]
+            .as_str()
+            .expect("tagged read");
+        let patch = format!("[sample.txt#{tag}]\nPUT 1:\n+omega");
+
+        let preview = handle_edit(
+            &request("hashline_edit", json!({ "patch": patch, "preview": true })),
+            &ctx,
+        );
+        assert!(preview.success, "{}", preview.data);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\n");
+        assert!(preview.data["preview"].as_bool().unwrap_or(false));
     }
 
     #[test]
