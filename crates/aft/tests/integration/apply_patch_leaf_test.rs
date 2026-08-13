@@ -92,9 +92,13 @@ fn apply_patch_full_multifile_and_single_undo_reverts_all() {
     let undo = aft.send(&json!({ "id": "undo-full", "command": "undo" }).to_string());
     assert_eq!(undo["success"], true, "undo failed: {undo:?}");
     assert_eq!(undo["operation"], true);
+    // All three touched paths are reported: the two content restores
+    // (update.txt, delete.txt) plus the removal of the created add.txt,
+    // which undo reports as a restored path since the tombstone commit
+    // is part of reverting the operation.
     assert_eq!(
-        undo["restored_count"], 2,
-        "content backups restored: {undo:?}"
+        undo["restored_count"], 3,
+        "all reverted paths reported: {undo:?}"
     );
     assert!(!root.join("add.txt").exists());
     assert_eq!(
