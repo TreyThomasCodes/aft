@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
@@ -167,15 +167,11 @@ impl RewriteRule for CatRule {
             .get("file")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !path_is_safe(ctx, path, true) || !read_shape_is_faithful(ctx, path) {
-            crate::slog_warn!(
-                "bash rewrite rule cat declined: read declined: path is outside the project root or exceeds the read contract"
-            );
-            return decline(
-                "cat",
-                "cat.decline",
-                "read path is outside the project root or exceeds the read contract",
-            );
+        if !path_is_safe(ctx, path, true) {
+            return decline_cat_read(ctx, path, "path_is_safe");
+        }
+        if !read_shape_is_faithful(ctx, path) {
+            return decline_cat_read(ctx, path, "read_shape_is_faithful");
         }
         accept(
             "cat",
@@ -625,14 +621,44 @@ fn response_output(data: &Value) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
 }
 
-fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
-    let root = grep_project_root(ctx);
+fn path_candidate(ctx: &AppContext, path: &str) -> PathBuf {
     let candidate = Path::new(path);
-    let candidate = if candidate.is_absolute() {
+    if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        root.join(candidate)
-    };
+        grep_project_root(ctx).join(candidate)
+    }
+}
+
+fn resolved_path_candidate(ctx: &AppContext, path: &str) -> PathBuf {
+    let candidate = path_candidate(ctx, path);
+    std::fs::canonicalize(&candidate).unwrap_or(candidate)
+}
+
+fn decline_cat_read(
+    ctx: &AppContext,
+    path: &str,
+    predicate: &'static str,
+) -> crate::bash_rewrite::RewriteDecision {
+    let candidate = resolved_path_candidate(ctx, path);
+    crate::slog_warn!(
+        "bash rewrite rule cat declined: read declined: predicate={} resolved_candidate={:?}",
+        predicate,
+        candidate
+    );
+    decline(
+        "cat",
+        "cat.decline",
+        &format!(
+            "read declined: {predicate} failed for {}",
+            candidate.display()
+        ),
+    )
+}
+
+fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
+    let root = grep_project_root(ctx);
+    let candidate = path_candidate(ctx, path);
     if require_existing && !candidate.exists() {
         return false;
     }
@@ -641,12 +667,7 @@ fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
 }
 
 fn read_shape_is_faithful(ctx: &AppContext, path: &str) -> bool {
-    let root = grep_project_root(ctx);
-    let candidate = if Path::new(path).is_absolute() {
-        Path::new(path).to_path_buf()
-    } else {
-        root.join(path)
-    };
+    let candidate = path_candidate(ctx, path);
     let Ok(metadata) = std::fs::metadata(&candidate) else {
         return false;
     };

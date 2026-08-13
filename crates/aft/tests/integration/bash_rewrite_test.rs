@@ -670,13 +670,40 @@ fn rewrite_target_failure_logs_warning_before_fallthrough() {
     );
 
     let logs = take_logs();
+    let resolved = outside_path.canonicalize().unwrap();
     assert!(
         logs.iter().any(|line| {
             line.contains("bash rewrite rule cat declined")
-                && line.contains("read declined")
-                && line.contains("outside the project root")
+                && line.contains("predicate=path_is_safe")
+                && line.contains(&format!("resolved_candidate={resolved:?}"))
         }),
-        "expected warn-level rewrite decline log, got {logs:?}"
+        "expected predicate-specific rewrite decline log, got {logs:?}"
+    );
+}
+
+#[test]
+fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
+    init_test_logger();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized.txt");
+    fs::write(&path, vec![b'x'; 50 * 1024 + 1]).unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(
+        rewrite("cat oversized.txt", &ctx).is_none(),
+        "oversized reads must remain native bash commands"
+    );
+
+    let logs = take_logs();
+    let resolved = path.canonicalize().unwrap();
+    assert!(
+        logs.iter().any(|line| {
+            line.contains("bash rewrite rule cat declined")
+                && line.contains("predicate=read_shape_is_faithful")
+                && line.contains(&format!("resolved_candidate={resolved:?}"))
+        }),
+        "expected predicate-specific shape decline log, got {logs:?}"
     );
 }
 

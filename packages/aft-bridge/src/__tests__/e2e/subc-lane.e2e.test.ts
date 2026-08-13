@@ -30,7 +30,10 @@ maybeDescribe(describeName, () => {
     await rig?.cleanup();
   });
 
-  async function bridge(): Promise<AftProjectTransport> {
+  async function bridge(
+    editSlotSurvives?: boolean,
+    projectRoot = rig.projectDir,
+  ): Promise<AftProjectTransport> {
     const pool = await createAftTransportPool({
       harness: "opencode",
       binaryPath: prepared.aftBinaryPath ?? "",
@@ -40,9 +43,41 @@ maybeDescribe(describeName, () => {
       subcConsumerIdentity: null,
       onBgEventsNudge: (root, session) => nudges.push({ root, session, at: Date.now() }),
     });
+    if (editSlotSurvives !== undefined) {
+      pool.setConfigureOverride("edit_slot_survives", editSlotSurvives);
+    }
     pools.push(pool);
-    return pool.getBridge(rig.projectDir);
+    return pool.getBridge(projectRoot);
   }
+
+  test("registered hashline relative cat is rewritten by the supervised module", async () => {
+    const projectRoot = await rig.createProject("hashline-relative-cat");
+    await writeFile(
+      join(projectRoot, ".cortexkit", "aft.jsonc"),
+      JSON.stringify(
+        {
+          edit_mode: "hashline",
+          bash: { rewrite: true, background: false },
+          search_index: false,
+          semantic_search: false,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await writeFile(join(projectRoot, "build.rs"), "fn main() {}\n", "utf8");
+    const transport = await bridge(true, projectRoot);
+
+    const result = await transport.toolCall("hashline-bash-cat", "bash", {
+      command: "cat build.rs",
+      foreground_orchestrate: true,
+      compressed: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.text).toMatch(/^\[build\.rs#[0-9A-F]{4}\]/);
+  }, 20_000);
 
   test("preview edit is dry-run, apply mutates, and stale re-apply returns success:false", async () => {
     const transport = await bridge();
