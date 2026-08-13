@@ -5610,6 +5610,25 @@ async fn call_tool_response(
     tool_response_json(&frame)
 }
 
+async fn call_registered_tool_response(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    edit_slot_survives: bool,
+    label: &str,
+) -> Value {
+    send_registered_tool_call(stream, channel, corr, name, arguments, edit_slot_survives).await;
+    let frame = read_frame_timeout(stream, label).await;
+    assert_eq!(
+        frame.header.channel, channel,
+        "unexpected channel for {label}"
+    );
+    assert_eq!(frame.header.corr, corr, "unexpected corr for {label}");
+    tool_response_json(&frame)
+}
+
 /// Tool call over an UNTRUSTED bind — returns the text-only reply.
 async fn call_untrusted_tool_text(
     stream: &mut tokio::net::TcpStream,
@@ -7175,12 +7194,13 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
     .await;
     expect_route_bind_ack(&mut stream, 10).await;
 
-    let read = call_tool_response(
+    let read = call_registered_tool_response(
         &mut stream,
         1,
         100,
         "read",
         json!({ "filePath": "hashline.txt" }),
+        true,
         "hashline tagged read",
     )
     .await;
@@ -7700,6 +7720,34 @@ async fn send_tool_call(
     arguments: Value,
 ) {
     send_tool_call_epoch(stream, channel, 1, corr, name, arguments).await;
+}
+
+async fn send_registered_tool_call(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    edit_slot_survives: bool,
+) {
+    let body = json!({
+        "name": name,
+        "arguments": arguments,
+        "edit_slot_survives": edit_slot_survives,
+    });
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("registered tool call body"),
+        )
+        .expect("registered tool call frame"),
+    )
+    .await;
 }
 
 async fn send_tool_call_epoch(
