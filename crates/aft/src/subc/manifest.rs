@@ -71,6 +71,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   first for every `bash_*` name.
 /// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
 ///   the bound root; scan work runs on the maintenance class either way.
+/// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
+///   the session's enabled hashline edit surface; it returns affected paths
+///   before the plugin requests edit permission.
 pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
@@ -86,6 +89,7 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_unnotify"
             | "bash_wait_detach"
             | "inspect_tier2_run"
+            | "hashline_preflight"
     )
 }
 
@@ -104,6 +108,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "edit_history"
         | "checkpoint_paths"
         | "list_checkpoints"
+        | "hashline_preflight"
         | "conflicts"
         | "glob"
         | "grep"
@@ -507,6 +512,9 @@ mod tests {
         assert!(is_subc_native_plumbing_tool("bash_unnotify"));
         assert!(is_subc_native_plumbing_tool("bash_wait_detach"));
         assert!(is_subc_native_plumbing_tool("inspect_tier2_run"));
+        // Hashline preflight parses the patch and reports permission paths; it
+        // does not mutate files or expose configuration or trust controls.
+        assert!(is_subc_native_plumbing_tool("hashline_preflight"));
 
         // The allowlist is TIGHT — it must not admit the config-bypass vector
         // the fail-closed gate exists to block, nor mutation commands the
@@ -520,8 +528,10 @@ mod tests {
         // of the manifest gate so they never reach the model surface.
         assert!(!is_subc_agent_core_tool("bash_drain_completions"));
         assert!(!is_subc_agent_core_tool("bash_ack_completions"));
+        assert!(!is_subc_agent_core_tool("hashline_preflight"));
 
-        // Lanes are already assigned (pre-existing): drain reads, ack mutates.
+        // Parse-only preflight and completion drain are reads; ack mutates.
+        assert_eq!(command_lane("hashline_preflight"), Lane::PureRead);
         assert_eq!(command_lane("bash_drain_completions"), Lane::PureRead);
         assert_eq!(command_lane("bash_ack_completions"), Lane::Mutating);
     }

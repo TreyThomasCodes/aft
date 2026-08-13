@@ -1010,6 +1010,20 @@ fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn hashline_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "read" => aft::commands::read::handle_read(&req, ctx),
+        "hashline_preflight" => aft::commands::hashline::handle_preflight(&req, ctx),
+        "hashline_edit" => aft::commands::hashline::handle_edit(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected hashline bridge command: {other}"),
+        ),
+    }
+}
+
 pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = current_bridge_state();
     match req.command.as_str() {
@@ -1338,6 +1352,20 @@ fn run_subc_bridge_production_test<F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
+    run_subc_bridge_production_test_with_dispatch(name, watchdog, driver, after, bridge_dispatch);
+}
+
+fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
     run_subc_bridge_test_inner(
         name,
         watchdog,
@@ -1345,7 +1373,7 @@ fn run_subc_bridge_production_test<F, Fut, A>(
         driver,
         after,
         false,
-        bridge_dispatch,
+        dispatch,
         bridge_executor_config(),
     );
 }
@@ -2330,6 +2358,17 @@ fn subc_bridge_new_manifest_tools_route_in_production() {
         Duration::from_secs(90),
         drive_manifest_reachability_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_hashline_preflight_and_edit_round_route_in_production() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_hashline_preflight_and_edit_round_route_in_production",
+        Duration::from_secs(30),
+        drive_hashline_edit_round_daemon,
+        |_, _, _| {},
+        hashline_bridge_dispatch,
     );
 }
 
@@ -7108,6 +7147,93 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         .pointer("/bash/pending_completions")
         .and_then(Value::as_u64)
         .is_some());
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    let target = root1.join("hashline.txt");
+    std::fs::write(&target, "alpha\nbeta\n").expect("write hashline bridge fixture");
+    let canonical_target =
+        std::fs::canonicalize(&target).expect("canonicalize hashline bridge fixture");
+
+    send_route_bind_with_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        json!({
+            "edit_mode": "hashline",
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let read = call_tool_response(
+        &mut stream,
+        1,
+        100,
+        "read",
+        json!({ "filePath": "hashline.txt" }),
+        "hashline tagged read",
+    )
+    .await;
+    assert_tool_success(&read, "hashline tagged read");
+    let tag = read["hashline_tag"]
+        .as_str()
+        .unwrap_or_else(|| panic!("hashline read missing tag: {read:?}"));
+    assert!(
+        read["text"].as_str().unwrap_or_default().starts_with('['),
+        "hashline read should return tagged text: {read:?}"
+    );
+
+    let patch = format!("*** Begin Patch\n[hashline.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
+    let preflight = call_tool_response(
+        &mut stream,
+        1,
+        101,
+        "hashline_preflight",
+        json!({ "patch": patch }),
+        "hashline preflight",
+    )
+    .await;
+    assert_tool_success(&preflight, "hashline preflight");
+    assert_eq!(
+        preflight["affected_paths"],
+        json!([canonical_target.to_string_lossy()]),
+        "preflight should report the edited absolute path: {preflight:?}"
+    );
+    assert_eq!(
+        preflight["affected_rel_paths"],
+        json!(["hashline.txt"]),
+        "preflight should report the edited project path: {preflight:?}"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read preflight target"),
+        b"alpha\nbeta\n",
+        "preflight must not mutate the target"
+    );
+
+    let edit = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "edit",
+        json!({ "patch": patch }),
+        "hashline edit",
+    )
+    .await;
+    assert_tool_success(&edit, "hashline edit");
+    assert_eq!(
+        std::fs::read(&target).expect("read edited hashline target"),
+        b"omega\nbeta\n"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }
