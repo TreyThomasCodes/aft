@@ -260,8 +260,8 @@
     },
     {
       "path": "crates/aft/src/hashline/integration/mod.rs",
-      "location": "line 776, column 14",
-      "line": 776,
+      "location": "line 777, column 14",
+      "line": 777,
       "column": 14,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -269,8 +269,8 @@
     },
     {
       "path": "crates/aft/src/hashline/integration/mod.rs",
-      "location": "line 795, column 48",
-      "line": 795,
+      "location": "line 796, column 48",
+      "line": 796,
       "column": 48,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -278,8 +278,8 @@
     },
     {
       "path": "crates/aft/src/hashline/integration/mod.rs",
-      "location": "line 806, column 61",
-      "line": 806,
+      "location": "line 807, column 61",
+      "line": 807,
       "column": 61,
       "token": "filePath",
       "class": "rust-compatibility",
