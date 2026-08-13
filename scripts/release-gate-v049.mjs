@@ -26,18 +26,23 @@ const SURFACE_MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SOURCE_INVENTORY_PATH = "docs/v0.49-unified-tool-surface-inventory.json";
 const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
 // The surface GENERATION label: manifests describe the v0.49.0 activation
-// surface and keep that identity for the whole 0.49 line.
+// surface, whose identity carries forward until the next surface-changing
+// release. v0.50 keeps the same agent-facing surface in default mode (the
+// hashline gate is opt-in and schema artifacts are byte-identical), so the
+// generation label stays 0.49.0 while released versions advance.
 const TARGET_VERSION = "0.49.0";
 const PREVIOUS_VERSION = "0.48.1";
-// The version actually being released (patch releases move this while the
-// surface generation stays 0.49.0). Version-consistency checks compare
-// against this; surface-identity checks keep TARGET_VERSION.
+// The version actually being released (patch and surface-preserving minor
+// releases move this while the surface generation stays 0.49.0).
+// Version-consistency checks compare against this; surface-identity checks
+// keep TARGET_VERSION.
+const GOVERNED_VERSION_LINES = ["0.49.", "0.50."];
 const RELEASE_VERSION = (() => {
   const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
   const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
   if (!version) fail("could not read the workspace version from crates/aft/Cargo.toml");
-  if (!version.startsWith("0.49."))
-    fail(`workspace version ${version} is outside the v0.49 line this gate governs`);
+  if (!GOVERNED_VERSION_LINES.some((line) => version.startsWith(line)))
+    fail(`workspace version ${version} is outside the version lines this gate governs`);
   return version;
 })();
 const BUN = process.env.BUN_BIN || "bun";
