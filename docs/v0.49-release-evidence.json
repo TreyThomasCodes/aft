@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S6-ACTIVATION-EVIDENCE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "20d671af143e0fafbb85c7b3a765a89f4f4d0f19",
+  "source_commit": "79d64f1d6b2db8505db3b78613ab03420c363212",
   "previous_version": "0.48.1",
   "candidate_version": "0.49.0",
   "capture_rule": "Each prefix and generated-subc value is a complete byte snapshot. A valid profile has exactly old -> candidate and no mixed snapshot.",
@@ -39,7 +39,7 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1202,
-            "sha256": "e7feacdd895450ccab98a748b491941ba0e19412c74779b2184a931e2a7c3684"
+            "sha256": "d12570240d8ec810437bfc6b0b1ecb5d6aa5cfce1050b8c1a5a08b095bf13f89"
           },
           "generated_subc": {
             "complete": true,
@@ -88,7 +88,7 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1406,
-            "sha256": "2bb5c6424379bbbcffd1570aae2586c2ad3469e2259fd55d68ab3a9c1b731ca8"
+            "sha256": "013bb3e844c0bcbe96bc8b04e207d78056236f6337159da3e65dfdf21d7e0bd3"
           },
           "generated_subc": {
             "complete": true,
@@ -137,7 +137,7 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1828,
-            "sha256": "afe200de2309873b0334339cfceedd1a02dfd1679f034122965822745c8b7d23"
+            "sha256": "c6c425f0ca3358710d20bdd1e0eecc5956bd42aa7fcc63964906f24b237a5190"
           },
           "generated_subc": {
             "complete": true,
