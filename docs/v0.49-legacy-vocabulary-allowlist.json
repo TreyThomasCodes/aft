@@ -2939,6 +2939,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/normalize-schemas.test.ts",
+      "location": "file-level",
+      "token": "filePath",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/permission-layer-audit.test.ts",
       "location": "file-level",
       "token": "filePath",
@@ -3038,8 +3045,8 @@
     },
     {
       "path": "packages/opencode-plugin/src/normalize-schemas.ts",
-      "location": "line 100, column 65",
-      "line": 100,
+      "location": "line 101, column 65",
+      "line": 101,
       "column": 65,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -3047,8 +3054,8 @@
     },
     {
       "path": "packages/opencode-plugin/src/normalize-schemas.ts",
-      "location": "line 101, column 9",
-      "line": 101,
+      "location": "line 102, column 9",
+      "line": 102,
       "column": 9,
       "token": "filePath",
       "class": "internal-compatibility",
