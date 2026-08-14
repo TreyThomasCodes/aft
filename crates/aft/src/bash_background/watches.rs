@@ -271,14 +271,16 @@ impl WatchRegistry {
         let mut matches = Vec::new();
         let mut remove_once = Vec::new();
         for watch in watches {
-            if let Some((start, end, matched)) = find_match(&watch.pattern, &text, prefix_len) {
+            if let Some((text_start, text_end, source_start, matched)) =
+                find_match(&watch.pattern, &text, &scan_bytes, prefix_len)
+            {
                 self.matched_tasks.insert(task_id.to_string());
                 matches.push(PatternMatch {
                     watch_id: watch.watch_id.clone(),
                     task_id: watch.task_id.clone(),
                     match_text: matched,
-                    match_offset: scan_base_offset.saturating_add(start as u64),
-                    context: context_snippet(&text, start, end),
+                    match_offset: scan_base_offset.saturating_add(source_start as u64),
+                    context: context_snippet(&text, text_start, text_end),
                     once: watch.once,
                 });
                 if watch.once {
@@ -301,30 +303,66 @@ impl WatchRegistry {
 fn find_match(
     pattern: &WatchPattern,
     text: &str,
-    min_end_exclusive: usize,
-) -> Option<(usize, usize, String)> {
+    source: &[u8],
+    min_source_end_exclusive: usize,
+) -> Option<(usize, usize, usize, String)> {
+    let make_match = |start: usize, end: usize, matched: String| {
+        let source_end = source_offset_for_lossy_utf8(source, end);
+        (source_end > min_source_end_exclusive).then(|| {
+            (
+                start,
+                end,
+                source_offset_for_lossy_utf8(source, start),
+                matched,
+            )
+        })
+    };
     match pattern {
         WatchPattern::Substring(needle) => {
             if needle.is_empty() {
                 return None;
             }
-            let mut search_start = min_end_exclusive.saturating_sub(needle.len().saturating_sub(1));
-            while search_start > 0 && !text.is_char_boundary(search_start) {
-                search_start -= 1;
-            }
-            text.get(search_start..).and_then(|tail| {
-                tail.find(needle).and_then(|relative_start| {
-                    let start = search_start + relative_start;
-                    let end = start + needle.len();
-                    (end > min_end_exclusive).then(|| (start, end, needle.clone()))
-                })
+            text.match_indices(needle).find_map(|(start, matched)| {
+                make_match(start, start + matched.len(), needle.clone())
             })
         }
-        WatchPattern::Regex(regex) => regex
-            .find_iter(text)
-            .find(|m| m.end() > min_end_exclusive)
-            .map(|m| (m.start(), m.end(), m.as_str().to_string())),
+        WatchPattern::Regex(regex) => regex.find_iter(text).find_map(|matched| {
+            make_match(matched.start(), matched.end(), matched.as_str().to_string())
+        }),
     }
+}
+
+fn source_offset_for_lossy_utf8(source: &[u8], lossy_offset: usize) -> usize {
+    let mut source_start = 0;
+    let mut rendered_start = 0;
+    while source_start < source.len() {
+        match std::str::from_utf8(&source[source_start..]) {
+            Ok(valid) => {
+                return source_start
+                    .saturating_add(lossy_offset.saturating_sub(rendered_start).min(valid.len()));
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                let rendered_valid_end = rendered_start.saturating_add(valid_len);
+                if lossy_offset <= rendered_valid_end {
+                    return source_start
+                        .saturating_add(lossy_offset.saturating_sub(rendered_start));
+                }
+                source_start = source_start.saturating_add(valid_len);
+                rendered_start = rendered_valid_end;
+
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| source.len().saturating_sub(source_start));
+                if lossy_offset < rendered_start.saturating_add('\u{FFFD}'.len_utf8()) {
+                    return source_start;
+                }
+                source_start = source_start.saturating_add(invalid_len);
+                rendered_start = rendered_start.saturating_add('\u{FFFD}'.len_utf8());
+            }
+        }
+    }
+    source.len()
 }
 
 fn context_snippet(text: &str, start: usize, end: usize) -> String {
@@ -461,6 +499,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(registry.scan_new_bytes(&task_id, b"READY").len(), 1);
+        assert!(registry.scan_new_bytes(&task_id, b"\n").is_empty());
+    }
+
+    #[test]
+    fn lossy_utf8_indices_are_mapped_back_to_source_offsets() {
+        let mut registry = WatchRegistry::default();
+        let task_id = "bash-1".to_string();
+        registry
+            .register(
+                task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                false,
+            )
+            .unwrap();
+
+        let hits = registry.scan_new_bytes(&task_id, b"\xffREADY");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].match_offset, 1);
         assert!(registry.scan_new_bytes(&task_id, b"\n").is_empty());
     }
 }

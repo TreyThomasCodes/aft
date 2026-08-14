@@ -168,6 +168,31 @@ fn pattern_match_emits_push_frame() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn pattern_match_offset_counts_original_bytes_before_invalid_utf8() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("invalid-utf8-release");
+    let payload = dir.path().join("invalid-utf8-output");
+    fs::write(&payload, b"\xffREADY\n").unwrap();
+    let command = format!(
+        "while [ ! -f {} ]; do sleep 0.05; done; cat {}",
+        shell_quote(&release.display().to_string()),
+        shell_quote(&payload.display().to_string()),
+    );
+    let task_id = spawn(&mut aft, &command);
+    let response = notify(&mut aft, &task_id, json!({ "pattern": "READY" }));
+    assert_eq!(response["success"], true, "notify failed: {response:?}");
+
+    release_task(&release);
+    let frame = wait_for_pattern_frame(&mut aft, &task_id);
+
+    assert_eq!(frame["match_text"], "READY");
+    assert_eq!(frame["match_offset"], 1);
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn cap_8_watches_per_task_rejects_9th() {
     let mut aft = AftProcess::spawn();
