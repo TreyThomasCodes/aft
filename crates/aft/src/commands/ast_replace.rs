@@ -242,18 +242,19 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 1 — parallel compute. Each worker reads, parses, computes edits,
     // and produces the new content. No mutation of shared state, no ctx access.
-    let computed: Vec<FileChange> = scope
+    let outcomes: Vec<Result<Option<FileChange>, (PathBuf, String)>> = scope
         .files
         .par_iter()
-        .filter_map(|file_path| {
-            let original = std::fs::read_to_string(file_path.as_path()).ok()?;
+        .map(|file_path| {
+            let original = std::fs::read_to_string(file_path.as_path())
+                .map_err(|err| (file_path.clone(), err.to_string()))?;
 
             let root = lang.ast_grep(&original);
             // Use replace_all to get ALL edits — root.replace() only replaces the FIRST match.
             // Pass the precompiled `&Pattern` rather than `&str` so we don't reparse per file.
             let mut edits = root.root().replace_all(&compiled_pattern, rewrite.as_str());
             if edits.is_empty() {
-                return None;
+                return Ok(None);
             }
 
             let replacement_count = edits.len();
@@ -269,16 +270,56 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             let new_content = String::from_utf8(new_bytes).unwrap_or_else(|_| original.clone());
 
-            Some(FileChange {
+            Ok(Some(FileChange {
                 file_path: file_path.clone(),
                 original,
                 new_content,
                 replacement_count,
-            })
+            }))
         })
         .collect();
 
-    let files_searched = scope.files.len();
+    let mut computed = Vec::new();
+    let mut read_errors = Vec::new();
+    let mut files_searched = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            Ok(change) => {
+                files_searched += 1;
+                if let Some(change) = change {
+                    computed.push(change);
+                }
+            }
+            Err(error) => read_errors.push(error),
+        }
+    }
+
+    if !read_errors.is_empty() {
+        read_errors.sort_by(|a, b| a.0.cmp(&b.0));
+        let failed_files: Vec<serde_json::Value> = read_errors
+            .iter()
+            .map(|(path, err)| {
+                serde_json::json!({
+                    "file": path.display().to_string(),
+                    "reason": format!("read_error: {err}"),
+                })
+            })
+            .collect();
+        return Response::error_with_data(
+            &req.id,
+            "io_error",
+            format!(
+                "ast_replace: failed to read {} file(s); no files were written",
+                failed_files.len()
+            ),
+            serde_json::json!({
+                "failed_files": failed_files,
+                "files_searched": files_searched,
+                "rolled_back": true,
+            }),
+        );
+    }
+
     let files_with_matches = computed.len();
     let mut total_replacements = 0usize;
     let mut total_files = 0usize;

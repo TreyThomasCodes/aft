@@ -38,6 +38,23 @@ fn count_occurrences(text: &str, needle: &str) -> usize {
     text.matches(needle).count()
 }
 
+fn node_stdout(path: &Path) -> String {
+    let output = std::process::Command::new("node")
+        .arg(path)
+        .output()
+        .expect("Node.js is required for AST replacement runtime tests");
+    assert!(
+        output.status.success(),
+        "Node failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Node stdout should be UTF-8")
+        .trim()
+        .to_string()
+}
+
 fn file_result<'a>(resp: &'a Value, suffix: &str) -> &'a Value {
     // Windows reports paths with backslashes (`src\one.ts`); normalize for
     // suffix matching so the test stays platform-agnostic.
@@ -281,6 +298,98 @@ fn ast_replace_unwritable_target_fails_without_partial_write() {
     );
     assert_eq!(read_file(project.path(), "src/a.ts"), original_a);
     assert_eq!(read_file(project.path(), "src/z.ts"), original_z);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn ast_replace_read_error_fails_without_partial_write() {
+    let project = setup_project(&[("valid.js", "console.log(\"old-valid\");\n")]);
+    let invalid = project.path().join("invalid.js");
+    fs::write(
+        &invalid,
+        b"console.log(\"old-invalid\");\n// non-UTF8 comment: \xff\n",
+    )
+    .expect("write non-UTF8 JavaScript fixture");
+    let valid = project.path().join("valid.js");
+    let valid_before = fs::read(&valid).expect("read valid fixture bytes");
+    let invalid_before = fs::read(&invalid).expect("read invalid fixture bytes");
+
+    // Node executes this file despite the non-UTF8 comment, so silently skipping it
+    // would leave runnable code unchanged while claiming the replacement succeeded.
+    assert_eq!(node_stdout(&invalid), "old-invalid");
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let replace = send(
+        &mut aft,
+        json!({
+            "id": "replace-read-error",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "console.log(\"new\")",
+            "lang": "javascript",
+            "paths": [valid.display().to_string(), invalid.display().to_string()],
+            "dry_run": false,
+        }),
+    );
+
+    assert_eq!(
+        replace["success"], false,
+        "replace should fail: {replace:?}"
+    );
+    assert_eq!(replace["code"], "io_error");
+    assert_eq!(replace["rolled_back"], true);
+    assert_eq!(replace["files_searched"], 1);
+    let failed = replace["failed_files"]
+        .as_array()
+        .expect("failed_files array");
+    assert_eq!(failed.len(), 1, "exactly one file should fail: {replace:?}");
+    assert!(
+        failed[0]["file"]
+            .as_str()
+            .expect("failed file path")
+            .replace('\\', "/")
+            .ends_with("invalid.js"),
+        "failed file should name invalid.js: {replace:?}"
+    );
+    assert!(
+        failed[0]["reason"]
+            .as_str()
+            .expect("failure reason")
+            .contains("read_error"),
+        "failure should identify the read error: {replace:?}"
+    );
+    assert_eq!(
+        fs::read(&valid).expect("read valid fixture after failure"),
+        valid_before,
+        "a readable peer must not be partially rewritten"
+    );
+    assert_eq!(
+        fs::read(&invalid).expect("read invalid fixture after failure"),
+        invalid_before
+    );
+    assert_eq!(node_stdout(&invalid), "old-invalid");
+
+    let valid_only = send(
+        &mut aft,
+        json!({
+            "id": "replace-readable-control",
+            "command": "ast_replace",
+            "pattern": "console.log($ARG)",
+            "rewrite": "console.log(\"new-valid\")",
+            "lang": "javascript",
+            "paths": [valid.display().to_string()],
+            "dry_run": false,
+        }),
+    );
+    assert_eq!(
+        valid_only["success"], true,
+        "readable files should still be rewritten: {valid_only:?}"
+    );
+    assert_eq!(valid_only["total_replacements"], 1);
+    assert_eq!(node_stdout(&valid), "new-valid");
 
     let status = aft.shutdown();
     assert!(status.success());
