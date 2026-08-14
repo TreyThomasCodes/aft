@@ -52,6 +52,7 @@ static CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static SEMANTIC_REFRESH_RESTART_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEMANTIC_REFRESH_RESTART_RESULT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static WORKSPACE_MANIFEST_FINGERPRINT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn note_configure_artifact_load_attempt() {
@@ -805,7 +806,19 @@ fn should_clear_failed_spawns(
         || previous.lsp_inflight_installs != next.lsp_inflight_installs
 }
 
+#[cfg(test)]
+fn reset_workspace_manifest_fingerprint_scans_for_test() {
+    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn workspace_manifest_fingerprint_scans_for_test() -> usize {
+    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(std::cell::Cell::get)
+}
+
 fn workspace_manifest_fingerprint(project_root: &Path) -> String {
+    #[cfg(test)]
+    WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(count.get() + 1));
     let mut parts = Vec::new();
     push_manifest_fingerprint(&mut parts, project_root.join("package.json"));
     let packages_dir = project_root.join("packages");
@@ -1672,6 +1685,7 @@ fn configure_warm_key(
     home_match: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
+    workspace_manifests: Option<&str>,
 ) -> String {
     format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
@@ -1687,7 +1701,7 @@ fn configure_warm_key(
         config.callgraph_store,
         config.callgraph_chunk_size,
         config.inspect.enabled,
-        workspace_manifest_fingerprint(canonical_root),
+        workspace_manifests.unwrap_or_default(),
     )
 }
 
@@ -2036,12 +2050,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             )
         });
     let effective_configure_changed = current_fingerprint.as_ref() != Some(&requested_fingerprint);
+    // Package manifests can only affect callgraph-store warming. Capture their
+    // fingerprint once when that lane is enabled; disabled roots should not stat
+    // every package on every equivalent bind.
+    let workspace_manifests = next_config
+        .callgraph_store
+        .then(|| workspace_manifest_fingerprint(&canonical_cache_root));
     let preflight_warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        workspace_manifests.as_deref(),
     );
     if ctx.configure_generation() > 0
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -2327,6 +2348,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
+        workspace_manifests.as_deref(),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
     let first_session_bind =
@@ -6665,6 +6687,70 @@ mod tests {
     }
 
     #[test]
+    fn workspace_manifest_fingerprint_is_lazy_and_reused_per_configure() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        std::fs::create_dir_all(root.path().join("packages/pkg-a")).unwrap();
+        std::fs::write(root.path().join("packages/pkg-a/package.json"), "{}").unwrap();
+        let ctx = test_context();
+        super::reset_workspace_manifest_fingerprint_scans_for_test();
+
+        let disabled = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        assert!(handle_configure_for_test(&disabled, &ctx).success);
+        let disabled_generation = ctx.configure_generation();
+        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 0);
+        std::fs::write(
+            root.path().join("packages/pkg-a/package.json"),
+            "{\"disabled\":true}",
+        )
+        .unwrap();
+        assert!(handle_configure_for_test(&disabled, &ctx).success);
+        assert_eq!(ctx.configure_generation(), disabled_generation);
+        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 0);
+
+        let enabled = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true
+            }))]
+        }));
+        assert!(handle_configure_for_test(&enabled, &ctx).success);
+        let enabled_generation = ctx.configure_generation();
+        assert_eq!(
+            super::workspace_manifest_fingerprint_scans_for_test(),
+            1,
+            "a full configure must reuse its preflight manifest fingerprint"
+        );
+        std::fs::write(
+            root.path().join("packages/pkg-a/package.json"),
+            "{\"enabled\":true,\"changed\":true}",
+        )
+        .unwrap();
+        assert!(handle_configure_for_test(&enabled, &ctx).success);
+        assert_eq!(ctx.configure_generation(), enabled_generation + 1);
+        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 2);
+        assert!(handle_configure_for_test(&enabled, &ctx).success);
+        assert_eq!(ctx.configure_generation(), enabled_generation + 1);
+        assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
+    }
+
+    #[test]
     fn equivalent_reconfigure_keeps_warm_work_adopted_and_idempotent() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -7585,5 +7671,179 @@ mod tests {
 
         assert!(should_clear_failed_spawns(&previous, &next, true));
         assert!(!should_clear_failed_spawns(&previous, &previous, true));
+    }
+
+    /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.
+    /// The legacy samples explicitly replay the manifest scans removed from the
+    /// handler, keeping before/after timings paired in the same process.
+    /// Run with:
+    /// `cargo test --release -p agent-file-tools configure_bind_path_measurement -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual configure bind-path measurement"]
+    fn configure_bind_path_measurement() {
+        const RUNS: usize = 21;
+        const PACKAGES: usize = 64;
+        const FILES_PER_PACKAGE: usize = 80;
+
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(fixture.path());
+        std::fs::create_dir_all(fixture.path().join(".cortexkit")).unwrap();
+        std::fs::write(
+            fixture.path().join(".cortexkit/aft.jsonc"),
+            r#"{
+                // A representative project config is reparsed by every bind.
+                "format_on_edit": false,
+                "validate_on_edit": "syntax",
+                "formatter": {"typescript": "biome", "rust": "rustfmt"},
+                "checker": {"typescript": "biome", "rust": "cargo"},
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "inspect": {
+                    "enabled": false,
+                    "duplicates": {
+                        "expected_mirrors": [
+                            ["packages/opencode-plugin/**", "packages/pi-plugin/**"],
+                            ["packages/npm/darwin-*/**", "packages/npm/linux-*/**"]
+                        ]
+                    }
+                },
+                "backup": {"enabled": true, "max_depth": 20, "max_file_size": 1048576}
+            }"#,
+        )
+        .unwrap();
+        for package in 0..PACKAGES {
+            let package_root = fixture
+                .path()
+                .join("packages")
+                .join(format!("pkg-{package:02}"));
+            let source_root = package_root.join("src");
+            std::fs::create_dir_all(&source_root).unwrap();
+            std::fs::write(
+                package_root.join("package.json"),
+                format!(r#"{{"name":"@fixture/pkg-{package:02}","version":"1.0.0"}}"#),
+            )
+            .unwrap();
+            for file in 0..FILES_PER_PACKAGE {
+                std::fs::write(
+                    source_root.join(format!("module-{file:03}.ts")),
+                    format!("export const value{file} = {file};\n"),
+                )
+                .unwrap();
+            }
+        }
+
+        let params = json!({
+            "project_root": fixture.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+        });
+        let measure_cold_bind = |session: &str, emulate_legacy_scans: bool| {
+            let ctx = test_context();
+            let req = configure_request_with_session(params.clone(), session);
+            let started = Instant::now();
+            if emulate_legacy_scans {
+                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
+                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
+            }
+            let response = handle_configure_for_test(&req, &ctx);
+            let pre_ack = started.elapsed();
+            assert!(response.success, "cold configure failed: {response:?}");
+            ctx.mark_subc_bound();
+            let started = Instant::now();
+            super::drain_deferred_configure_maintenance(&ctx);
+            (pre_ack, started.elapsed())
+        };
+        let mut legacy_cold_pre_ack = Vec::with_capacity(RUNS);
+        let mut legacy_cold_post_ack = Vec::with_capacity(RUNS);
+        let mut optimized_cold_pre_ack = Vec::with_capacity(RUNS);
+        let mut optimized_cold_post_ack = Vec::with_capacity(RUNS);
+        for run in 0..RUNS {
+            let legacy_session = format!("legacy-cold-{run}");
+            let optimized_session = format!("optimized-cold-{run}");
+            let (first_session, first_legacy, second_session, second_legacy) = if run % 2 == 0 {
+                (&optimized_session, false, &legacy_session, true)
+            } else {
+                (&legacy_session, true, &optimized_session, false)
+            };
+            for (session, legacy) in [
+                (first_session.as_str(), first_legacy),
+                (second_session.as_str(), second_legacy),
+            ] {
+                let (pre_ack, post_ack) = measure_cold_bind(session, legacy);
+                if legacy {
+                    legacy_cold_pre_ack.push(pre_ack);
+                    legacy_cold_post_ack.push(post_ack);
+                } else {
+                    optimized_cold_pre_ack.push(pre_ack);
+                    optimized_cold_post_ack.push(post_ack);
+                }
+            }
+        }
+
+        let ctx = test_context();
+        let initial = configure_request_with_session(params.clone(), "warm-initial");
+        assert!(handle_configure_for_test(&initial, &ctx).success);
+        ctx.mark_subc_bound();
+        super::drain_deferred_configure_maintenance(&ctx);
+        let measure_warm_bind = |req: &RawRequest, emulate_legacy_scan: bool| {
+            let started = Instant::now();
+            if emulate_legacy_scan {
+                std::hint::black_box(super::workspace_manifest_fingerprint(fixture.path()));
+            }
+            let response = handle_configure_for_test(req, &ctx);
+            let pre_ack = started.elapsed();
+            assert!(response.success, "warm configure failed: {response:?}");
+            let started = Instant::now();
+            super::drain_deferred_configure_maintenance(&ctx);
+            (pre_ack, started.elapsed())
+        };
+        let mut legacy_warm_pre_ack = Vec::with_capacity(RUNS);
+        let mut legacy_warm_post_ack = Vec::with_capacity(RUNS);
+        let mut optimized_warm_pre_ack = Vec::with_capacity(RUNS);
+        let mut optimized_warm_post_ack = Vec::with_capacity(RUNS);
+        for run in 0..RUNS {
+            let legacy =
+                configure_request_with_session(params.clone(), &format!("legacy-warm-{run}"));
+            let optimized =
+                configure_request_with_session(params.clone(), &format!("optimized-warm-{run}"));
+            let (first, first_legacy, second, second_legacy) = if run % 2 == 0 {
+                (&optimized, false, &legacy, true)
+            } else {
+                (&legacy, true, &optimized, false)
+            };
+            for (req, legacy) in [(first, first_legacy), (second, second_legacy)] {
+                let (pre_ack, post_ack) = measure_warm_bind(req, legacy);
+                if legacy {
+                    legacy_warm_pre_ack.push(pre_ack);
+                    legacy_warm_post_ack.push(post_ack);
+                } else {
+                    optimized_warm_pre_ack.push(pre_ack);
+                    optimized_warm_post_ack.push(post_ack);
+                }
+            }
+        }
+
+        eprintln!(
+            "configure bind path: files={} packages={PACKAGES} runs={RUNS} legacy_cold_pre_ack_us={} optimized_cold_pre_ack_us={} legacy_cold_post_ack_us={} optimized_cold_post_ack_us={} legacy_warm_pre_ack_us={} optimized_warm_pre_ack_us={} legacy_warm_post_ack_us={} optimized_warm_post_ack_us={}",
+            PACKAGES * FILES_PER_PACKAGE,
+            median(&mut legacy_cold_pre_ack).as_micros(),
+            median(&mut optimized_cold_pre_ack).as_micros(),
+            median(&mut legacy_cold_post_ack).as_micros(),
+            median(&mut optimized_cold_post_ack).as_micros(),
+            median(&mut legacy_warm_pre_ack).as_micros(),
+            median(&mut optimized_warm_pre_ack).as_micros(),
+            median(&mut legacy_warm_post_ack).as_micros(),
+            median(&mut optimized_warm_post_ack).as_micros(),
+        );
     }
 }

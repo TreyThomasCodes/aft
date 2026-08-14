@@ -1828,6 +1828,18 @@ fn subc_bridge_idle_echo_round_trip_benchmark() {
 }
 
 #[test]
+#[ignore = "manual subc configure bind benchmark"]
+fn subc_bridge_configure_bind_benchmark() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_configure_bind_benchmark",
+        Duration::from_secs(120),
+        drive_configure_bind_benchmark_daemon,
+        |_, _, _| {},
+        configure_bind_benchmark_dispatch,
+    );
+}
+
+#[test]
 fn subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots() {
     run_subc_bridge_test(
         "subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots",
@@ -3860,6 +3872,121 @@ async fn drive_watcher_stale_daemon(input: FakeDaemonInput) {
             .await;
     assert_eq!(watcher_pushes.len(), 1);
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+fn configure_bind_benchmark_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "configure" {
+        aft::commands::configure::handle_configure(&req, ctx)
+    } else {
+        Response::error(
+            req.id,
+            "unexpected_command",
+            "configure bind benchmark only accepts configure",
+        )
+    }
+}
+
+async fn drive_configure_bind_benchmark_daemon(input: FakeDaemonInput) {
+    const RUNS: usize = 21;
+    const PACKAGES: usize = 64;
+    const FILES_PER_PACKAGE: usize = 80;
+
+    fn median(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn emulate_legacy_manifest_scan(root: &std::path::Path) {
+        let mut manifests = std::fs::read_dir(root.join("packages"))
+            .expect("packages fixture")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("package.json"))
+            .collect::<Vec<_>>();
+        manifests.sort();
+        let mut fingerprint = Vec::with_capacity(manifests.len() + 1);
+        for path in std::iter::once(root.join("package.json")).chain(manifests) {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                fingerprint.push((path, metadata.len(), metadata.modified().ok()));
+            }
+        }
+        std::hint::black_box(fingerprint);
+    }
+
+    std::fs::write(input.root1.join("README.md"), "# configure bind fixture\n")
+        .expect("benchmark fixture seed");
+    init_git_fixture(&input.root1);
+    for package in 0..PACKAGES {
+        let source_root = input
+            .root1
+            .join("packages")
+            .join(format!("pkg-{package:02}"))
+            .join("src");
+        std::fs::create_dir_all(&source_root).expect("benchmark package source");
+        std::fs::write(
+            source_root
+                .parent()
+                .expect("package root")
+                .join("package.json"),
+            format!(r#"{{"name":"@fixture/pkg-{package:02}","version":"1.0.0"}}"#),
+        )
+        .expect("benchmark package manifest");
+        for file in 0..FILES_PER_PACKAGE {
+            std::fs::write(
+                source_root.join(format!("module-{file:03}.ts")),
+                format!("export const value{file} = {file};\n"),
+            )
+            .expect("benchmark source file");
+        }
+    }
+
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    stream.set_nodelay(true).expect("set benchmark TCP_NODELAY");
+    send_route_bind_with_session(&mut stream, 1, 10, &root1, "warm-initial").await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let mut legacy = Vec::with_capacity(RUNS);
+    let mut optimized = Vec::with_capacity(RUNS);
+    let mut next_channel = 2u16;
+    let mut next_corr = 100u64;
+    for run in 0..RUNS {
+        let order = if run % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for emulate_legacy in order {
+            let started = Instant::now();
+            if emulate_legacy {
+                emulate_legacy_manifest_scan(&root1);
+            }
+            send_route_bind_with_session(
+                &mut stream,
+                next_channel,
+                next_corr,
+                &root1,
+                &format!("bind-benchmark-{next_channel}"),
+            )
+            .await;
+            expect_route_bind_ack(&mut stream, next_corr).await;
+            if emulate_legacy {
+                legacy.push(started.elapsed());
+            } else {
+                optimized.push(started.elapsed());
+            }
+            next_channel += 1;
+            next_corr += 1;
+        }
+    }
+
+    eprintln!(
+        "subc configure bind: files={} packages={PACKAGES} runs={RUNS} legacy_warm_bind_ack_us={} optimized_warm_bind_ack_us={}",
+        PACKAGES * FILES_PER_PACKAGE,
+        median(&mut legacy).as_micros(),
+        median(&mut optimized).as_micros(),
+    );
     send_connection_goodbye(&mut stream).await;
 }
 
