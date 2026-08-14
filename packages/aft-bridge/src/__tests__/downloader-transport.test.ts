@@ -10,10 +10,12 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
@@ -92,6 +94,55 @@ describe("downloadBinary hardened transport", () => {
     ).toEqual([]);
   });
 
+  test("sweeps stale partial download artifacts after acquiring the lock", async () => {
+    const { downloadBinary, getBinaryName } = await import(
+      `../downloader.js?stale-temp-sweep-${Date.now()}`
+    );
+    const assetName = currentAssetName();
+    const payload = Buffer.from("partial artifact sweep");
+    const sha256 = createHash("sha256").update(payload).digest("hex");
+    const versionedDir = join(tmpDir, "aft", "bin", "v1.2.4");
+    const staleTemp = join(versionedDir, `${getBinaryName()}.interrupted.tmp`);
+    const freshTemp = join(versionedDir, `${getBinaryName()}.active.tmp`);
+    mkdirSync(versionedDir, { recursive: true });
+    writeFileSync(staleTemp, "interrupted");
+    writeFileSync(freshTemp, "active");
+    const staleTime = new Date(Date.now() - 11 * 60_000);
+    utimesSync(staleTemp, staleTime, staleTime);
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("checksums.sha256")) {
+        return new Response(`${sha256}  ${assetName}\n`, { status: 200 });
+      }
+      return new Response(payload, { status: 200 });
+    }) as typeof fetch;
+
+    await expect(downloadBinary("v1.2.4")).resolves.toBe(join(versionedDir, getBinaryName()));
+    expect(existsSync(staleTemp)).toBe(false);
+    expect(existsSync(freshTemp)).toBe(true);
+  });
+
+  test("rejects a checksum-mismatched partial download before promotion", async () => {
+    const { downloadBinary, getBinaryName } = await import(
+      `../downloader.js?checksum-promotion-${Date.now()}`
+    );
+    const assetName = currentAssetName();
+    const payload = Buffer.from("untrusted partial artifact");
+    const mismatchedHash = createHash("sha256").update("different bytes").digest("hex");
+    const versionedDir = join(tmpDir, "aft", "bin", "v1.2.5");
+
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("checksums.sha256")) {
+        return new Response(`${mismatchedHash}  ${assetName}\n`, { status: 200 });
+      }
+      return new Response(payload, { status: 200 });
+    }) as typeof fetch;
+
+    await expect(downloadBinary("v1.2.5")).resolves.toBeNull();
+    expect(existsSync(join(versionedDir, getBinaryName()))).toBe(false);
+    expect(readdirSync(versionedDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
   test("ensureBinary redownloads mismatched versioned cache entries", async () => {
     if (!shellFixtureAvailable()) return;
 
@@ -138,6 +189,74 @@ describe("downloadBinary hardened transport", () => {
     release();
 
     expect(readFileSync(lockPath, "utf8")).toBe("other-owner");
+  });
+
+  test("reclaims a lock owned by a dead local PID immediately", async () => {
+    const { __test__ } = await import(`../downloader.js?download-lock-dead-pid-${Date.now()}`);
+    const lockDir = join(tmpDir, "dead-owner");
+    const lockPath = join(lockDir, ".download.lock");
+    const deadPid = 999_999_999;
+    expect(() => process.kill(deadPid, 0)).toThrow();
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(lockPath, `${deadPid}:${Date.now()}:interrupted`);
+
+    const release = await __test__.acquireDownloadLock(lockPath, {
+      timeoutMs: 50,
+      staleMs: 1_000,
+      pollIntervalMs: 5,
+    });
+
+    expect(JSON.parse(readFileSync(lockPath, "utf8"))).toMatchObject({
+      pid: process.pid,
+      hostname: hostname(),
+    });
+    release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("respects a fresh lock held by a live local writer", async () => {
+    const { __test__ } = await import(`../downloader.js?download-lock-live-pid-${Date.now()}`);
+    const lockDir = join(tmpDir, "live-owner");
+    const lockPath = join(lockDir, ".download.lock");
+    mkdirSync(lockDir, { recursive: true });
+
+    const release = await __test__.acquireDownloadLock(lockPath);
+    await expect(
+      __test__.acquireDownloadLock(lockPath, {
+        timeoutMs: 30,
+        staleMs: 1_000,
+        pollIntervalMs: 5,
+      }),
+    ).rejects.toThrow("Timed out waiting for download lock");
+    expect(existsSync(lockPath)).toBe(true);
+    release();
+  });
+
+  test("reclaims an old lock whose live-looking PID belongs to another host", async () => {
+    const { __test__ } = await import(`../downloader.js?download-lock-foreign-${Date.now()}`);
+    const lockDir = join(tmpDir, "foreign-owner");
+    const lockPath = join(lockDir, ".download.lock");
+    mkdirSync(lockDir, { recursive: true });
+    const foreignHostname = hostname() === "other-host" ? "other-host-2" : "other-host";
+    writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: process.pid, hostname: foreignHostname, createdAt: Date.now() }),
+    );
+    const staleTime = new Date(Date.now() - 1_000);
+    utimesSync(lockPath, staleTime, staleTime);
+
+    const release = await __test__.acquireDownloadLock(lockPath, {
+      timeoutMs: 50,
+      staleMs: 20,
+      pollIntervalMs: 5,
+    });
+
+    expect(JSON.parse(readFileSync(lockPath, "utf8"))).toMatchObject({
+      pid: process.pid,
+      hostname: hostname(),
+    });
+    release();
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   test("rejects oversized advertised downloads before buffering", async () => {

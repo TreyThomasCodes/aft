@@ -21,6 +21,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -28,6 +29,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -39,8 +41,10 @@ const REPO = "cortexkit/aft";
 const DOWNLOAD_TIMEOUT_MS = 300_000;
 const LATEST_TAG_TIMEOUT_MS = 30_000;
 const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
-const DOWNLOAD_LOCK_TIMEOUT_MS = 120_000;
 const DOWNLOAD_LOCK_STALE_MS = 10 * 60_000;
+// A waiter must remain active past the stale threshold so a lock held by a
+// crashed or unreachable writer can be reclaimed without a second launch.
+const DOWNLOAD_LOCK_TIMEOUT_MS = DOWNLOAD_LOCK_STALE_MS + 30_000;
 
 /**
  * Read the version string from an `aft` binary by invoking it with
@@ -165,6 +169,37 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   let binaryTimeout: ReturnType<typeof setTimeout> | null = null;
   let checksumTimeout: ReturnType<typeof setTimeout> | null = null;
   const tmpPath = `${binaryPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  const cleanUpPartialDownload = () => {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {
+      // Signal and exit handlers cannot wait for an in-flight stream to close.
+      // A later lock holder sweeps any temp file this synchronous cleanup misses.
+    }
+  };
+  let interrupted = false;
+  const cleanUpInterruptedDownload = () => {
+    if (interrupted) return;
+    interrupted = true;
+    binaryController?.abort();
+    checksumController?.abort();
+    cleanUpPartialDownload();
+    releaseLock?.();
+    releaseLock = null;
+  };
+  const handleSigint = () => {
+    cleanUpInterruptedDownload();
+    process.off("SIGINT", handleSigint);
+    // Installing a signal listener suppresses Node's default SIGINT exit. Send
+    // the signal again after synchronous cleanup to preserve that default.
+    process.kill(process.pid, "SIGINT");
+  };
+  const handleExit = () => cleanUpInterruptedDownload();
+
+  // SIGINT bypasses async catch/finally cleanup. Keep these handlers scoped to
+  // the active download so an interrupted first launch releases its lock.
+  process.once("SIGINT", handleSigint);
+  process.once("exit", handleExit);
 
   try {
     // Ensure versioned cache directory exists before taking the per-version lock.
@@ -173,6 +208,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
 
     releaseLock = await acquireDownloadLock(lockPath);
+    sweepStaleDownloadTemps(versionedCacheDir, binaryName);
 
     // Another process may have completed the same version while we waited.
     // Re-probe here too because a stale owner might have left a mismatched
@@ -286,17 +322,11 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     const msg = err instanceof Error ? err.message : String(err);
     error(`Failed to download AFT binary: ${msg}`);
 
-    // Clean up partial download
-    if (existsSync(tmpPath)) {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // ignore cleanup failure
-      }
-    }
-
+    cleanUpPartialDownload();
     return null;
   } finally {
+    process.off("SIGINT", handleSigint);
+    process.off("exit", handleExit);
     if (binaryTimeout) {
       binaryController?.abort();
       clearTimeout(binaryTimeout);
@@ -340,45 +370,152 @@ export async function ensureBinary(version?: string): Promise<string | null> {
   return downloadBinary();
 }
 
-async function acquireDownloadLock(lockPath: string): Promise<() => void> {
+type DownloadLockTiming = {
+  timeoutMs?: number;
+  staleMs?: number;
+  pollIntervalMs?: number;
+};
+
+type DownloadLockOwner = {
+  pid: number | null;
+  hostname: string | null;
+};
+
+function createDownloadLockOwner(): string {
+  return JSON.stringify({
+    pid: process.pid,
+    hostname: hostname(),
+    createdAt: Date.now(),
+    token: randomUUID(),
+  });
+}
+
+function parseDownloadLockOwner(raw: string): DownloadLockOwner {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null) {
+      const { pid, hostname: ownerHostname } = parsed as Record<string, unknown>;
+      return {
+        pid: typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+        hostname: typeof ownerHostname === "string" && ownerHostname ? ownerHostname : null,
+      };
+    }
+  } catch {
+    // Older lock files used colon-delimited owner strings without a hostname.
+  }
+
+  const legacyPid = Number(raw.split(":", 1)[0]);
+  return {
+    pid: Number.isSafeInteger(legacyPid) && legacyPid > 0 ? legacyPid : null,
+    hostname: null,
+  };
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // ESRCH means no process has this PID. Permission errors still mean the
+    // process exists, and unknown failures are safer to treat as live.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function isReclaimableDownloadLock(
+  owner: DownloadLockOwner,
+  ageMs: number,
+  staleMs: number,
+): boolean {
+  if (Math.abs(ageMs) > staleMs) return true;
+  // Legacy locks omitted a hostname and were written to the local cache. A
+  // recorded foreign hostname is the only case where probing its PID is unsafe.
+  return (
+    (owner.hostname === null || owner.hostname === hostname()) &&
+    owner.pid !== null &&
+    !isProcessAlive(owner.pid)
+  );
+}
+
+function reclaimDownloadLock(lockPath: string, expectedOwner: string): boolean {
+  try {
+    // Re-check ownership immediately before removing the file so a waiter does
+    // not delete a replacement lock that another process acquired meanwhile.
+    if (readFileSync(lockPath, "utf-8") !== expectedOwner) return false;
+    rmSync(lockPath, { force: true });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw err;
+  }
+}
+
+function sweepStaleDownloadTemps(versionedCacheDir: string, binaryName: string): void {
+  const tempPrefix = `${binaryName}.`;
+  try {
+    for (const entry of readdirSync(versionedCacheDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.startsWith(tempPrefix) || !entry.name.endsWith(".tmp")) {
+        continue;
+      }
+      const tempPath = join(versionedCacheDir, entry.name);
+      const ageMs = Date.now() - statSync(tempPath).mtimeMs;
+      // Treat large future ages as stale too; a backward clock adjustment
+      // should not make an interrupted artifact permanent.
+      if (Math.abs(ageMs) > DOWNLOAD_LOCK_STALE_MS) unlinkSync(tempPath);
+    }
+  } catch {
+    // Temp cleanup is best-effort. A failed sweep must not block a download.
+  }
+}
+
+async function acquireDownloadLock(
+  lockPath: string,
+  timing: DownloadLockTiming = {},
+): Promise<() => void> {
+  const timeoutMs = timing.timeoutMs ?? DOWNLOAD_LOCK_TIMEOUT_MS;
+  const staleMs = timing.staleMs ?? DOWNLOAD_LOCK_STALE_MS;
+  const pollIntervalMs = timing.pollIntervalMs ?? 100;
   const startedAt = Date.now();
   while (true) {
     try {
-      const owner = `${process.pid}:${Date.now()}:${randomUUID()}`;
+      const owner = createDownloadLockOwner();
       const fd = openSync(lockPath, "wx");
-      writeSync(fd, owner);
+      try {
+        writeSync(fd, owner);
+      } finally {
+        closeSync(fd);
+      }
       return () => {
-        try {
-          closeSync(fd);
-        } catch {
-          // already closed — ignore
-        }
         try {
           if (readFileSync(lockPath, "utf-8") === owner) {
             rmSync(lockPath, { force: true });
           }
         } catch {
-          // best-effort lock cleanup; missing or reclaimed locks are fine
+          // Best-effort lock cleanup; missing or reclaimed locks are fine.
         }
       };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw err;
 
+      let existingOwner: string;
+      let ageMs: number;
       try {
-        const ageMs = Date.now() - statSync(lockPath).mtimeMs;
-        if (ageMs > DOWNLOAD_LOCK_STALE_MS) {
-          rmSync(lockPath, { force: true });
-          continue;
-        }
-      } catch {
-        continue;
+        existingOwner = readFileSync(lockPath, "utf-8");
+        ageMs = Date.now() - statSync(lockPath).mtimeMs;
+      } catch (readErr) {
+        if ((readErr as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw readErr;
       }
 
-      if (Date.now() - startedAt > DOWNLOAD_LOCK_TIMEOUT_MS) {
+      if (isReclaimableDownloadLock(parseDownloadLockOwner(existingOwner), ageMs, staleMs)) {
+        if (reclaimDownloadLock(lockPath, existingOwner)) continue;
+      }
+
+      if (Date.now() - startedAt > timeoutMs) {
         throw new Error(`Timed out waiting for download lock: ${lockPath}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
   }
 }
