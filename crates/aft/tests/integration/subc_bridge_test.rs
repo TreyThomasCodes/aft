@@ -32,7 +32,7 @@ use subc_protocol::{
     Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
-use subc_transport::{authenticate_server, read_frame, write_frame};
+use subc_transport::{authenticate_server, read_frame as read_subc_frame, write_frame};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
@@ -5210,6 +5210,79 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn expect_fleet_status_exchange(
+    stream: &mut tokio::net::TcpStream,
+    root: &std::path::Path,
+    session_id: &str,
+) {
+    let publish = tokio::time::timeout(Duration::from_secs(5), read_subc_frame(stream))
+        .await
+        .expect("status.publish timeout")
+        .expect("status.publish read")
+        .expect("status.publish EOF");
+    assert_eq!(publish.header.ty, FrameType::Request);
+    assert_eq!(publish.header.channel, 0);
+    assert_eq!(
+        publish.header.flags,
+        Flags::new(false, Priority::Passive, true)
+    );
+    let publish_body: Value = serde_json::from_slice(&publish.body).expect("status.publish body");
+    assert_eq!(publish_body["op"], "status.publish");
+    assert_eq!(publish_body["module"], "aft");
+    assert_eq!(
+        publish_body["scope"],
+        format!("project:{}", root.to_string_lossy())
+    );
+    assert_eq!(publish_body["text"], "E0 W0 | D21 U12 C13 | T14");
+    assert_eq!(publish_body["ttl_ms"], 7_500);
+    assert_eq!(publish_body["revision"], 1);
+    let publish_response = Frame::build_with_version(
+        publish.header.ver,
+        FrameType::Response,
+        publish.header.flags,
+        0,
+        0,
+        publish.header.corr,
+        serde_json::to_vec(&producer_status_fixture("publish_aft")).expect("publish fixture"),
+    )
+    .expect("status.publish response");
+    send_frame(stream, publish_response).await;
+
+    let line = tokio::time::timeout(Duration::from_secs(5), read_subc_frame(stream))
+        .await
+        .expect("status.line timeout")
+        .expect("status.line read")
+        .expect("status.line EOF");
+    assert_eq!(line.header.ty, FrameType::Request);
+    assert_eq!(line.header.channel, 0);
+    assert_eq!(
+        line.header.flags,
+        Flags::new(false, Priority::Passive, true)
+    );
+    let line_body: Value = serde_json::from_slice(&line.body).expect("status.line body");
+    assert_eq!(line_body["op"], "status.line");
+    assert_eq!(
+        line_body["scopes"],
+        json!([
+            "global",
+            format!("project:{}", root.to_string_lossy()),
+            format!("session:{session_id}"),
+        ])
+    );
+    let line_response = Frame::build_with_version(
+        line.header.ver,
+        FrameType::Response,
+        line.header.flags,
+        0,
+        0,
+        line.header.corr,
+        serde_json::to_vec(&producer_status_fixture("line_foreign_present"))
+            .expect("status.line fixture"),
+    )
+    .expect("status.line response");
+    send_frame(stream, line_response).await;
+}
+
 async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -5229,6 +5302,7 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
         json!({ "case": "status_bar", "dead_code": 21 }),
     )
     .await;
+    expect_fleet_status_exchange(&mut stream, &root1, "session-1").await;
     let status_bar_read = read_frame_timeout(&mut stream, "status-bar read response").await;
     assert_eq!(status_bar_read.header.corr, 80);
     let status_bar_response = tool_response_json(&status_bar_read);
@@ -5236,6 +5310,10 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     assert_eq!(status_bar_response["status_bar"]["unused_exports"], 12);
     assert_eq!(status_bar_response["status_bar"]["duplicates"], 13);
     assert_eq!(status_bar_response["status_bar"]["todos"], 14);
+    assert_eq!(
+        status_bar_response["status_bar"]["line"],
+        "[CK: aft E0 W0 idx fresh | pfc 1567 events (777 gaps)]"
+    );
 
     // A completed bg-bash task for the bound route's BindIdentity.session is
     // attached to subsequent non-skip responses. The bash_status poll itself is
@@ -8195,8 +8273,57 @@ async fn send_frame(stream: &mut tokio::net::TcpStream, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
 
+fn producer_status_fixture(name: &str) -> Value {
+    static FIXTURES: OnceLock<Value> = OnceLock::new();
+    FIXTURES
+        .get_or_init(|| {
+            serde_json::from_str(include_str!(
+                "../../../../.cortexkit/status-line-fixtures-2026-08-14.json"
+            ))
+            .expect("producer status-line fixtures")
+        })
+        .get(name)
+        .unwrap_or_else(|| panic!("missing producer status fixture {name}"))
+        .clone()
+}
+
+async fn read_frame_servicing_status(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<Option<Frame>, subc_transport::FrameIoError> {
+    loop {
+        let Some(frame) = read_subc_frame(stream).await? else {
+            return Ok(None);
+        };
+        let op = (frame.header.ty == FrameType::Request && frame.header.channel == 0)
+            .then(|| serde_json::from_slice::<Value>(&frame.body).ok())
+            .flatten()
+            .and_then(|body| body.get("op").and_then(Value::as_str).map(str::to_owned));
+        let fixture = match op.as_deref() {
+            Some("status.publish") => Some(producer_status_fixture("publish_aft_project")),
+            Some("status.line") => Some(producer_status_fixture("line_aft_solo_scope")),
+            _ => None,
+        };
+        let Some(fixture) = fixture else {
+            return Ok(Some(frame));
+        };
+        let response = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Response,
+            frame.header.flags,
+            0,
+            0,
+            frame.header.corr,
+            serde_json::to_vec(&fixture).expect("status fixture body"),
+        )
+        .expect("status fixture response frame");
+        write_frame(stream, &response)
+            .await
+            .expect("write status fixture response");
+    }
+}
+
 async fn read_any_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> Frame {
-    tokio::time::timeout(Duration::from_secs(30), read_frame(stream))
+    tokio::time::timeout(Duration::from_secs(30), read_frame_servicing_status(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
         .expect("read frame")
@@ -8209,7 +8336,7 @@ async fn read_frame_timeout(stream: &mut tokio::net::TcpStream, label: &str) -> 
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for {label}");
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
             .expect("read frame")
@@ -8232,7 +8359,8 @@ async fn read_frame_within(
             return None;
         }
         let remaining = deadline.saturating_duration_since(now);
-        let frame = match tokio::time::timeout(remaining, read_frame(stream)).await {
+        let frame = match tokio::time::timeout(remaining, read_frame_servicing_status(stream)).await
+        {
             Ok(Ok(Some(frame))) => frame,
             Ok(Ok(None)) => panic!("EOF waiting for {label}"),
             Ok(Err(error)) => panic!("read frame for {label}: {error}"),
@@ -8267,7 +8395,7 @@ async fn read_any_frame_until(
         return None;
     }
     let remaining = deadline.saturating_duration_since(now);
-    match tokio::time::timeout(remaining, read_frame(stream)).await {
+    match tokio::time::timeout(remaining, read_frame_servicing_status(stream)).await {
         Ok(Ok(Some(frame))) => Some(frame),
         Ok(Ok(None)) => panic!("EOF waiting for {label}"),
         Ok(Err(error)) => panic!("read frame for {label}: {error}"),
@@ -8680,7 +8808,7 @@ async fn expect_configure_warning_pushes(
             "timed out waiting for configure_warnings push"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for configure_warnings push"))
             .expect("read frame")
@@ -8731,7 +8859,7 @@ async fn expect_tool_response_without_configure_warning_for_message(
             "timed out waiting for sentinel response without configure warning"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| {
                 panic!("timed out waiting for sentinel response without configure warning")
@@ -8784,7 +8912,7 @@ async fn expect_bash_completed_pushes_for_tool(
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for bash push {task_id}");
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for bash push {task_id}"))
             .expect("read frame")
@@ -8846,7 +8974,7 @@ async fn expect_route_bind_ack_and_status_pushes(
             "timed out waiting for RouteBindAck {corr} and marker {marker}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| {
                 panic!("timed out waiting for RouteBindAck {corr} and marker {marker}")
@@ -8915,7 +9043,7 @@ async fn expect_route_bind_ack_status_and_bash_completed_pushes(
             "timed out waiting for RouteBindAck {corr}, marker {marker}, and bash push {task_id}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| {
                 panic!(
@@ -8992,7 +9120,7 @@ async fn expect_bash_completed_sentinel_without_task_before(
             "timed out waiting for sentinel bash push {sentinel_task_id}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| {
                 panic!("timed out waiting for sentinel bash push {sentinel_task_id}")
@@ -9052,7 +9180,7 @@ async fn expect_route_bind_ack_and_bash_completed_push(
             "timed out waiting for RouteBindAck {corr} and replay {task_id}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| {
                 panic!("timed out waiting for RouteBindAck {corr} and replay {task_id}")
@@ -9090,7 +9218,7 @@ async fn expect_route_bind_ack_without_task_push(
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for RouteBindAck {corr}");
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for RouteBindAck {corr}"))
             .expect("read frame")
@@ -9129,7 +9257,7 @@ async fn expect_watcher_stale_status_pushes_for_tool(
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for watcher stale push");
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for watcher stale push"))
             .expect("read frame")
@@ -9191,7 +9319,7 @@ async fn expect_semantic_refresh_status_pushes_for_tool(
             "timed out waiting for semantic refresh status push"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for semantic refresh status push"))
             .expect("read frame")
@@ -9249,7 +9377,7 @@ async fn expect_status_pushes_for_tool(
         let now = Instant::now();
         assert!(now < deadline, "timed out waiting for push marker {marker}");
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker}"))
             .expect("read frame")
@@ -9298,7 +9426,7 @@ async fn expect_status_pushes_for_marker_seq(
             "timed out waiting for push marker {marker} seq {seq}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for push marker {marker} seq {seq}"))
             .expect("read frame")
@@ -9351,7 +9479,7 @@ async fn expect_status_sentinel_without_marker_before(
             "timed out waiting for sentinel marker {sentinel_marker}"
         );
         let remaining = deadline.saturating_duration_since(now);
-        let frame = tokio::time::timeout(remaining, read_frame(stream))
+        let frame = tokio::time::timeout(remaining, read_frame_servicing_status(stream))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for sentinel marker {sentinel_marker}"))
             .expect("read frame")

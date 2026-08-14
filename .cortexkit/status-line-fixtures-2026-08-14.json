@@ -1,0 +1,243 @@
+{
+ "publish_aft": {
+  "accepted_revision": 1,
+  "epoch": 3
+ },
+ "line_foreign_present": {
+  "line": "aft E0 W0 idx fresh | pfc 1567 events (777 gaps)",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   }
+  ]
+ },
+ "supersede_r3": {
+  "accepted_revision": 3,
+  "epoch": 3
+ },
+ "supersede_line_after_r3": {
+  "line": "aft E0 W0 idx fresh | fx revision three | pfc 1567 events (777 gaps)",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   }
+  ]
+ },
+ "supersede_r2_late": {
+  "accepted_revision": 3,
+  "epoch": 3
+ },
+ "supersede_line_after_late_r2": {
+  "line": "aft E0 W0 idx fresh | fx revision three | pfc 1567 events (777 gaps)",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   }
+  ]
+ },
+ "ttl_publish": {
+  "accepted_revision": 1,
+  "epoch": 3
+ },
+ "ttl_line_before": {
+  "line": "aft E0 W0 idx fresh | fx revision three | pfc 1567 events (777 gaps) | ttlfx short lived",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   },
+   {
+    "module": "ttlfx",
+    "scope": "global",
+    "text": "short lived"
+   }
+  ]
+ },
+ "ttl_line_after_expiry": {
+  "line": "aft E0 W0 idx fresh | fx revision three | pfc 1567 events (777 gaps)",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   }
+  ]
+ },
+ "quiet_publish_empty_text": {
+  "accepted_revision": 2,
+  "epoch": 3
+ },
+ "quiet_line": {
+  "line": "aft E0 W0 idx fresh | fx revision three | pfc 1567 events (777 gaps)",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   },
+   {
+    "module": "ttlfx",
+    "scope": "global",
+    "text": ""
+   }
+  ]
+ },
+ "fat1": {
+  "accepted_revision": 1,
+  "epoch": 3
+ },
+ "fat2": {
+  "accepted_revision": 1,
+  "epoch": 3
+ },
+ "line_cap_overflow": {
+  "line": "aft E0 W0 idx fresh | fat1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fat1",
+    "scope": "global",
+    "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   {
+    "module": "fat2",
+    "scope": "global",
+    "text": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "revision three"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   },
+   {
+    "module": "ttlfx",
+    "scope": "global",
+    "text": ""
+   }
+  ]
+ },
+ "epoch_bump_republish_r1_new_conn": {
+  "accepted_revision": 1,
+  "epoch": 4
+ },
+ "epoch_bump_line_after": {
+  "line": "aft E0 W0 idx fresh | fat1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "global",
+    "text": "E0 W0 idx fresh"
+   },
+   {
+    "module": "fat1",
+    "scope": "global",
+    "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   {
+    "module": "fat2",
+    "scope": "global",
+    "text": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+   },
+   {
+    "module": "fx",
+    "scope": "global",
+    "text": "fresh epoch revision one"
+   },
+   {
+    "module": "pfc",
+    "scope": "global",
+    "text": "1567 events (777 gaps)"
+   },
+   {
+    "module": "ttlfx",
+    "scope": "global",
+    "text": ""
+   }
+  ]
+ },
+ "publish_aft_project": {
+  "accepted_revision": 1,
+  "epoch": 4
+ },
+ "line_aft_solo_scope": {
+  "line": "aft solo scope segment",
+  "segments": [
+   {
+    "module": "aft",
+    "scope": "project:/tmp/fixture-solo",
+    "text": "solo scope segment"
+   }
+  ]
+ }
+}

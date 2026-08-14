@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::config_resolve::ConfigTier;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
 use crate::executor::{Executor, Lane};
+use crate::fleet_status::{FleetStatusClient, StatusWireRequest};
 use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
@@ -156,7 +157,7 @@ use self::health::{
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
-    is_subc_agent_core_tool, is_subc_native_plumbing_tool,
+    is_subc_agent_core_tool, is_subc_native_plumbing_tool, module_internal_flags,
 };
 pub use self::wire::SubcError;
 
@@ -170,7 +171,8 @@ use self::wire::{
     build_error_frame, build_goodbye_frame, build_tool_response_frame,
     build_tool_response_frame_with_limit, decrement_counted_channel, response_is_fatal_panic,
     response_message, send_counted_channel, send_frame, send_reliable_writer_frame,
-    send_traced_tool_response_frame, ToolResponseWriteTrace, WriterFrame, WriterSender,
+    send_traced_tool_response_frame, try_enqueue_writer_frame, ToolResponseWriteTrace,
+    WriterEnqueueOutcome, WriterFrame, WriterSender,
 };
 
 struct DecodedFrame {
@@ -189,6 +191,7 @@ struct PushSenders {
     reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
     lossy_overflow: Arc<push::LossyOverflow>,
     lossy_seq: Arc<AtomicU64>,
+    fleet_status_client: FleetStatusClient,
 }
 
 #[derive(Clone)]
@@ -2374,11 +2377,13 @@ where
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
+    let (fleet_status_client, mut fleet_status_rx) = FleetStatusClient::channel(64);
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
         lossy_overflow: Arc::clone(&lossy_overflow),
         lossy_seq,
+        fleet_status_client,
     };
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
@@ -2398,6 +2403,8 @@ where
     let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
     let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
     let mut next_bash_ask_corr: u64 = 1;
+    let mut pending_status_requests: HashMap<u64, (Instant, StatusWireRequest)> = HashMap::new();
+    let mut next_status_corr: u64 = HELLO_CORR + 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let health_rollup_cache = HealthRollupCache::new();
     health_rollup_cache.refresh(&executor, &shared_app);
@@ -2411,6 +2418,15 @@ where
         }
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
+        let expired_status_corrs = pending_status_requests
+            .iter()
+            .filter_map(|(corr, (expires_at, _))| (Instant::now() >= *expires_at).then_some(*corr))
+            .collect::<Vec<_>>();
+        for corr in expired_status_corrs {
+            if let Some((_, request)) = pending_status_requests.remove(&corr) {
+                request.complete_unavailable();
+            }
+        }
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
             &mut pending_bash_asks,
@@ -2558,6 +2574,43 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
+            Some(request) = fleet_status_rx.recv() => {
+                let corr = loop {
+                    let corr = next_status_corr;
+                    next_status_corr = next_status_corr.wrapping_add(1).max(HELLO_CORR + 1);
+                    if !pending_status_requests.contains_key(&corr) {
+                        break corr;
+                    }
+                };
+                let frame = serde_json::to_vec(request.body())
+                    .ok()
+                    .and_then(|body| {
+                        Frame::build(
+                            FrameType::Request,
+                            module_internal_flags(),
+                            0,
+                            0,
+                            corr,
+                            body,
+                        )
+                        .ok()
+                    });
+                let Some(frame) = frame else {
+                    request.complete_unavailable();
+                    continue;
+                };
+                match try_enqueue_writer_frame(&writer_tx, &dispatch_path_metrics, frame) {
+                    WriterEnqueueOutcome::Enqueued => {
+                        pending_status_requests.insert(
+                            corr,
+                            (Instant::now() + DRAIN_TICK_PERIOD, request),
+                        );
+                    }
+                    WriterEnqueueOutcome::Full(_) | WriterEnqueueOutcome::Closed => {
+                        request.complete_unavailable();
+                    }
+                }
+            }
             maybe_frame = reader_rx.recv() => {
                 let frame = match maybe_frame {
                     None => {
@@ -2652,6 +2705,15 @@ where
                         .await
                         {
                             break Err(error);
+                        }
+                    }
+                    FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+                        if let Some((_, request)) = pending_status_requests.remove(&frame.header.corr) {
+                            if frame.header.ty == FrameType::Response {
+                                request.complete_response(&frame.body);
+                            } else {
+                                request.complete_unavailable();
+                            }
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
@@ -2978,6 +3040,9 @@ where
     );
 
     let mut loop_result = loop_result;
+    for (_, (_, request)) in pending_status_requests.drain() {
+        request.complete_unavailable();
+    }
     if !pending_bash_asks.is_empty() {
         let no_routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
         if let Err(error) = settle_all_pending_bash_asks(
@@ -3191,6 +3256,7 @@ fn register_actor_for_bind(
         Config::default(),
     ));
     install_bash_compressor(&actor_ctx);
+    actor_ctx.install_fleet_status_client(Some(push_senders.fleet_status_client.clone()));
     actor_ctx.set_progress_sender(Some(push::progress_sender_for_root(
         push_senders.clone(),
         bind_root_id.clone(),

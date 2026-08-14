@@ -1077,7 +1077,7 @@ mod pending_response_tests {
             fixture_with_completion_and_status(session_id, "bash-0000000000000501");
         let mut inline = Response::success("req-finalize", serde_json::json!({"value": true}));
         attach_bg_completions(&mut inline, &inline_fixture.ctx, session_id, "read");
-        attach_status_bar(&mut inline, &inline_fixture.ctx, "read");
+        attach_status_bar(&mut inline, &inline_fixture.ctx, session_id, "read");
 
         let helper_fixture =
             fixture_with_completion_and_status(session_id, "bash-0000000000000501");
@@ -2355,19 +2355,19 @@ mod watcher_filter_tests {
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
 
         let mut first = Response::success("one", serde_json::json!({}));
-        attach_status_bar(&mut first, &ctx, "read");
+        attach_status_bar(&mut first, &ctx, "session-status", "read");
         assert_eq!(first.data["status_bar"]["dead_code"], 1);
         assert_eq!(first.data["status_bar"]["unused_exports"], 2);
         assert_eq!(first.data["status_bar"]["duplicates"], 3);
         assert_eq!(first.data["status_bar"]["todos"], 4);
 
         let mut unchanged = Response::success("two", serde_json::json!({}));
-        attach_status_bar(&mut unchanged, &ctx, "read");
+        attach_status_bar(&mut unchanged, &ctx, "session-status", "read");
         assert!(unchanged.data.get("status_bar").is_none());
 
         ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
         let mut changed = Response::success("three", serde_json::json!({}));
-        attach_status_bar(&mut changed, &ctx, "read");
+        attach_status_bar(&mut changed, &ctx, "session-status", "read");
         assert_eq!(changed.data["status_bar"]["dead_code"], 5);
     }
 

@@ -1539,6 +1539,7 @@ mod tests {
                 reliable_tx,
                 lossy_overflow: Arc::clone(&lossy_overflow),
                 lossy_seq: Arc::new(AtomicU64::new(0)),
+                fleet_status_client: FleetStatusClient::channel(1).0,
             },
             root.clone(),
         );

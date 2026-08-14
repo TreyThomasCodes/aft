@@ -21,7 +21,7 @@ pub fn finalize_response_with_bg_completions(
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
-    attach_status_bar(response, ctx, attach_command);
+    attach_status_bar(response, ctx, session_id, attach_command);
 }
 
 pub enum DispatchOutcome {
@@ -130,13 +130,33 @@ pub fn attach_bg_completions(
     }
 }
 
+fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
+    let stale_mark = if counts.tier2_stale { "~" } else { "" };
+    format!(
+        "E{} W{} | {}D{} U{} C{} | T{}",
+        counts.errors,
+        counts.warnings,
+        stale_mark,
+        counts.dead_code,
+        counts.unused_exports,
+        counts.duplicates,
+        counts.todos
+    )
+}
+
 /// Attach the agent status-bar counts to the response envelope so the plugin
 /// after-hook can surface the IDE-style status bar (emit-on-change). Skips
 /// internal/transport commands that don't represent agent tool calls (their
 /// responses never reach the agent, and bash-lifecycle commands fire rapidly).
 /// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
-/// last-known. Omitted entirely until the Tier-2 cache is populated once.
-pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &str) {
+/// last-known. Before Tier-2 is populated, the payload remains omitted unless a
+/// daemon pull supplies a foreign fleet segment.
+pub fn attach_status_bar(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    command: &str,
+) {
     // Cross-root indexed searches report on a borrowed project, so attaching the
     // session project's diagnostics footer would falsely attribute unrelated
     // counts to the external results. The command sets this private marker and
@@ -168,13 +188,25 @@ pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &st
     ) {
         return;
     }
-    let Some(counts) = ctx.status_bar_counts() else {
-        return;
+    let local_counts = ctx.status_bar_counts();
+    let fleet_line = ctx.fleet_status_client().and_then(|client| {
+        let config = ctx.config();
+        let project_root = config.project_root.as_deref()?;
+        let aft_text = local_counts
+            .as_ref()
+            .map(aft_status_segment)
+            .unwrap_or_default();
+        client.render(project_root, session_id, &aft_text)
+    });
+    let counts = match local_counts {
+        Some(counts) => counts,
+        None if fleet_line.is_some() => crate::context::StatusBarCounts::default(),
+        None => return,
     };
-    if !ctx.should_emit_status_bar(&counts) {
+    if !ctx.should_emit_status_bar(&counts, fleet_line.as_deref()) {
         return;
     }
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "errors": counts.errors,
         "warnings": counts.warnings,
         "dead_code": counts.dead_code,
@@ -183,6 +215,9 @@ pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &st
         "todos": counts.todos,
         "tier2_stale": counts.tier2_stale,
     });
+    if let (Some(data), Some(line)) = (value.as_object_mut(), fleet_line) {
+        data.insert("line".to_string(), serde_json::Value::String(line));
+    }
     match response.data.as_object_mut() {
         Some(data) => {
             data.insert("status_bar".to_string(), value);
@@ -190,5 +225,41 @@ pub fn attach_status_bar(response: &mut Response, ctx: &AppContext, command: &st
         None => {
             response.data = serde_json::json!({ "status_bar": value });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aft_status_segment;
+    use crate::context::StatusBarCounts;
+
+    #[test]
+    fn solo_bar_bytes_remain_the_existing_golden() {
+        let counts = StatusBarCounts {
+            errors: 2,
+            warnings: 5,
+            dead_code: 331,
+            unused_exports: 221,
+            duplicates: 1159,
+            todos: 8,
+            tier2_stale: false,
+        };
+        assert_eq!(
+            format!("[AFT {}]", aft_status_segment(&counts)),
+            "[AFT E2 W5 | D331 U221 C1159 | T8]"
+        );
+    }
+
+    #[test]
+    fn solo_bar_stale_marker_bytes_remain_the_existing_golden() {
+        let counts = StatusBarCounts {
+            dead_code: 10,
+            tier2_stale: true,
+            ..StatusBarCounts::default()
+        };
+        assert_eq!(
+            format!("[AFT {}]", aft_status_segment(&counts)),
+            "[AFT E0 W0 | ~D10 U0 C0 | T0]"
+        );
     }
 }

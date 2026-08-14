@@ -20,6 +20,8 @@ export interface StatusBarCounts {
   todos: number;
   /** Tier-2 counts (D/U/C) predate the latest edit; rendered with a `~` marker. */
   tier2_stale: boolean;
+  /** Complete fleet bar assembled by the status holder; present when a non-AFT module reports non-empty text. */
+  line?: string;
 }
 
 /**
@@ -55,6 +57,7 @@ export function parseStatusBarCounts(value: unknown): StatusBarCounts | undefine
     duplicates: num("duplicates"),
     todos: num("todos"),
     tier2_stale: record.tier2_stale === true,
+    ...(typeof record.line === "string" ? { line: record.line } : {}),
   };
 }
 
@@ -66,7 +69,8 @@ function countsEqual(a: StatusBarCounts, b: StatusBarCounts): boolean {
     a.unused_exports === b.unused_exports &&
     a.duplicates === b.duplicates &&
     a.todos === b.todos &&
-    a.tier2_stale === b.tier2_stale
+    a.tier2_stale === b.tier2_stale &&
+    a.line === b.line
   );
 }
 
@@ -99,6 +103,7 @@ export function shouldEmitStatusBar(state: StatusBarEmitState, next: StatusBarCo
  * Stale:   `[AFT E2 W5 | ~D331 U221 C1159 | T8]`
  */
 export function formatStatusBar(counts: StatusBarCounts): string {
+  if (counts.line !== undefined) return counts.line;
   const staleMark = counts.tier2_stale ? "~" : "";
   return (
     `[AFT E${counts.errors} W${counts.warnings} | ` +

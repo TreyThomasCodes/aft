@@ -54,6 +54,12 @@ describe("parseStatusBarCounts", () => {
   test("coerces missing/invalid numbers to 0 and stale to false", () => {
     expect(parseStatusBarCounts({ errors: "x", dead_code: 4 })).toEqual(counts({ dead_code: 4 }));
   });
+
+  test("preserves a producer-composed fleet line", () => {
+    expect(parseStatusBarCounts({ line: "[CK: aft ready | pfc ready]" })).toEqual(
+      counts({ line: "[CK: aft ready | pfc ready]" }),
+    );
+  });
 });
 
 describe("formatStatusBar", () => {
@@ -77,6 +83,12 @@ describe("formatStatusBar", () => {
       "[AFT E0 W0 | ~D10 U0 C0 | T0]",
     );
   });
+
+  test("uses the producer-composed fleet line when present", () => {
+    expect(formatStatusBar(counts({ line: "[CK: aft ready | pfc ready]" }))).toBe(
+      "[CK: aft ready | pfc ready]",
+    );
+  });
 });
 
 describe("shouldEmitStatusBar", () => {
@@ -97,6 +109,12 @@ describe("shouldEmitStatusBar", () => {
     const state = createStatusBarEmitState();
     shouldEmitStatusBar(state, counts({ dead_code: 5 }));
     expect(shouldEmitStatusBar(state, counts({ dead_code: 5, tier2_stale: true }))).toBe(true);
+  });
+
+  test("fleet line changes count as a change", () => {
+    const state = createStatusBarEmitState();
+    shouldEmitStatusBar(state, counts({ line: "[CK: pfc one]" }));
+    expect(shouldEmitStatusBar(state, counts({ line: "[CK: pfc two]" }))).toBe(true);
   });
 
   test("re-emits after the heartbeat interval of unchanged calls", () => {

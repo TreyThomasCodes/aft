@@ -1592,10 +1592,13 @@ pub struct AppContext {
     /// this Arc so a sender installed after construction is observed at emit time.
     progress_sender: SharedProgressSender,
     status_emitter: StatusEmitter,
+    /// Present only for daemon-bound actors. Standalone NDJSON contexts never
+    /// acquire a status-holder transport and therefore keep the solo bar path.
+    fleet_status_client: RwLock<Option<crate::fleet_status::FleetStatusClient>>,
     /// Last status-bar payload attached to a tool response for this project root.
     /// Deduping here (not in a process-global static) lets daemon roots emit the
     /// same counts independently.
-    status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
+    status_bar_last_emitted: RwLock<Option<(StatusBarCounts, Option<String>)>>,
     status_bar_cached: RwLock<StatusBarCache>,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
@@ -1932,6 +1935,7 @@ impl AppContext {
             configure_warnings_rx,
             progress_sender: Arc::clone(&progress_sender),
             status_emitter,
+            fleet_status_client: RwLock::new(None),
             status_bar_last_emitted: RwLock::new(None),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             compression_aggregates,
@@ -2162,15 +2166,20 @@ impl AppContext {
         self.try_health_summary().into_snapshot(project_root)
     }
 
-    pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
+    pub fn should_emit_status_bar(
+        &self,
+        counts: &StatusBarCounts,
+        fleet_line: Option<&str>,
+    ) -> bool {
         let mut last = self
             .status_bar_last_emitted
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.as_ref() == Some(counts) {
+        let next = (counts.clone(), fleet_line.map(str::to_owned));
+        if last.as_ref() == Some(&next) {
             return false;
         }
-        *last = Some(counts.clone());
+        *last = Some(next);
         true
     }
 
@@ -2569,6 +2578,23 @@ impl AppContext {
 
     pub fn status_emitter(&self) -> &StatusEmitter {
         &self.status_emitter
+    }
+
+    pub(crate) fn install_fleet_status_client(
+        &self,
+        client: Option<crate::fleet_status::FleetStatusClient>,
+    ) {
+        *self
+            .fleet_status_client
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
+    }
+
+    pub(crate) fn fleet_status_client(&self) -> Option<crate::fleet_status::FleetStatusClient> {
+        self.fleet_status_client
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Get a clone of the current progress sender for use from background
