@@ -514,6 +514,23 @@ function parseEditArray(value: unknown): unknown[] {
   return value;
 }
 
+/**
+ * Strip default values from the find/replace arm of a line-range edit.
+ *
+ * Some hosts serialize all optional fields. These values cannot affect a
+ * line-range edit, while non-default values remain to surface a mixed-mode
+ * request instead of being discarded.
+ */
+function stripLineRangeSentinels(item: Record<string, unknown>): void {
+  const hasRangeField = ["startLine", "endLine", "content"].some((key) => hasOwn(item, key));
+  if (!hasRangeField) return;
+
+  if (item.oldString === "") delete item.oldString;
+  if (item.newString === "") delete item.newString;
+  if (item.replaceAll === false) delete item.replaceAll;
+  if (item.occurrence === 1) delete item.occurrence;
+}
+
 function normalizeEditItem(value: unknown, index: number): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new InvalidRequestError(`edit: edits[${index}] must be an object`);
@@ -523,6 +540,7 @@ function normalizeEditItem(value: unknown, index: number): Record<string, unknow
   const item = copyOwnProperties(source);
   normalizeItemAlias(item, "oldString", "oldText");
   normalizeItemAlias(item, "newString", "newText");
+  stripLineRangeSentinels(item);
 
   const hasFindField = ["oldString", "newString", "replaceAll", "occurrence"].some((key) =>
     hasOwn(item, key),

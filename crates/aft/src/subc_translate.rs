@@ -447,6 +447,33 @@ fn parse_edit_array(value: Option<Value>) -> Result<Vec<Value>, TranslateError> 
     Ok(items)
 }
 
+/// Strip default values from the find/replace arm of a line-range edit.
+///
+/// Some hosts serialize all optional fields. These values cannot affect a
+/// line-range edit, while non-default values remain to surface a mixed-mode
+/// request instead of being discarded.
+fn strip_line_range_sentinels(item: &mut Map<String, Value>) {
+    let has_range = ["startLine", "endLine", "content"]
+        .iter()
+        .any(|key| item.contains_key(*key));
+    if !has_range {
+        return;
+    }
+
+    if matches!(item.get("oldString"), Some(Value::String(value)) if value.is_empty()) {
+        item.remove("oldString");
+    }
+    if matches!(item.get("newString"), Some(Value::String(value)) if value.is_empty()) {
+        item.remove("newString");
+    }
+    if matches!(item.get("replaceAll"), Some(Value::Bool(false))) {
+        item.remove("replaceAll");
+    }
+    if item.get("occurrence").and_then(Value::as_u64) == Some(1) {
+        item.remove("occurrence");
+    }
+}
+
 fn normalize_edit_item(value: Value, index: usize) -> Result<Map<String, Value>, TranslateError> {
     let Value::Object(mut item) = value else {
         return Err(invalid_request(format!(
@@ -456,6 +483,7 @@ fn normalize_edit_item(value: Value, index: usize) -> Result<Map<String, Value>,
 
     normalize_item_alias(&mut item, "oldString", "oldText");
     normalize_item_alias(&mut item, "newString", "newText");
+    strip_line_range_sentinels(&mut item);
 
     let has_find = ["oldString", "newString", "replaceAll", "occurrence"]
         .iter()
@@ -2760,6 +2788,80 @@ mod tests {
                 .get("append_content")
                 .and_then(Value::as_str),
             Some("APPEND")
+        );
+    }
+
+    #[test]
+    fn edit_normalization_strips_line_range_sentinels_without_hiding_meaningful_fields() {
+        let project = Path::new("/project");
+        let issue_payload = serde_json::json!({
+            "path": "src/example.ts",
+            "edits": [{
+                "content": "const value = new;",
+                "startLine": 14,
+                "endLine": 14,
+                "oldString": "",
+                "newString": "",
+                "replaceAll": false,
+                "occurrence": 1,
+            }],
+        });
+        let translated = subc_translate_owned("edit", issue_payload, project)
+            .expect("line-range sentinels must not select find/replace mode");
+        assert_eq!(translated.command, "batch");
+        assert_eq!(
+            translated.args["edits"],
+            serde_json::json!([{
+                "content": "const value = new;",
+                "line_start": 14,
+                "line_end": 14,
+            }]),
+        );
+
+        for arguments in [
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{
+                    "content": "replacement", "startLine": 14, "endLine": 14,
+                    "oldString": "meaningful", "newString": "",
+                }],
+            }),
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{
+                    "content": "replacement", "startLine": 14, "endLine": 14,
+                    "oldString": "", "newString": "", "replaceAll": true,
+                }],
+            }),
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{
+                    "content": "replacement", "startLine": 14, "endLine": 14,
+                    "oldString": "", "newString": "", "occurrence": 2,
+                }],
+            }),
+        ] {
+            let error = subc_translate_owned("edit", arguments, project)
+                .expect_err("meaningful find/replace fields must remain mixed-mode errors");
+            assert_eq!(
+                error.message,
+                "edit: edits[0] mixes find/replace and line-range fields"
+            );
+        }
+
+        let empty_find = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{ "oldString": "", "newString": "replacement" }],
+            }),
+            project,
+        )
+        .expect("empty find match without line-range fields must reach batch validation");
+        assert_eq!(empty_find.command, "batch");
+        assert_eq!(
+            empty_find.args["edits"][0]["match"],
+            Value::String(String::new())
         );
     }
 

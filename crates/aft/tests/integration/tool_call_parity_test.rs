@@ -584,6 +584,52 @@ fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
 }
 
 #[test]
+fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
+    let project = tempfile::tempdir().expect("tool_call line-range sentinel temp project");
+    let target = project.path().join("src/example.ts");
+    fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
+    let original = (1..14)
+        .map(|line| format!("line {line}\n"))
+        .chain(std::iter::once("const value = old;\n".to_string()))
+        .collect::<String>();
+    fs::write(&target, original).expect("write edit fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, project.path(), "cfg-edit-line-range-sentinels");
+    let response = send_json(
+        &mut aft,
+        json!({
+            "id": "tool-call-edit-line-range-sentinels",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "filePath": "src/example.ts",
+                "edits": [{
+                    "content": "const value = new;",
+                    "startLine": 14,
+                    "endLine": 14,
+                    "oldString": "",
+                    "newString": "",
+                    "replaceAll": false,
+                    "occurrence": 1,
+                }],
+            },
+        }),
+    );
+
+    assert_eq!(response["success"], true, "edit failed: {response:#}");
+    assert_eq!(
+        fs::read_to_string(target).expect("read edited fixture"),
+        (1..14)
+            .map(|line| format!("line {line}\n"))
+            .chain(std::iter::once("const value = new;\n".to_string()))
+            .collect::<String>(),
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
     let project = tempfile::tempdir().expect("tool_call configure temp project");
     let mut aft = AftProcess::spawn();

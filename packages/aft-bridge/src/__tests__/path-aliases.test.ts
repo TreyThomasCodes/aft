@@ -218,6 +218,27 @@ describe("edit boundary preparation", () => {
       },
       expected: { path: "src/example.ts", edits: [{ oldString: "", newString: "real" }] },
     },
+    {
+      label: "line-range edit removes embedded find/replace sentinels",
+      input: {
+        path: "src/example.ts",
+        edits: [
+          {
+            content: "const value = new;",
+            startLine: 14,
+            endLine: 14,
+            oldString: "",
+            newString: "",
+            replaceAll: false,
+            occurrence: 1,
+          },
+        ],
+      },
+      expected: {
+        path: "src/example.ts",
+        edits: [{ content: "const value = new;", startLine: 14, endLine: 14 }],
+      },
+    },
   ];
 
   for (const { label, input, expected, error } of meaningfulModeCases) {
@@ -229,6 +250,22 @@ describe("edit boundary preparation", () => {
       }
     });
   }
+
+  test("retains meaningful fields alongside line-range edits as mixed-mode errors", () => {
+    const lineRange = { content: "replacement", startLine: 14, endLine: 14 };
+    for (const findFields of [
+      { oldString: "meaningful", newString: "" },
+      { oldString: "", newString: "", replaceAll: true },
+      { oldString: "", newString: "", occurrence: 2 },
+    ]) {
+      expect(() =>
+        prepareCanonicalEditArguments("edit", {
+          path: "src/example.ts",
+          edits: [{ ...lineRange, ...findFields }],
+        }),
+      ).toThrow("mixes find/replace and line-range fields");
+    }
+  });
 
   test("applies mode conflict precedence before parsing stringified edits", () => {
     expect(() =>
