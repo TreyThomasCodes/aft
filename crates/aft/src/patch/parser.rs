@@ -213,7 +213,12 @@ pub fn parse_patch(patch_text: &str) -> Result<Vec<Hunk>, String> {
 
     let trimmed = patch_text.trim();
     let cleaned = strip_heredoc(trimmed);
-    let lines: Vec<&str> = cleaned.split('\n').collect();
+    // Splitting on `\n` leaves CRLF's `\r` attached to patch payload lines. Remove only
+    // that terminator byte so carriage returns inside added or replacement content survive.
+    let lines: Vec<&str> = cleaned
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
     let mut hunks = Vec::new();
 
     let begin_idx = lines
@@ -473,6 +478,41 @@ mod tests {
                     },
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn crlf_envelope_does_not_leak_carriage_returns_into_patch_content() {
+        let patch = [
+            "*** Begin Patch",
+            "*** Add File: created.txt",
+            "+created",
+            "*** Update File: existing.txt",
+            "@@",
+            "-old\rinside",
+            "+new\rinside",
+            "*** End Patch",
+        ]
+        .join("\r\n");
+
+        assert_eq!(
+            parse_patch(&patch).unwrap(),
+            vec![
+                Hunk::Add {
+                    path: "created.txt".to_owned(),
+                    contents: "created".to_owned(),
+                },
+                Hunk::Update {
+                    path: "existing.txt".to_owned(),
+                    move_path: None,
+                    chunks: vec![UpdateFileChunk {
+                        old_lines: vec!["old\rinside".to_owned()],
+                        new_lines: vec!["new\rinside".to_owned()],
+                        change_context: None,
+                        is_end_of_file: false,
+                    }],
+                },
+            ]
         );
     }
 }

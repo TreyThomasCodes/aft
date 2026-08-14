@@ -114,6 +114,55 @@ fn apply_patch_full_multifile_and_single_undo_reverts_all() {
 }
 
 #[test]
+fn apply_patch_crlf_envelope_preserves_only_content_carriage_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "existing.txt", "alpha\nold\rinside\nomega\n");
+    let mut aft = configured_aft(root);
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Add File: created.txt",
+        "+created",
+        "*** Update File: existing.txt",
+        "@@",
+        "-old\rinside",
+        "+new\rinside",
+        "*** End Patch",
+    ]
+    .join("\r\n");
+
+    let preview_resp = preview(&mut aft, "preview-crlf-envelope", &patch);
+    assert_eq!(
+        preview_resp["success"], true,
+        "CRLF preview failed: {preview_resp:?}"
+    );
+    assert!(!root.join("created.txt").exists());
+    assert_eq!(
+        fs::read(&root.join("existing.txt")).unwrap(),
+        b"alpha\nold\rinside\nomega\n"
+    );
+
+    let apply_resp = apply(&mut aft, "apply-crlf-envelope", &patch);
+    assert_eq!(
+        apply_resp["success"], true,
+        "CRLF apply failed: {apply_resp:?}"
+    );
+    assert_eq!(
+        preview_resp["preview_diff"], apply_resp["metadata"]["diff"],
+        "preview and apply must normalize the same patch envelope"
+    );
+    assert_eq!(fs::read(root.join("created.txt")).unwrap(), b"created\n");
+    assert_eq!(
+        fs::read(root.join("existing.txt")).unwrap(),
+        b"alpha\nnew\rinside\nomega\n",
+        "the CRLF terminator must be removed while the content carriage return remains"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn apply_patch_update_uses_reflow_fuzzy_hunk() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
