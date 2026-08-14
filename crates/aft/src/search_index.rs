@@ -1697,10 +1697,17 @@ impl SearchIndexSnapshot {
 
         let trigram_started = Instant::now();
         let raw_pattern = pattern.raw_pattern_for_trigrams();
-        let query = if pattern.case_insensitive() && !raw_pattern.is_ascii() {
-            RegexQuery::default()
-        } else {
-            decompose_regex(&raw_pattern)
+        let query = match pattern {
+            CompiledPattern::Regex {
+                case_insensitive: true,
+                ..
+            } => {
+                // RegexBuilder applies this flag outside the raw pattern. Parse the
+                // same effective regex so Unicode folds such as `K` matching `K` do
+                // not become false mandatory trigrams.
+                decompose_regex(&format!("(?i:{raw_pattern})"))
+            }
+            _ => decompose_regex(&raw_pattern),
         };
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
         let candidate_ids = self.candidates(&query);

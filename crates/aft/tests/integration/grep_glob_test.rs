@@ -499,6 +499,38 @@ fn grep_indexed_supports_line_anchors() {
 }
 
 #[test]
+fn case_insensitive_unicode_regex_agrees_between_indexed_and_fallback_grep() {
+    let project = setup_project(&[
+        (
+            ".fixture-id",
+            "case_insensitive_unicode_regex_agrees_between_indexed_and_fallback_grep\n",
+        ),
+        ("release.txt", "\u{212a}ELVIN release\n"),
+    ]);
+    let request = || {
+        json!({
+            "id": "grep-case-fold-parity",
+            "command": "grep",
+            "pattern": "KELVIN.*",
+            "case_sensitive": false,
+        })
+    };
+
+    let mut fallback_aft = AftProcess::spawn();
+    configure(&mut fallback_aft, project.path());
+    let fallback = send(&mut fallback_aft, request());
+    assert_eq!(fallback["index_status"], "Fallback");
+    assert_eq!(fallback["total_matches"], 1, "fallback grep: {fallback:?}");
+    assert!(fallback_aft.shutdown().success());
+
+    let mut indexed_aft = AftProcess::spawn();
+    configure_with_index(&mut indexed_aft, project.path());
+    let indexed = wait_for_index_ready(&mut indexed_aft, request);
+    assert_eq!(indexed["total_matches"], 1, "indexed grep: {indexed:?}");
+    assert!(indexed_aft.shutdown().success());
+}
+
+#[test]
 fn grep_treats_leading_dash_pattern_as_literal() {
     let project = setup_project(&[("notes.txt", "-foo\nbar\n")]);
     let mut aft = AftProcess::spawn();
