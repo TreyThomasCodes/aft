@@ -1,13 +1,13 @@
-//! Pull-on-render consumer for the fleet status-holder plane.
+//! Publisher for AFT's segment on the fleet status-holder plane.
 //!
-//! The daemon owns status retention and composition. AFT only publishes its
-//! project-scoped segment, asks for the three scopes relevant to the current
-//! render, and caches the producer's composed response briefly.
+//! The holder owns retention and composed rendering. While its route is live,
+//! AFT publishes its project-scoped segment and leaves status-bar attachment to
+//! the holder's host plugin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -15,10 +15,10 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 const STATUS_CADENCE: Duration = Duration::from_millis(2_500);
-const STATUS_PULL_BUDGET: Duration = Duration::from_millis(50);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct StatusLineSegment {
     pub(crate) module: String,
@@ -26,12 +26,14 @@ pub(crate) struct StatusLineSegment {
     pub(crate) text: String,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(crate) struct StatusLineSnapshot {
     pub(crate) line: String,
     pub(crate) segments: Vec<StatusLineSegment>,
 }
 
+#[cfg(test)]
 impl StatusLineSnapshot {
     fn parse(body: &[u8]) -> Option<Self> {
         serde_json::from_slice(body).ok()
@@ -41,11 +43,6 @@ impl StatusLineSnapshot {
         self.segments
             .iter()
             .any(|segment| segment.module != STATUS_MODULE && !segment.text.is_empty())
-    }
-
-    pub(crate) fn compose_fleet_bar(&self) -> Option<String> {
-        self.has_foreign_segment()
-            .then(|| format!("[CK: {}]", self.line))
     }
 }
 
@@ -78,41 +75,14 @@ impl PublishFence {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct RenderKey {
-    project_scope: String,
-    session_scope: String,
-}
-
-impl RenderKey {
-    fn new(project_root: &Path, session_id: &str) -> Self {
-        Self {
-            project_scope: format!("project:{}", project_root.to_string_lossy()),
-            session_scope: format!("session:{session_id}"),
-        }
-    }
-
-    fn scopes(&self) -> [&str; 3] {
-        ["global", &self.project_scope, &self.session_scope]
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CachedLine {
-    observed_at: Instant,
-    snapshot: StatusLineSnapshot,
-}
-
 #[derive(Default)]
 struct ClientState {
-    cache: HashMap<RenderKey, CachedLine>,
-    pulls_in_flight: HashSet<RenderKey>,
     last_publish_at: HashMap<String, Instant>,
     publish_fence: PublishFence,
 }
 
 struct FleetStatusInner {
-    wire_tx: mpsc::Sender<StatusWireRequest>,
+    wire_tx: Option<mpsc::Sender<StatusWireRequest>>,
     state: parking_lot::Mutex<ClientState>,
     next_revision: AtomicU64,
 }
@@ -128,7 +98,7 @@ impl FleetStatusClient {
         (
             Self {
                 inner: Arc::new(FleetStatusInner {
-                    wire_tx,
+                    wire_tx: Some(wire_tx),
                     state: parking_lot::Mutex::new(ClientState::default()),
                     next_revision: AtomicU64::new(1),
                 }),
@@ -137,87 +107,46 @@ impl FleetStatusClient {
         )
     }
 
-    /// Return the producer-composed fleet bar when a fresh pull observes a
-    /// non-empty foreign segment. Contention, transport errors, and the bounded
-    /// wait all return `None`, leaving the existing solo renderer untouched.
-    pub(crate) fn render(
-        &self,
-        project_root: &Path,
-        session_id: &str,
-        aft_text: &str,
-    ) -> Option<String> {
-        let key = RenderKey::new(project_root, session_id);
-        let now = Instant::now();
-        let (publish, revision) = {
-            let mut state = self.inner.state.try_lock()?;
-            if let Some(cached) = state.cache.get(&key) {
-                if now.saturating_duration_since(cached.observed_at) <= STATUS_CADENCE {
-                    return cached.snapshot.compose_fleet_bar();
-                }
-            }
-            if !state.pulls_in_flight.insert(key.clone()) {
-                return None;
-            }
-
-            let publish = state
-                .last_publish_at
-                .get(&key.project_scope)
-                .is_none_or(|last| now.saturating_duration_since(*last) >= STATUS_CADENCE);
-            let revision = publish
-                .then(|| self.inner.next_revision.fetch_add(1, Ordering::Relaxed))
-                .unwrap_or(0);
-            if publish {
-                state.last_publish_at.insert(key.project_scope.clone(), now);
-            }
-            (publish, revision)
-        };
-
-        if publish {
-            let request = StatusWireRequest::publish(
-                Arc::downgrade(&self.inner),
-                &key.project_scope,
-                aft_text,
-                revision,
-            );
-            if self.inner.wire_tx.try_send(request).is_err() {
-                self.inner
-                    .state
-                    .lock()
-                    .last_publish_at
-                    .remove(&key.project_scope);
-            }
+    pub(crate) fn dormant() -> Self {
+        Self {
+            inner: Arc::new(FleetStatusInner {
+                wire_tx: None,
+                state: parking_lot::Mutex::new(ClientState::default()),
+                next_revision: AtomicU64::new(1),
+            }),
         }
-
-        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-        let request = StatusWireRequest::line(key.scopes(), reply_tx);
-        if self.inner.wire_tx.try_send(request).is_err() {
-            self.clear_in_flight(&key);
-            return None;
-        }
-
-        let snapshot = match reply_rx.recv_timeout(STATUS_PULL_BUDGET) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) | Err(_) => {
-                self.clear_in_flight(&key);
-                return None;
-            }
-        };
-
-        let rendered = snapshot.compose_fleet_bar();
-        let mut state = self.inner.state.lock();
-        state.pulls_in_flight.remove(&key);
-        state.cache.insert(
-            key,
-            CachedLine {
-                observed_at: Instant::now(),
-                snapshot,
-            },
-        );
-        rendered
     }
 
-    fn clear_in_flight(&self, key: &RenderKey) {
-        self.inner.state.lock().pulls_in_flight.remove(key);
+    /// Publish AFT's segment when the holder route is live. The return value is
+    /// ownership, not delivery: `true` means the holder's host plugin owns the
+    /// response bar even when cadence, contention, or backpressure skips a send.
+    pub(crate) fn publish(&self, project_root: &Path, aft_text: &str) -> bool {
+        let Some(wire_tx) = self.inner.wire_tx.as_ref() else {
+            return false;
+        };
+        let scope = format!("project:{}", project_root.to_string_lossy());
+        let now = Instant::now();
+        let revision = {
+            let Some(mut state) = self.inner.state.try_lock() else {
+                return true;
+            };
+            if state
+                .last_publish_at
+                .get(&scope)
+                .is_some_and(|last| now.saturating_duration_since(*last) < STATUS_CADENCE)
+            {
+                return true;
+            }
+            state.last_publish_at.insert(scope.clone(), now);
+            self.inner.next_revision.fetch_add(1, Ordering::Relaxed)
+        };
+
+        let request =
+            StatusWireRequest::publish(Arc::downgrade(&self.inner), &scope, aft_text, revision);
+        if wire_tx.try_send(request).is_err() {
+            self.inner.state.lock().last_publish_at.remove(&scope);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -226,27 +155,12 @@ impl FleetStatusClient {
     }
 }
 
-enum StatusWireCompletion {
-    Line(std_mpsc::SyncSender<Option<StatusLineSnapshot>>),
-    Publish(Weak<FleetStatusInner>),
-}
-
 pub(crate) struct StatusWireRequest {
     body: Value,
-    completion: StatusWireCompletion,
+    client: Weak<FleetStatusInner>,
 }
 
 impl StatusWireRequest {
-    fn line(scopes: [&str; 3], reply: std_mpsc::SyncSender<Option<StatusLineSnapshot>>) -> Self {
-        Self {
-            body: json!({
-                "op": "status.line",
-                "scopes": scopes,
-            }),
-            completion: StatusWireCompletion::Line(reply),
-        }
-    }
-
     fn publish(client: Weak<FleetStatusInner>, scope: &str, text: &str, revision: u64) -> Self {
         Self {
             body: json!({
@@ -257,7 +171,7 @@ impl StatusWireRequest {
                 "ttl_ms": STATUS_PUBLISH_TTL_MS,
                 "revision": revision,
             }),
-            completion: StatusWireCompletion::Publish(client),
+            client,
         }
     }
 
@@ -266,36 +180,47 @@ impl StatusWireRequest {
     }
 
     pub(crate) fn complete_response(self, body: &[u8]) {
-        match self.completion {
-            StatusWireCompletion::Line(reply) => {
-                let _ = reply.send(StatusLineSnapshot::parse(body));
-            }
-            StatusWireCompletion::Publish(client) => {
-                let Some(ack) = StatusPublishAck::parse(body) else {
-                    return;
-                };
-                let Some(client) = client.upgrade() else {
-                    return;
-                };
-                client.state.lock().publish_fence.observe(ack);
-            }
-        }
+        let Some(ack) = StatusPublishAck::parse(body) else {
+            return;
+        };
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        client.state.lock().publish_fence.observe(ack);
     }
 
-    pub(crate) fn complete_unavailable(self) {
-        if let StatusWireCompletion::Line(reply) = self.completion {
-            let _ = reply.send(None);
-        }
-    }
+    pub(crate) fn complete_unavailable(self) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Map;
-    use std::thread;
+    use std::collections::HashSet;
 
     const FIXTURES: &str = include_str!("../../../.cortexkit/status-line-fixtures-2026-08-14.json");
+    const PUBLISH_ACK_FIXTURES: [&str; 9] = [
+        "publish_aft",
+        "supersede_r3",
+        "supersede_r2_late",
+        "ttl_publish",
+        "quiet_publish_empty_text",
+        "fat1",
+        "fat2",
+        "epoch_bump_republish_r1_new_conn",
+        "publish_aft_project",
+    ];
+    const LINE_REPLY_FIXTURES: [&str; 9] = [
+        "line_foreign_present",
+        "supersede_line_after_r3",
+        "supersede_line_after_late_r2",
+        "ttl_line_before",
+        "ttl_line_after_expiry",
+        "quiet_line",
+        "line_cap_overflow",
+        "epoch_bump_line_after",
+        "line_aft_solo_scope",
+    ];
 
     fn fixtures() -> Map<String, Value> {
         serde_json::from_str::<Value>(FIXTURES)
@@ -316,26 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn all_producer_fixtures_exercise_parse_compose_and_fencing_paths() {
+    fn publish_ack_fixtures_drive_runtime_fencing() {
         let fixtures = fixtures();
         assert_eq!(fixtures.len(), 18, "fixture probe entry count changed");
-        let mut exercised = HashSet::new();
-
-        let ack_names = [
-            "publish_aft",
-            "supersede_r3",
-            "supersede_r2_late",
-            "ttl_publish",
-            "quiet_publish_empty_text",
-            "fat1",
-            "fat2",
-            "epoch_bump_republish_r1_new_conn",
-            "publish_aft_project",
-        ];
         let mut fence = PublishFence::default();
-        for name in ack_names {
+        for name in PUBLISH_ACK_FIXTURES {
             fence.observe(parse_ack(&fixtures[name]));
-            exercised.insert(name);
         }
         assert_eq!(
             fence,
@@ -344,30 +255,29 @@ mod tests {
                 accepted_revision: 1
             }
         );
+    }
 
-        let line_names = [
-            "line_foreign_present",
-            "supersede_line_after_r3",
-            "supersede_line_after_late_r2",
-            "ttl_line_before",
-            "ttl_line_after_expiry",
-            "quiet_line",
-            "line_cap_overflow",
-            "epoch_bump_line_after",
-            "line_aft_solo_scope",
-        ];
-        let mut lines = HashMap::new();
-        for name in line_names {
-            let line = parse_line(&fixtures[name]);
-            let _ = line.compose_fleet_bar();
-            lines.insert(name, line);
-            exercised.insert(name);
-        }
+    #[test]
+    fn line_reply_fixtures_remain_wire_shape_documentation() {
+        let fixtures = fixtures();
+        let documented = PUBLISH_ACK_FIXTURES
+            .into_iter()
+            .chain(LINE_REPLY_FIXTURES)
+            .collect::<HashSet<_>>();
+        assert_eq!(documented.len(), fixtures.len());
+        assert!(fixtures
+            .keys()
+            .all(|name| documented.contains(name.as_str())));
 
+        let lines = LINE_REPLY_FIXTURES
+            .into_iter()
+            .map(|name| (name, parse_line(&fixtures[name])))
+            .collect::<HashMap<_, _>>();
         assert_eq!(
-            lines["line_foreign_present"].compose_fleet_bar().as_deref(),
-            Some("[CK: aft E0 W0 idx fresh | pfc 1567 events (777 gaps)]")
+            lines["line_foreign_present"].line,
+            "aft E0 W0 idx fresh | pfc 1567 events (777 gaps)"
         );
+        assert!(lines["line_foreign_present"].has_foreign_segment());
         assert_eq!(
             lines["supersede_line_after_r3"],
             lines["supersede_line_after_late_r2"]
@@ -378,7 +288,10 @@ mod tests {
         assert_eq!(lines["ttl_line_before"].segments.len(), 4);
         assert_eq!(lines["ttl_line_after_expiry"].segments.len(), 3);
         assert_eq!(
-            lines["quiet_line"].segments.last().map(|s| s.text.as_str()),
+            lines["quiet_line"]
+                .segments
+                .last()
+                .map(|segment| segment.text.as_str()),
             Some("")
         );
         assert!(!lines["quiet_line"].line.contains("ttlfx"));
@@ -395,19 +308,10 @@ mod tests {
             "whole tail segments are dropped"
         );
         assert_eq!(
-            capped.compose_fleet_bar(),
-            Some(format!("[CK: {}]", capped.line))
-        );
-        assert_eq!(
             lines["epoch_bump_line_after"].segments[3].text,
             "fresh epoch revision one"
         );
-        assert_eq!(lines["line_aft_solo_scope"].compose_fleet_bar(), None);
-
-        assert_eq!(exercised.len(), fixtures.len());
-        assert!(fixtures
-            .keys()
-            .all(|name| exercised.contains(name.as_str())));
+        assert!(!lines["line_aft_solo_scope"].has_foreign_segment());
     }
 
     #[test]
@@ -438,86 +342,47 @@ mod tests {
     }
 
     #[test]
-    fn timeout_falls_back_within_the_render_budget() {
-        let (client, mut wire_rx) = FleetStatusClient::channel(4);
-        let receiver = thread::spawn(move || {
-            let publish = wire_rx.blocking_recv().expect("publish request");
-            assert_eq!(publish.body()["op"], "status.publish");
-            let line = wire_rx.blocking_recv().expect("line request");
-            assert_eq!(line.body()["op"], "status.line");
-            thread::sleep(Duration::from_millis(300));
-            line.complete_unavailable();
-        });
+    fn dormant_client_falls_back_without_publishing() {
+        let client = FleetStatusClient::dormant();
 
-        let started = Instant::now();
-        let rendered = client.render(
-            Path::new("/tmp/project"),
-            "session-1",
-            "E0 W0 | D0 U0 C0 | T0",
-        );
-        let elapsed = started.elapsed();
-
-        assert_eq!(rendered, None);
-        assert!(elapsed >= STATUS_PULL_BUDGET);
-        assert!(
-            elapsed < Duration::from_millis(200),
-            "render blocked for {elapsed:?}"
-        );
-        receiver.join().expect("receiver thread");
+        assert!(!client.publish(Path::new("/tmp/project"), "E0 W0 | D0 U0 C0 | T0"));
+        let state = client.inner.state.lock();
+        assert!(state.last_publish_at.is_empty());
+        assert_eq!(client.inner.next_revision.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn empty_local_status_publishes_alive_quiet() {
         let (client, mut wire_rx) = FleetStatusClient::channel(4);
-        let solo_fixture = serde_json::to_vec(&fixtures()["line_aft_solo_scope"])
-            .expect("solo status fixture bytes");
-        let receiver = thread::spawn(move || {
-            let publish = wire_rx.blocking_recv().expect("publish request");
-            assert_eq!(publish.body()["op"], "status.publish");
-            assert_eq!(publish.body()["text"], "");
-            assert_eq!(publish.body()["ttl_ms"], STATUS_PUBLISH_TTL_MS);
 
-            let line = wire_rx.blocking_recv().expect("line request");
-            line.complete_response(&solo_fixture);
-        });
-
-        assert_eq!(
-            client.render(Path::new("/tmp/project"), "session-1", ""),
-            None
+        assert!(client.publish(Path::new("/tmp/project"), ""));
+        let publish = wire_rx.try_recv().expect("publish request");
+        assert_eq!(publish.body()["op"], "status.publish");
+        assert_eq!(publish.body()["text"], "");
+        assert_eq!(publish.body()["ttl_ms"], STATUS_PUBLISH_TTL_MS);
+        assert!(
+            wire_rx.try_recv().is_err(),
+            "publisher emitted a pull request"
         );
-        receiver.join().expect("receiver thread");
     }
 
     #[test]
-    fn cache_serves_bursts_without_multiplying_pulls() {
+    fn cadence_suppresses_duplicate_publishes_and_ack_updates_fence() {
         let (client, mut wire_rx) = FleetStatusClient::channel(4);
         let fixtures = fixtures();
         let publish_fixture =
             serde_json::to_vec(&fixtures["publish_aft"]).expect("publish fixture bytes");
-        let line_fixture = serde_json::to_vec(&fixtures["line_foreign_present"])
-            .expect("status.line fixture bytes");
-        let receiver = thread::spawn(move || {
-            let publish = wire_rx.blocking_recv().expect("publish request");
-            assert_eq!(publish.body()["revision"], 1);
-            publish.complete_response(&publish_fixture);
 
-            let line = wire_rx.blocking_recv().expect("line request");
-            line.complete_response(&line_fixture);
-            thread::sleep(Duration::from_millis(20));
-            assert!(
-                wire_rx.try_recv().is_err(),
-                "fresh cache issued another request"
-            );
-        });
+        assert!(client.publish(Path::new("/tmp/project"), "local"));
+        let publish = wire_rx.try_recv().expect("first publish request");
+        assert_eq!(publish.body()["revision"], 1);
+        publish.complete_response(&publish_fixture);
 
-        let first = client.render(Path::new("/tmp/project"), "session-1", "local");
-        let second = client.render(Path::new("/tmp/project"), "session-1", "local");
-        assert_eq!(
-            first.as_deref(),
-            Some("[CK: aft E0 W0 idx fresh | pfc 1567 events (777 gaps)]")
+        assert!(client.publish(Path::new("/tmp/project"), "local"));
+        assert!(
+            wire_rx.try_recv().is_err(),
+            "publish cadence issued another request"
         );
-        assert_eq!(second, first);
-        receiver.join().expect("receiver thread");
         assert_eq!(
             client.publish_fence(),
             PublishFence {

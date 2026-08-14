@@ -144,17 +144,21 @@ fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
     )
 }
 
+fn holder_owns_status_bar(plane_live: bool, harness: Option<&crate::harness::Harness>) -> bool {
+    plane_live && matches!(harness, Some(crate::harness::Harness::Opencode))
+}
+
 /// Attach the agent status-bar counts to the response envelope so the plugin
 /// after-hook can surface the IDE-style status bar (emit-on-change). Skips
 /// internal/transport commands that don't represent agent tool calls (their
 /// responses never reach the agent, and bash-lifecycle commands fire rapidly).
-/// `errors`/`warnings` are read live from the LSP store here; Tier-2/todos are
-/// last-known. Before Tier-2 is populated, the payload remains omitted unless a
-/// daemon pull supplies a foreign fleet segment.
+/// `errors`/`warnings` are read live from the LSP store. Tier-2 and todo counts
+/// come from a cached snapshot, so the payload stays omitted until that snapshot
+/// has been populated.
 pub fn attach_status_bar(
     response: &mut Response,
     ctx: &AppContext,
-    session_id: &str,
+    _session_id: &str,
     command: &str,
 ) {
     // Cross-root indexed searches report on a borrowed project, so attaching the
@@ -189,24 +193,28 @@ pub fn attach_status_bar(
         return;
     }
     let local_counts = ctx.status_bar_counts();
-    let fleet_line = ctx.fleet_status_client().and_then(|client| {
+    let plane_live = ctx.fleet_status_client().is_some_and(|client| {
         let config = ctx.config();
-        let project_root = config.project_root.as_deref()?;
+        let Some(project_root) = config.project_root.as_deref() else {
+            return false;
+        };
         let aft_text = local_counts
             .as_ref()
             .map(aft_status_segment)
             .unwrap_or_default();
-        client.render(project_root, session_id, &aft_text)
+        client.publish(project_root, &aft_text)
     });
-    let counts = match local_counts {
-        Some(counts) => counts,
-        None if fleet_line.is_some() => crate::context::StatusBarCounts::default(),
-        None => return,
-    };
-    if !ctx.should_emit_status_bar(&counts, fleet_line.as_deref()) {
+    let harness = ctx.harness_opt();
+    if holder_owns_status_bar(plane_live, harness.as_ref()) {
         return;
     }
-    let mut value = serde_json::json!({
+    let Some(counts) = local_counts else {
+        return;
+    };
+    if !ctx.should_emit_status_bar(&counts) {
+        return;
+    }
+    let value = serde_json::json!({
         "errors": counts.errors,
         "warnings": counts.warnings,
         "dead_code": counts.dead_code,
@@ -215,9 +223,6 @@ pub fn attach_status_bar(
         "todos": counts.todos,
         "tier2_stale": counts.tier2_stale,
     });
-    if let (Some(data), Some(line)) = (value.as_object_mut(), fleet_line) {
-        data.insert("line".to_string(), serde_json::Value::String(line));
-    }
     match response.data.as_object_mut() {
         Some(data) => {
             data.insert("status_bar".to_string(), value);
@@ -230,8 +235,22 @@ pub fn attach_status_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::aft_status_segment;
+    use super::{aft_status_segment, holder_owns_status_bar};
     use crate::context::StatusBarCounts;
+    use crate::harness::Harness;
+
+    #[test]
+    fn live_holder_retires_only_opencode_response_bars() {
+        assert_eq!(
+            (
+                holder_owns_status_bar(true, Some(&Harness::Opencode)),
+                holder_owns_status_bar(true, Some(&Harness::Runner)),
+            ),
+            (true, false)
+        );
+        assert!(!holder_owns_status_bar(true, Some(&Harness::Pi)));
+        assert!(!holder_owns_status_bar(false, Some(&Harness::Opencode)));
+    }
 
     #[test]
     fn solo_bar_bytes_remain_the_existing_golden() {

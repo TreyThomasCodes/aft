@@ -1598,7 +1598,7 @@ pub struct AppContext {
     /// Last status-bar payload attached to a tool response for this project root.
     /// Deduping here (not in a process-global static) lets daemon roots emit the
     /// same counts independently.
-    status_bar_last_emitted: RwLock<Option<(StatusBarCounts, Option<String>)>>,
+    status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
     status_bar_cached: RwLock<StatusBarCache>,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
@@ -2166,20 +2166,15 @@ impl AppContext {
         self.try_health_summary().into_snapshot(project_root)
     }
 
-    pub fn should_emit_status_bar(
-        &self,
-        counts: &StatusBarCounts,
-        fleet_line: Option<&str>,
-    ) -> bool {
+    pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
         let mut last = self
             .status_bar_last_emitted
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next = (counts.clone(), fleet_line.map(str::to_owned));
-        if last.as_ref() == Some(&next) {
+        if last.as_ref() == Some(counts) {
             return false;
         }
-        *last = Some(next);
+        *last = Some(counts.clone());
         true
     }
 

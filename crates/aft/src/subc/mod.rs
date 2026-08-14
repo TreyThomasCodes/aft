@@ -2287,6 +2287,41 @@ async fn drain_pending_route_bind_completions(
     Ok(drained)
 }
 
+fn send_fleet_status_request(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    route: Option<RouteChannel>,
+    corr: u64,
+    request: StatusWireRequest,
+) -> Option<StatusWireRequest> {
+    let Some(route) = route else {
+        request.complete_unavailable();
+        return None;
+    };
+    let frame = serde_json::to_vec(request.body()).ok().and_then(|body| {
+        Frame::build(
+            FrameType::Request,
+            module_internal_flags(),
+            route.channel,
+            route.epoch,
+            corr,
+            body,
+        )
+        .ok()
+    });
+    let Some(frame) = frame else {
+        request.complete_unavailable();
+        return None;
+    };
+    match try_enqueue_writer_frame(writer_tx, metrics, frame) {
+        WriterEnqueueOutcome::Enqueued => Some(request),
+        WriterEnqueueOutcome::Full(_) | WriterEnqueueOutcome::Closed => {
+            request.complete_unavailable();
+            None
+        }
+    }
+}
+
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
 /// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
 /// response requests whole-connection teardown.
@@ -2377,7 +2412,19 @@ where
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
-    let (fleet_status_client, mut fleet_status_rx) = FleetStatusClient::channel(64);
+    // Protocol 0.9 exposes neither a module-side catalog.list response nor a
+    // route.open request. Without those typed contracts AFT cannot prove that
+    // prefrontal-core advertises status.line or open its management route, so
+    // status transport stays dormant instead of probing with an invalid frame.
+    // The closed receiver keeps the outbound dial isolated in
+    // send_fleet_status_request for the protocol upgrade that supplies both.
+    let (discovered_fleet_status_client, mut fleet_status_rx) = FleetStatusClient::channel(64);
+    let fleet_status_route: Option<RouteChannel> = None;
+    let fleet_status_client = if fleet_status_route.is_some() {
+        discovered_fleet_status_client
+    } else {
+        FleetStatusClient::dormant()
+    };
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -2582,33 +2629,17 @@ where
                         break corr;
                     }
                 };
-                let frame = serde_json::to_vec(request.body())
-                    .ok()
-                    .and_then(|body| {
-                        Frame::build(
-                            FrameType::Request,
-                            module_internal_flags(),
-                            0,
-                            0,
-                            corr,
-                            body,
-                        )
-                        .ok()
-                    });
-                let Some(frame) = frame else {
-                    request.complete_unavailable();
-                    continue;
-                };
-                match try_enqueue_writer_frame(&writer_tx, &dispatch_path_metrics, frame) {
-                    WriterEnqueueOutcome::Enqueued => {
-                        pending_status_requests.insert(
-                            corr,
-                            (Instant::now() + DRAIN_TICK_PERIOD, request),
-                        );
-                    }
-                    WriterEnqueueOutcome::Full(_) | WriterEnqueueOutcome::Closed => {
-                        request.complete_unavailable();
-                    }
+                if let Some(request) = send_fleet_status_request(
+                    &writer_tx,
+                    &dispatch_path_metrics,
+                    fleet_status_route,
+                    corr,
+                    request,
+                ) {
+                    pending_status_requests.insert(
+                        corr,
+                        (Instant::now() + DRAIN_TICK_PERIOD, request),
+                    );
                 }
             }
             maybe_frame = reader_rx.recv() => {
@@ -2687,6 +2718,21 @@ where
                             break Err(error);
                         }
                     }
+                    FrameType::Response | FrameType::Error
+                        if fleet_status_route.is_some_and(|route| {
+                            frame.header.channel == route.channel
+                                && frame.header.epoch == route.epoch
+                                && pending_status_requests.contains_key(&frame.header.corr)
+                        }) =>
+                    {
+                        if let Some((_, request)) = pending_status_requests.remove(&frame.header.corr) {
+                            if frame.header.ty == FrameType::Response {
+                                request.complete_response(&frame.body);
+                            } else {
+                                request.complete_unavailable();
+                            }
+                        }
+                    }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
                         if let Err(error) = handle_bash_elicitation_reply(
                             &writer_tx,
@@ -2705,15 +2751,6 @@ where
                         .await
                         {
                             break Err(error);
-                        }
-                    }
-                    FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
-                        if let Some((_, request)) = pending_status_requests.remove(&frame.header.corr) {
-                            if frame.header.ty == FrameType::Response {
-                                request.complete_response(&frame.body);
-                            } else {
-                                request.complete_unavailable();
-                            }
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
