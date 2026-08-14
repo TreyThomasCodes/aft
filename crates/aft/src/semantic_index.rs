@@ -3109,8 +3109,24 @@ impl SemanticIndex {
         self.remove_indexed_file_keys(&deleted_set, files);
     }
 
-    /// Search the index with a query embedding, returning top-K results sorted by relevance
+    /// Search the index with a query embedding, returning top-K results sorted by relevance.
     pub fn search(&self, query_vector: &[f32], top_k: usize) -> Vec<SemanticResult> {
+        self.search_filtered(query_vector, top_k, |_| true)
+    }
+
+    /// Search only entries whose resolved source path satisfies `include`.
+    ///
+    /// Filtering before top-K selection prevents excluded files from consuming the
+    /// bounded candidate window and hiding lower-ranked eligible results.
+    pub(crate) fn search_filtered<F>(
+        &self,
+        query_vector: &[f32],
+        top_k: usize,
+        include: F,
+    ) -> Vec<SemanticResult>
+    where
+        F: Fn(&Path) -> bool,
+    {
         let (entries, dimension) = self
             .shared_base
             .as_ref()
@@ -3126,7 +3142,16 @@ impl SemanticIndex {
         let mut scored: Vec<(f32, usize)> = entries
             .iter()
             .enumerate()
-            .map(|(i, entry)| {
+            .filter_map(|(i, entry)| {
+                let included = if self.shared_base.is_some() {
+                    include(&self.project_root.join(&entry.chunk.file))
+                } else {
+                    include(&entry.chunk.file)
+                };
+                if !included {
+                    return None;
+                }
+
                 let dot = if query_vector.len() == entry.vector.len() {
                     dot_product(query_vector, &entry.vector)
                 } else {
@@ -3137,7 +3162,7 @@ impl SemanticIndex {
                 if entry.chunk.exported {
                     score *= 1.1;
                 }
-                (score, i)
+                Some((score, i))
             })
             .collect();
 

@@ -1594,6 +1594,88 @@ fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
 }
 
 #[test]
+fn excluded_test_results_do_not_starve_default_semantic_search() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let tests_dir = project.path().join("tests");
+    std::fs::create_dir_all(&tests_dir).expect("create tests dir");
+
+    let mut files = Vec::new();
+    for index in 0..102 {
+        let test_file = tests_dir.join(format!("crowding_{index}_test.rs"));
+        std::fs::write(
+            &test_file,
+            format!("pub fn crowding_symbol_{index}() -> bool {{ true }}\n"),
+        )
+        .expect("write test source");
+        files.push(test_file);
+    }
+
+    let source_file = project.path().join("src/lib.rs");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source dir");
+    std::fs::write(
+        &source_file,
+        "pub fn production_semantic_target() -> bool { true }\n",
+    )
+    .expect("write production source");
+    files.push(source_file.clone());
+
+    let mut embed =
+        |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+    let semantic_index =
+        SemanticIndex::build(project.path(), &files, &mut embed, 32).expect("build semantic index");
+    let unfiltered = semantic_index.search(&[0.1, 0.2, 0.3], 101);
+    assert_eq!(
+        unfiltered.len(),
+        101,
+        "test setup must fill the fetch window"
+    );
+    assert!(
+        unfiltered
+            .iter()
+            .all(|result| result.file.starts_with(&tests_dir)),
+        "test setup must crowd the unfiltered semantic fetch with hidden tests"
+    );
+
+    let (base_url, handle) = start_mock_embedding_server();
+    let ctx = openai_context(project.path(), base_url);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k(
+            "where is the production semantic target implemented",
+            None,
+            5,
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "semantic query failed: {response:?}"
+    );
+    let results = response["results"].as_array().expect("results array");
+    assert!(
+        results.iter().any(|result| result["file"]
+            .as_str()
+            .is_some_and(|file| path_ends_with(file, "src/lib.rs"))),
+        "hidden tests must not crowd the production result out of the semantic fetch: {response:?}"
+    );
+    assert!(
+        results.iter().all(|result| !result["file"]
+            .as_str()
+            .is_some_and(|file| file.replace('\\', "/").contains("/tests/"))),
+        "default search must continue to hide test files: {response:?}"
+    );
+    handle.join().expect("embedding server thread");
+}
+
+#[test]
 fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
     let (project, source_file, source) = project_with_needle();
     let mut embed =

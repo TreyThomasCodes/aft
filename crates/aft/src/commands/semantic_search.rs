@@ -759,7 +759,10 @@ fn handle_external_semantic_or_hybrid_search(
         MAX_TOP_K
     };
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
-    let mut semantic_results = semantic_index.search(&query_vector, semantic_fetch_limit);
+    let mut semantic_results =
+        semantic_index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
+            path_allowed_by_include_tests(file, &external_root, params.include_tests)
+        });
     semantic_results.retain(|result| result.file.is_file());
     let semantic_more_available = semantic_results.len() > semantic_limit;
     if semantic_more_available {
@@ -1606,7 +1609,11 @@ fn handle_semantic_or_hybrid_search(
         match try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
             Some(semantic_index) => semantic_index
                 .as_ref()
-                .map(|index| index.search(&query_vector, semantic_fetch_limit))
+                .map(|index| {
+                    index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
+                        path_allowed_by_include_tests(file, project_root, params.include_tests)
+                    })
+                })
                 .unwrap_or_default(),
             None => {
                 let lexical = if mode == SearchMode::Semantic {
