@@ -284,10 +284,6 @@ pub(super) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-pub(super) fn module_internal_flags() -> Flags {
-    Flags::new(false, Priority::Passive, true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

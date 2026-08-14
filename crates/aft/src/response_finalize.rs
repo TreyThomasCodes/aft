@@ -158,7 +158,7 @@ fn holder_owns_status_bar(plane_live: bool, harness: Option<&crate::harness::Har
 pub fn attach_status_bar(
     response: &mut Response,
     ctx: &AppContext,
-    _session_id: &str,
+    session_id: &str,
     command: &str,
 ) {
     // Cross-root indexed searches report on a borrowed project, so attaching the
@@ -193,18 +193,22 @@ pub fn attach_status_bar(
         return;
     }
     let local_counts = ctx.status_bar_counts();
+    let harness = ctx.harness_opt();
     let plane_live = ctx.fleet_status_client().is_some_and(|client| {
         let config = ctx.config();
         let Some(project_root) = config.project_root.as_deref() else {
             return false;
         };
+        let harness_label = harness
+            .as_ref()
+            .map(crate::harness::Harness::wire_label)
+            .unwrap_or_else(|| "unknown".to_string());
         let aft_text = local_counts
             .as_ref()
             .map(aft_status_segment)
             .unwrap_or_default();
-        client.publish(project_root, &aft_text)
+        client.publish(project_root, &harness_label, session_id, &aft_text)
     });
-    let harness = ctx.harness_opt();
     if holder_owns_status_bar(plane_live, harness.as_ref()) {
         return;
     }

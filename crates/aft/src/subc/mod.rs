@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::config_resolve::ConfigTier;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
 use crate::executor::{Executor, Lane};
-use crate::fleet_status::{FleetStatusClient, StatusWireRequest};
+use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
 use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
@@ -157,7 +157,7 @@ use self::health::{
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
-    is_subc_agent_core_tool, is_subc_native_plumbing_tool, module_internal_flags,
+    is_subc_agent_core_tool, is_subc_native_plumbing_tool,
 };
 pub use self::wire::SubcError;
 
@@ -171,8 +171,7 @@ use self::wire::{
     build_error_frame, build_goodbye_frame, build_tool_response_frame,
     build_tool_response_frame_with_limit, decrement_counted_channel, response_is_fatal_panic,
     response_message, send_counted_channel, send_frame, send_reliable_writer_frame,
-    send_traced_tool_response_frame, try_enqueue_writer_frame, ToolResponseWriteTrace,
-    WriterEnqueueOutcome, WriterFrame, WriterSender,
+    send_traced_tool_response_frame, ToolResponseWriteTrace, WriterFrame, WriterSender,
 };
 
 struct DecodedFrame {
@@ -1935,6 +1934,7 @@ fn run_subc_mode_inner(
         run_module_loop(
             read_half,
             write_half,
+            connection_file_path,
             shared_app,
             executor_for_loop,
             dispatch,
@@ -2287,47 +2287,13 @@ async fn drain_pending_route_bind_completions(
     Ok(drained)
 }
 
-fn send_fleet_status_request(
-    writer_tx: &WriterSender,
-    metrics: &DispatchPathMetrics,
-    route: Option<RouteChannel>,
-    corr: u64,
-    request: StatusWireRequest,
-) -> Option<StatusWireRequest> {
-    let Some(route) = route else {
-        request.complete_unavailable();
-        return None;
-    };
-    let frame = serde_json::to_vec(request.body()).ok().and_then(|body| {
-        Frame::build(
-            FrameType::Request,
-            module_internal_flags(),
-            route.channel,
-            route.epoch,
-            corr,
-            body,
-        )
-        .ok()
-    });
-    let Some(frame) = frame else {
-        request.complete_unavailable();
-        return None;
-    };
-    match try_enqueue_writer_frame(writer_tx, metrics, frame) {
-        WriterEnqueueOutcome::Enqueued => Some(request),
-        WriterEnqueueOutcome::Full(_) | WriterEnqueueOutcome::Closed => {
-            request.complete_unavailable();
-            None
-        }
-    }
-}
-
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
 /// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
 /// response requests whole-connection teardown.
 async fn run_module_loop<R, W>(
     mut read: R,
     mut write: W,
+    connection_file_path: &Path,
     shared_app: Arc<App>,
     executor: Arc<Executor>,
     dispatch: DispatchFn,
@@ -2412,25 +2378,14 @@ where
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
-    // Protocol 0.9 exposes neither a module-side catalog.list response nor a
-    // route.open request. Without those typed contracts AFT cannot prove that
-    // prefrontal-core advertises status.line or open its management route, so
-    // status transport stays dormant instead of probing with an invalid frame.
-    // The closed receiver keeps the outbound dial isolated in
-    // send_fleet_status_request for the protocol upgrade that supplies both.
-    let (discovered_fleet_status_client, mut fleet_status_rx) = FleetStatusClient::channel(64);
-    let fleet_status_route: Option<RouteChannel> = None;
-    let fleet_status_client = if fleet_status_route.is_some() {
-        discovered_fleet_status_client
-    } else {
-        FleetStatusClient::dormant()
-    };
+    let (fleet_status_client, fleet_status_task) =
+        spawn_fleet_status_dial(connection_file_path, 64);
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
         lossy_overflow: Arc::clone(&lossy_overflow),
         lossy_seq,
-        fleet_status_client,
+        fleet_status_client: fleet_status_client.clone(),
     };
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
@@ -2450,8 +2405,6 @@ where
     let mut pending_binds: HashMap<RouteChannel, PendingBind> = HashMap::new();
     let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
     let mut next_bash_ask_corr: u64 = 1;
-    let mut pending_status_requests: HashMap<u64, (Instant, StatusWireRequest)> = HashMap::new();
-    let mut next_status_corr: u64 = HELLO_CORR + 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let health_rollup_cache = HealthRollupCache::new();
     health_rollup_cache.refresh(&executor, &shared_app);
@@ -2465,15 +2418,6 @@ where
         }
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
-        let expired_status_corrs = pending_status_requests
-            .iter()
-            .filter_map(|(corr, (expires_at, _))| (Instant::now() >= *expires_at).then_some(*corr))
-            .collect::<Vec<_>>();
-        for corr in expired_status_corrs {
-            if let Some((_, request)) = pending_status_requests.remove(&corr) {
-                request.complete_unavailable();
-            }
-        }
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
             &mut pending_bash_asks,
@@ -2621,27 +2565,6 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            Some(request) = fleet_status_rx.recv() => {
-                let corr = loop {
-                    let corr = next_status_corr;
-                    next_status_corr = next_status_corr.wrapping_add(1).max(HELLO_CORR + 1);
-                    if !pending_status_requests.contains_key(&corr) {
-                        break corr;
-                    }
-                };
-                if let Some(request) = send_fleet_status_request(
-                    &writer_tx,
-                    &dispatch_path_metrics,
-                    fleet_status_route,
-                    corr,
-                    request,
-                ) {
-                    pending_status_requests.insert(
-                        corr,
-                        (Instant::now() + DRAIN_TICK_PERIOD, request),
-                    );
-                }
-            }
             maybe_frame = reader_rx.recv() => {
                 let frame = match maybe_frame {
                     None => {
@@ -2716,21 +2639,6 @@ where
                         .await
                         {
                             break Err(error);
-                        }
-                    }
-                    FrameType::Response | FrameType::Error
-                        if fleet_status_route.is_some_and(|route| {
-                            frame.header.channel == route.channel
-                                && frame.header.epoch == route.epoch
-                                && pending_status_requests.contains_key(&frame.header.corr)
-                        }) =>
-                    {
-                        if let Some((_, request)) = pending_status_requests.remove(&frame.header.corr) {
-                            if frame.header.ty == FrameType::Response {
-                                request.complete_response(&frame.body);
-                            } else {
-                                request.complete_unavailable();
-                            }
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
@@ -3076,10 +2984,11 @@ where
         &executor,
     );
 
+    fleet_status_client.set_route_live(false);
+    fleet_status_task.abort();
+    let _ = fleet_status_task.await;
+
     let mut loop_result = loop_result;
-    for (_, (_, request)) in pending_status_requests.drain() {
-        request.complete_unavailable();
-    }
     if !pending_bash_asks.is_empty() {
         let no_routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
         if let Err(error) = settle_all_pending_bash_asks(
@@ -3683,6 +3592,7 @@ async fn handle_control_request(
             identity,
             principal,
             consumer_capabilities,
+            admission_facts: _,
         } => {
             let route_id = route_key(route_channel, epoch);
             if epoch == 0 {

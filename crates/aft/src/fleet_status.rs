@@ -6,17 +6,27 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use subc_client_rs::{
+    CallOptions, CloseRouteOptions, ConnectionState, ConsumerOptions, RouteHandle, SubcConsumer,
+};
+use subc_protocol::manifest::ProviderRole;
+use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 const STATUS_CADENCE: Duration = Duration::from_millis(2_500);
+const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
+const STATUS_HOLDER_MODULE: &str = "prefrontal-core";
+const STATUS_LINE_OPERATION: &str = "status.line";
 
 #[cfg(test)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -83,6 +93,7 @@ struct ClientState {
 
 struct FleetStatusInner {
     wire_tx: Option<mpsc::Sender<StatusWireRequest>>,
+    route_live: AtomicBool,
     state: parking_lot::Mutex<ClientState>,
     next_revision: AtomicU64,
 }
@@ -93,12 +104,25 @@ pub(crate) struct FleetStatusClient {
 }
 
 impl FleetStatusClient {
+    #[cfg(test)]
     pub(crate) fn channel(capacity: usize) -> (Self, mpsc::Receiver<StatusWireRequest>) {
+        Self::channel_with_liveness(capacity, true)
+    }
+
+    pub(crate) fn dial_channel(capacity: usize) -> (Self, mpsc::Receiver<StatusWireRequest>) {
+        Self::channel_with_liveness(capacity, false)
+    }
+
+    fn channel_with_liveness(
+        capacity: usize,
+        route_live: bool,
+    ) -> (Self, mpsc::Receiver<StatusWireRequest>) {
         let (wire_tx, wire_rx) = mpsc::channel(capacity);
         (
             Self {
                 inner: Arc::new(FleetStatusInner {
                     wire_tx: Some(wire_tx),
+                    route_live: AtomicBool::new(route_live),
                     state: parking_lot::Mutex::new(ClientState::default()),
                     next_revision: AtomicU64::new(1),
                 }),
@@ -111,19 +135,34 @@ impl FleetStatusClient {
         Self {
             inner: Arc::new(FleetStatusInner {
                 wire_tx: None,
+                route_live: AtomicBool::new(false),
                 state: parking_lot::Mutex::new(ClientState::default()),
                 next_revision: AtomicU64::new(1),
             }),
         }
     }
 
+    pub(crate) fn set_route_live(&self, route_live: bool) {
+        self.inner.route_live.store(route_live, Ordering::Release);
+        if !route_live {
+            self.inner.state.lock().last_publish_at.clear();
+        }
+    }
+
     /// Publish AFT's segment when the holder route is live. The return value is
     /// ownership, not delivery: `true` means the holder's host plugin owns the
     /// response bar even when cadence, contention, or backpressure skips a send.
-    pub(crate) fn publish(&self, project_root: &Path, aft_text: &str) -> bool {
+    pub(crate) fn publish(
+        &self,
+        project_root: &Path,
+        harness: &str,
+        session: &str,
+        aft_text: &str,
+    ) -> bool {
         let Some(wire_tx) = self.inner.wire_tx.as_ref() else {
             return false;
         };
+        let route_live = self.inner.route_live.load(Ordering::Acquire);
         let scope = format!("project:{}", project_root.to_string_lossy());
         let now = Instant::now();
         let revision = {
@@ -141,12 +180,26 @@ impl FleetStatusClient {
             self.inner.next_revision.fetch_add(1, Ordering::Relaxed)
         };
 
-        let request =
-            StatusWireRequest::publish(Arc::downgrade(&self.inner), &scope, aft_text, revision);
-        if wire_tx.try_send(request).is_err() {
-            self.inner.state.lock().last_publish_at.remove(&scope);
+        let request = StatusWireRequest::publish(
+            Arc::downgrade(&self.inner),
+            project_root,
+            harness,
+            session,
+            &scope,
+            aft_text,
+            revision,
+        );
+        match wire_tx.try_send(request) {
+            Ok(()) => route_live,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.inner.state.lock().last_publish_at.remove(&scope);
+                route_live
+            }
+            Err(mpsc::error::TrySendError::Closed(request)) => {
+                request.complete_unavailable();
+                false
+            }
         }
-        true
     }
 
     #[cfg(test)]
@@ -157,11 +210,29 @@ impl FleetStatusClient {
 
 pub(crate) struct StatusWireRequest {
     body: Value,
+    project_root: String,
+    harness: String,
+    session: String,
     client: Weak<FleetStatusInner>,
 }
 
+#[derive(Clone)]
+struct FleetRouteIdentity {
+    project_root: String,
+    harness: String,
+    session: String,
+}
+
 impl StatusWireRequest {
-    fn publish(client: Weak<FleetStatusInner>, scope: &str, text: &str, revision: u64) -> Self {
+    fn publish(
+        client: Weak<FleetStatusInner>,
+        project_root: &Path,
+        harness: &str,
+        session: &str,
+        scope: &str,
+        text: &str,
+        revision: u64,
+    ) -> Self {
         Self {
             body: json!({
                 "op": "status.publish",
@@ -171,25 +242,304 @@ impl StatusWireRequest {
                 "ttl_ms": STATUS_PUBLISH_TTL_MS,
                 "revision": revision,
             }),
+            project_root: project_root.to_string_lossy().into_owned(),
+            harness: harness.to_owned(),
+            session: session.to_owned(),
             client,
         }
+    }
+
+    pub(crate) fn project_root(&self) -> &str {
+        &self.project_root
+    }
+
+    pub(crate) fn harness(&self) -> &str {
+        &self.harness
+    }
+
+    pub(crate) fn session(&self) -> &str {
+        &self.session
     }
 
     pub(crate) fn body(&self) -> &Value {
         &self.body
     }
 
-    pub(crate) fn complete_response(self, body: &[u8]) {
+    pub(crate) fn complete_response(self, body: &[u8]) -> bool {
         let Some(ack) = StatusPublishAck::parse(body) else {
-            return;
+            self.complete_unavailable();
+            return false;
         };
         let Some(client) = self.client.upgrade() else {
-            return;
+            return true;
         };
         client.state.lock().publish_fence.observe(ack);
+        true
     }
 
-    pub(crate) fn complete_unavailable(self) {}
+    pub(crate) fn complete_unavailable(self) {
+        if let Some(client) = self.client.upgrade() {
+            client.route_live.store(false, Ordering::Release);
+            client.state.lock().last_publish_at.clear();
+        }
+    }
+}
+
+impl From<&StatusWireRequest> for FleetRouteIdentity {
+    fn from(request: &StatusWireRequest) -> Self {
+        Self {
+            project_root: request.project_root().to_owned(),
+            harness: request.harness().to_owned(),
+            session: request.session().to_owned(),
+        }
+    }
+}
+
+pub(crate) fn spawn_fleet_status_dial(
+    connection_file: &Path,
+    capacity: usize,
+) -> (FleetStatusClient, JoinHandle<()>) {
+    if !consumer_identity_is_available() {
+        return (FleetStatusClient::dormant(), tokio::spawn(async {}));
+    }
+    let (client, wire_rx) = FleetStatusClient::dial_channel(capacity);
+    let task_client = client.clone();
+    let connection_file = connection_file.to_path_buf();
+    let task = tokio::spawn(async move {
+        run_fleet_status_dial(connection_file, task_client, wire_rx).await;
+    });
+    (client, task)
+}
+
+async fn run_fleet_status_dial(
+    connection_file: std::path::PathBuf,
+    client: FleetStatusClient,
+    mut wire_rx: mpsc::Receiver<StatusWireRequest>,
+) {
+    let Some(first_request) = wire_rx.recv().await else {
+        return;
+    };
+    let route_identity = FleetRouteIdentity::from(&first_request);
+    let mut pending_request = Some(first_request);
+    let mut connect_backoff = DISCOVERY_INITIAL_BACKOFF;
+    let consumer = loop {
+        let options = ConsumerOptions {
+            call_timeout: STATUS_CADENCE,
+            ..ConsumerOptions::default()
+        };
+        match SubcConsumer::connect(&connection_file, options).await {
+            Ok(consumer) => break consumer,
+            Err(error) => {
+                client.set_route_live(false);
+                if let Some(request) = pending_request.take() {
+                    request.complete_unavailable();
+                }
+                log::debug!("fleet status dial: consumer connect unavailable: {error}");
+                tokio::time::sleep(connect_backoff).await;
+                connect_backoff = next_discovery_backoff(connect_backoff);
+            }
+        }
+    };
+
+    let (connection_state_tx, mut connection_state_rx) = mpsc::unbounded_channel();
+    let connection_state_client = client.clone();
+    consumer.on_connection_state(move |state| {
+        connection_state_client.set_route_live(false);
+        let _ = connection_state_tx.send(state);
+    });
+
+    let mut route: Option<RouteHandle> = None;
+    let mut route_events = None;
+    let mut next_discovery_at = tokio::time::Instant::now();
+    let mut discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
+    loop {
+        if tokio::time::Instant::now() >= next_discovery_at {
+            match consumer.catalog_list().await {
+                Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
+                    discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
+                    if route.is_none() {
+                        let identity = BindIdentity {
+                            project_root: route_identity.project_root.clone().into(),
+                            harness: route_identity.harness.clone(),
+                            session: route_identity.session.clone(),
+                        };
+                        match consumer
+                            .open_route(
+                                RouteTarget::ManagementSurface {
+                                    module_id: STATUS_HOLDER_MODULE.to_string(),
+                                },
+                                identity,
+                                CallOptions::default(),
+                            )
+                            .await
+                        {
+                            Ok(opened_route) => match consumer.push_events(&opened_route) {
+                                Ok(events) => {
+                                    route_events = Some(events);
+                                    route = Some(opened_route);
+                                }
+                                Err(error) => {
+                                    log::debug!(
+                                        "fleet status dial: route event registration unavailable: {error}"
+                                    );
+                                    client.set_route_live(false);
+                                }
+                            },
+                            Err(error) => {
+                                log::debug!("fleet status dial: route unavailable: {error}");
+                                client.set_route_live(false);
+                            }
+                        }
+                    }
+                    client.set_route_live(route.is_some());
+                    next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                }
+                Ok(_) => {
+                    if let Some(opened_route) = route.take() {
+                        let _ = consumer
+                            .close_handle(&opened_route, CloseRouteOptions::default())
+                            .await;
+                    }
+                    route_events = None;
+                    client.set_route_live(false);
+                    discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
+                    next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                }
+                Err(error) => {
+                    route = None;
+                    route_events = None;
+                    client.set_route_live(false);
+                    log::debug!("fleet status dial: catalog unavailable: {error}");
+                    next_discovery_at = tokio::time::Instant::now() + discovery_backoff;
+                    discovery_backoff = next_discovery_backoff(discovery_backoff);
+                }
+            }
+        }
+
+        if let Some(request) = pending_request.take() {
+            let Some(opened_route) = route.as_ref() else {
+                request.complete_unavailable();
+                continue;
+            };
+            let body = match encode_status_publish_call(request.body()) {
+                Some(body) => body,
+                None => {
+                    request.complete_unavailable();
+                    continue;
+                }
+            };
+            match consumer
+                .request(opened_route, body, CallOptions::default())
+                .await
+            {
+                Ok(response) => {
+                    if !complete_status_publish_call(request, &response) {
+                        route = None;
+                        route_events = None;
+                        client.set_route_live(false);
+                        next_discovery_at = tokio::time::Instant::now();
+                    }
+                }
+                Err(error) => {
+                    log::debug!("fleet status dial: publish unavailable: {error}");
+                    request.complete_unavailable();
+                    route = None;
+                    route_events = None;
+                    client.set_route_live(false);
+                    next_discovery_at = tokio::time::Instant::now();
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            maybe_request = wire_rx.recv() => {
+                let Some(request) = maybe_request else {
+                    client.set_route_live(false);
+                    return;
+                };
+                pending_request = Some(request);
+            }
+            maybe_state = connection_state_rx.recv() => {
+                match maybe_state {
+                    Some(ConnectionState::Dropped | ConnectionState::Restored { .. }) => {
+                        route = None;
+                        route_events = None;
+                        client.set_route_live(false);
+                        next_discovery_at = tokio::time::Instant::now();
+                    }
+                    None => {}
+                }
+            }
+            maybe_event = async {
+                route_events
+                    .as_mut()
+                    .expect("route event receiver guarded by select condition")
+                    .recv()
+                    .await
+            }, if route_events.is_some() => {
+                if maybe_event.is_none() {
+                    route = None;
+                    route_events = None;
+                    client.set_route_live(false);
+                    next_discovery_at = tokio::time::Instant::now();
+                }
+            }
+            _ = tokio::time::sleep_until(next_discovery_at) => {}
+        }
+    }
+}
+
+fn encode_status_publish_call(body: &Value) -> Option<Vec<u8>> {
+    let mut params = body.as_object()?.clone();
+    let method = params.remove("op")?.as_str()?.to_owned();
+    if method != "status.publish" {
+        return None;
+    }
+    serde_json::to_vec(&json!({
+        "method": method,
+        "params": params,
+    }))
+    .ok()
+}
+
+fn complete_status_publish_call(request: StatusWireRequest, body: &[u8]) -> bool {
+    let result = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|response| response.get("result").cloned())
+        .and_then(|result| serde_json::to_vec(&result).ok());
+    let Some(result) = result else {
+        request.complete_unavailable();
+        return false;
+    };
+    request.complete_response(&result)
+}
+
+fn consumer_identity_is_available() -> bool {
+    ["SUBC_MODULE_ID", "SUBC_LAUNCH_NONCE"].iter().all(|key| {
+        std::env::var(key)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn catalog_advertises_status_line(entries: &[subc_client_rs::CatalogEntry]) -> bool {
+    entries.iter().any(|entry| {
+        entry.module_id == STATUS_HOLDER_MODULE && entry.roles.iter().any(|role| {
+            matches!(
+                role,
+                ProviderRole::ManagementSurface { operations, .. }
+                    if operations.iter().any(|operation| operation.name == STATUS_LINE_OPERATION)
+            )
+        })
+    })
+}
+
+fn next_discovery_backoff(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(DISCOVERY_MAX_BACKOFF)
+        .min(DISCOVERY_MAX_BACKOFF)
 }
 
 #[cfg(test)]
@@ -197,6 +547,7 @@ mod tests {
     use super::*;
     use serde_json::Map;
     use std::collections::HashSet;
+    use subc_protocol::manifest::{ManagementOperation, ManagementOperationKind};
 
     const FIXTURES: &str = include_str!("../../../.cortexkit/status-line-fixtures-2026-08-14.json");
     const PUBLISH_ACK_FIXTURES: [&str; 9] = [
@@ -238,6 +589,23 @@ mod tests {
     fn parse_ack(value: &Value) -> StatusPublishAck {
         StatusPublishAck::parse(&serde_json::to_vec(value).expect("fixture bytes"))
             .expect("status.publish fixture")
+    }
+
+    fn status_catalog_entry(module_id: &str, operation: &str) -> subc_client_rs::CatalogEntry {
+        subc_client_rs::CatalogEntry {
+            module_id: module_id.to_string(),
+            module_version: None,
+            roles: vec![ProviderRole::ManagementSurface {
+                operations: vec![ManagementOperation {
+                    name: operation.to_string(),
+                    kind: ManagementOperationKind::Query,
+                }],
+                config_schema: Value::Null,
+                observability: Vec::new(),
+                identity_scope: Vec::new(),
+            }],
+            control_ops: Vec::new(),
+        }
     }
 
     #[test]
@@ -342,10 +710,52 @@ mod tests {
     }
 
     #[test]
+    fn catalog_gate_requires_matching_module_management_role_and_exact_operation() {
+        assert!(catalog_advertises_status_line(&[status_catalog_entry(
+            STATUS_HOLDER_MODULE,
+            STATUS_LINE_OPERATION,
+        )]));
+        assert!(!catalog_advertises_status_line(&[status_catalog_entry(
+            "other-module",
+            STATUS_LINE_OPERATION,
+        )]));
+        assert!(!catalog_advertises_status_line(&[status_catalog_entry(
+            STATUS_HOLDER_MODULE,
+            "status.lines",
+        )]));
+    }
+
+    #[test]
+    fn dial_channel_queues_discovery_without_claiming_the_status_bar() {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+
+        assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+        let request = wire_rx.try_recv().expect("discovery request");
+        assert_eq!(request.project_root(), "/tmp/project");
+        assert_eq!(request.harness(), "opencode");
+        assert_eq!(request.session(), "session-1");
+        request.complete_unavailable();
+    }
+
+    #[test]
+    fn closed_dial_channel_falls_back_to_the_solo_status_bar() {
+        let (client, wire_rx) = FleetStatusClient::channel(1);
+        drop(wire_rx);
+
+        assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+        assert!(!client.inner.route_live.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn dormant_client_falls_back_without_publishing() {
         let client = FleetStatusClient::dormant();
 
-        assert!(!client.publish(Path::new("/tmp/project"), "E0 W0 | D0 U0 C0 | T0"));
+        assert!(!client.publish(
+            Path::new("/tmp/project"),
+            "opencode",
+            "session-1",
+            "E0 W0 | D0 U0 C0 | T0"
+        ));
         let state = client.inner.state.lock();
         assert!(state.last_publish_at.is_empty());
         assert_eq!(client.inner.next_revision.load(Ordering::Relaxed), 1);
@@ -355,7 +765,7 @@ mod tests {
     fn empty_local_status_publishes_alive_quiet() {
         let (client, mut wire_rx) = FleetStatusClient::channel(4);
 
-        assert!(client.publish(Path::new("/tmp/project"), ""));
+        assert!(client.publish(Path::new("/tmp/project"), "opencode", "session-1", ""));
         let publish = wire_rx.try_recv().expect("publish request");
         assert_eq!(publish.body()["op"], "status.publish");
         assert_eq!(publish.body()["text"], "");
@@ -373,12 +783,12 @@ mod tests {
         let publish_fixture =
             serde_json::to_vec(&fixtures["publish_aft"]).expect("publish fixture bytes");
 
-        assert!(client.publish(Path::new("/tmp/project"), "local"));
+        assert!(client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
         let publish = wire_rx.try_recv().expect("first publish request");
         assert_eq!(publish.body()["revision"], 1);
-        publish.complete_response(&publish_fixture);
+        assert!(publish.complete_response(&publish_fixture));
 
-        assert!(client.publish(Path::new("/tmp/project"), "local"));
+        assert!(client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
         assert!(
             wire_rx.try_recv().is_err(),
             "publish cadence issued another request"

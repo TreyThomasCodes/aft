@@ -2250,6 +2250,7 @@ fn send_bind_epoch(
         },
         consumer_capabilities: None,
         principal: Some(Principal::Direct),
+        admission_facts: Default::default(),
     };
     send_control(tx, corr, request);
 }
@@ -2283,6 +2284,7 @@ async fn write_measure_bind(
         },
         consumer_capabilities: None,
         principal: Some(Principal::Direct),
+        admission_facts: Default::default(),
     };
     let frame = Frame::build(
         FrameType::Request,

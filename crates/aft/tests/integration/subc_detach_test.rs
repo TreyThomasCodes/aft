@@ -172,6 +172,8 @@ impl ModuleProcess {
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
+            .env_remove("SUBC_MODULE_ID")
+            .env_remove("SUBC_LAUNCH_NONCE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -299,6 +301,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         },
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
+        admission_facts: Default::default(),
     };
     send_frame(
         stream,

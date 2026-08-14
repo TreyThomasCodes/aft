@@ -307,11 +307,20 @@ impl Drop for EnvVarGuard {
     }
 }
 
-fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
-    let key = "AFT_TEST_FOREGROUND_WAIT_MS";
+fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
     let previous = std::env::var_os(key);
-    std::env::set_var(key, ms.to_string());
+    std::env::set_var(key, value);
     EnvVarGuard { key, previous }
+}
+
+fn remove_test_env(key: &'static str) -> EnvVarGuard {
+    let previous = std::env::var_os(key);
+    std::env::remove_var(key);
+    EnvVarGuard { key, previous }
+}
+
+fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
+    set_test_env("AFT_TEST_FOREGROUND_WAIT_MS", &ms.to_string())
 }
 
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
@@ -1496,6 +1505,8 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _serial = bridge_test_serial_guard();
     crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
+    let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
     let state = Arc::new(BridgeState::default());
     install_bridge_state(Arc::clone(&state));
@@ -2160,10 +2171,32 @@ fn subc_bridge_response_finalizer_status_bar_and_bg_completion_once_per_epoch() 
 }
 
 #[test]
+fn subc_bridge_discovered_status_line_publishes_over_consumer_connection() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_discovered_status_line_publishes_over_consumer_connection",
+        Duration::from_secs(30),
+        || {
+            vec![
+                set_test_env("SUBC_MODULE_ID", "aft"),
+                set_test_env("SUBC_LAUNCH_NONCE", "test-launch-nonce"),
+            ]
+        },
+        drive_discovered_status_line_surface_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_without_discovered_status_line_surface_emits_no_status_requests() {
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_env(
         "subc_bridge_without_discovered_status_line_surface_emits_no_status_requests",
         Duration::from_secs(30),
+        || {
+            vec![
+                set_test_env("SUBC_MODULE_ID", "aft"),
+                set_test_env("SUBC_LAUNCH_NONCE", "test-launch-nonce"),
+            ]
+        },
         drive_without_discovered_status_line_surface_daemon,
         |_, _, _| {},
     );
@@ -2871,6 +2904,7 @@ async fn drive_s1_rejection_daemon(
         },
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
+        admission_facts: Default::default(),
     };
     send_frame(
         &mut stream,
@@ -5326,6 +5360,44 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         }
     }
 
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("fleet consumer connection timeout")
+        .expect("accept fleet consumer");
+    authenticate_server(
+        &mut consumer_stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate fleet consumer");
+    let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
+    assert_eq!(catalog.header.ty, FrameType::Request);
+    assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
+    let mut consumer_inventory = vec![catalog.clone()];
+    send_frame(
+        &mut consumer_stream,
+        Frame::build_with_version(
+            catalog.header.ver,
+            FrameType::Response,
+            catalog.header.flags,
+            catalog.header.channel,
+            catalog.header.epoch,
+            catalog.header.corr,
+            serde_json::to_vec(&json!({
+                "op": "catalog.list",
+                "generation": 1,
+                "modules": [],
+                "subc_ops": [],
+            }))
+            .expect("catalog response body"),
+        )
+        .expect("catalog response frame"),
+    )
+    .await;
+
     let quiet_deadline = Instant::now() + Duration::from_millis(100);
     while Instant::now() < quiet_deadline {
         let remaining = quiet_deadline.saturating_duration_since(Instant::now());
@@ -5333,6 +5405,16 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
             Ok(Ok(Some(frame))) => inventory.push(frame),
             Ok(Ok(None)) => panic!("EOF while collecting post-completion inventory"),
             Ok(Err(error)) => panic!("read post-completion inventory: {error}"),
+            Err(_) => break,
+        }
+    }
+    let consumer_quiet_deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < consumer_quiet_deadline {
+        let remaining = consumer_quiet_deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, read_subc_frame(&mut consumer_stream)).await {
+            Ok(Ok(Some(frame))) => consumer_inventory.push(frame),
+            Ok(Ok(None)) => panic!("EOF while collecting consumer inventory"),
+            Ok(Err(error)) => panic!("read consumer inventory: {error}"),
             Err(_) => break,
         }
     }
@@ -5350,7 +5432,19 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         .count();
     assert_eq!(
         status_requests, 0,
-        "daemon without a discovered {STATUS_LINE_OPERATION} surface received status traffic: {labels:?}"
+        "supervision connection received status traffic: {labels:?}"
+    );
+    let consumer_labels = frame_inventory_labels(&consumer_inventory);
+    let gated_consumer_frames = consumer_inventory
+        .iter()
+        .filter(|frame| {
+            frame.header.ty == FrameType::Request
+                && frame_operation(frame).as_deref() != Some("catalog.list")
+        })
+        .count();
+    assert_eq!(
+        gated_consumer_frames, 0,
+        "daemon without a discovered {STATUS_LINE_OPERATION} surface received consumer route/status traffic: {consumer_labels:?}"
     );
     assert!(
         inventory.iter().any(|frame| {
@@ -5369,6 +5463,297 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         "inventory omitted tool completion: {labels:?}"
     );
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
+    let FakeDaemonInput {
+        listener,
+        key,
+        daemon_id,
+        root1,
+        ..
+    } = input;
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+
+    let mut module_inventory = Vec::new();
+    let hello = read_raw_inventory_frame(&mut stream, "ModuleHello").await;
+    let hello_corr = hello.header.corr;
+    module_inventory.push(hello);
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello_corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+                storage: None,
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+
+    send_route_bind(&mut stream, 1, 10, &root1).await;
+    loop {
+        let frame = read_raw_inventory_frame(&mut stream, "RouteBindAck inventory").await;
+        let bind_completed = frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.corr == 10;
+        module_inventory.push(frame);
+        if bind_completed {
+            break;
+        }
+    }
+
+    send_tool_call(
+        &mut stream,
+        1,
+        80,
+        "echo",
+        json!({ "case": "status_bar", "dead_code": 21 }),
+    )
+    .await;
+    loop {
+        let frame = read_raw_inventory_frame(&mut stream, "first status response").await;
+        let completed = frame.header.ty == FrameType::Response
+            && frame.header.channel == 1
+            && frame.header.corr == 80;
+        if completed {
+            assert_eq!(tool_response_json(&frame)["status_bar"]["dead_code"], 21);
+        }
+        module_inventory.push(frame);
+        if completed {
+            break;
+        }
+    }
+
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("fleet consumer connection timeout")
+        .expect("accept fleet consumer");
+    authenticate_server(
+        &mut consumer_stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate fleet consumer");
+
+    let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
+    assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
+    send_frame(
+        &mut consumer_stream,
+        Frame::build_with_version(
+            catalog.header.ver,
+            FrameType::Response,
+            catalog.header.flags,
+            catalog.header.channel,
+            catalog.header.epoch,
+            catalog.header.corr,
+            serde_json::to_vec(&json!({
+                "op": "catalog.list",
+                "generation": 7,
+                "modules": [{
+                    "module_id": "prefrontal-core",
+                    "roles": [{
+                        "role": "management_surface",
+                        "operations": [{ "name": "status.line", "kind": "query" }],
+                        "config_schema": { "type": "object" },
+                        "observability": [],
+                        "identity_scope": ["project"],
+                    }],
+                    "control_ops": [],
+                }],
+                "subc_ops": ["catalog.list", "route.open"],
+            }))
+            .expect("catalog response body"),
+        )
+        .expect("catalog response frame"),
+    )
+    .await;
+
+    let route_open = read_raw_inventory_frame(&mut consumer_stream, "route.open").await;
+    let route_open_body: Value =
+        serde_json::from_slice(&route_open.body).expect("route.open request body");
+    assert_eq!(route_open_body["op"], "route.open");
+    assert_eq!(
+        route_open_body["target"],
+        json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+    );
+    assert_eq!(
+        route_open_body["consumer_identity"],
+        json!({ "module_id": "aft", "launch_nonce": "test-launch-nonce" })
+    );
+    assert_eq!(route_open_body["identity"]["project_root"], json!(root1));
+    assert_eq!(route_open_body["identity"]["harness"], "opencode");
+    send_frame(
+        &mut consumer_stream,
+        Frame::build_with_version(
+            route_open.header.ver,
+            FrameType::Response,
+            route_open.header.flags,
+            route_open.header.channel,
+            route_open.header.epoch,
+            route_open.header.corr,
+            serde_json::to_vec(&json!({
+                "op": "route.open",
+                "route_channel": 42,
+                "route_epoch": 7,
+            }))
+            .expect("route.open response body"),
+        )
+        .expect("route.open response frame"),
+    )
+    .await;
+
+    let publish = read_raw_inventory_frame(&mut consumer_stream, "status.publish").await;
+    assert_eq!(publish.header.ty, FrameType::Request);
+    assert_eq!(publish.header.channel, 42);
+    assert_eq!(publish.header.epoch, 7);
+    let publish_body: Value =
+        serde_json::from_slice(&publish.body).expect("status.publish request body");
+    assert_eq!(publish_body["method"], "status.publish");
+    assert_eq!(publish_body["params"]["module"], "aft");
+    assert_eq!(publish_body["params"]["revision"], 1);
+    assert_eq!(publish_body["params"]["ttl_ms"], 7_500);
+    assert_eq!(
+        publish_body["params"]["scope"],
+        format!("project:{}", root1.to_string_lossy())
+    );
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../../.cortexkit/status-line-fixtures-2026-08-14.json"
+    ))
+    .expect("status line producer fixtures");
+    send_frame(
+        &mut consumer_stream,
+        Frame::build_with_version(
+            publish.header.ver,
+            FrameType::Response,
+            publish.header.flags,
+            publish.header.channel,
+            publish.header.epoch,
+            publish.header.corr,
+            serde_json::to_vec(&json!({ "result": fixtures["publish_aft"] }))
+                .expect("publish ack fixture"),
+        )
+        .expect("publish ack frame"),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    send_tool_call(
+        &mut stream,
+        1,
+        81,
+        "echo",
+        json!({ "case": "status_bar", "dead_code": 21 }),
+    )
+    .await;
+    loop {
+        let frame = read_raw_inventory_frame(&mut stream, "live plane response").await;
+        let completed = frame.header.ty == FrameType::Response
+            && frame.header.channel == 1
+            && frame.header.corr == 81;
+        if completed {
+            assert!(
+                tool_response_json(&frame)["status_bar"].is_null(),
+                "opencode-harness solo bar must be suppressed while the fleet plane is live"
+            );
+        }
+        module_inventory.push(frame);
+        if completed {
+            break;
+        }
+    }
+
+    send_frame(
+        &mut consumer_stream,
+        Frame::build(FrameType::Goodbye, control_flags(), 42, 7, 90, Vec::new())
+            .expect("fleet route goodbye frame"),
+    )
+    .await;
+    let catalog_after_goodbye =
+        read_raw_inventory_frame(&mut consumer_stream, "catalog.list after route Goodbye").await;
+    assert_eq!(
+        frame_operation(&catalog_after_goodbye).as_deref(),
+        Some("catalog.list")
+    );
+    send_frame(
+        &mut consumer_stream,
+        Frame::build_with_version(
+            catalog_after_goodbye.header.ver,
+            FrameType::Response,
+            catalog_after_goodbye.header.flags,
+            catalog_after_goodbye.header.channel,
+            catalog_after_goodbye.header.epoch,
+            catalog_after_goodbye.header.corr,
+            serde_json::to_vec(&json!({
+                "op": "catalog.list",
+                "generation": 8,
+                "modules": [],
+                "subc_ops": ["catalog.list", "route.open"],
+            }))
+            .expect("catalog drop response body"),
+        )
+        .expect("catalog drop response frame"),
+    )
+    .await;
+
+    send_tool_call(
+        &mut stream,
+        1,
+        82,
+        "echo",
+        json!({ "case": "status_bar", "dead_code": 22 }),
+    )
+    .await;
+    loop {
+        let frame = read_raw_inventory_frame(&mut stream, "dormant plane response").await;
+        let completed = frame.header.ty == FrameType::Response
+            && frame.header.channel == 1
+            && frame.header.corr == 82;
+        if completed {
+            assert_eq!(
+                tool_response_json(&frame)["status_bar"]["dead_code"],
+                22,
+                "catalog drop after route Goodbye must restore the solo bar"
+            );
+        }
+        module_inventory.push(frame);
+        if completed {
+            break;
+        }
+    }
+
+    let labels = frame_inventory_labels(&module_inventory);
+    assert!(
+        module_inventory.iter().all(|frame| {
+            frame.header.ty != FrameType::Request
+                || !matches!(
+                    frame_operation(frame).as_deref(),
+                    Some("status.publish" | "status.line" | "route.open" | "catalog.list")
+                )
+        }),
+        "supervision connection carried fleet consumer traffic: {labels:?}"
+    );
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -5906,6 +6291,7 @@ async fn send_route_bind_with_elicitation_capability(
         },
         principal: Some(subc_mcp_principal()),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
+        admission_facts: Default::default(),
     };
     send_frame(
         stream,
@@ -6837,6 +7223,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         },
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
+        admission_facts: Default::default(),
     };
     send_frame(
         &mut stream,
@@ -8205,6 +8592,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         },
         principal,
         consumer_capabilities,
+        admission_facts: Default::default(),
     };
     send_frame(
         stream,
