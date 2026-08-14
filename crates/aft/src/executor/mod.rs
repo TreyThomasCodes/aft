@@ -181,6 +181,105 @@ pub struct DispatchLivenessSnapshot {
     pub maintenance_cap: usize,
 }
 
+/// Scheduler-owned mirror read by health probes without taking the actor map
+/// lock or scanning every root. Oldest queue timestamps use `0` for absent and
+/// elapsed-milliseconds-plus-one for a present timestamp.
+struct DispatchLivenessAtomics {
+    origin: Instant,
+    interactive_queued: AtomicUsize,
+    interactive_oldest_enqueued_ms_plus_one: AtomicU64,
+    maintenance_queued: AtomicUsize,
+    maintenance_oldest_enqueued_ms_plus_one: AtomicU64,
+    interactive_running: AtomicUsize,
+    maintenance_running: AtomicUsize,
+}
+
+impl DispatchLivenessAtomics {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            interactive_queued: AtomicUsize::new(0),
+            interactive_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
+            maintenance_queued: AtomicUsize::new(0),
+            maintenance_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
+            interactive_running: AtomicUsize::new(0),
+            maintenance_running: AtomicUsize::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn record(&self, snapshot: &DispatchLivenessSnapshot) {
+        let now_ms = self.now_ms();
+        let encode_oldest = |queued: usize, oldest_age_ms: Option<u64>| {
+            if queued == 0 {
+                0
+            } else {
+                now_ms
+                    .saturating_sub(oldest_age_ms.unwrap_or(0))
+                    .saturating_add(1)
+            }
+        };
+        self.interactive_oldest_enqueued_ms_plus_one.store(
+            encode_oldest(
+                snapshot.interactive.queued,
+                snapshot.interactive.oldest_age_ms,
+            ),
+            Ordering::Relaxed,
+        );
+        self.maintenance_oldest_enqueued_ms_plus_one.store(
+            encode_oldest(
+                snapshot.maintenance.queued,
+                snapshot.maintenance.oldest_age_ms,
+            ),
+            Ordering::Relaxed,
+        );
+        self.interactive_running
+            .store(snapshot.running.interactive, Ordering::Release);
+        self.maintenance_running
+            .store(snapshot.running.maintenance, Ordering::Release);
+        self.interactive_queued
+            .store(snapshot.interactive.queued, Ordering::Release);
+        self.maintenance_queued
+            .store(snapshot.maintenance.queued, Ordering::Release);
+    }
+
+    fn snapshot(&self, config: &EffectiveConfig) -> DispatchLivenessSnapshot {
+        let now_ms = self.now_ms();
+        let decode_oldest = |queued: usize, encoded: u64| {
+            (queued > 0 && encoded > 0).then(|| now_ms.saturating_sub(encoded - 1))
+        };
+        let interactive_queued = self.interactive_queued.load(Ordering::Acquire);
+        let maintenance_queued = self.maintenance_queued.load(Ordering::Acquire);
+        DispatchLivenessSnapshot {
+            interactive: DispatchClassQueueSnapshot {
+                queued: interactive_queued,
+                oldest_age_ms: decode_oldest(
+                    interactive_queued,
+                    self.interactive_oldest_enqueued_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+            },
+            maintenance: DispatchClassQueueSnapshot {
+                queued: maintenance_queued,
+                oldest_age_ms: decode_oldest(
+                    maintenance_queued,
+                    self.maintenance_oldest_enqueued_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+            },
+            running: DispatchRunningSnapshot {
+                interactive: self.interactive_running.load(Ordering::Acquire),
+                maintenance: self.maintenance_running.load(Ordering::Acquire),
+            },
+            interactive_reserve: config.interactive_reserve,
+            maintenance_cap: config.maintenance_cap,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutatingLaneSnapshot {
     pub root_id: ProjectRootId,
@@ -389,6 +488,7 @@ impl Executor {
         let nonrunnable_dispatches = Arc::new(AtomicUsize::new(0));
         let completed_interactive = Arc::new(AtomicU64::new(0));
         let completed_maintenance = Arc::new(AtomicU64::new(0));
+        let dispatch_liveness = Arc::new(DispatchLivenessAtomics::new());
         let (run_tx, run_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
@@ -397,6 +497,7 @@ impl Executor {
         let scheduler_violations = Arc::clone(&nonrunnable_dispatches);
         let scheduler_completed_interactive = Arc::clone(&completed_interactive);
         let scheduler_completed_maintenance = Arc::clone(&completed_maintenance);
+        let scheduler_dispatch_liveness = Arc::clone(&dispatch_liveness);
         let scheduler_handle = thread::Builder::new()
             .name("aft-executor-scheduler".to_string())
             .spawn(move || {
@@ -408,6 +509,7 @@ impl Executor {
                     scheduler_violations,
                     scheduler_completed_interactive,
                     scheduler_completed_maintenance,
+                    scheduler_dispatch_liveness,
                 );
             })
             .expect("spawn AFT executor scheduler");
@@ -433,6 +535,7 @@ impl Executor {
                 nonrunnable_dispatches,
                 completed_interactive,
                 completed_maintenance,
+                dispatch_liveness,
             }),
         }
     }
@@ -602,6 +705,11 @@ impl Executor {
                 .map(|(root_id, actor_state)| (root_id.clone(), Arc::clone(&actor_state.ctx)))
                 .collect(),
         )
+    }
+
+    /// Constant-time scheduler contention signal for the health reply path.
+    pub fn try_actor_count(&self) -> Option<usize> {
+        self.inner.state.try_lock().map(|state| state.actors.len())
     }
 
     pub fn submit(
@@ -831,10 +939,7 @@ impl Executor {
     }
 
     pub fn try_dispatch_liveness_snapshot(&self) -> Option<DispatchLivenessSnapshot> {
-        self.inner
-            .state
-            .try_lock()
-            .map(|state| state.dispatch_liveness_snapshot())
+        Some(self.inner.dispatch_liveness.snapshot(&self.inner.config))
     }
 
     pub fn try_mutating_lane_snapshots(&self) -> Option<Vec<MutatingLaneSnapshot>> {
@@ -910,6 +1015,7 @@ struct ExecutorInner {
     nonrunnable_dispatches: Arc<AtomicUsize>,
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
+    dispatch_liveness: Arc<DispatchLivenessAtomics>,
 }
 
 impl Drop for ExecutorInner {
@@ -1514,6 +1620,7 @@ fn scheduler_loop(
     nonrunnable_dispatches: Arc<AtomicUsize>,
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
+    dispatch_liveness: Arc<DispatchLivenessAtomics>,
 ) {
     while let Ok(event) = event_rx.recv() {
         let mut shutdown = false;
@@ -1538,6 +1645,7 @@ fn scheduler_loop(
             if !shutdown {
                 dispatch_runnable(&mut state, &heavy, &run_tx, &nonrunnable_dispatches);
             }
+            dispatch_liveness.record(&state.dispatch_liveness_snapshot());
         }
 
         if shutdown {

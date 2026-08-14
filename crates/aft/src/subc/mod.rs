@@ -151,8 +151,8 @@ mod push;
 mod wire;
 
 use self::health::{
-    build_health_report, warn_slow_pending_binds, DispatchPathMetrics, ReapBlockerCensus,
-    ResponseTaskGuard,
+    build_health_report, warn_slow_pending_binds, DispatchPathMetrics, HealthRollupCache,
+    ReapBlockerCensus, ResponseTaskGuard, HEALTH_ROLLUP_TTL,
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
@@ -2399,9 +2399,16 @@ where
     let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
+    let health_rollup_cache = HealthRollupCache::new();
+    health_rollup_cache.refresh(&executor, &shared_app);
+    let mut next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
 
     let loop_result: Result<ModuleLoopExit, SubcError> = loop {
         shared_app.set_open_route_count(routes.len());
+        if tokio::time::Instant::now() >= next_health_rollup_at {
+            health_rollup_cache.refresh(&executor, &shared_app);
+            next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
+        }
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
         if let Err(error) = expire_pending_bash_asks(
@@ -2440,6 +2447,8 @@ where
             Ok(drained) => {
                 if drained > 0 {
                     next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+                    health_rollup_cache.refresh(&executor, &shared_app);
+                    next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
                 }
             }
             Err(error) => break Err(error),
@@ -2543,6 +2552,7 @@ where
                     break Err(error);
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+                next_health_rollup_at = tokio::time::Instant::now();
             }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
@@ -2665,6 +2675,7 @@ where
                             &shutdown,
                             &control_completion_tx,
                             &dispatch_path_metrics,
+                            &health_rollup_cache,
                             &push_senders,
                             dispatch,
                             user_config_path.as_deref(),
@@ -3554,6 +3565,7 @@ async fn handle_control_request(
     shutdown: &Arc<Notify>,
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
+    health_rollup_cache: &HealthRollupCache,
     push_senders: &PushSenders,
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
@@ -3826,11 +3838,18 @@ async fn handle_control_request(
                 }
             });
 
+            health_rollup_cache.refresh(executor, shared_app);
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
             metrics.record_bg_runtime(bg_subs.len(), bg_wake_pending.len());
-            let report = build_health_report(executor, pending_binds, metrics, shared_app);
+            let report = build_health_report(
+                health_rollup_cache,
+                executor,
+                pending_binds,
+                metrics,
+                shared_app,
+            );
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(SubcError::Json)?;
             let response = Frame::build_with_version(
@@ -5982,11 +6001,15 @@ mod tests {
         );
         assert_eq!(outcome.evicted, 0);
 
+        let app = crate::context::App::default_shared();
+        let health_rollup_cache = HealthRollupCache::new();
+        health_rollup_cache.refresh(&executor, &app);
         let report = build_health_report(
+            &health_rollup_cache,
             &executor,
             &HashMap::new(),
             &metrics,
-            &crate::context::App::default_shared(),
+            &app,
         );
         let reap = report
             .metrics

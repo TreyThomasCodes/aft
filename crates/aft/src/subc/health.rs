@@ -1,6 +1,5 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -8,7 +7,7 @@ use super::{
     HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot, RouteChannel,
     StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::{App, AppContext, RootHealthState};
+use crate::context::App;
 use crate::executor::BindBlockerSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -139,6 +138,73 @@ enum BgEventKind {
     SubscriptionEnded,
 }
 
+impl BgEventKind {
+    fn index(self) -> usize {
+        match self {
+            Self::ArmHit => 0,
+            Self::ArmMiss => 1,
+            Self::NudgeEnqueued => 2,
+            Self::SubscriptionInstalled => 3,
+            Self::SubscriptionEnded => 4,
+        }
+    }
+}
+
+const BG_EVENT_RATE_BUCKETS: usize = 60;
+
+#[derive(Clone, Copy, Default)]
+struct BgEventRateBucket {
+    second: u64,
+    counts: [u64; 5],
+}
+
+/// Fixed-size rolling counters keep 60-second wake metrics live without
+/// traversing the per-root observability map on every probe.
+struct BgEventRates {
+    origin: Instant,
+    buckets: StdMutex<[BgEventRateBucket; BG_EVENT_RATE_BUCKETS]>,
+}
+
+impl BgEventRates {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            buckets: StdMutex::new([BgEventRateBucket::default(); BG_EVENT_RATE_BUCKETS]),
+        }
+    }
+
+    fn second_at(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.origin).as_secs()
+    }
+
+    fn record(&self, kind: BgEventKind, now: Instant) {
+        let second = self.second_at(now);
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return;
+        };
+        let bucket = &mut buckets[(second as usize) % BG_EVENT_RATE_BUCKETS];
+        if bucket.second != second {
+            *bucket = BgEventRateBucket {
+                second,
+                counts: [0; 5],
+            };
+        }
+        bucket.counts[kind.index()] = bucket.counts[kind.index()].saturating_add(1);
+    }
+
+    fn count_60s(&self, kind: BgEventKind) -> u64 {
+        let second = self.second_at(Instant::now());
+        let Ok(buckets) = self.buckets.try_lock() else {
+            return 0;
+        };
+        buckets
+            .iter()
+            .filter(|bucket| second.saturating_sub(bucket.second) < 60)
+            .map(|bucket| bucket.counts[kind.index()])
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct BgEventKey {
     root: ProjectRootId,
@@ -184,6 +250,7 @@ pub(super) struct DispatchPathMetrics {
     bg_subscriptions: AtomicUsize,
     bg_wake_pending: AtomicUsize,
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
+    bg_event_rates: BgEventRates,
     reap: ReapMetrics,
 }
 
@@ -205,6 +272,7 @@ impl DispatchPathMetrics {
             bg_subscriptions: AtomicUsize::new(0),
             bg_wake_pending: AtomicUsize::new(0),
             bg_events: StdMutex::new(HashMap::new()),
+            bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
         }
     }
@@ -239,6 +307,7 @@ impl DispatchPathMetrics {
         kind: BgEventKind,
         now: Instant,
     ) -> Option<u64> {
+        self.bg_event_rates.record(kind, now);
         let Ok(mut events) = self.bg_events.lock() else {
             return None;
         };
@@ -273,19 +342,7 @@ impl DispatchPathMetrics {
     }
 
     fn bg_event_count_60s(&self, kind: BgEventKind) -> u64 {
-        let Ok(events) = self.bg_events.try_lock() else {
-            return 0;
-        };
-        let now = Instant::now();
-        events
-            .iter()
-            .filter(|(key, record)| {
-                key.kind == kind
-                    && now.saturating_duration_since(record.window_start)
-                        < BG_OBSERVABILITY_INTERVAL
-            })
-            .map(|(_, record)| record.event_count)
-            .sum()
+        self.bg_event_rates.count_60s(kind)
     }
 
     pub(super) fn bg_arm_misses_60s_total(&self) -> u64 {
@@ -397,11 +454,7 @@ impl DispatchPathMetrics {
         self.reap.snapshot()
     }
 
-    fn snapshot(
-        &self,
-        pending_binds: &HashMap<RouteChannel, PendingBind>,
-        executor: &Executor,
-    ) -> Value {
+    fn snapshot(&self, pending_binds: &HashMap<RouteChannel, PendingBind>) -> Value {
         let now = Instant::now();
         let oldest_pending_age_ms = pending_binds
             .values()
@@ -435,7 +488,6 @@ impl DispatchPathMetrics {
             "response_tasks": {
                 "live": self.response_tasks_live.load(Ordering::Relaxed),
             },
-            "mutating_lanes": mutating_lanes_metrics(executor),
         })
     }
 }
@@ -526,28 +578,93 @@ fn pending_bind_breadcrumb(
     )
 }
 
-/// Per-root attributed-bytes rollup for health metrics: top roots by size
-/// (same cap as the status payload's memory section) plus process RSS and
-/// attributed totals. `None` scheduler entries (contended) yield a busy
-/// marker instead of waiting.
+const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
+pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+struct HealthDiagnosticRollup {
+    status: HealthStatus,
+    detail: Option<String>,
+    metrics: Value,
+}
+
+impl HealthDiagnosticRollup {
+    fn unavailable() -> Self {
+        Self {
+            status: HealthStatus::Degraded,
+            detail: Some("health diagnostic snapshot is being refreshed".to_string()),
+            metrics: json!({
+                "actor_count": 0,
+                "root_count": 0,
+                "root_details_omitted": 0,
+                "callgraph_repair_entries_60s_total": 0,
+                "callgraph_repair_roots_annotated": 0,
+                "callgraph_repair_roots_total": 0,
+                "callgraph_commits_60s_total": 0,
+                "callgraph_pages_or_bytes_written_60s_total": 0,
+                "memory": memory_rollup_metrics(None),
+                "mutating_lanes": { "scheduler_busy": true },
+                "roots": [],
+            }),
+        }
+    }
+}
+
+pub(super) struct HealthRollupCache {
+    origin: Instant,
+    generated_at_ms: AtomicU64,
+    snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
+}
+
+impl HealthRollupCache {
+    pub(super) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            generated_at_ms: AtomicU64::new(0),
+            snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
+        }
+    }
+
+    /// Assemble outside the cache lock, then hold the write lock only long
+    /// enough to replace one `Arc`. Probe readers never wait for a refresh.
+    pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
+        let rollup = Arc::new(build_health_diagnostic_rollup(executor, shared_app));
+        let generated_at_ms = duration_millis_u64(self.origin.elapsed());
+        match self.snapshot.write() {
+            Ok(mut snapshot) => *snapshot = rollup,
+            Err(error) => *error.into_inner() = rollup,
+        }
+        self.generated_at_ms
+            .store(generated_at_ms, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, u64) {
+        let generated_at_ms = self.generated_at_ms.load(Ordering::Acquire);
+        let age_ms = duration_millis_u64(self.origin.elapsed()).saturating_sub(generated_at_ms);
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => Arc::clone(&snapshot),
+            Err(std::sync::TryLockError::Poisoned(error)) => Arc::clone(&error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Arc::new(HealthDiagnosticRollup::unavailable())
+            }
+        };
+        (snapshot, age_ms)
+    }
+}
+
+/// Build the compact memory rollup from pre-aggregated root counters. Rich
+/// subsystem detail is never constructed for roots omitted by the top-N cap.
 fn memory_rollup_metrics(
-    actor_entries: Option<Vec<(cortexkit_paths::ProjectRootId, Arc<AppContext>)>>,
+    roots: Option<std::collections::BTreeMap<String, crate::memory::RootMemoryRollup>>,
 ) -> Value {
-    let Some(entries) = actor_entries else {
+    let Some(roots) = roots else {
         return json!({
             "status": "busy",
             "allocator_slack_bytes": 0,
             "allocator_slack_measured": false,
         });
     };
-    let mut roots = std::collections::BTreeMap::new();
-    for (root_id, ctx) in entries {
-        roots.insert(
-            root_id.as_path().display().to_string(),
-            ctx.memory_root_snapshot(),
-        );
-    }
-    let snapshot = crate::memory::MemorySnapshot::new("ready", roots);
+    let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
     let per_root: Value = snapshot
         .roots
         .iter()
@@ -563,7 +680,7 @@ fn memory_rollup_metrics(
         .collect::<serde_json::Map<String, Value>>()
         .into();
     json!({
-        "status": "ready",
+        "status": snapshot.roots_status,
         "roots": per_root,
         "roots_total": snapshot.roots_total,
         "roots_omitted": snapshot.roots_omitted,
@@ -621,84 +738,81 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
-pub(super) fn build_health_report(
-    executor: &Executor,
-    pending_binds: &HashMap<RouteChannel, PendingBind>,
-    dispatch_path_metrics: &DispatchPathMetrics,
-    shared_app: &App,
-) -> HealthReport {
-    // Health replies must stay cheap under any load (subc-health rule: a
-    // probe that queues behind busy state lies about liveness and gets the
-    // module health-killed). Every read below is try-lock-only: a contended
-    // scheduler lock produces a degraded report with an empty root list instead
-    // of waiting.
-    let actor_entries = executor.try_actor_entries();
-    let scheduler_busy = actor_entries.is_none();
-    let actor_entries_for_memory = actor_entries.clone();
-    let mut roots: Vec<RootHealthSnapshot> = actor_entries
-        .unwrap_or_default()
+fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> HealthDiagnosticRollup {
+    struct RootCandidate {
+        root_id: cortexkit_paths::ProjectRootId,
+        health: crate::context::RootHealthSummary,
+        attributed_bytes: u64,
+        repair_entries_60s: Option<u64>,
+    }
+
+    let Some(actor_entries) = executor.try_actor_entries() else {
+        return HealthDiagnosticRollup {
+            status: HealthStatus::Degraded,
+            detail: Some(
+                "executor scheduler state could not be snapshotted without contention".to_string(),
+            ),
+            metrics: HealthDiagnosticRollup::unavailable().metrics,
+        };
+    };
+
+    let mut memory_roots = std::collections::BTreeMap::new();
+    let mut candidates = Vec::with_capacity(actor_entries.len());
+    let mut repair_roots_annotated = 0usize;
+    for (root_id, ctx) in actor_entries {
+        let root_label = root_id.as_path().display().to_string();
+        let memory = ctx.memory_root_rollup();
+        let attributed_bytes = memory.attributed_bytes;
+        memory_roots.insert(root_label, memory);
+
+        let project_key = crate::search_index::artifact_cache_key_memoized_only(root_id.as_path());
+        let repair_entries_60s = project_key.as_deref().and_then(|key| {
+            repair_roots_annotated = repair_roots_annotated.saturating_add(1);
+            crate::callgraph_store::repair_entry_rate(key)
+                .map(|(count, _window_start)| count)
+                .filter(|count| *count > 0)
+        });
+        candidates.push(RootCandidate {
+            health: ctx.try_health_summary(),
+            root_id,
+            attributed_bytes,
+            repair_entries_60s,
+        });
+    }
+
+    let repair_roots_total = candidates.len();
+    let busy_roots = candidates
+        .iter()
+        .filter(|candidate| candidate.health.is_busy())
+        .count();
+    let warming_roots = candidates
+        .iter()
+        .filter(|candidate| !candidate.health.is_busy() && !candidate.health.is_fully_ready())
+        .count();
+    candidates.sort_by(|left, right| {
+        right
+            .attributed_bytes
+            .cmp(&left.attributed_bytes)
+            .then_with(|| left.root_id.as_path().cmp(right.root_id.as_path()))
+    });
+    let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
+    let mut roots: Vec<RootHealthSnapshot> = candidates
         .into_iter()
-        .map(|(root_id, ctx)| ctx.try_health_snapshot(root_id.as_path()))
+        .take(HEALTH_ROOT_DETAIL_CAP)
+        .map(|candidate| {
+            let mut snapshot = candidate.health.into_snapshot(candidate.root_id.as_path());
+            snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
+            snapshot
+        })
         .collect();
     roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+
+    let root_count = repair_roots_total;
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
-    let mut repair_roots_annotated = 0usize;
-    for root in &mut roots {
-        // Memo-only, never a git probe: artifact_cache_key() spawns a git
-        // subprocess per unmemoized root, and this loop runs on the channel-0
-        // reply path across every live root. On a host with exec stalls — the
-        // exact fault health probes ride through — a spawn loop here pushes
-        // the reply past the supervisor deadline and the module is killed as
-        // unresponsive (2026-08-08 second outage). An unmemoized root simply
-        // loses its per-root repair annotation; the process-wide total above
-        // does not depend on cache keys.
-        let Some(project_key) =
-            crate::search_index::artifact_cache_key_memoized_only(Path::new(&root.project_root))
-        else {
-            continue;
-        };
-        repair_roots_annotated += 1;
-        if let Some((count, _window_start)) =
-            crate::callgraph_store::repair_entry_rate(&project_key)
-        {
-            if count > 0 {
-                root.callgraph_repair_entries_60s = Some(count);
-            }
-        }
-    }
-    // Absent-vs-zero disambiguation for the per-root repair annotation: a
-    // root without a derived cache key is NOT MEASURED, which must render
-    // differently from "measured, zero". The denominator pair makes the
-    // coverage visible instead of letting absence read as health.
-    let repair_roots_total = roots.len();
-
-    // Compact memory rollup for operator drill-down (`ck health aft`): per-root
-    // attributed bytes with the same top-N cap as the status payload, plus
-    // process totals. Memory estimates are themselves try-lock-only (busy
-    // subsystems report as such), so this stays within the health-path lock
-    // doctrine.
-    let memory = memory_rollup_metrics(actor_entries_for_memory);
-
-    // Health-verdict rule: DEGRADED means dispatch is impaired (an actor we
-    // could not even snapshot without contention), never "a background index
-    // is still warming". A serving root with search/callgraph mid-build is
-    // healthy — component build states are informational detail, otherwise a
-    // module with any active mason worktree reads permanently degraded and
-    // the daemon's on-failing policies treat routine warmup as wreckage.
-    let busy_roots = roots
-        .iter()
-        .filter(|root| matches!(root.state, RootHealthState::Busy))
-        .count();
-    let warming_roots = roots
-        .iter()
-        .filter(|root| !matches!(root.state, RootHealthState::Busy) && !root.is_fully_ready())
-        .count();
+    let memory = memory_rollup_metrics(Some(memory_roots));
     let lsp_children = shared_app.lsp_child_registry().try_health_snapshot();
-
-    let detail = if scheduler_busy {
-        Some("executor scheduler state could not be snapshotted without contention".to_string())
-    } else if busy_roots > 0 {
+    let detail = if busy_roots > 0 {
         Some(format!(
             "{busy_roots} root actor(s) could not be snapshotted without contention"
         ))
@@ -710,42 +824,91 @@ pub(super) fn build_health_report(
         None
     };
 
-    HealthReport {
-        // Failing to acquire the scheduler snapshot is itself dispatch contention;
-        // reporting Ok with an empty root list would hide the condition being probed.
-        status: if scheduler_busy || busy_roots > 0 {
+    HealthDiagnosticRollup {
+        status: if busy_roots > 0 {
             HealthStatus::Degraded
         } else {
             HealthStatus::Ok
         },
         detail,
-        metrics: Some(json!({
-            "actor_count": roots.iter().map(|root| root.actor_count).sum::<usize>(),
-            "root_count": roots.len(),
+        metrics: json!({
+            "actor_count": root_count,
+            "root_count": root_count,
+            "root_details_omitted": root_details_omitted,
             "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
             "callgraph_repair_roots_annotated": repair_roots_annotated,
             "callgraph_repair_roots_total": repair_roots_total,
             "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
             "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
-            // Lifecycle audit counters (fleet leak tracking): process-wide
-            // watcher runtimes, registered actor roots, and open routes.
-            "runtime": {
-                "live_watchers": shared_app.watcher_count(),
-                "live_actor_roots": shared_app.actor_root_count(),
-                "open_routes": shared_app.open_route_count(),
-                "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
-                "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
-                "bg_nudges_enqueued_60s_total": dispatch_path_metrics.bg_nudges_enqueued_60s_total(),
-                "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
-                "spawned_lsp_children": lsp_children.map(|health| health.spawned),
-                "lsp_children_with_deleted_cwd": lsp_children.map(|health| health.cwd_gone),
+            "lsp_children": {
+                "spawned": lsp_children.map(|health| health.spawned),
+                "cwd_gone": lsp_children.map(|health| health.cwd_gone),
             },
             "memory": memory,
+            "mutating_lanes": mutating_lanes_metrics(executor),
             "roots": roots,
-            "reap": dispatch_path_metrics.reap_snapshot(),
-            "dispatch_liveness": dispatch_liveness_metrics(executor),
-            "dispatch_path": dispatch_path_metrics.snapshot(pending_binds, executor),
-        })),
+        }),
+    }
+}
+
+pub(super) fn build_health_report(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
+) -> HealthReport {
+    // The diagnostic payload is fixed-size and cached. Only probe-purpose
+    // liveness signals are read fresh, using atomics or non-blocking snapshots.
+    let (rollup, snapshot_age_ms) = cache.snapshot();
+    let mut metrics = rollup
+        .metrics
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    let lsp_children = metrics.remove("lsp_children").unwrap_or(Value::Null);
+    let mutating_lanes = metrics
+        .remove("mutating_lanes")
+        .unwrap_or_else(|| json!({ "scheduler_busy": true }));
+    metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert(
+        "runtime".to_string(),
+        json!({
+            "live_watchers": shared_app.watcher_count(),
+            "live_actor_roots": shared_app.actor_root_count(),
+            "open_routes": shared_app.open_route_count(),
+            "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
+            "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
+            "bg_nudges_enqueued_60s_total": dispatch_path_metrics.bg_nudges_enqueued_60s_total(),
+            "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
+            "spawned_lsp_children": lsp_children.get("spawned").cloned().unwrap_or(Value::Null),
+            "lsp_children_with_deleted_cwd": lsp_children.get("cwd_gone").cloned().unwrap_or(Value::Null),
+        }),
+    );
+    metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
+    metrics.insert(
+        "dispatch_liveness".to_string(),
+        dispatch_liveness_metrics(executor),
+    );
+    let mut dispatch_path = dispatch_path_metrics.snapshot(pending_binds);
+    if let Some(dispatch_path) = dispatch_path.as_object_mut() {
+        dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
+    }
+    metrics.insert("dispatch_path".to_string(), dispatch_path);
+
+    let scheduler_busy = executor.try_actor_count().is_none();
+    HealthReport {
+        status: if scheduler_busy {
+            HealthStatus::Degraded
+        } else {
+            rollup.status.clone()
+        },
+        detail: if scheduler_busy {
+            Some("executor scheduler state could not be snapshotted without contention".to_string())
+        } else {
+            rollup.detail.clone()
+        },
+        metrics: Some(Value::Object(metrics)),
     }
 }
 
@@ -755,6 +918,69 @@ mod tests {
     use super::super::{Lane, Response};
     use super::*;
     use serde_json::json;
+
+    fn test_health_report(
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+    ) -> HealthReport {
+        let cache = HealthRollupCache::new();
+        let root_count = executor.actor_entries().len() as u64;
+        if root_count == 0 {
+            cache.refresh(executor, app);
+        } else {
+            refresh_until_root_count(&cache, executor, app, root_count);
+        }
+        build_health_report(&cache, executor, pending_binds, metrics, app)
+    }
+
+    fn refresh_until_root_count(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        app: &App,
+        expected: u64,
+    ) {
+        let metrics = DispatchPathMetrics::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            cache.refresh(executor, app);
+            let report = build_health_report(cache, executor, &HashMap::new(), &metrics, app);
+            if report
+                .metrics
+                .as_ref()
+                .and_then(|metrics| metrics["root_count"].as_u64())
+                == Some(expected)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "health cache did not capture {expected} roots"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn cached_reply_median(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+    ) -> Duration {
+        let mut samples = Vec::with_capacity(31);
+        for _ in 0..31 {
+            let started = Instant::now();
+            let report = build_health_report(cache, executor, &HashMap::new(), metrics, app);
+            let response = subc_protocol::session::ModuleControlResponse::from(report);
+            std::hint::black_box(
+                serde_json::to_vec(&response).expect("serialize health.check response"),
+            );
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
 
     #[test]
     fn bg_observability_rate_limit_reports_suppressed_count_and_lifecycle_lines() {
@@ -812,8 +1038,10 @@ mod tests {
         let app = crate::context::App::default_shared();
         let (_dir, root) = test_root("health-bg-runtime-fields");
         let channel = super::super::route_key(22, 4);
+        let cache = HealthRollupCache::new();
+        cache.refresh(&executor, &app);
 
-        let cold = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let cold = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         let cold_metrics = cold.metrics.expect("cold health metrics");
         let cold_runtime = &cold_metrics["runtime"];
         assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
@@ -828,7 +1056,8 @@ mod tests {
         metrics.record_bg_arm_miss(&root, "missing-session", 2);
         metrics.record_bg_nudge_enqueued(&root, "live-session", channel);
 
-        let hot = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        // The rollup remains unchanged; liveness counters must bypass it.
+        let hot = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         let hot_metrics = hot.metrics.expect("hot health metrics");
         let hot_runtime = &hot_metrics["runtime"];
         assert_eq!(hot_runtime["bg_subscriptions"].as_u64(), Some(2));
@@ -894,7 +1123,7 @@ mod tests {
         // artifact_cache_key records it as a side effect.
         let project_key = crate::search_index::artifact_cache_key(root.as_path());
 
-        let quiet = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let quiet = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let quiet_metrics = quiet.metrics.expect("quiet health metrics");
         assert_eq!(
             quiet_metrics["callgraph_repair_entries_60s_total"].as_u64(),
@@ -912,7 +1141,7 @@ mod tests {
         for _ in 0..3 {
             crate::callgraph_store::note_repair_entry(&project_key);
         }
-        let hot = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let hot = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let hot_metrics = hot.metrics.expect("hot health metrics");
         assert_eq!(
             hot_metrics["callgraph_repair_entries_60s_total"].as_u64(),
@@ -924,7 +1153,7 @@ mod tests {
         );
 
         crate::callgraph_store::expire_repair_entry_window_for_test(&project_key);
-        let decayed = build_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let decayed = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let decayed_metrics = decayed.metrics.expect("decayed health metrics");
         assert_eq!(
             decayed_metrics["callgraph_repair_entries_60s_total"].as_u64(),
@@ -986,7 +1215,7 @@ mod tests {
 
         let metrics = DispatchPathMetrics::new();
         let pending_binds = HashMap::new();
-        let report = build_health_report(
+        let report = test_health_report(
             &executor,
             &pending_binds,
             &metrics,
@@ -1027,7 +1256,7 @@ mod tests {
         let app = crate::context::App::default_shared();
         let registry = app.lsp_child_registry();
         registry.track(std::process::id());
-        let report = build_health_report(&executor, &HashMap::new(), &dispatch_path_metrics, &app);
+        let report = test_health_report(&executor, &HashMap::new(), &dispatch_path_metrics, &app);
         let metrics = report.metrics.expect("health metrics present");
         let memory = metrics.get("memory").expect("memory rollup present");
         // No actors registered: ready rollup with zero roots and process totals.
@@ -1088,7 +1317,7 @@ mod tests {
             drr_quantum: 1,
         });
         let app = crate::context::App::default_shared();
-        let report = build_health_report(
+        let report = test_health_report(
             &executor,
             &HashMap::new(),
             &DispatchPathMetrics::new(),
@@ -1136,7 +1365,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("mutating lock holder starts");
 
-        let report = build_health_report(
+        let report = test_health_report(
             &executor,
             &HashMap::new(),
             &DispatchPathMetrics::new(),
@@ -1151,5 +1380,145 @@ mod tests {
             .expect("mutating lock holder completes");
 
         assert_eq!(report.status, HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn cached_health_reply_is_fixed_cost_and_caps_root_detail_before_assembly() {
+        fn fixture(root_count: usize) -> (Executor, Vec<tempfile::TempDir>) {
+            let executor = Executor::with_config(crate::executor::ExecutorConfig {
+                pool_size: 1,
+                read_cap: 1,
+                actor_cap: 64,
+                heavy_permits: 1,
+                drr_quantum: 1,
+            });
+            let mut dirs = Vec::with_capacity(root_count);
+            for index in 0..root_count {
+                let (dir, root) = test_root(&format!("health-cost-{root_count}-{index:02}"));
+                assert!(executor.register_actor(root, test_ctx()));
+                dirs.push(dir);
+            }
+            (executor, dirs)
+        }
+
+        let app = crate::context::App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let (five, five_dirs) = fixture(5);
+        let five_cache = HealthRollupCache::new();
+        refresh_until_root_count(&five_cache, &five, &app, 5);
+        let five_median = cached_reply_median(&five_cache, &five, &metrics, &app);
+        let five_bytes = serde_json::to_vec(&build_health_report(
+            &five_cache,
+            &five,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        ))
+        .expect("serialize five-root health report")
+        .len();
+
+        let (fifty, fifty_dirs) = fixture(50);
+        let fifty_cache = HealthRollupCache::new();
+        refresh_until_root_count(&fifty_cache, &fifty, &app, 50);
+        let fifty_median = cached_reply_median(&fifty_cache, &fifty, &metrics, &app);
+        let report = build_health_report(&fifty_cache, &fifty, &HashMap::new(), &metrics, &app);
+        let fifty_bytes = serde_json::to_vec(&report)
+            .expect("serialize fifty-root health report")
+            .len();
+        let report_metrics = report.metrics.expect("health metrics");
+
+        assert_eq!(report_metrics["root_count"].as_u64(), Some(50));
+        assert_eq!(report_metrics["root_details_omitted"].as_u64(), Some(42));
+        assert_eq!(report_metrics["roots"].as_array().map(Vec::len), Some(8));
+        assert_eq!(report_metrics["memory"]["roots_total"].as_u64(), Some(50));
+        assert_eq!(
+            report_metrics["memory"]["roots"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(8)
+        );
+        assert!(
+            fifty_bytes <= five_bytes.saturating_mul(2),
+            "cached reply payload scaled with roots: five={five_bytes}, fifty={fifty_bytes}"
+        );
+        assert!(
+            fifty_median <= five_median.saturating_mul(4) + Duration::from_millis(2),
+            "cached reply scaled with roots: five={five_median:?}, fifty={fifty_median:?}"
+        );
+        assert!(
+            fifty_median < Duration::from_millis(50),
+            "cached 50-root reply exceeded CI bound: {fifty_median:?}"
+        );
+        std::hint::black_box((five_dirs, fifty_dirs));
+    }
+
+    #[test]
+    fn cached_health_reply_exposes_snapshot_age_and_counter_coverage() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-snapshot-age-coverage");
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let app = crate::context::App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        std::thread::sleep(Duration::from_millis(2));
+
+        let absent = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        assert!(absent["snapshot_age_ms"].is_u64());
+        assert_eq!(absent["callgraph_repair_roots_annotated"].as_u64(), Some(0));
+        assert_eq!(absent["callgraph_repair_roots_total"].as_u64(), Some(1));
+
+        let _project_key = crate::search_index::artifact_cache_key(root.as_path());
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let measured_zero = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        assert_eq!(
+            measured_zero["callgraph_repair_roots_annotated"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            measured_zero["callgraph_repair_roots_total"].as_u64(),
+            Some(1)
+        );
+        assert!(measured_zero["roots"][0]
+            .get("callgraph_repair_entries_60s")
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "manual production-shape health profiling harness"]
+    fn profile_fifty_root_cached_health_reply() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 64,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let mut dirs = Vec::new();
+        for index in 0..50 {
+            let (dir, root) = test_root(&format!("health-profile-{index:02}"));
+            dirs.push(dir);
+            assert!(executor.register_actor(root, test_ctx()));
+        }
+        let app = crate::context::App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 50);
+        let median = cached_reply_median(&cache, &executor, &metrics, &app);
+        std::hint::black_box(dirs);
+        eprintln!(
+            "health-profile roots=50 cached_health_check_reply_us={}",
+            median.as_micros()
+        );
     }
 }

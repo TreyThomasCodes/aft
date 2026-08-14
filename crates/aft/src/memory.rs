@@ -92,6 +92,37 @@ pub struct RootMemorySnapshot {
     pub parser_pool: MemoryEstimate,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct RootMemoryRollup {
+    pub(crate) status: &'static str,
+    pub(crate) attributed_bytes: u64,
+    pub(crate) busy_subsystems: usize,
+    pub(crate) not_estimated_subsystems: usize,
+}
+
+impl RootMemoryRollup {
+    pub(crate) fn from_estimates(estimates: &[&MemoryEstimate]) -> Self {
+        let attributed_bytes = estimates
+            .iter()
+            .filter_map(|estimate| estimate.estimated_bytes)
+            .fold(0u64, u64::saturating_add);
+        let busy_subsystems = estimates
+            .iter()
+            .filter(|estimate| estimate.status == "busy")
+            .count();
+        let not_estimated_subsystems = estimates
+            .iter()
+            .filter(|estimate| estimate.estimated_bytes.is_none())
+            .count();
+        Self {
+            status: if busy_subsystems > 0 { "busy" } else { "ready" },
+            attributed_bytes,
+            busy_subsystems,
+            not_estimated_subsystems,
+        }
+    }
+}
+
 impl RootMemorySnapshot {
     pub fn new(
         semantic: MemoryEstimate,
@@ -104,7 +135,7 @@ impl RootMemorySnapshot {
         lsp: MemoryEstimate,
         parser_pool: MemoryEstimate,
     ) -> Self {
-        let estimates = [
+        let rollup = RootMemoryRollup::from_estimates(&[
             &semantic,
             &trigram,
             &symbols,
@@ -114,19 +145,10 @@ impl RootMemorySnapshot {
             &bash,
             &lsp,
             &parser_pool,
-        ];
-        let attributed_bytes = estimates
-            .iter()
-            .filter_map(|estimate| estimate.estimated_bytes)
-            .fold(0u64, u64::saturating_add);
-        let status = if estimates.iter().any(|estimate| estimate.status == "busy") {
-            "busy"
-        } else {
-            "ready"
-        };
+        ]);
         Self {
-            status,
-            attributed_bytes,
+            status: rollup.status,
+            attributed_bytes: rollup.attributed_bytes,
             semantic,
             trigram,
             symbols,
@@ -139,22 +161,8 @@ impl RootMemorySnapshot {
         }
     }
 
-    pub fn busy_subsystem_count(&self) -> usize {
-        self.estimates()
-            .iter()
-            .filter(|estimate| estimate.status == "busy")
-            .count()
-    }
-
-    pub fn not_estimated_subsystem_count(&self) -> usize {
-        self.estimates()
-            .iter()
-            .filter(|estimate| estimate.estimated_bytes.is_none())
-            .count()
-    }
-
-    fn estimates(&self) -> [&MemoryEstimate; 9] {
-        [
+    fn rollup(&self) -> RootMemoryRollup {
+        RootMemoryRollup::from_estimates(&[
             &self.semantic,
             &self.trigram,
             &self.symbols,
@@ -164,7 +172,15 @@ impl RootMemorySnapshot {
             &self.bash,
             &self.lsp,
             &self.parser_pool,
-        ]
+        ])
+    }
+
+    pub fn busy_subsystem_count(&self) -> usize {
+        self.rollup().busy_subsystems
+    }
+
+    pub fn not_estimated_subsystem_count(&self) -> usize {
+        self.rollup().not_estimated_subsystems
     }
 }
 
@@ -267,22 +283,29 @@ impl ProcessMemorySnapshot {
         roots: &BTreeMap<String, RootMemorySnapshot>,
         shared_semantic_bases: &MemoryEstimate,
     ) -> Self {
+        let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
+        Self::from_root_rollups(rollups.iter(), roots.len(), shared_semantic_bases)
+    }
+
+    fn from_root_rollups<'a>(
+        roots: impl Iterator<Item = &'a RootMemoryRollup>,
+        root_count: usize,
+        shared_semantic_bases: &MemoryEstimate,
+    ) -> Self {
+        let mut root_attributed_bytes = 0u64;
+        let mut busy_subsystems = 0usize;
+        let mut not_estimated_subsystems = 0usize;
+        for root in roots {
+            root_attributed_bytes = root_attributed_bytes.saturating_add(root.attributed_bytes);
+            busy_subsystems = busy_subsystems.saturating_add(root.busy_subsystems);
+            not_estimated_subsystems =
+                not_estimated_subsystems.saturating_add(root.not_estimated_subsystems);
+        }
         let sqlite = SqliteMemorySnapshot::measure();
         let allocator = allocator_memory_snapshot();
-        let total_attributed_bytes = roots
-            .values()
-            .map(|root| root.attributed_bytes)
-            .fold(0u64, u64::saturating_add)
+        let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
             .saturating_add(sqlite.memory_used_bytes);
-        let busy_subsystems = roots
-            .values()
-            .map(RootMemorySnapshot::busy_subsystem_count)
-            .sum();
-        let not_estimated_subsystems = roots
-            .values()
-            .map(RootMemorySnapshot::not_estimated_subsystem_count)
-            .sum();
         let rss_bytes = process_rss_bytes();
         let phys_footprint_bytes = process_phys_footprint_bytes();
         // Attribute against the footprint when available: it excludes
@@ -306,7 +329,7 @@ impl ProcessMemorySnapshot {
             allocator,
             total_attributed_bytes,
             unattributed_bytes,
-            root_count: roots.len(),
+            root_count,
             busy_subsystems,
             not_estimated_subsystems,
         }
@@ -340,6 +363,41 @@ pub struct MemorySnapshot {
     pub process: ProcessMemorySnapshot,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct MemoryRollupSnapshot {
+    pub(crate) roots_status: &'static str,
+    pub(crate) roots: BTreeMap<String, RootMemoryRollup>,
+    pub(crate) roots_total: usize,
+    pub(crate) roots_omitted: usize,
+    pub(crate) roots_omitted_bytes: u64,
+    pub(crate) process: ProcessMemorySnapshot,
+}
+
+impl MemoryRollupSnapshot {
+    pub(crate) fn new(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemoryRollup>,
+    ) -> Self {
+        let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
+        let process = ProcessMemorySnapshot::from_root_rollups(
+            roots.values(),
+            roots.len(),
+            &shared_semantic_bases,
+        );
+        let roots_total = roots.len();
+        let (roots, roots_omitted, roots_omitted_bytes) =
+            cap_root_rollups(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
+        Self {
+            roots_status,
+            roots,
+            roots_total,
+            roots_omitted,
+            roots_omitted_bytes,
+            process,
+        }
+    }
+}
+
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
@@ -360,28 +418,42 @@ impl MemorySnapshot {
     }
 }
 
+fn cap_roots<T>(
+    roots: BTreeMap<String, T>,
+    cap: usize,
+    attributed_bytes: impl Fn(&T) -> u64,
+) -> (BTreeMap<String, T>, usize, u64) {
+    if roots.len() <= cap {
+        return (roots, 0, 0);
+    }
+    let mut entries: Vec<_> = roots.into_iter().collect();
+    entries.sort_by(|a, b| {
+        attributed_bytes(&b.1)
+            .cmp(&attributed_bytes(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let omitted = entries.split_off(cap);
+    let omitted_bytes = omitted
+        .iter()
+        .map(|(_, snapshot)| attributed_bytes(snapshot))
+        .fold(0u64, u64::saturating_add);
+    (entries.into_iter().collect(), omitted.len(), omitted_bytes)
+}
+
+fn cap_root_rollups(
+    roots: BTreeMap<String, RootMemoryRollup>,
+    cap: usize,
+) -> (BTreeMap<String, RootMemoryRollup>, usize, u64) {
+    cap_roots(roots, cap, |snapshot| snapshot.attributed_bytes)
+}
+
 /// Keep the `cap` roots with the highest attributed bytes; report the rest
 /// as an omitted-count + omitted-bytes rollup.
 fn cap_root_detail(
     roots: BTreeMap<String, RootMemorySnapshot>,
     cap: usize,
 ) -> (BTreeMap<String, RootMemorySnapshot>, usize, u64) {
-    if roots.len() <= cap {
-        return (roots, 0, 0);
-    }
-    let mut entries: Vec<(String, RootMemorySnapshot)> = roots.into_iter().collect();
-    // Sort by attributed bytes descending; ties keep path order for determinism.
-    entries.sort_by(|a, b| {
-        b.1.attributed_bytes
-            .cmp(&a.1.attributed_bytes)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    let omitted: Vec<(String, RootMemorySnapshot)> = entries.split_off(cap);
-    let omitted_bytes = omitted
-        .iter()
-        .map(|(_, snapshot)| snapshot.attributed_bytes)
-        .fold(0u64, u64::saturating_add);
-    (entries.into_iter().collect(), omitted.len(), omitted_bytes)
+    cap_roots(roots, cap, |snapshot| snapshot.attributed_bytes)
 }
 
 #[cfg(test)]
@@ -426,6 +498,27 @@ mod snapshot_cap_tests {
             .values()
             .all(|root| root.attributed_bytes > 4000));
         // Process totals include omitted roots' bytes.
+        let expected_total: u64 = (1..=(MEMORY_SNAPSHOT_ROOT_DETAIL_CAP as u64 + 4))
+            .map(|i| i * 1000)
+            .sum();
+        assert!(snapshot.process.total_attributed_bytes >= expected_total);
+    }
+
+    #[test]
+    fn rollup_cap_keeps_only_top_roots_while_totals_cover_all() {
+        let mut roots = BTreeMap::new();
+        for i in 0..(MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4) {
+            roots.insert(
+                format!("/rollup/{i:02}"),
+                root_with_bytes((i as u64 + 1) * 1000).rollup(),
+            );
+        }
+        let snapshot = MemoryRollupSnapshot::new("ready", roots);
+
+        assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
+        assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4);
+        assert_eq!(snapshot.roots_omitted, 4);
+        assert_eq!(snapshot.roots_omitted_bytes, 1000 + 2000 + 3000 + 4000);
         let expected_total: u64 = (1..=(MEMORY_SNAPSHOT_ROOT_DETAIL_CAP as u64 + 4))
             .map(|i| i * 1000)
             .sum();

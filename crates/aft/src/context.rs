@@ -323,6 +323,91 @@ pub struct RootHealthSnapshot {
     pub bash: Option<BgTaskHealthCounts>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootHealthSummary {
+    state: RootHealthState,
+    search_index_status: Option<&'static str>,
+    semantic_index_status: Option<&'static str>,
+    callgraph_store_status: Option<&'static str>,
+    tier2_status: Option<&'static str>,
+    bash: Option<BgTaskHealthCounts>,
+}
+
+impl RootHealthSummary {
+    fn busy() -> Self {
+        Self {
+            state: RootHealthState::Busy,
+            search_index_status: None,
+            semantic_index_status: None,
+            callgraph_store_status: None,
+            tier2_status: None,
+            bash: None,
+        }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self.state, RootHealthState::Busy)
+    }
+
+    pub(crate) fn is_fully_ready(&self) -> bool {
+        let component_is_satisfied = |status: &str| matches!(status, "ready" | "disabled");
+        matches!(self.state, RootHealthState::Ready)
+            && self.search_index_status.is_some_and(component_is_satisfied)
+            && self
+                .semantic_index_status
+                .is_some_and(component_is_satisfied)
+            && self
+                .callgraph_store_status
+                .is_some_and(component_is_satisfied)
+            && self.tier2_status.is_some_and(component_is_satisfied)
+    }
+
+    pub(crate) fn into_snapshot(self, project_root: &Path) -> RootHealthSnapshot {
+        if self.is_busy() {
+            return RootHealthSnapshot::busy(project_root);
+        }
+        // Health snapshots may be assembled by the maintenance refresh, but the
+        // public snapshot helper also has latency-sensitive callers. Never derive
+        // a cache key here: derivation can spawn git and read repository state.
+        let callgraph_write_metrics =
+            crate::search_index::artifact_cache_key_memoized_only(project_root)
+                .map(|key| crate::callgraph_store::callgraph_write_metrics_for_project(&key));
+        let (callgraph_commits_60s, callgraph_pages_or_bytes_written_60s) =
+            match callgraph_write_metrics {
+                Some(metrics)
+                    if metrics.commits_60s > 0 || metrics.pages_or_bytes_written_60s > 0 =>
+                {
+                    (
+                        Some(metrics.commits_60s),
+                        Some(metrics.pages_or_bytes_written_60s),
+                    )
+                }
+                _ => (None, None),
+            };
+        RootHealthSnapshot {
+            project_root: project_root.display().to_string(),
+            actor_count: 1,
+            state: self.state,
+            search_index: self
+                .search_index_status
+                .map(|status| HealthComponentSnapshot { status }),
+            semantic_index: self
+                .semantic_index_status
+                .map(|status| HealthComponentSnapshot { status }),
+            callgraph_store: self
+                .callgraph_store_status
+                .map(|status| HealthComponentSnapshot { status }),
+            callgraph_repair_entries_60s: None,
+            callgraph_commits_60s,
+            callgraph_pages_or_bytes_written_60s,
+            tier2: self
+                .tier2_status
+                .map(|status| Tier2HealthSnapshot { status }),
+            bash: self.bash,
+        }
+    }
+}
+
 impl RootHealthSnapshot {
     fn busy(project_root: &Path) -> Self {
         Self {
@@ -1958,52 +2043,51 @@ impl AppContext {
         counts
     }
 
-    pub fn try_health_snapshot(&self, project_root: &Path) -> RootHealthSnapshot {
+    pub(crate) fn try_health_summary(&self) -> RootHealthSummary {
         // Read lifecycle state before taking artifact locks. Worker admission takes
         // the lifecycle lock first and then installs artifact receivers, so the
         // reverse order here would deadlock a health poll against worker startup.
         let heavy_root_work_allowed = match self.try_heavy_root_work_allowed() {
             Some(allowed) => allowed,
-            None => return RootHealthSnapshot::busy(project_root),
+            None => return RootHealthSummary::busy(),
         };
         let config = match self.config.try_read() {
             Ok(guard) => Arc::clone(&*guard),
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let search_index = match self.search_index.try_read() {
             Ok(guard) => guard,
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let search_index_rx = match self.search_index_rx.try_read() {
             Ok(guard) => guard,
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let semantic_status = match self.semantic_index_status.try_read() {
             Ok(guard) => guard,
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let callgraph_store = match self.callgraph_store.try_read() {
             Ok(guard) => guard,
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
             Some(guard) => guard,
-            None => return RootHealthSnapshot::busy(project_root),
+            None => return RootHealthSummary::busy(),
         };
         let tier2 = match self.status_bar_tier2.try_read() {
             Ok(guard) => guard,
-            Err(_) => return RootHealthSnapshot::busy(project_root),
+            Err(_) => return RootHealthSummary::busy(),
         };
         let bash = match self.bash_background.try_health_counts() {
             Some(counts) => counts,
-            None => return RootHealthSnapshot::busy(project_root),
+            None => return RootHealthSummary::busy(),
         };
 
         // Borrow-only roots (mason worktrees, read-only siblings) never
         // materialize an in-RAM index or spawn a build: queries go through the
         // read-only disk openers against the shared artifact. Reporting them
-        // as "building" is a permanent lie that keeps module health degraded
-        // whenever any worktree is bound.
+        // as "building" would never resolve.
         let borrows_shared_artifacts = self.shared_artifacts_read_only.load(Ordering::SeqCst);
         let search_index_status = if search_index
             .as_ref()
@@ -2032,21 +2116,16 @@ impl AppContext {
             "ready"
         } else if !callgraph_writer && config.callgraph_store {
             // Read-only roots never cold-build; they query the shared store
-            // via ReadonlyCallGraphStore on demand. "building" would never
-            // resolve.
+            // via ReadonlyCallGraphStore on demand.
             "ready"
         } else if callgraph_store_rx.is_some() || config.callgraph_store {
             "building"
         } else {
             "disabled"
         };
-        // dead_code is suppressed (reports `None`) while the callgraph store is
-        // not ready, so a root whose only missing category is dead_code would
-        // otherwise stay "building" forever: nothing recomputes dead_code until
-        // the callgraph store becomes ready. Treat that blocked-on-callgraph case
-        // as complete and let the callgraph component's own status tell the
-        // callgraph story, instead of double-reporting it here as a permanent
-        // "building".
+        // dead_code is suppressed while the callgraph store is unavailable.
+        // Let the callgraph component report that dependency instead of leaving
+        // tier2 permanently "building" with no refresh able to complete it.
         let dead_code_blocked_on_callgraph = tier2.dead_code_blocked_on_callgraph;
         let tier2_complete = (tier2.dead_code.is_some() || dead_code_blocked_on_callgraph)
             && tier2.unused_exports.is_some()
@@ -2062,49 +2141,25 @@ impl AppContext {
         let tier2_status = if tier2_complete {
             "ready"
         } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
-            // A partial snapshot can only be "building" when this root is
+            // A partial snapshot can be "building" only when this root is
             // allowed to run the refresh that would complete it.
             "disabled"
         } else {
             "building"
         };
 
-        let callgraph_write_metrics = crate::callgraph_store::callgraph_write_metrics_for_project(
-            &crate::search_index::artifact_cache_key(project_root),
-        );
-        let (callgraph_commits_60s, callgraph_pages_or_bytes_written_60s) =
-            if callgraph_write_metrics.commits_60s > 0
-                || callgraph_write_metrics.pages_or_bytes_written_60s > 0
-            {
-                (
-                    Some(callgraph_write_metrics.commits_60s),
-                    Some(callgraph_write_metrics.pages_or_bytes_written_60s),
-                )
-            } else {
-                (None, None)
-            };
-
-        RootHealthSnapshot {
-            project_root: project_root.display().to_string(),
-            actor_count: 1,
+        RootHealthSummary {
             state: RootHealthState::Ready,
-            search_index: Some(HealthComponentSnapshot {
-                status: search_index_status,
-            }),
-            semantic_index: Some(HealthComponentSnapshot {
-                status: semantic_index_status,
-            }),
-            callgraph_store: Some(HealthComponentSnapshot {
-                status: callgraph_store_status,
-            }),
-            callgraph_repair_entries_60s: None,
-            callgraph_commits_60s,
-            callgraph_pages_or_bytes_written_60s,
-            tier2: Some(Tier2HealthSnapshot {
-                status: tier2_status,
-            }),
+            search_index_status: Some(search_index_status),
+            semantic_index_status: Some(semantic_index_status),
+            callgraph_store_status: Some(callgraph_store_status),
+            tier2_status: Some(tier2_status),
             bash: Some(bash),
         }
+    }
+
+    pub fn try_health_snapshot(&self, project_root: &Path) -> RootHealthSnapshot {
+        self.try_health_summary().into_snapshot(project_root)
     }
 
     pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
@@ -6169,10 +6224,7 @@ impl AppContext {
         })
     }
 
-    /// Build one root's memory estimate using only non-blocking lock attempts.
-    /// A contended subsystem is represented as `busy` rather than delaying the
-    /// status control path.
-    pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
+    fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 9] {
         let semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
@@ -6226,12 +6278,30 @@ impl AppContext {
             .try_lock()
             .map(|lsp| lsp.estimated_memory())
             .unwrap_or_else(crate::memory::MemoryEstimate::busy);
-        // AFT currently creates tree-sitter parsers per operation rather than
-        // retaining a parser pool. Keep that fact explicit instead of assigning
-        // a guessed byte size to tree-sitter internals.
+        // Parsers are created per operation rather than retained in a pool, so
+        // parser bytes remain an explicit estimation gap instead of a guess.
         let parser_pool = crate::memory::MemoryEstimate::not_estimated()
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");
+        [
+            semantic,
+            trigram,
+            symbols,
+            callgraph,
+            callgraph_projection,
+            inspect,
+            bash,
+            lsp,
+            parser_pool,
+        ]
+    }
+
+    /// Build one root's memory estimate using only non-blocking lock attempts.
+    /// A contended subsystem is represented as `busy` rather than delaying the
+    /// status control path.
+    pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
+        let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool] =
+            self.memory_estimates();
         crate::memory::RootMemorySnapshot::new(
             semantic,
             trigram,
@@ -6243,6 +6313,23 @@ impl AppContext {
             lsp,
             parser_pool,
         )
+    }
+
+    /// Pre-aggregate root memory for capped health diagnostics without building
+    /// the rich per-subsystem detail that the status command returns.
+    pub(crate) fn memory_root_rollup(&self) -> crate::memory::RootMemoryRollup {
+        let estimates = self.memory_estimates();
+        crate::memory::RootMemoryRollup::from_estimates(&[
+            &estimates[0],
+            &estimates[1],
+            &estimates[2],
+            &estimates[3],
+            &estimates[4],
+            &estimates[5],
+            &estimates[6],
+            &estimates[7],
+            &estimates[8],
+        ])
     }
 
     /// Attribute all actor roots registered in this process. Standalone mode
