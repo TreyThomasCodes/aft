@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1761,6 +1762,58 @@ fn post_edit_outcome_reports_complete_when_no_server_registered() {
     assert!(outcome.diagnostics.is_empty());
     assert!(outcome.pending_servers.is_empty());
     assert!(outcome.exited_servers.is_empty());
+}
+
+#[test]
+fn slow_post_edit_wait_does_not_hold_lsp_manager_mutex() {
+    let (temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
+    let file = files[0].clone();
+    let delay_signal = temp_dir.path().join("did-change-delay-started");
+    let ctx = Arc::new(app_context_with_fake_lsp());
+
+    {
+        let mut manager = ctx.lsp();
+        manager.set_extra_env("AFT_FAKE_LSP_CHANGE_DELAY_MS", "1500");
+        manager.set_extra_env(
+            "AFT_FAKE_LSP_CHANGE_DELAY_SIGNAL",
+            &delay_signal.to_string_lossy(),
+        );
+        manager
+            .notify_file_changed_default(&file, "fn main() {}\n")
+            .expect("open fixture");
+        wait_for_publish(&mut manager);
+    }
+
+    let wait_ctx = Arc::clone(&ctx);
+    let wait_file = file.clone();
+    let wait_thread = thread::spawn(move || {
+        wait_ctx.lsp_notify_and_collect_diagnostics(
+            &wait_file,
+            "fn main() { let changed = true; }\n",
+            Duration::from_secs(5),
+        )
+    });
+
+    let signal_deadline = Instant::now() + Duration::from_secs(10);
+    while !delay_signal.exists() && Instant::now() < signal_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        delay_signal.exists(),
+        "fake server never entered its delayed didChange response"
+    );
+
+    let count_started = Instant::now();
+    let server_count = ctx.lsp().server_count();
+    let count_elapsed = count_started.elapsed();
+    assert_eq!(server_count, 1);
+    assert!(
+        count_elapsed < Duration::from_millis(500),
+        "server_count waited {count_elapsed:?} behind the post-edit diagnostics delay"
+    );
+
+    let outcome = wait_thread.join().expect("post-edit wait thread");
+    assert!(outcome.complete(), "delayed publish should still complete");
 }
 
 #[test]

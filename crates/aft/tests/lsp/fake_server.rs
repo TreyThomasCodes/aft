@@ -221,6 +221,18 @@ fn changed_diagnostics() -> Value {
     ])
 }
 
+fn delay_changed_diagnostics_if_requested() {
+    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_CHANGE_DELAY_SIGNAL") {
+        let _ = std::fs::write(signal_path, b"waiting");
+    }
+    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_CHANGE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+}
+
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -705,6 +717,7 @@ fn main() -> io::Result<()> {
                 "textDocument/didChange" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    delay_changed_diagnostics_if_requested();
                     if std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1") {
                         write_notification(
                             &mut writer,

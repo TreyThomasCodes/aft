@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
     DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
 };
@@ -239,6 +239,43 @@ pub struct DrainedLspEvents {
     pub has_more: bool,
 }
 
+/// State carried by an `AppContext` post-edit wait after it releases the
+/// manager mutex. The raw receiver clone competes for each event exactly once;
+/// the dedicated wake receiver covers the case where another drain path wins
+/// that race and updates the manager before this waiter sees the raw event.
+pub(crate) struct PostEditDiagnosticsWait {
+    lookup_path: PathBuf,
+    expected_versions: Vec<(ServerKey, i32)>,
+    pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
+    event_rx: Receiver<LspEvent>,
+    wake_rx: Receiver<()>,
+    waiter_id: u64,
+    deadline: std::time::Instant,
+    fresh: HashMap<ServerKey, Vec<StoredDiagnostic>>,
+    exited: Vec<ServerKey>,
+}
+
+impl PostEditDiagnosticsWait {
+    pub(crate) fn deadline_reached(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+
+    pub(crate) fn next_event(&self) -> Option<LspEvent> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+
+        crossbeam_channel::select! {
+            recv(self.event_rx) -> event => event.ok(),
+            recv(self.wake_rx) -> _ => None,
+            default(remaining) => None,
+        }
+    }
+}
+
 impl IntoIterator for DrainedLspEvents {
     type Item = LspEvent;
     type IntoIter = std::vec::IntoIter<LspEvent>;
@@ -262,6 +299,11 @@ pub struct LspManager {
     /// Unified event channel — all server reader threads send here.
     event_tx: Sender<LspEvent>,
     event_rx: Receiver<LspEvent>,
+    /// One-slot wake channels for post-edit waits that released the manager
+    /// mutex. Drains notify them after handling an event, so a waiter cannot
+    /// sleep through a diagnostics update consumed by another drain path.
+    post_edit_waiters: HashMap<u64, Sender<()>>,
+    next_post_edit_waiter_id: u64,
     /// Optional binary path overrides used by integration tests.
     binary_overrides: HashMap<ServerKind, PathBuf>,
     /// Extra env vars merged into every spawned LSP child. Used in tests to
@@ -306,6 +348,8 @@ impl LspManager {
             diagnostics: DiagnosticsStore::new(),
             event_tx,
             event_rx,
+            post_edit_waiters: HashMap::new(),
+            next_post_edit_waiter_id: 0,
             binary_overrides: HashMap::new(),
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
@@ -1191,28 +1235,97 @@ impl LspManager {
         matches!(entry.version, Some(version) if version >= target_version)
     }
 
-    /// Wait for FRESH per-server diagnostics that match the just-sent
-    /// document version. This is the v0.17.3 post-edit path that fixes the
-    /// stale-diagnostics bug: instead of returning whatever is in the cache
-    /// when the deadline hits, we only return entries whose `version`
-    /// matches the post-edit target version (or, for servers that don't
-    /// participate in versioned sync, whose `epoch` was bumped after the
-    /// pre-edit snapshot).
+    /// Prepare a post-edit wait and subscribe it before the manager mutex is
+    /// released. The subscription closes the race between the state snapshot
+    /// and a concurrent event drain.
+    pub(crate) fn start_post_edit_diagnostics_wait(
+        &mut self,
+        file_path: &Path,
+        expected_versions: &[(ServerKey, i32)],
+        pre_snapshot: &HashMap<ServerKey, PreEditSnapshot>,
+        timeout: std::time::Duration,
+    ) -> PostEditDiagnosticsWait {
+        let lookup_path = normalize_lookup_path(file_path);
+
+        // Events sent after didChange may already be queued. Handle them before
+        // parking, while freshness checks still reject pre-edit publications.
+        let _ = self.drain_events_for_file(&lookup_path);
+
+        let waiter_id = self.next_post_edit_waiter_id;
+        self.next_post_edit_waiter_id = self.next_post_edit_waiter_id.wrapping_add(1);
+        let (wake_tx, wake_rx) = bounded(1);
+        self.post_edit_waiters.insert(waiter_id, wake_tx);
+
+        PostEditDiagnosticsWait {
+            lookup_path,
+            expected_versions: expected_versions.to_vec(),
+            pre_snapshot: pre_snapshot.clone(),
+            event_rx: self.event_rx.clone(),
+            wake_rx,
+            waiter_id,
+            deadline: std::time::Instant::now() + timeout,
+            fresh: HashMap::new(),
+            exited: Vec::new(),
+        }
+    }
+
+    pub(crate) fn poll_post_edit_diagnostics_wait(
+        &mut self,
+        wait: &mut PostEditDiagnosticsWait,
+        event: Option<LspEvent>,
+    ) -> bool {
+        if let Some(event) = event {
+            self.handle_event(&event);
+        }
+
+        for (key, target_version) in &wait.expected_versions {
+            if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+                continue;
+            }
+            if !self.clients.contains_key(key) {
+                wait.exited.push(key.clone());
+                continue;
+            }
+            if let Some(entry) = self
+                .diagnostics
+                .entries_for_file(&wait.lookup_path)
+                .into_iter()
+                .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
+            {
+                let pre = wait.pre_snapshot.get(key).copied().unwrap_or_default();
+                if let Some(diagnostics) =
+                    Self::authoritative_post_edit_diagnostics(entry, *target_version, pre)
+                {
+                    wait.fresh.insert(key.clone(), diagnostics);
+                }
+            }
+        }
+
+        wait.fresh.len() + wait.exited.len() == wait.expected_versions.len()
+    }
+
+    pub(crate) fn finish_post_edit_diagnostics_wait(
+        &mut self,
+        wait: PostEditDiagnosticsWait,
+    ) -> PostEditWaitOutcome {
+        self.post_edit_waiters.remove(&wait.waiter_id);
+        Self::post_edit_outcome(
+            wait.expected_versions
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect(),
+            wait.fresh,
+            wait.exited,
+        )
+    }
+
+    /// Wait for fresh per-server diagnostics matching the just-sent document
+    /// version. Cached pre-edit entries and provisional warming reports remain
+    /// pending; a server exit is reported separately.
     ///
-    /// `expected_versions` should come from `notify_file_changed_versioned`
-    /// — one `(ServerKey, target_version)` per server we sent didChange/
-    /// didOpen to.
-    ///
-    /// `pre_snapshot` is the per-server epoch BEFORE the notification was
-    /// sent; it gates the epoch-fallback path so an old-version publish
-    /// arriving after `drain_events` and before `didChange` cannot be
-    /// mistaken for a fresh response.
-    ///
-    /// Returns a per-server tri-state: `Fresh` (publish matched target
-    /// version OR epoch advanced past snapshot for an unversioned server),
-    /// `Pending` (deadline hit before this server published anything we
-    /// could verify), or `Exited` (server died between notification and
-    /// deadline).
+    /// `AppContext` uses the prepare/poll/finish methods directly so channel
+    /// waiting happens without its manager mutex. This convenience method keeps
+    /// the same behavior for standalone manager callers.
     pub fn wait_for_post_edit_diagnostics(
         &mut self,
         file_path: &Path,
@@ -1224,76 +1337,20 @@ impl LspManager {
         pre_snapshot: &HashMap<ServerKey, PreEditSnapshot>,
         timeout: std::time::Duration,
     ) -> PostEditWaitOutcome {
-        let lookup_path = normalize_lookup_path(file_path);
-        let deadline = std::time::Instant::now() + timeout;
+        let mut wait = self.start_post_edit_diagnostics_wait(
+            file_path,
+            expected_versions,
+            pre_snapshot,
+            timeout,
+        );
+        let mut complete = self.poll_post_edit_diagnostics_wait(&mut wait, None);
 
-        // Drain any events that arrived while we were sending didChange.
-        // The publishDiagnostics handler stores the version, so even
-        // pre-snapshot publishes that landed late won't be mistaken for
-        // fresh — the version-match check will reject them.
-        let _ = self.drain_events_for_file(&lookup_path);
-
-        let mut fresh: HashMap<ServerKey, Vec<StoredDiagnostic>> = HashMap::new();
-        let mut exited: Vec<ServerKey> = Vec::new();
-
-        loop {
-            // Check freshness for every expected server. A server is fresh
-            // if its current entry for this file satisfies either:
-            //   1. version-match: entry.version == Some(target_version), OR
-            //   2. push-only freshness: entry.version is None AND entry.epoch
-            //      advanced strictly after the pre-edit snapshot. Versioned
-            //      publishes must be >= the post-edit target version.
-            // Servers whose process has exited are reported separately.
-            for (key, target_version) in expected_versions {
-                if fresh.contains_key(key) || exited.contains(key) {
-                    continue;
-                }
-                if !self.clients.contains_key(key) {
-                    exited.push(key.clone());
-                    continue;
-                }
-                if let Some(entry) = self
-                    .diagnostics
-                    .entries_for_file(&lookup_path)
-                    .into_iter()
-                    .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
-                {
-                    let pre = pre_snapshot.get(key).copied().unwrap_or_default();
-                    if let Some(diagnostics) =
-                        Self::authoritative_post_edit_diagnostics(entry, *target_version, pre)
-                    {
-                        fresh.insert(key.clone(), diagnostics);
-                    }
-                }
-            }
-
-            // All accounted for? Done.
-            if fresh.len() + exited.len() == expected_versions.len() {
-                break;
-            }
-
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-
-            let timeout = deadline.saturating_duration_since(now);
-            match self.event_rx.recv_timeout(timeout) {
-                Ok(event) => {
-                    self.handle_event(&event);
-                }
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
-            }
+        while !complete && !wait.deadline_reached() {
+            let event = wait.next_event();
+            complete = self.poll_post_edit_diagnostics_wait(&mut wait, event);
         }
 
-        Self::post_edit_outcome(
-            expected_versions
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect(),
-            fresh,
-            exited,
-        )
+        self.finish_post_edit_diagnostics_wait(wait)
     }
 
     fn post_edit_outcome(
@@ -1916,7 +1973,7 @@ impl LspManager {
     }
 
     fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
-        match event {
+        let published_file = match event {
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -1946,7 +2003,17 @@ impl LspManager {
                 None
             }
             _ => None,
-        }
+        };
+        self.wake_post_edit_waiters();
+        published_file
+    }
+
+    fn wake_post_edit_waiters(&mut self) {
+        self.post_edit_waiters
+            .retain(|_, sender| match sender.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(())) => true,
+                Err(TrySendError::Disconnected(())) => false,
+            });
     }
 
     fn handle_publish_diagnostics(
@@ -2519,6 +2586,44 @@ mod diagnostic_capacity_tests {
             .notify_file_changed_if_running(&file, "export const value = 1;\n", &Config::default())
             .unwrap();
         assert!(manager.clients.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod post_edit_waiter_tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::LspManager;
+    use crate::lsp::client::LspEvent;
+    use crate::lsp::registry::ServerKind;
+
+    #[test]
+    fn draining_an_event_wakes_registered_post_edit_waiter() {
+        let mut manager = LspManager::new();
+        let mut wait = manager.start_post_edit_diagnostics_wait(
+            PathBuf::from("/workspace/src/main.rs").as_path(),
+            &[],
+            &HashMap::new(),
+            Duration::from_secs(2),
+        );
+        manager.enqueue_event_for_test(LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: PathBuf::from("/workspace"),
+            method: "custom/drainedElsewhere".to_string(),
+            params: None,
+        });
+
+        assert_eq!(manager.drain_events().events.len(), 1);
+        let started = Instant::now();
+        assert!(wait.next_event().is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a competing drain did not wake the parked post-edit waiter"
+        );
+        let _ = manager.poll_post_edit_diagnostics_wait(&mut wait, None);
+        let _ = manager.finish_post_edit_diagnostics_wait(wait);
     }
 }
 

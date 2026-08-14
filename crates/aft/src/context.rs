@@ -5699,10 +5699,8 @@ impl AppContext {
     /// Sends didChange to the server, waits briefly for publishDiagnostics, and returns
     /// any diagnostics for the file. If no server is running, returns empty immediately.
     ///
-    /// v0.17.3: this is the version-aware path. Pre-edit cached diagnostics
-    /// are NEVER returned — only entries whose `version` matches the
-    /// post-edit document version (or, for unversioned servers, whose
-    /// `epoch` advanced past the pre-edit snapshot).
+    /// Pre-edit cached diagnostics are never returned: only entries whose version
+    /// matches the post-edit document version are authoritative.
     pub fn lsp_notify_and_collect_diagnostics(
         &self,
         file_path: &Path,
@@ -5739,13 +5737,29 @@ impl AppContext {
             return crate::lsp::manager::PostEditWaitOutcome::default();
         }
 
-        lsp.wait_for_post_edit_diagnostics(
+        // Register the wake receiver while the manager is still locked. Events
+        // that raced with registration remain on the raw receiver; events won by
+        // another drain path wake this waiter after that path updates the store.
+        let mut wait = lsp.start_post_edit_diagnostics_wait(
             file_path,
-            &config,
             &expected_versions,
             &pre_snapshot,
             timeout,
-        )
+        );
+        let mut complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, None);
+        drop(lsp);
+
+        while !complete && !wait.deadline_reached() {
+            // Waiting on channel activity does not require access to manager
+            // state, so other LSP operations can continue their bookkeeping.
+            let event = wait.next_event();
+            let mut lsp = self.lsp_manager.lock();
+            complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
+        }
+
+        self.lsp_manager
+            .lock()
+            .finish_post_edit_diagnostics_wait(wait)
     }
 
     /// Collect custom server root_markers from user config for use in
