@@ -1036,6 +1036,68 @@ fn validate_glob_edit_path(
     ctx.validate_path(req_id, path)
 }
 
+/// Fuzzy line matches include the final newline even when the needle omits it.
+/// Restore that separator so replacing a line block cannot merge the next line.
+fn fuzzy_replacement_restores_newline(
+    source: &str,
+    matched: &crate::fuzzy_match::FuzzyMatch,
+    replacement: &str,
+) -> bool {
+    let byte_end = matched.byte_start.saturating_add(matched.byte_len);
+    matched.pass >= 2
+        && byte_end > 0
+        && byte_end <= source.len()
+        && source.as_bytes()[byte_end - 1] == b'\n'
+        && !replacement.is_empty()
+        && !replacement.ends_with('\n')
+}
+
+fn push_fuzzy_replacement(
+    output: &mut String,
+    source: &str,
+    matched: &crate::fuzzy_match::FuzzyMatch,
+    replacement: &str,
+) {
+    output.push_str(replacement);
+    if fuzzy_replacement_restores_newline(source, matched, replacement) {
+        output.push('\n');
+    }
+}
+
+fn apply_sorted_non_overlapping_fuzzy_matches(
+    source: &str,
+    matches: &[crate::fuzzy_match::FuzzyMatch],
+    replacement: &str,
+) -> Result<String, crate::error::AftError> {
+    let mut removed_bytes = 0usize;
+    let mut replacement_bytes = 0usize;
+    for matched in matches {
+        let byte_end = matched.byte_start.saturating_add(matched.byte_len);
+        edit::validate_byte_range(source, matched.byte_start, byte_end)?;
+        removed_bytes = removed_bytes.saturating_add(matched.byte_len);
+        replacement_bytes = replacement_bytes.saturating_add(replacement.len());
+        if fuzzy_replacement_restores_newline(source, matched, replacement) {
+            replacement_bytes = replacement_bytes.saturating_add(1);
+        }
+    }
+
+    // The matches are offsets into the original source. Copying untouched spans
+    // forward keeps those offsets stable while visiting every source byte once.
+    let capacity = source
+        .len()
+        .saturating_sub(removed_bytes)
+        .saturating_add(replacement_bytes);
+    let mut result = String::with_capacity(capacity);
+    let mut copied_through = 0usize;
+    for matched in matches {
+        result.push_str(&source[copied_through..matched.byte_start]);
+        push_fuzzy_replacement(&mut result, source, matched, replacement);
+        copied_through = matched.byte_start + matched.byte_len;
+    }
+    result.push_str(&source[copied_through..]);
+    Ok(result)
+}
+
 /// Handle a single-file edit_match (original behavior).
 fn handle_single_file_edit_match(
     req: &RawRequest,
@@ -1184,37 +1246,14 @@ fn handle_single_file_edit_match(
         );
     }
 
-    // Fuzzy passes (rstrip/trim/unicode) are line-based: `find_line_matches`
-    // sets the byte range to include the trailing newline after the last
-    // matched line, even when the user's `oldString` had no trailing newline.
-    // Applying the replacement verbatim over that range drops the newline, so
-    // the last replaced line merges with the following line (#83). Re-append
-    // a newline when the matched range ended in one and the replacement does
-    // not — mirroring batch.rs line-range mode. Gated to fuzzy passes (pass >=
-    // 2); the exact pass (1) matches the needle byte-for-byte, so its trailing
-    // newline behavior reflects exactly what the caller typed.
-    let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
-        let byte_end = m.byte_start + m.byte_len;
-        let range_has_trailing_nl = m.pass >= 2
-            && byte_end > 0
-            && byte_end <= source.len()
-            && source.as_bytes()[byte_end - 1] == b'\n';
-        if range_has_trailing_nl && !replacement.is_empty() && !replacement.ends_with('\n') {
-            format!("{replacement}\n")
-        } else {
-            replacement.to_string()
-        }
-    };
-
-    // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len())
+    // Apply edit(s) — use fuzzy match byte lengths (may differ from match_str.len()).
     let (new_source, count) = if replace_all {
         // Guard against overlapping matches before applying. The fuzzy line
         // passes (2-4) step line-by-line, so a multi-line needle can match
         // overlapping regions (e.g. needle "a\na" over "a\na\na" when whitespace
-        // variants defeat the exact pass). Applying overlapping ranges in
-        // reverse would let a later replacement overwrite part of an earlier
-        // one, silently corrupting the file. Fail cleanly instead — mirrors the
-        // `batch` command's overlap guard. (matches are ascending by byte_start.)
+        // variants defeat the exact pass). Applying overlapping ranges would
+        // silently corrupt the file. Fail cleanly instead — mirrors the `batch`
+        // command's overlap guard. (Matches are ascending by byte_start.)
         for pair in fuzzy_matches.windows(2) {
             let cur_end = pair[0].byte_start + pair[0].byte_len;
             if cur_end > pair[1].byte_start {
@@ -1229,36 +1268,29 @@ fn handle_single_file_edit_match(
             }
         }
         let count = fuzzy_matches.len();
-        // Apply replacements in reverse order to preserve byte offsets
-        let mut result = source.clone();
-        for m in fuzzy_matches.iter().rev() {
-            result = match edit::replace_byte_range(
-                &result,
-                m.byte_start,
-                m.byte_start + m.byte_len,
-                &effective_replacement(m),
-            ) {
-                Ok(updated) => updated,
-                Err(e) => {
-                    return Response::error(&req.id, e.code(), e.to_string());
-                }
-            };
-        }
+        let result = match apply_sorted_non_overlapping_fuzzy_matches(
+            &source,
+            &fuzzy_matches,
+            replacement,
+        ) {
+            Ok(updated) => updated,
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        };
         (result, count)
     } else {
         let target_idx = occurrence.unwrap_or(0);
-        let m = &fuzzy_matches[target_idx];
+        let matched = &fuzzy_matches[target_idx];
+        let mut effective_replacement = String::with_capacity(replacement.len().saturating_add(1));
+        push_fuzzy_replacement(&mut effective_replacement, &source, matched, replacement);
         (
             match edit::replace_byte_range(
                 &source,
-                m.byte_start,
-                m.byte_start + m.byte_len,
-                &effective_replacement(m),
+                matched.byte_start,
+                matched.byte_start + matched.byte_len,
+                &effective_replacement,
             ) {
                 Ok(updated) => updated,
-                Err(e) => {
-                    return Response::error(&req.id, e.code(), e.to_string());
-                }
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
             },
             1,
         )
@@ -1375,4 +1407,89 @@ fn build_context(source: &str, target_line: usize, margin: usize) -> String {
     let start = target_line.saturating_sub(margin);
     let end = (target_line + margin + 1).min(lines.len());
     lines[start..end].join("\n")
+}
+
+#[cfg(test)]
+mod replace_all_tests {
+    use super::*;
+
+    fn frozen_reverse_apply(
+        source: &str,
+        matches: &[crate::fuzzy_match::FuzzyMatch],
+        replacement: &str,
+    ) -> String {
+        let mut result = source.to_string();
+        for matched in matches.iter().rev() {
+            let byte_end = matched.byte_start + matched.byte_len;
+            let restores_newline = matched.pass >= 2
+                && byte_end > 0
+                && byte_end <= source.len()
+                && source.as_bytes()[byte_end - 1] == b'\n'
+                && !replacement.is_empty()
+                && !replacement.ends_with('\n');
+            let effective = if restores_newline {
+                format!("{replacement}\n")
+            } else {
+                replacement.to_string()
+            };
+            result = edit::replace_byte_range(
+                &result,
+                matched.byte_start,
+                matched.byte_start + matched.byte_len,
+                &effective,
+            )
+            .expect("frozen reverse replacement");
+        }
+        result
+    }
+
+    #[test]
+    fn one_pass_replace_all_matches_frozen_reverse_reference() {
+        let cases = [
+            ("old α old\nold", "old", "replacement"),
+            ("old α old\nold", "old", ""),
+            ("old α old\nold", "old", "old"),
+            (
+                "alpha   \nbeta   \nmid\nalpha \nbeta \n",
+                "alpha\nbeta",
+                "gamma\ndelta",
+            ),
+            (
+                "let x = “hi”…\nmid\nlet x = “hi”…\n",
+                "let x = \"hi\"...",
+                "let x = 'bye'",
+            ),
+            ("old\r\nold\r\n", "old", "新"),
+        ];
+
+        for (source, needle, replacement) in cases {
+            let matches = crate::fuzzy_match::find_all_fuzzy(source, needle);
+            assert!(
+                matches.len() >= 2,
+                "fixture must exercise replace_all: {needle:?}"
+            );
+            let expected = frozen_reverse_apply(source, &matches, replacement);
+            let actual = apply_sorted_non_overlapping_fuzzy_matches(source, &matches, replacement)
+                .expect("one-pass replacement");
+            assert_eq!(actual.as_bytes(), expected.as_bytes(), "needle={needle:?}");
+        }
+    }
+
+    #[test]
+    fn replace_all_output_construction_allocates_once() {
+        let source = "old value\n".repeat(1_024);
+        let matches = crate::fuzzy_match::find_all_fuzzy(&source, "old");
+        assert_eq!(matches.len(), 1_024);
+
+        let (result, allocations) = crate::test_allocations::count(|| {
+            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "new")
+                .expect("one-pass replacement")
+        });
+
+        assert_eq!(result, "new value\n".repeat(1_024));
+        assert_eq!(
+            allocations, 1,
+            "output construction must not allocate once per match"
+        );
+    }
 }

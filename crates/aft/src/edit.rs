@@ -52,15 +52,7 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
     }
 }
 
-/// Replace bytes in `[start..end)` with `replacement`.
-///
-/// Returns an error if the range is invalid or does not align to UTF-8 char boundaries.
-pub fn replace_byte_range(
-    source: &str,
-    start: usize,
-    end: usize,
-    replacement: &str,
-) -> Result<String, AftError> {
+pub(crate) fn validate_byte_range(source: &str, start: usize, end: usize) -> Result<(), AftError> {
     if start > end {
         return Err(AftError::InvalidRequest {
             message: format!(
@@ -95,6 +87,19 @@ pub fn replace_byte_range(
             ),
         });
     }
+    Ok(())
+}
+
+/// Replace bytes in `[start..end)` with `replacement`.
+///
+/// Returns an error if the range is invalid or does not align to UTF-8 char boundaries.
+pub fn replace_byte_range(
+    source: &str,
+    start: usize,
+    end: usize,
+    replacement: &str,
+) -> Result<String, AftError> {
+    validate_byte_range(source, start, end)?;
 
     let mut result = String::with_capacity(
         source.len().saturating_sub(end.saturating_sub(start)) + replacement.len(),
