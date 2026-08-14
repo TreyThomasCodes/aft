@@ -1642,10 +1642,10 @@ impl SearchIndexSnapshot {
         max_files: usize,
         budget: Duration,
     ) -> GrepResult {
-        self.search_grep_profiled_with_limits(
+        let filters = build_path_filters(include, exclude).unwrap_or_default();
+        self.search_grep_profiled_with_filters_and_limits(
             pattern,
-            include,
-            exclude,
+            &filters,
             search_root,
             max_results,
             path_exclusion,
@@ -1663,10 +1663,10 @@ impl SearchIndexSnapshot {
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
-        self.search_grep_profiled_with_limits(
+        let filters = build_path_filters(include, exclude).unwrap_or_default();
+        self.search_grep_profiled_with_filters_and_limits(
             pattern,
-            include,
-            exclude,
+            &filters,
             search_root,
             max_results,
             path_exclusion,
@@ -1674,11 +1674,28 @@ impl SearchIndexSnapshot {
         )
     }
 
-    fn search_grep_profiled_with_limits(
+    pub(crate) fn search_grep_profiled_with_filters(
         &self,
         pattern: &CompiledPattern,
-        include: &[String],
-        exclude: &[String],
+        filters: &PathFilters,
+        search_root: &Path,
+        max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_filters_and_limits(
+            pattern,
+            filters,
+            search_root,
+            max_results,
+            path_exclusion,
+            None,
+        )
+    }
+
+    fn search_grep_profiled_with_filters_and_limits(
+        &self,
+        pattern: &CompiledPattern,
+        filters: &PathFilters,
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
@@ -1689,10 +1706,6 @@ impl SearchIndexSnapshot {
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
         };
 
-        let filters = match build_path_filters(include, exclude) {
-            Ok(filters) => filters,
-            Err(_) => PathFilters::default(),
-        };
         let search_root = canonicalize_for_search_membership(search_root);
 
         let trigram_started = Instant::now();

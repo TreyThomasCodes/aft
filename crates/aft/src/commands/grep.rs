@@ -68,13 +68,16 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(error) = build_path_filters(&include, &exclude) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("grep: invalid include/exclude glob: {}", error),
-        );
-    }
+    let filters = match build_path_filters(&include, &exclude) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("grep: invalid include/exclude glob: {}", error),
+            );
+        }
+    };
 
     let scope = match grep_executor::resolve_grep_scope(
         ctx,
@@ -94,7 +97,8 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         path_exclusion: None,
     };
-    let (result, phases) = grep_executor::execute_profiled(ctx, &compiled, &scope, &params);
+    let (result, phases) =
+        grep_executor::execute_profiled_with_filters(ctx, &compiled, &scope, &params, &filters);
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
     let scope_has_files = phases
@@ -499,5 +503,161 @@ mod tests {
         let params = serde_json::json!({"include": ["**/*.{ts,tsx}", "*.json"]});
         let result = string_array_param(&params, "include");
         assert_eq!(result, vec!["**/*.{ts,tsx}", "*.json"]);
+    }
+
+    fn compiled_literal(pattern: &str) -> crate::pattern_compile::CompiledPattern {
+        match crate::pattern_compile::compile(
+            pattern,
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+            other => panic!("compile literal {pattern:?}: {other:?}"),
+        }
+    }
+
+    fn grep_result_bytes(result: &GrepResult, project_root: &Path) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "text": format_grep_text(result, project_root),
+            "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
+            "total_matches": result.total_matches,
+            "files_searched": result.files_searched,
+            "files_with_matches": result.files_with_matches,
+            "index_status": result.index_status.as_str(),
+            "truncated": result.truncated,
+            "fully_degraded": result.fully_degraded,
+            "engine_capped": result.engine_capped,
+            "walk_truncated": result.walk_truncated,
+        }))
+        .expect("serialize grep result projection")
+    }
+
+    #[test]
+    fn precompiled_path_filters_preserve_indexed_grep_bytes() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let files = [
+            ("src/lib.rs", "pub fn needle_one() {}\n"),
+            ("src/lib.ts", "export const needle_two = 2;\n"),
+            ("src/ignored/generated.rs", "fn needle_ignored() {}\n"),
+            ("tests/lib.rs", "#[test] fn needle_test() {}\n"),
+            ("README.md", "needle docs\n"),
+        ];
+        for (relative, content) in files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create fixture directory");
+            std::fs::write(path, content).expect("write fixture");
+        }
+
+        let index = crate::search_index::SearchIndex::build(project.path());
+        let snapshot = index.snapshot();
+        let cases = [
+            (vec!["**/*.rs".to_string()], Vec::new(), 100),
+            (
+                vec!["**/*.{rs,ts}".to_string()],
+                vec!["**/ignored/**".to_string()],
+                100,
+            ),
+            (Vec::new(), vec!["tests/**".to_string()], 2),
+            (vec!["**/*.md".to_string()], Vec::new(), 100),
+        ];
+        let pattern = compiled_literal("needle");
+
+        for (include, exclude, max_results) in cases {
+            let legacy =
+                snapshot.search_grep(&pattern, &include, &exclude, project.path(), max_results);
+            let filters = build_path_filters(&include, &exclude).expect("valid filters");
+            let optimized = snapshot
+                .search_grep_profiled_with_filters(
+                    &pattern,
+                    &filters,
+                    project.path(),
+                    max_results,
+                    None,
+                )
+                .0;
+            assert_eq!(
+                grep_result_bytes(&optimized, project.path()),
+                grep_result_bytes(&legacy, project.path()),
+                "include={include:?} exclude={exclude:?} max_results={max_results}",
+            );
+        }
+    }
+
+    /// Manual release-mode probe for the request setup paid by indexed grep.
+    ///
+    /// The fixture models a warm 12k-file TypeScript repository and a no-hit
+    /// query, a common interactive shape where index lookup is deliberately
+    /// cheap and fixed per-request setup is a material share of latency.
+    #[test]
+    #[ignore = "manual release-mode indexed-grep performance probe"]
+    fn grep_path_filter_reuse_perf_probe() {
+        const FILES: usize = 12_000;
+        const SAMPLES: usize = 9;
+        const ITERATIONS: usize = 500;
+
+        let project_root = PathBuf::from("/tmp/aft-grep-filter-perf-project");
+        let mut index = crate::search_index::SearchIndex::new();
+        for file_index in 0..FILES {
+            index.index_file(
+                &project_root.join(format!("src/pkg_{file_index:05}/lib.ts")),
+                b"export const indexed_value = 'warm corpus';\n",
+            );
+        }
+        let snapshot = index.snapshot();
+        let pattern = compiled_literal("definitely_absent_grep_token_47");
+        let include = vec!["**/*.{ts,tsx}".to_string()];
+        let exclude = Vec::new();
+
+        let legacy_once = || {
+            let validated = build_path_filters(&include, &exclude).expect("valid filters");
+            std::hint::black_box(&validated);
+            let result = snapshot.search_grep(&pattern, &include, &exclude, &project_root, 100);
+            std::hint::black_box(result.total_matches);
+        };
+        let optimized_once = || {
+            let filters = build_path_filters(&include, &exclude).expect("valid filters");
+            let result = snapshot
+                .search_grep_profiled_with_filters(&pattern, &filters, &project_root, 100, None)
+                .0;
+            std::hint::black_box(result.total_matches);
+        };
+
+        let mut legacy_ns = Vec::with_capacity(SAMPLES);
+        let mut optimized_ns = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn()| {
+                let started = std::time::Instant::now();
+                for _ in 0..ITERATIONS {
+                    operation();
+                }
+                started.elapsed().as_nanos() / ITERATIONS as u128
+            };
+            if sample % 2 == 0 {
+                legacy_ns.push(measure(&legacy_once));
+                optimized_ns.push(measure(&optimized_once));
+            } else {
+                optimized_ns.push(measure(&optimized_once));
+                legacy_ns.push(measure(&legacy_once));
+            }
+        }
+        legacy_ns.sort_unstable();
+        optimized_ns.sort_unstable();
+        let legacy_median = legacy_ns[SAMPLES / 2];
+        let optimized_median = optimized_ns[SAMPLES / 2];
+        let speedup = legacy_median as f64 / optimized_median as f64;
+        let saved_percent =
+            100.0 * (legacy_median.saturating_sub(optimized_median)) as f64 / legacy_median as f64;
+
+        eprintln!(
+            "grep path-filter setup: files={FILES} samples={SAMPLES} iterations={ITERATIONS}"
+        );
+        eprintln!("legacy ns/op samples: {legacy_ns:?}");
+        eprintln!("reused ns/op samples: {optimized_ns:?}");
+        eprintln!(
+            "median: legacy={legacy_median}ns reused={optimized_median}ns speedup={speedup:.2}x saved={saved_percent:.1}%"
+        );
     }
 }

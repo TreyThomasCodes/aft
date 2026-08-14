@@ -181,6 +181,17 @@ pub(crate) fn execute_profiled(
     scope: &GrepScope,
     params: &GrepParams,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
+    let filters = build_path_filters(&params.include, &params.exclude).unwrap_or_default();
+    execute_profiled_with_filters(ctx, pattern, scope, params, &filters)
+}
+
+pub(crate) fn execute_profiled_with_filters(
+    ctx: &AppContext,
+    pattern: &CompiledPattern,
+    scope: &GrepScope,
+    params: &GrepParams,
+    filters: &PathFilters,
+) -> (GrepResult, GrepExecutionPhaseTimings) {
     let project_root = project_root(ctx);
     if scope.roots.len() == 1 {
         return execute_root_profiled(
@@ -188,6 +199,7 @@ pub(crate) fn execute_profiled(
             pattern,
             &scope.roots[0],
             params,
+            filters,
             params.max_results,
             &project_root,
         );
@@ -201,6 +213,7 @@ pub(crate) fn execute_profiled(
             pattern,
             root,
             params,
+            filters,
             scope.per_root_max,
             &project_root,
         );
@@ -274,6 +287,7 @@ fn execute_root_profiled(
     pattern: &CompiledPattern,
     root: &ResolvedRoot,
     params: &GrepParams,
+    filters: &PathFilters,
     max_results: usize,
     project_root: &Path,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
@@ -319,10 +333,9 @@ fn execute_root_profiled(
         let scope_started = Instant::now();
         let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
         let scope_elapsed = scope_started.elapsed();
-        let (result, mut query) = snapshot.search_grep_profiled(
+        let (result, mut query) = snapshot.search_grep_profiled_with_filters(
             pattern,
-            &params.include,
-            &params.exclude,
+            filters,
             &root.search_root,
             max_results,
             params.path_exclusion,
@@ -356,8 +369,7 @@ fn execute_root_profiled(
             &root.search_root,
             &root.filter_root,
             pattern,
-            &params.include,
-            &params.exclude,
+            filters,
             max_results,
             index_status,
             params.path_exclusion,
@@ -653,13 +665,13 @@ pub fn fallback_grep_bench(
     exclude: &[String],
     max_results: usize,
 ) -> GrepResult {
+    let filters = build_path_filters(include, exclude).unwrap_or_default();
     fallback_grep(
         project_root,
         search_root,
         filter_root,
         pattern,
-        include,
-        exclude,
+        &filters,
         max_results,
         IndexStatus::Fallback,
         None,
@@ -671,14 +683,11 @@ fn fallback_grep(
     search_root: &Path,
     filter_root: &Path,
     pattern: &CompiledPattern,
-    include: &[String],
-    exclude: &[String],
+    filters: &PathFilters,
     max_results: usize,
     index_status: IndexStatus,
     path_exclusion: Option<GrepPathExclusion>,
 ) -> GrepResult {
-    let filters = build_path_filters(include, exclude).unwrap_or_default();
-
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
     let files_with_matches = AtomicUsize::new(0);
@@ -727,7 +736,7 @@ fn fallback_grep(
     let walk_truncated = for_each_bounded_fallback_walk_file(
         filter_root,
         search_root,
-        &filters,
+        filters,
         project_root,
         path_exclusion,
         |path| {
@@ -1027,13 +1036,13 @@ mod tests {
             other => panic!("compile literal: {other:?}"),
         };
 
+        let filters = PathFilters::default();
         let unfiltered = fallback_grep(
             project.path(),
             project.path(),
             project.path(),
             &pattern,
-            &[],
-            &[],
+            &filters,
             10,
             IndexStatus::Fallback,
             None,
@@ -1046,8 +1055,7 @@ mod tests {
             project.path(),
             project.path(),
             &pattern,
-            &[],
-            &[],
+            &filters,
             10,
             IndexStatus::Fallback,
             Some(excludes_tests),
