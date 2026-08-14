@@ -2228,6 +2228,57 @@ fn rust_analyzer_warming_diagnostics_are_provisional_until_quiescent() {
 }
 
 #[test]
+fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
+    use aft::lsp::diagnostics::DiagnosticEntry;
+    use aft::lsp::manager::PreEditSnapshot;
+
+    let file = PathBuf::from("/workspace/src/main.rs");
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: PathBuf::from("/workspace"),
+    };
+    let entry = DiagnosticEntry {
+        diagnostics: vec![StoredDiagnostic {
+            file,
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "warming diagnostic".to_string(),
+            code: Some("E-WARM".to_string()),
+            source: Some("rust-analyzer".to_string()),
+        }],
+        epoch: 2,
+        result_id: None,
+        version: Some(1),
+        stale: false,
+        provisional: true,
+    };
+
+    let outcome = LspManager::post_edit_outcome_for_entry_for_test(
+        key,
+        &entry,
+        1,
+        PreEditSnapshot {
+            epoch: 1,
+            document_version_at_capture: Some(0),
+        },
+    );
+
+    assert!(
+        !outcome.complete(),
+        "a warming report must not make an edit diagnostic result complete: {outcome:?}"
+    );
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "warming diagnostics must not be returned as authoritative: {outcome:?}"
+    );
+    assert_eq!(outcome.pending_servers.len(), 1, "{outcome:?}");
+    assert!(outcome.exited_servers.is_empty(), "{outcome:?}");
+}
+
+#[test]
 fn server_without_server_status_keeps_authoritative_behavior() {
     let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
     let file = &files[0];

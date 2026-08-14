@@ -118,9 +118,9 @@ impl EnsureServerOutcomes {
 /// this type.
 #[derive(Debug, Clone, Default)]
 pub struct PostEditWaitOutcome {
-    /// Diagnostics from servers whose response we verified is FOR the
-    /// post-edit document version (or whose epoch we saw advance after our
-    /// pre-edit snapshot, for unversioned servers).
+    /// Authoritative diagnostics from servers whose response we verified is for
+    /// the post-edit document version. Reports produced while rust-analyzer is
+    /// still warming remain pending until its quiescence signal arrives.
     pub diagnostics: Vec<StoredDiagnostic>,
     /// Servers we expected to publish but didn't before the deadline.
     /// Reported to the agent via `pending_lsp_servers` so they understand
@@ -1008,6 +1008,40 @@ impl LspManager {
     }
 
     #[doc(hidden)]
+    pub fn post_edit_outcome_for_entry_for_test(
+        key: ServerKey,
+        entry: &DiagnosticEntry,
+        target_version: i32,
+        pre: PreEditSnapshot,
+    ) -> PostEditWaitOutcome {
+        Self::post_edit_outcome_for_entry(key, entry, target_version, pre)
+    }
+
+    fn post_edit_outcome_for_entry(
+        key: ServerKey,
+        entry: &DiagnosticEntry,
+        target_version: i32,
+        pre: PreEditSnapshot,
+    ) -> PostEditWaitOutcome {
+        let mut fresh = HashMap::new();
+        if let Some(diagnostics) =
+            Self::authoritative_post_edit_diagnostics(entry, target_version, pre)
+        {
+            fresh.insert(key.clone(), diagnostics);
+        }
+        Self::post_edit_outcome(vec![key], fresh, Vec::new())
+    }
+
+    fn authoritative_post_edit_diagnostics(
+        entry: &DiagnosticEntry,
+        target_version: i32,
+        pre: PreEditSnapshot,
+    ) -> Option<Vec<StoredDiagnostic>> {
+        (!entry.provisional && post_edit_entry_is_fresh(entry, target_version, pre))
+            .then(|| entry.diagnostics.clone())
+    }
+
+    #[doc(hidden)]
     pub fn enqueue_event_for_test(&self, event: LspEvent) {
         self.event_tx
             .send(event)
@@ -1222,12 +1256,13 @@ impl LspManager {
                     .diagnostics
                     .entries_for_file(&lookup_path)
                     .into_iter()
-                    .find_map(|(k, e)| if k == key { Some(e) } else { None })
+                    .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
                 {
                     let pre = pre_snapshot.get(key).copied().unwrap_or_default();
-                    let is_fresh = post_edit_entry_is_fresh(entry, *target_version, pre);
-                    if is_fresh {
-                        fresh.insert(key.clone(), entry.diagnostics.clone());
+                    if let Some(diagnostics) =
+                        Self::authoritative_post_edit_diagnostics(entry, *target_version, pre)
+                    {
+                        fresh.insert(key.clone(), diagnostics);
                     }
                 }
             }
@@ -1251,25 +1286,32 @@ impl LspManager {
             }
         }
 
-        // Pending = expected but neither fresh nor exited.
-        let pending: Vec<ServerKey> = expected_versions
-            .iter()
-            .filter(|(k, _)| !fresh.contains_key(k) && !exited.contains(k))
-            .map(|(k, _)| k.clone())
-            .collect();
+        Self::post_edit_outcome(
+            expected_versions
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect(),
+            fresh,
+            exited,
+        )
+    }
 
-        // Build deduplicated, sorted diagnostics from the fresh servers only.
-        // Stale or pending servers contribute zero diagnostics.
-        let mut diagnostics: Vec<StoredDiagnostic> = fresh
+    fn post_edit_outcome(
+        expected: Vec<ServerKey>,
+        fresh: HashMap<ServerKey, Vec<StoredDiagnostic>>,
+        exited: Vec<ServerKey>,
+    ) -> PostEditWaitOutcome {
+        let pending = expected
             .into_iter()
-            .flat_map(|(_, diags)| diags.into_iter())
+            .filter(|key| !fresh.contains_key(key) && !exited.contains(key))
             .collect();
-        diagnostics.sort_by(|a, b| {
-            a.file
-                .cmp(&b.file)
-                .then(a.line.cmp(&b.line))
-                .then(a.column.cmp(&b.column))
-                .then(a.message.cmp(&b.message))
+        let mut diagnostics = fresh.into_values().flatten().collect::<Vec<_>>();
+        diagnostics.sort_by(|left, right| {
+            left.file
+                .cmp(&right.file)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.message.cmp(&right.message))
         });
 
         PostEditWaitOutcome {
