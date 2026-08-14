@@ -1532,6 +1532,19 @@ pub trait CallGraphRead {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>>;
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        targets
+            .iter()
+            .cloned()
+            .map(|target| {
+                let callers = self.direct_callers_of(Path::new(&target.0), &target.1)?;
+                Ok((target, callers))
+            })
+            .collect()
+    }
     fn direct_caller_counts_of(
         &self,
         targets: &[(String, String)],
@@ -3342,6 +3355,20 @@ impl CallGraphStore {
         direct_callers_for_tuple(&conn, &rel_path, symbol)
     }
 
+    /// Fetch direct callers for a reverse-traversal frontier in bounded batches.
+    pub fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        direct_callers_for_tuples(&conn, targets)
+    }
+
     /// Count distinct direct call sites for store-relative target tuples in bounded batches.
     pub fn direct_caller_counts_of(
         &self,
@@ -3780,6 +3807,13 @@ impl ReadonlyCallGraphStore {
         self.inner.direct_callers_of(file_rel, symbol)
     }
 
+    pub fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        self.inner.direct_callers_for_symbols(targets)
+    }
+
     pub fn direct_caller_counts_of(
         &self,
         targets: &[(String, String)],
@@ -3893,6 +3927,12 @@ impl CallGraphRead for CallGraphStore {
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         CallGraphStore::direct_callers_of(self, file_rel, symbol)
     }
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        CallGraphStore::direct_callers_for_symbols(self, targets)
+    }
     fn direct_caller_counts_of(
         &self,
         targets: &[(String, String)],
@@ -3987,6 +4027,12 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         (**self).direct_callers_of(file_rel, symbol)
     }
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        (**self).direct_callers_for_symbols(targets)
+    }
     fn direct_caller_counts_of(
         &self,
         targets: &[(String, String)],
@@ -4080,6 +4126,12 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     }
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
         self.direct_callers_of(file_rel, symbol)
+    }
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        self.direct_callers_for_symbols(targets)
     }
     fn direct_caller_counts_of(
         &self,
@@ -4302,7 +4354,7 @@ fn collect_callers_recursive(
 }
 
 // Each target uses two parameters; 499 stays below SQLite's legacy 999-variable limit.
-const DIRECT_CALLER_COUNT_BATCH_SIZE: usize = 499;
+const DIRECT_CALLER_BATCH_SIZE: usize = 499;
 
 fn direct_caller_counts_for_tuples(
     conn: &Connection,
@@ -4316,7 +4368,7 @@ fn direct_caller_counts_for_tuples(
         .collect::<HashMap<_, _>>();
 
     let unique_targets = unique_targets.into_iter().collect::<Vec<_>>();
-    for chunk in unique_targets.chunks(DIRECT_CALLER_COUNT_BATCH_SIZE) {
+    for chunk in unique_targets.chunks(DIRECT_CALLER_BATCH_SIZE) {
         let requested_values = (0..chunk.len())
             .map(|_| "(?, ?)")
             .collect::<Vec<_>>()
@@ -4399,23 +4451,89 @@ fn direct_callers_for_tuple(
          WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
     )?;
-    let rows = stmt.query_map(params![target_file, target_symbol], |row| {
-        let caller = store_node_from_row_at(row, 7)?;
-        let target = optional_store_node_from_row_at(row, 18)?;
-        Ok(StoreCallSite {
-            caller,
-            target_file: row.get(0)?,
-            target_symbol: row.get(1)?,
-            target,
-            line: row.get::<_, i64>(2)?.max(0) as u32,
-            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
-            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
-            resolved: row.get::<_, String>(5)? == "resolved",
-            provenance: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![target_file, target_symbol],
+        direct_call_site_from_row,
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn direct_call_site_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreCallSite> {
+    let caller = store_node_from_row_at(row, 7)?;
+    let target = optional_store_node_from_row_at(row, 18)?;
+    Ok(StoreCallSite {
+        caller,
+        target_file: row.get(0)?,
+        target_symbol: row.get(1)?,
+        target,
+        line: row.get::<_, i64>(2)?.max(0) as u32,
+        byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+        byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+        resolved: row.get::<_, String>(5)? == "resolved",
+        provenance: row.get(6)?,
+    })
+}
+
+fn direct_callers_for_tuples(
+    conn: &Connection,
+    targets: &[(String, String)],
+) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+    let unique_targets = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut callers_by_target = unique_targets
+        .iter()
+        .cloned()
+        .map(|target| (target, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    let unique_targets = unique_targets.into_iter().collect::<Vec<_>>();
+
+    for chunk in unique_targets.chunks(DIRECT_CALLER_BATCH_SIZE) {
+        let requested_values = (0..chunk.len())
+            .map(|_| "(?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH requested(target_file, target_symbol) AS (VALUES {requested_values})
+             SELECT e.target_file, e.target_symbol, e.line,
+                    r.byte_start, r.byte_end, r.status, e.provenance,
+                    src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
+                    src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
+                    src_file.lang,
+                    tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                    tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                    tgt_file.lang
+             FROM requested requested
+             JOIN edges e
+               ON e.target_file = requested.target_file
+              AND e.target_symbol = requested.target_symbol
+              AND e.kind = 'call'
+             JOIN refs r ON r.ref_id = e.ref_id
+             JOIN nodes src ON src.id = e.source_node
+             JOIN files src_file ON src_file.path = src.file_path
+             LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
+                 ON tgt.id = e.target_node
+             ORDER BY e.target_file, e.target_symbol, e.source_node,
+                      r.byte_start, r.line, r.ref_id"
+        );
+        let bindings = chunk
+            .iter()
+            .flat_map(|(file, symbol)| [file.as_str(), symbol.as_str()]);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(bindings), |row| {
+            let call = direct_call_site_from_row(row)?;
+            let target_key = (call.target_file.clone(), call.target_symbol.clone());
+            Ok((target_key, call))
+        })?;
+        for row in rows {
+            let (target, call) = row?;
+            callers_by_target
+                .get_mut(&target)
+                .expect("batched caller row belongs to a requested target")
+                .push(call);
+        }
+    }
+
+    Ok(callers_by_target)
 }
 
 // Each symbol uses two parameters; 499 stays below SQLite's legacy 999-variable limit.
@@ -12790,7 +12908,7 @@ mod cold_build_insert_tests {
         {
             CALLER_QUERY_SELECTS.with(|count| count.set(count.get() + 1));
         }
-        if sql.starts_with("WITH requested") {
+        if sql.starts_with("WITH requested") && sql.contains("COUNT(*)") {
             BOUNDARY_COUNT_SELECTS.with(|count| count.set(count.get() + 1));
         }
     }
@@ -13087,6 +13205,48 @@ mod cold_build_insert_tests {
 
         let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
         conn.trace(None);
+    }
+
+    #[test]
+    fn direct_caller_frontier_chunks_sqlite_selects() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        fs::write(
+            &file,
+            "export function caller() { target(); }\nexport function target() {}\n",
+        )
+        .expect("write fixture");
+        let store = CallGraphStore::open(
+            dir.path().join(".store-caller-frontier-query"),
+            dir.path().to_path_buf(),
+        )
+        .expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&file))
+            .expect("cold build");
+        let mut targets = vec![("main.ts".to_string(), "target".to_string())];
+        targets.extend((1..1_000).map(|index| ("main.ts".to_string(), format!("missing{index}"))));
+
+        CALLER_QUERY_SELECTS.with(|count| count.set(0));
+        BOUNDARY_COUNT_SELECTS.with(|count| count.set(0));
+        TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.trace(Some(count_caller_traversal_selects));
+        }
+        let callers = store
+            .direct_callers_for_symbols(&targets)
+            .expect("batched callers");
+        {
+            let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
+            conn.trace(None);
+        }
+
+        assert_eq!(callers.len(), 1_000);
+        assert_eq!(callers.get(&targets[0]).unwrap().len(), 1);
+        assert_eq!(CALLER_QUERY_SELECTS.with(Cell::get), 3);
+        assert_eq!(BOUNDARY_COUNT_SELECTS.with(Cell::get), 0);
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
     }
 
     #[test]

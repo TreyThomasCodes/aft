@@ -447,9 +447,16 @@ pub fn callers_result(
     let mut sites = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
+    let callers_by_symbol = prefetch_callers(
+        store,
+        &target.representative.file,
+        &target.representative.symbol,
+        effective_depth,
+    )?;
 
     collect_callers_recursive(
         store,
+        &callers_by_symbol,
         &target.representative.file,
         &target.representative.symbol,
         effective_depth,
@@ -561,9 +568,16 @@ pub fn impact_result(
     let mut sites = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
+    let callers_by_symbol = prefetch_callers(
+        store,
+        &target.representative.file,
+        &target.representative.symbol,
+        effective_depth,
+    )?;
 
     collect_callers_recursive(
         store,
+        &callers_by_symbol,
         &target.representative.file,
         &target.representative.symbol,
         effective_depth,
@@ -1833,9 +1847,41 @@ fn collapse_exact_nodes(mut nodes: Vec<StoreNode>) -> ResolvedStoreSymbol {
     }
 }
 
+fn prefetch_callers(
+    store: &impl CallGraphRead,
+    file: &str,
+    symbol: &str,
+    max_depth: usize,
+) -> StoreAdapterResult<HashMap<(String, String), Vec<StoreCallSite>>> {
+    let mut callers_by_symbol = HashMap::new();
+    let mut frontier = BTreeSet::from([(file.to_string(), symbol.to_string())]);
+
+    for depth in 0..max_depth {
+        let targets = frontier
+            .into_iter()
+            .filter(|target| !callers_by_symbol.contains_key(target))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            break;
+        }
+        let fetched = store.direct_callers_for_symbols(&targets)?;
+        let mut next_frontier = BTreeSet::new();
+        if depth + 1 < max_depth {
+            for site in fetched.values().flatten() {
+                next_frontier.insert((site.caller.file.clone(), site.caller.symbol.clone()));
+            }
+        }
+        callers_by_symbol.extend(fetched);
+        frontier = next_frontier;
+    }
+
+    Ok(callers_by_symbol)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_callers_recursive(
     store: &impl CallGraphRead,
+    callers_by_symbol: &HashMap<(String, String), Vec<StoreCallSite>>,
     file: &str,
     symbol: &str,
     max_depth: usize,
@@ -1860,7 +1906,9 @@ fn collect_callers_recursive(
         return Ok(());
     }
 
-    let sites = store.direct_callers_of(Path::new(file), symbol)?;
+    let Some(sites) = callers_by_symbol.get(&(file.to_string(), symbol.to_string())) else {
+        return Ok(());
+    };
     if sites.is_empty() {
         return Ok(());
     }
@@ -1869,6 +1917,7 @@ fn collect_callers_recursive(
             result.push(site.clone());
             collect_callers_recursive(
                 store,
+                callers_by_symbol,
                 &site.caller.file,
                 &site.caller.symbol,
                 max_depth,
@@ -2173,6 +2222,8 @@ mod trace_to_tests {
         callers: HashMap<(String, String), Vec<StoreCallSite>>,
         outgoing: HashMap<(String, String), Vec<StoreCallSite>>,
         caller_queries: RefCell<HashMap<(String, String), usize>>,
+        caller_frontier_query_count: RefCell<usize>,
+        caller_frontier_target_count: RefCell<usize>,
         forward_query_count: RefCell<usize>,
         frontier_query_count: RefCell<usize>,
         caller_count_queries: RefCell<usize>,
@@ -2188,6 +2239,8 @@ mod trace_to_tests {
                 callers: HashMap::new(),
                 outgoing: HashMap::new(),
                 caller_queries: RefCell::new(HashMap::new()),
+                caller_frontier_query_count: RefCell::new(0),
+                caller_frontier_target_count: RefCell::new(0),
                 forward_query_count: RefCell::new(0),
                 frontier_query_count: RefCell::new(0),
                 caller_count_queries: RefCell::new(0),
@@ -2254,6 +2307,14 @@ mod trace_to_tests {
             self.caller_queries.borrow().values().sum()
         }
 
+        fn total_caller_frontier_queries(&self) -> usize {
+            *self.caller_frontier_query_count.borrow()
+        }
+
+        fn caller_frontier_target_count(&self) -> usize {
+            *self.caller_frontier_target_count.borrow()
+        }
+
         fn total_caller_count_queries(&self) -> usize {
             *self.caller_count_queries.borrow()
         }
@@ -2264,6 +2325,8 @@ mod trace_to_tests {
 
         fn reset_query_counts(&self) {
             self.caller_queries.borrow_mut().clear();
+            *self.caller_frontier_query_count.borrow_mut() = 0;
+            *self.caller_frontier_target_count.borrow_mut() = 0;
             *self.caller_count_queries.borrow_mut() = 0;
             *self.caller_count_targets.borrow_mut() = 0;
         }
@@ -2334,6 +2397,22 @@ mod trace_to_tests {
                 .entry(key.clone())
                 .or_default() += 1;
             Ok(self.callers.get(&key).cloned().unwrap_or_default())
+        }
+
+        fn direct_callers_for_symbols(
+            &self,
+            targets: &[(String, String)],
+        ) -> CallGraphResult<HashMap<(String, String), Vec<StoreCallSite>>> {
+            *self.caller_frontier_query_count.borrow_mut() += 1;
+            *self.caller_frontier_target_count.borrow_mut() += targets.len();
+            Ok(targets
+                .iter()
+                .cloned()
+                .map(|target| {
+                    let callers = self.callers.get(&target).cloned().unwrap_or_default();
+                    (target, callers)
+                })
+                .collect())
         }
 
         fn direct_caller_counts_of(
@@ -2539,6 +2618,21 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn reverse_frontiers_batch_caller_fetches_by_depth() {
+        let (store, target) = layered_store(20, 6);
+
+        let result = callers_result(&store, Path::new(&target.file), &target.symbol, 5, true)
+            .expect("callers result");
+
+        assert_eq!(store.total_caller_queries(), 0);
+        assert_eq!(store.total_caller_frontier_queries(), 5);
+        assert_eq!(store.caller_frontier_target_count(), 81);
+        assert_eq!(result.total_callers, 1_620);
+        assert_eq!(result.callers.len(), 15);
+        assert!(result.depth_limited);
+    }
+
+    #[test]
     fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
         let mut store = CountingStore::new();
         let target = node("target", false);
@@ -2556,7 +2650,9 @@ mod trace_to_tests {
 
         let callers = callers_result(&store, Path::new(&target.file), &target.symbol, 1, true)
             .expect("callers result");
-        assert_eq!(store.total_caller_queries(), 1);
+        assert_eq!(store.total_caller_queries(), 0);
+        assert_eq!(store.total_caller_frontier_queries(), 1);
+        assert_eq!(store.caller_frontier_target_count(), 1);
         assert_eq!(store.total_caller_count_queries(), 1);
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
@@ -2567,7 +2663,9 @@ mod trace_to_tests {
         store.reset_query_counts();
         let impact = impact_result(&store, Path::new(&target.file), &target.symbol, 1, true)
             .expect("impact result");
-        assert_eq!(store.total_caller_queries(), 1);
+        assert_eq!(store.total_caller_queries(), 0);
+        assert_eq!(store.total_caller_frontier_queries(), 1);
+        assert_eq!(store.caller_frontier_target_count(), 1);
         assert_eq!(store.total_caller_count_queries(), 1);
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(

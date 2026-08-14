@@ -398,6 +398,21 @@ function leaf() {}
     assert!(!tree.children[1].resolved);
     assert_eq!(tree.children[0].children[0].name, "leaf");
 
+    let reverse_targets = vec![
+        ("main.ts".to_string(), "leaf".to_string()),
+        ("main.ts".to_string(), "second".to_string()),
+        ("main.ts".to_string(), "missing".to_string()),
+    ];
+    let batched_callers = store.direct_callers_for_symbols(&reverse_targets).unwrap();
+    for (file, symbol) in &reverse_targets {
+        assert_eq!(
+            batched_callers
+                .get(&(file.clone(), symbol.clone()))
+                .unwrap(),
+            &store.direct_callers_of(Path::new(file), symbol).unwrap()
+        );
+    }
+
     let callers = store.callers_of(Path::new("main.ts"), "leaf", 2).unwrap();
     assert_eq!(callers.target.symbol, "leaf");
     assert!(callers
