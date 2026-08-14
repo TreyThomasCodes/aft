@@ -64,7 +64,7 @@ use prettier::PrettierCompressor;
 use pytest::PytestCompressor;
 use ruff::RuffCompressor;
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -524,21 +524,26 @@ pub(crate) fn missing_raw_failure_signal_lines(
     raw_output: &str,
     compressed_text: &str,
 ) -> Vec<String> {
-    let compressed_lines: BTreeSet<String> = compressed_text
+    let compressed_lower = compressed_text.to_ascii_lowercase();
+    let compressed_lines: HashSet<&str> = compressed_text
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
+        .zip(compressed_lower.lines())
+        .filter_map(|(line, lower)| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty() && line_has_failure_signal_lower(trimmed, lower.trim()))
+                .then_some(trimmed)
+        })
         .collect();
-    let mut seen = BTreeSet::new();
+    let raw_lower = raw_output.to_ascii_lowercase();
+    let mut seen = HashSet::new();
     let mut missing = Vec::new();
 
-    for line in raw_output.lines() {
+    for (line, lower) in raw_output.lines().zip(raw_lower.lines()) {
         let trimmed = line.trim();
-        if trimmed.is_empty() || !line_has_failure_signal(trimmed) {
+        if trimmed.is_empty() || !line_has_failure_signal_lower(trimmed, lower.trim()) {
             continue;
         }
-        if compressed_lines.contains(trimmed) || !seen.insert(trimmed.to_string()) {
+        if compressed_lines.contains(trimmed) || !seen.insert(trimmed) {
             continue;
         }
         missing.push(trimmed.to_string());
@@ -568,12 +573,13 @@ fn result_looks_successful(text: &str) -> bool {
 }
 
 pub(crate) fn text_has_failure_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     text.lines()
-        .any(|line| line_has_failure_signal(line.trim()))
+        .zip(lower.lines())
+        .any(|(line, lower)| line_has_failure_signal_lower(line.trim(), lower.trim()))
 }
 
-fn line_has_failure_signal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
+fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
     line.contains("error[")
         || lower.contains("error:")
         || line.contains("Error")
@@ -591,39 +597,40 @@ fn line_has_failure_signal(line: &str) -> bool {
         || lower.contains("fatal error")
         || line.contains("FAILED")
         || line.contains("FAIL")
-        || contains_nonzero_failure_word(line, "fail")
-        || contains_nonzero_failure_word(line, "failed")
-        || contains_nonzero_failure_word(line, "failure")
-        || contains_nonzero_failure_word(line, "failures")
+        || contains_nonzero_failure_word_lower(lower)
         || lower.contains("panic")
         || lower.contains("cannot find")
         || lower.contains("not found")
         || lower.contains("no such")
 }
 
-fn contains_nonzero_failure_word(line: &str, word: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    for (index, _) in lower.match_indices(word) {
-        let end = index + word.len();
-        let before_is_word = lower[..index].chars().next_back().is_some_and(is_word_char);
-        let after_is_word = lower[end..].chars().next().is_some_and(is_word_char);
-        if before_is_word || after_is_word {
-            continue;
-        }
+fn contains_nonzero_failure_word_lower(lower: &str) -> bool {
+    for (index, _) in lower.match_indices("fail") {
+        let tail = &lower[index + "fail".len()..];
+        for suffix in ["ures", "ure", "ed", ""] {
+            let Some(after_suffix) = tail.strip_prefix(suffix) else {
+                continue;
+            };
+            let before_is_word = lower[..index].chars().next_back().is_some_and(is_word_char);
+            let after_is_word = after_suffix.chars().next().is_some_and(is_word_char);
+            if before_is_word || after_is_word {
+                continue;
+            }
 
-        let prefix = lower[..index].trim_end();
-        let digits_start = prefix
-            .char_indices()
-            .rev()
-            .take_while(|(_, ch)| ch.is_ascii_digit())
-            .last()
-            .map(|(idx, _)| idx);
-        let Some(digits_start) = digits_start else {
-            return true;
-        };
-        let digits = &prefix[digits_start..];
-        if digits.parse::<usize>().ok() != Some(0) {
-            return true;
+            let prefix = lower[..index].trim_end();
+            let digits_start = prefix
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| ch.is_ascii_digit())
+                .last()
+                .map(|(idx, _)| idx);
+            let Some(digits_start) = digits_start else {
+                return true;
+            };
+            let digits = &prefix[digits_start..];
+            if digits.parse::<usize>().ok() != Some(0) {
+                return true;
+            }
         }
     }
     false
@@ -2139,6 +2146,199 @@ ERROR: compiler crashed
 
         assert_ne!(failed.text, "make: ok");
         assert!(failed.text.contains("ERROR: compiler crashed"));
+    }
+
+    // aft:expected-duplicate -- the frozen implementation is the independent differential oracle.
+    fn frozen_contains_nonzero_failure_word(line: &str, word: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        for (index, _) in lower.match_indices(word) {
+            let end = index + word.len();
+            let before_is_word = lower[..index].chars().next_back().is_some_and(is_word_char);
+            let after_is_word = lower[end..].chars().next().is_some_and(is_word_char);
+            if before_is_word || after_is_word {
+                continue;
+            }
+
+            let prefix = lower[..index].trim_end();
+            let digits_start = prefix
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| ch.is_ascii_digit())
+                .last()
+                .map(|(idx, _)| idx);
+            let Some(digits_start) = digits_start else {
+                return true;
+            };
+            let digits = &prefix[digits_start..];
+            if digits.parse::<usize>().ok() != Some(0) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn frozen_line_has_failure_signal(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        line.contains("error[")
+            || lower.contains("error:")
+            || line.contains("Error")
+            || line.contains("ERROR")
+            || lower.contains("internalerror")
+            || lower.contains("traceback")
+            || lower.contains("exception")
+            || lower.contains("no module named")
+            || lower.contains("undefined reference")
+            || lower.contains("linker command failed")
+            || lower.contains("undefined:")
+            || lower.contains("expected declaration")
+            || lower.contains("collect2: error")
+            || lower.contains("ld: error")
+            || lower.contains("fatal error")
+            || line.contains("FAILED")
+            || line.contains("FAIL")
+            || frozen_contains_nonzero_failure_word(line, "fail")
+            || frozen_contains_nonzero_failure_word(line, "failed")
+            || frozen_contains_nonzero_failure_word(line, "failure")
+            || frozen_contains_nonzero_failure_word(line, "failures")
+            || lower.contains("panic")
+            || lower.contains("cannot find")
+            || lower.contains("not found")
+            || lower.contains("no such")
+    }
+
+    fn frozen_missing_failure_lines_reference(
+        raw_output: &str,
+        compressed_text: &str,
+    ) -> Vec<String> {
+        let compressed_lines: std::collections::BTreeSet<String> = compressed_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut missing = Vec::new();
+
+        for line in raw_output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !frozen_line_has_failure_signal(trimmed) {
+                continue;
+            }
+            if compressed_lines.contains(trimmed) || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            missing.push(trimmed.to_string());
+        }
+
+        missing
+    }
+
+    #[test]
+    fn failure_line_index_is_byte_equivalent_to_frozen_reference() {
+        let signals = [
+            "Error: ordinary failure",
+            "ERROR: uppercase failure",
+            "error[E0432]: unresolved import",
+            "eRrOr: mixed case",
+            "0 fail",
+            "00 failed",
+            "1 failed",
+            "0 failures",
+            "01 failure",
+            "2 failures",
+            "failed_extra",
+            "prefix_failure_suffix",
+            "failures!",
+            "thread panicked at src/lib.rs:1",
+            "undefined reference to `main`",
+            "例外ではない unicode status",
+        ];
+        for signal in signals {
+            assert_eq!(
+                line_has_failure_signal_lower(signal, &signal.to_ascii_lowercase()),
+                frozen_line_has_failure_signal(signal),
+                "classifier diverged for {signal:?}"
+            );
+        }
+        for prefix in ["", "0 ", "00 ", "1 ", "01 ", "pre", "_", "2 errors and "] {
+            for word in [
+                "fail",
+                "failed",
+                "failure",
+                "failures",
+                "failing",
+                "failuresx",
+            ] {
+                for suffix in ["", "!", "_tail", "x", " then continue"] {
+                    let line = format!("{prefix}{word}{suffix}");
+                    assert_eq!(
+                        line_has_failure_signal_lower(&line, &line.to_ascii_lowercase()),
+                        frozen_line_has_failure_signal(&line),
+                        "classifier diverged for {line:?}"
+                    );
+                }
+            }
+        }
+
+        let mut raw = String::new();
+        let mut compressed = String::new();
+        for (index, signal) in signals.iter().enumerate() {
+            raw.push_str("ordinary progress\n");
+            raw.push_str("  ");
+            raw.push_str(signal);
+            raw.push_str("  \n");
+            if index % 2 == 0 {
+                compressed.push_str(signal);
+                compressed.push('\n');
+            }
+            if index % 3 == 0 {
+                raw.push_str(signal);
+                raw.push('\n');
+            }
+        }
+
+        let expected = frozen_missing_failure_lines_reference(&raw, &compressed);
+        let actual = missing_raw_failure_signal_lines(&raw, &compressed);
+        assert_eq!(actual, expected);
+
+        let render_raw = "Error: first failure\nprogress\nError: second failure\n";
+        let render_compressed = "Error: first failure";
+        let render_missing = frozen_missing_failure_lines_reference(render_raw, render_compressed);
+        let expected_text = format!(
+            "{render_compressed}\n[raw failure lines preserved by AFT]\n{}",
+            render_missing.join("\n")
+        );
+        let actual_result = failure_preserving_result(
+            "cargo test",
+            render_raw,
+            CompressionResult::new(render_compressed),
+            Some(101),
+        );
+        assert_eq!(actual_result.text.as_bytes(), expected_text.as_bytes());
+    }
+
+    #[test]
+    fn failure_line_index_allocations_do_not_scale_with_progress_lines() {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        for index in 0..5_000 {
+            writeln!(
+                output,
+                "worker-{index:05}: processed /workspace/src/file-{index:05}.rs"
+            )
+            .expect("writing to String cannot fail");
+        }
+        output.push_str("ERROR: linker command failed for target app\n");
+
+        let (missing, allocations) =
+            crate::test_allocations::count(|| missing_raw_failure_signal_lines(&output, &output));
+
+        assert!(missing.is_empty());
+        assert!(
+            allocations <= 8,
+            "failure-line membership should borrow progress lines; got {allocations} allocations"
+        );
     }
 
     #[test]
