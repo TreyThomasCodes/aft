@@ -48,7 +48,8 @@ use subc_protocol::session::{
     MODULE_CONTROL_OP_HEALTH_CHECK,
 };
 use subc_protocol::{
-    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, PROTOCOL_VERSION,
+    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -166,10 +167,10 @@ pub fn is_tool_call_admitted_for_test(name: &str) -> bool {
     manifest::is_subc_agent_core_tool(name) || manifest::is_subc_native_plumbing_tool(name)
 }
 use self::wire::{
-    build_error_frame, build_goodbye_frame, build_tool_response_frame, decrement_counted_channel,
-    response_is_fatal_panic, response_message, send_counted_channel, send_frame,
-    send_reliable_writer_frame, send_traced_tool_response_frame, ToolResponseWriteTrace,
-    WriterFrame, WriterSender,
+    build_error_frame, build_goodbye_frame, build_tool_response_frame,
+    build_tool_response_frame_with_limit, decrement_counted_channel, response_is_fatal_panic,
+    response_message, send_counted_channel, send_frame, send_reliable_writer_frame,
+    send_traced_tool_response_frame, ToolResponseWriteTrace, WriterFrame, WriterSender,
 };
 
 struct DecodedFrame {
@@ -1900,6 +1901,7 @@ pub fn run_subc_mode(
         dispatch,
         user_config_path,
         false,
+        MAX_FRAME_BODY_LEN as usize,
     )
 }
 
@@ -1910,6 +1912,7 @@ fn run_subc_mode_inner(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
     allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1934,6 +1937,7 @@ fn run_subc_mode_inner(
             dispatch,
             user_config_path,
             allow_native_passthrough,
+            tool_response_body_limit,
         )
         .await
     });
@@ -1978,6 +1982,30 @@ pub fn run_subc_mode_for_test(
         dispatch,
         user_config_path,
         true,
+        MAX_FRAME_BODY_LEN as usize,
+    )
+}
+
+/// Test-only entry that lowers the effective tool-response body limit without
+/// allocating a 64 MiB fixture. The fixed fallback envelope needs 4 KiB of room.
+#[doc(hidden)]
+pub fn run_subc_mode_for_test_with_response_body_limit(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    tool_response_body_limit: usize,
+) -> Result<(), SubcError> {
+    assert!((4 * 1_024..=MAX_FRAME_BODY_LEN as usize).contains(&tool_response_body_limit));
+    run_subc_mode_inner(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        true,
+        tool_response_body_limit,
     )
 }
 
@@ -2267,6 +2295,7 @@ async fn run_module_loop<R, W>(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
     allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2668,6 +2697,7 @@ where
                             &mut bg_wake_epoch,
                             dispatch,
                             allow_native_passthrough,
+                            tool_response_body_limit,
                         )
                         .await
                         {
@@ -3970,6 +4000,7 @@ async fn handle_tool_call(
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
     allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
     let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
@@ -4114,13 +4145,14 @@ async fn handle_tool_call(
             &format_context,
         );
         let result = ToolCallResult { text, response };
-        let response_frame = build_tool_response_frame(
+        let response_frame = build_tool_response_frame_with_limit(
             frame.header.ver,
             route_id,
             frame.header.corr,
             frame.header.flags,
             &result,
             bind_trust,
+            tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
@@ -4136,13 +4168,14 @@ async fn handle_tool_call(
             &format_context,
         );
         let result = ToolCallResult { text, response };
-        let response_frame = build_tool_response_frame(
+        let response_frame = build_tool_response_frame_with_limit(
             frame.header.ver,
             route_id,
             frame.header.corr,
             frame.header.flags,
             &result,
             bind_trust,
+            tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
@@ -4174,13 +4207,14 @@ async fn handle_tool_call(
             &format_context,
         );
         let result = ToolCallResult { text, response };
-        let response_frame = build_tool_response_frame(
+        let response_frame = build_tool_response_frame_with_limit(
             frame.header.ver,
             route_id,
             frame.header.corr,
             frame.header.flags,
             &result,
             bind_trust,
+            tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
@@ -4200,13 +4234,14 @@ async fn handle_tool_call(
                         &format_context,
                     );
                     let result = ToolCallResult { text, response };
-                    let response_frame = build_tool_response_frame(
+                    let response_frame = build_tool_response_frame_with_limit(
                         frame.header.ver,
                         route_id,
                         frame.header.corr,
                         frame.header.flags,
                         &result,
                         bind_trust,
+                        tool_response_body_limit,
                     )?;
                     return send_reliable_writer_frame(
                         tx,
@@ -4404,7 +4439,15 @@ async fn handle_tool_call(
         };
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
-        match build_tool_response_frame(ver, route, corr, flags, &result, bind_trust) {
+        match build_tool_response_frame_with_limit(
+            ver,
+            route,
+            corr,
+            flags,
+            &result,
+            bind_trust,
+            tool_response_body_limit,
+        ) {
             Ok(response_frame) => {
                 let send_result = if let Some(phase_trace) = phase_trace {
                     let trace = ToolResponseWriteTrace::new(

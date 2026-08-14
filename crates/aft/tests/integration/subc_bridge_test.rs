@@ -19,7 +19,10 @@ use aft::protocol::{
     BashCompletedFrame, BashLongRunningFrame, ConfigureWarningsFrame, PushFrame, RawRequest,
     Response, StatusChangedFrame,
 };
-use aft::subc::{run_subc_mode, run_subc_mode_for_test, SubcError};
+use aft::subc::{
+    run_subc_mode, run_subc_mode_for_test, run_subc_mode_for_test_with_response_body_limit,
+    SubcError,
+};
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
@@ -1116,6 +1119,23 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         }
         "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
         "semantic_search" => state.heavy(req.id),
+        "subc_test_transport_response" => {
+            let bytes = req.params.get("bytes").and_then(Value::as_u64).unwrap_or(0) as usize;
+            match req.params.get("shape").and_then(Value::as_str) {
+                Some("normal") => Response::success(req.id, json!({ "case": "normal" })),
+                Some("truncated") => {
+                    Response::success(req.id, json!({ "text": "x".repeat(bytes) }))
+                }
+                Some("fallback") => {
+                    Response::success(req.id, json!({ "payload": "x".repeat(bytes) }))
+                }
+                other => Response::error(
+                    req.id,
+                    "invalid_request",
+                    format!("unexpected transport response shape: {other:?}"),
+                ),
+            }
+        }
         "subc_test_mutating_internal_error" => Response::error(
             req.id,
             "internal_error",
@@ -1311,6 +1331,30 @@ where
     run_subc_bridge_test_with_env(name, watchdog, Vec::new, driver, after);
 }
 
+fn run_subc_bridge_test_with_response_body_limit<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    response_body_limit: usize,
+    driver: F,
+    after: A,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        Some(response_body_limit),
+        bridge_dispatch,
+        bridge_executor_config(),
+    );
+}
+
 /// Like [`run_subc_bridge_test`], but installs the process-global test env vars
 /// that control foreground wait windows and forced promote errors or panics AFTER
 /// acquiring the serial guard, so the returned [`EnvVarGuard`]s live entirely
@@ -1338,6 +1382,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         driver,
         after,
         true,
+        None,
         bridge_dispatch,
         bridge_executor_config(),
     );
@@ -1374,6 +1419,7 @@ fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
         driver,
         after,
         false,
+        None,
         dispatch,
         bridge_executor_config(),
     );
@@ -1397,6 +1443,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
         driver,
         after,
         true,
+        None,
         dispatch,
         bridge_executor_config(),
     );
@@ -1421,6 +1468,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
         driver,
         after,
         true,
+        None,
         dispatch,
         executor_config,
     );
@@ -1434,6 +1482,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     driver: F,
     after: A,
     allow_native_passthrough: bool,
+    response_body_limit: Option<usize>,
     dispatch: aft::subc::DispatchFn,
     executor_config: ExecutorConfig,
 ) where
@@ -1527,7 +1576,16 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     // Inject a hermetic user config path so local config reads never touch a
     // real ~/.config/cortexkit/aft.jsonc on the dev/CI machine. Most tests leave
     // it absent; storm tests can write it through FakeDaemonInput.
-    let run_result = if allow_native_passthrough {
+    let run_result = if let Some(response_body_limit) = response_body_limit {
+        run_subc_mode_for_test_with_response_body_limit(
+            &conn_path,
+            ctx,
+            executor,
+            dispatch,
+            Some(user_config_path),
+            response_body_limit,
+        )
+    } else if allow_native_passthrough {
         run_subc_mode_for_test(&conn_path, ctx, executor, dispatch, Some(user_config_path))
     } else {
         run_subc_mode(&conn_path, ctx, executor, dispatch, Some(user_config_path))
@@ -1836,6 +1894,17 @@ fn subc_bridge_configure_bind_benchmark() {
         drive_configure_bind_benchmark_daemon,
         |_, _, _| {},
         configure_bind_benchmark_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_oversized_tool_responses_resolve_with_truncation_or_fallback() {
+    run_subc_bridge_test_with_response_body_limit(
+        "subc_bridge_oversized_tool_responses_resolve_with_truncation_or_fallback",
+        Duration::from_secs(30),
+        8 * 1_024,
+        drive_oversized_tool_response_daemon,
+        |_, _, _| {},
     );
 }
 
@@ -2943,6 +3012,93 @@ pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) 
             .expect("goodbye frame"),
     )
     .await;
+}
+
+async fn drive_oversized_tool_response_daemon(input: FakeDaemonInput) {
+    const TEST_BODY_LIMIT: usize = 8 * 1_024;
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    send_tool_call(
+        &mut stream,
+        1,
+        90,
+        "subc_test_transport_response",
+        json!({ "shape": "normal" }),
+    )
+    .await;
+    let normal = read_frame_timeout(&mut stream, "normal transport response").await;
+    assert_eq!(normal.header.corr, 90);
+    assert_eq!(tool_response_json(&normal)["case"], json!("normal"));
+
+    send_tool_call(
+        &mut stream,
+        1,
+        91,
+        "subc_test_transport_response",
+        json!({ "shape": "truncated", "bytes": 5_000 }),
+    )
+    .await;
+    let truncated = read_frame_within(
+        &mut stream,
+        Duration::from_secs(2),
+        "truncated oversized tool response",
+    )
+    .await
+    .expect("an oversized rendered response must resolve instead of hanging");
+    assert_eq!(truncated.header.ty, FrameType::Response);
+    assert_eq!(truncated.header.channel, 1);
+    assert_eq!(truncated.header.corr, 91);
+    assert!(truncated.body.len() <= TEST_BODY_LIMIT);
+    let truncated_body: Value = serde_json::from_slice(&truncated.body).expect("truncated body");
+    assert_eq!(truncated_body["isError"], json!(false));
+    let truncated_response = tool_response_json(&truncated);
+    assert_eq!(truncated_response["success"], json!(true));
+    assert_eq!(truncated_response["complete"], json!(false));
+    assert_eq!(truncated_response["truncated"], json!(true));
+    assert_eq!(
+        truncated_response["truncation_reason"],
+        json!("transport_frame_limit")
+    );
+    assert!(truncated_response["text"]
+        .as_str()
+        .expect("truncated response text")
+        .contains("full output exceeds the transport frame limit"));
+
+    send_tool_call(
+        &mut stream,
+        1,
+        92,
+        "subc_test_transport_response",
+        json!({ "shape": "fallback", "bytes": 4_096 }),
+    )
+    .await;
+    let fallback = read_frame_within(
+        &mut stream,
+        Duration::from_secs(2),
+        "response_too_large fallback",
+    )
+    .await
+    .expect("oversized structured data must resolve instead of hanging");
+    assert_eq!(fallback.header.ty, FrameType::Response);
+    assert_eq!(fallback.header.channel, 1);
+    assert_eq!(fallback.header.corr, 92);
+    assert!(fallback.body.len() <= TEST_BODY_LIMIT);
+    let fallback_body: Value = serde_json::from_slice(&fallback.body).expect("fallback body");
+    assert_eq!(fallback_body["isError"], json!(true));
+    let fallback_response = tool_response_json(&fallback);
+    assert_eq!(fallback_response["success"], json!(false));
+    assert_eq!(fallback_response["code"], json!("response_too_large"));
+    let message = fallback_response["message"]
+        .as_str()
+        .expect("fallback response message");
+    assert!(message.contains("8192 bytes"));
+    assert!(message.contains("narrower range"));
+    assert!(message.contains("offset+limit paging"));
+
+    send_connection_goodbye(&mut stream).await;
 }
 
 async fn drive_mutating_internal_error_daemon(input: FakeDaemonInput) {

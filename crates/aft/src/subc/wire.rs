@@ -11,6 +11,8 @@ use super::{
     CONTROL_SEND_TIMEOUT, RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
 use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
+use std::borrow::Cow;
+use subc_protocol::{FrameBuildError, MAX_FRAME_BODY_LEN};
 
 pub(super) type WriterSender = mpsc::Sender<WriterFrame>;
 
@@ -474,9 +476,59 @@ struct TextContent<'a> {
     text: &'a str,
 }
 
+const TRANSPORT_MIB: usize = 1024 * 1024;
+const TOOL_RESPONSE_ENVELOPE_MARGIN_DIVISOR: usize = 8;
+const RESPONSE_TOO_LARGE_CODE: &str = "response_too_large";
+const TRANSPORT_TRUNCATION_REASON: &str = "transport_frame_limit";
+
+fn transport_limit_mib(bytes: usize) -> usize {
+    bytes.div_ceil(TRANSPORT_MIB).max(1)
+}
+
+fn tool_response_text_limit(max_body_len: usize, include_structured: bool) -> usize {
+    // Trusted binds carry rendered text in both MCP content and structuredContent.
+    // Keep one eighth free for the envelope and sidecars; anything larger there
+    // is handled by the correlated fallback instead of silently dropping the call.
+    let margin = (max_body_len / TOOL_RESPONSE_ENVELOPE_MARGIN_DIVISOR)
+        .max(1_024)
+        .min(max_body_len / 2);
+    let rendered_copies = if include_structured { 2 } else { 1 };
+    max_body_len.saturating_sub(margin) / rendered_copies
+}
+
+fn truncate_rendered_text(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        return Cow::Borrowed(text);
+    }
+
+    let notice = format!(
+        "[response truncated at {} MiB: full output exceeds the transport frame limit; use offset/limit or write to a file]",
+        transport_limit_mib(limit)
+    );
+    let suffix = format!("\n{notice}");
+    let mut prefix_end = text.len().min(limit.saturating_sub(suffix.len()));
+    while !text.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+
+    let mut truncated = String::with_capacity(prefix_end.saturating_add(suffix.len()));
+    truncated.push_str(&text[..prefix_end]);
+    truncated.push_str(&suffix);
+    Cow::Owned(truncated)
+}
+
 fn serialize_tool_response_body(
     result: &ToolCallResult,
     include_structured: bool,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serialize_tool_response_body_with_text(result, include_structured, &result.text, false)
+}
+
+fn serialize_tool_response_body_with_text(
+    result: &ToolCallResult,
+    include_structured: bool,
+    rendered_text: &str,
+    transport_truncated: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let data_capacity = result
         .response
@@ -485,20 +537,30 @@ fn serialize_tool_response_body(
         .and_then(|data| {
             ["content", "output", "preview_diff"]
                 .into_iter()
-                .find_map(|key| data.get(key).and_then(Value::as_str).map(str::len))
+                .find_map(|key| data.get(key).and_then(Value::as_str))
+                .map(|data_text| {
+                    if transport_truncated && data_text == result.text.as_str() {
+                        rendered_text.len()
+                    } else {
+                        data_text.len()
+                    }
+                })
         })
         .unwrap_or(0);
-    let capacity = result
-        .text
+    let capacity = rendered_text
         .len()
         .saturating_add(include_structured.then_some(data_capacity).unwrap_or(0))
-        .saturating_add(include_structured.then_some(result.text.len()).unwrap_or(0))
+        .saturating_add(
+            include_structured
+                .then_some(rendered_text.len())
+                .unwrap_or(0),
+        )
         .saturating_add(512);
     let mut body = Vec::with_capacity(capacity);
 
     body.extend_from_slice(b"{\"content\":[{\"type\":\"text\",\"text\":");
     let encoded_text_start = body.len();
-    serde_json::to_writer(&mut body, &result.text)?;
+    serde_json::to_writer(&mut body, rendered_text)?;
     let encoded_text_end = body.len();
     body.extend_from_slice(b"}],\"isError\":");
     body.extend_from_slice(if result.response.success {
@@ -525,20 +587,33 @@ fn serialize_tool_response_body(
         }
 
         let mut has_text = false;
+        let mut has_complete = false;
+        let mut has_truncated = false;
+        let mut has_truncation_reason = false;
         if let Some(data) = data {
             for (key, value) in data {
                 match key.as_str() {
                     "id" | "success" => continue,
                     "text" => has_text = true,
+                    "complete" => has_complete = true,
+                    "truncated" => has_truncated = true,
+                    "truncation_reason" => has_truncation_reason = true,
                     _ => {}
                 }
                 body.push(b',');
                 serde_json::to_writer(&mut body, key)?;
                 body.push(b':');
-                if key == "text" || value.as_str() == Some(result.text.as_str()) {
-                    body.extend_from_within(encoded_text_start..encoded_text_end);
-                } else {
-                    serde_json::to_writer(&mut body, value)?;
+                match key.as_str() {
+                    "text" => body.extend_from_within(encoded_text_start..encoded_text_end),
+                    "complete" if transport_truncated => body.extend_from_slice(b"false"),
+                    "truncated" if transport_truncated => body.extend_from_slice(b"true"),
+                    "truncation_reason" if transport_truncated => {
+                        serde_json::to_writer(&mut body, TRANSPORT_TRUNCATION_REASON)?;
+                    }
+                    _ if value.as_str() == Some(result.text.as_str()) => {
+                        body.extend_from_within(encoded_text_start..encoded_text_end);
+                    }
+                    _ => serde_json::to_writer(&mut body, value)?,
                 }
             }
         }
@@ -546,10 +621,68 @@ fn serialize_tool_response_body(
             body.extend_from_slice(b",\"text\":");
             body.extend_from_within(encoded_text_start..encoded_text_end);
         }
+        if transport_truncated {
+            if !has_complete {
+                body.extend_from_slice(b",\"complete\":false");
+            }
+            if !has_truncated {
+                body.extend_from_slice(b",\"truncated\":true");
+            }
+            if !has_truncation_reason {
+                body.extend_from_slice(b",\"truncation_reason\":\"transport_frame_limit\"");
+            }
+        }
         body.push(b'}');
     }
     body.push(b'}');
     Ok(body)
+}
+
+fn response_too_large_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    body_len: usize,
+    max_body_len: usize,
+    include_structured: bool,
+) -> Frame {
+    let message = format!(
+        "tool response serialized to {body_len} bytes, exceeding the daemon transport limit of {max_body_len} bytes; re-run with a narrower range, a smaller limit, or offset+limit paging; output over {} MiB cannot cross the daemon transport",
+        transport_limit_mib(max_body_len)
+    );
+    // Never copy the original response id or data into this backstop. Its bounded
+    // fields make the fallback frame independent of the oversized source payload.
+    let response = Response::error_with_data(
+        format!("subc-{}-{corr}", route.channel),
+        RESPONSE_TOO_LARGE_CODE,
+        message.clone(),
+        serde_json::json!({
+            "complete": false,
+            "truncated": true,
+            "truncation_reason": TRANSPORT_TRUNCATION_REASON,
+        }),
+    );
+    let result = ToolCallResult {
+        text: message,
+        response,
+    };
+    let body = serialize_tool_response_body(&result, include_structured)
+        .expect("fixed response_too_large envelope must serialize");
+    debug_assert!(
+        body.len() <= max_body_len,
+        "fixed response_too_large envelope must fit the effective body limit"
+    );
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .expect("fixed response_too_large envelope must fit the protocol frame limit")
 }
 
 pub(super) fn build_tool_response_frame(
@@ -559,6 +692,26 @@ pub(super) fn build_tool_response_frame(
     flags: Flags,
     result: &ToolCallResult,
     trust: BindTrust,
+) -> Result<Frame, SubcError> {
+    build_tool_response_frame_with_limit(
+        ver,
+        route,
+        corr,
+        flags,
+        result,
+        trust,
+        MAX_FRAME_BODY_LEN as usize,
+    )
+}
+
+pub(super) fn build_tool_response_frame_with_limit(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    trust: BindTrust,
+    max_body_len: usize,
 ) -> Result<Frame, SubcError> {
     // `content`/`isError` is the MCP-native surface a GENERIC host reads. The
     // FIRST-PARTY AFT plugin instead reads `structuredContent`, which carries
@@ -576,9 +729,31 @@ pub(super) fn build_tool_response_frame(
     // for model input when present — feeding the model a raw JSON dump with
     // the rendered text buried inside it, at a multiple of the token cost.
     let include_structured = !matches!(trust, BindTrust::Untrusted);
-    let body = serialize_tool_response_body(result, include_structured).map_err(SubcError::Json)?;
+    let effective_max_body_len = max_body_len.min(MAX_FRAME_BODY_LEN as usize);
+    let text_limit = tool_response_text_limit(effective_max_body_len, include_structured);
+    let rendered_text = truncate_rendered_text(&result.text, text_limit);
+    let transport_truncated = matches!(rendered_text, Cow::Owned(_));
+    let body = serialize_tool_response_body_with_text(
+        result,
+        include_structured,
+        &rendered_text,
+        transport_truncated,
+    )
+    .map_err(SubcError::Json)?;
 
-    Frame::build_with_version(
+    if effective_max_body_len < MAX_FRAME_BODY_LEN as usize && body.len() > effective_max_body_len {
+        return Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body.len(),
+            effective_max_body_len,
+            include_structured,
+        ));
+    }
+
+    match Frame::build_with_version(
         ver,
         FrameType::Response,
         flags,
@@ -586,8 +761,27 @@ pub(super) fn build_tool_response_frame(
         route.epoch,
         corr,
         body,
-    )
-    .map_err(SubcError::FrameBuild)
+    ) {
+        Ok(frame) => Ok(frame),
+        Err(FrameBuildError::BodyExceedsMax { body_len, max }) => Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body_len,
+            max as usize,
+            include_structured,
+        )),
+        Err(FrameBuildError::BodyTooLarge { body_len }) => Ok(response_too_large_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            body_len,
+            MAX_FRAME_BODY_LEN as usize,
+            include_structured,
+        )),
+    }
 }
 
 pub(super) fn build_error_frame(
@@ -1151,5 +1345,123 @@ mod tests {
             untrusted_body.get("structuredContent").is_none(),
             "untrusted binds must not receive structuredContent: {untrusted_body}"
         );
+    }
+
+    #[test]
+    fn normal_response_is_byte_identical_with_the_size_guard_enabled() {
+        let result = production_shape_result("read", 1_024);
+        let default = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            76,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+        )
+        .expect("default response frame");
+        let guarded = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            76,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            8 * 1_024,
+        )
+        .expect("guarded response frame");
+
+        assert_eq!(guarded.header.encode(), default.header.encode());
+        assert_eq!(guarded.body, default.body);
+    }
+
+    #[test]
+    fn oversized_rendered_text_is_utf8_safely_truncated_with_an_explicit_gap() {
+        const TEST_BODY_LIMIT: usize = 8 * 1_024;
+        let text = "é".repeat(3_000);
+        let result = ToolCallResult {
+            text: text.clone(),
+            response: Response::success("large-text", json!({ "text": text })),
+        };
+
+        let frame = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(5, 2),
+            77,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            TEST_BODY_LIMIT,
+        )
+        .expect("truncated response frame");
+
+        assert!(frame.body.len() <= TEST_BODY_LIMIT);
+        let body: Value =
+            serde_json::from_slice(&frame.body).expect("valid truncated response JSON");
+        let rendered = body["content"][0]["text"]
+            .as_str()
+            .expect("rendered response text");
+        assert!(rendered.ends_with(
+            "[response truncated at 1 MiB: full output exceeds the transport frame limit; use offset/limit or write to a file]"
+        ));
+        assert!(rendered.len() < result.text.len());
+        assert_eq!(body["isError"], json!(false));
+        assert_eq!(body["structuredContent"]["success"], json!(true));
+        assert_eq!(body["structuredContent"]["complete"], json!(false));
+        assert_eq!(body["structuredContent"]["truncated"], json!(true));
+        assert_eq!(
+            body["structuredContent"]["truncation_reason"],
+            json!(TRANSPORT_TRUNCATION_REASON)
+        );
+        assert_eq!(body["structuredContent"]["text"], json!(rendered));
+    }
+
+    #[test]
+    fn oversized_structured_data_gets_a_correlated_response_too_large_fallback() {
+        const TEST_BODY_LIMIT: usize = 8 * 1_024;
+        let text_limit = tool_response_text_limit(TEST_BODY_LIMIT, true);
+        let between_threshold_and_limit = text_limit + 512;
+        assert!(between_threshold_and_limit < TEST_BODY_LIMIT);
+        let result = ToolCallResult {
+            text: "r".repeat(between_threshold_and_limit),
+            response: Response::success(
+                "large-structured",
+                json!({ "payload": "p".repeat(between_threshold_and_limit) }),
+            ),
+        };
+
+        let frame = build_tool_response_frame_with_limit(
+            PROTOCOL_VERSION,
+            route_key(9, 4),
+            88,
+            control_flags(),
+            &result,
+            BindTrust::FirstParty,
+            TEST_BODY_LIMIT,
+        )
+        .expect("response_too_large fallback frame");
+
+        assert_eq!(frame.header.ty, FrameType::Response);
+        assert_eq!(frame.header.channel, 9);
+        assert_eq!(frame.header.epoch, 4);
+        assert_eq!(frame.header.corr, 88);
+        assert!(frame.body.len() <= TEST_BODY_LIMIT);
+        let body: Value =
+            serde_json::from_slice(&frame.body).expect("valid fallback response JSON");
+        assert_eq!(body["isError"], json!(true));
+        assert_eq!(body["structuredContent"]["success"], json!(false));
+        assert_eq!(
+            body["structuredContent"]["code"],
+            json!(RESPONSE_TOO_LARGE_CODE)
+        );
+        assert_eq!(body["structuredContent"]["complete"], json!(false));
+        assert_eq!(body["structuredContent"]["truncated"], json!(true));
+        let message = body["structuredContent"]["message"]
+            .as_str()
+            .expect("fallback message");
+        assert!(message.contains("serialized to "));
+        assert!(message.contains("8192 bytes"));
+        assert!(message.contains("narrower range"));
+        assert!(message.contains("offset+limit paging"));
+        assert!(message.contains("output over 1 MiB cannot cross the daemon transport"));
     }
 }
