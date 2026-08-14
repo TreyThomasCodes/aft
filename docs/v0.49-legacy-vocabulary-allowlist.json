@@ -188,8 +188,8 @@
     },
     {
       "path": "crates/aft/src/compress/mod.rs",
-      "location": "line 2047, column 19",
-      "line": 2047,
+      "location": "line 2054, column 19",
+      "line": 2054,
       "column": 19,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -1379,8 +1379,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6462, column 18",
-      "line": 6462,
+      "location": "line 6550, column 18",
+      "line": 6550,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1388,8 +1388,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6509, column 18",
-      "line": 6509,
+      "location": "line 6597, column 18",
+      "line": 6597,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1397,8 +1397,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6528, column 18",
-      "line": 6528,
+      "location": "line 6616, column 18",
+      "line": 6616,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1406,8 +1406,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6564, column 18",
-      "line": 6564,
+      "location": "line 6652, column 18",
+      "line": 6652,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1415,8 +1415,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6638, column 18",
-      "line": 6638,
+      "location": "line 6726, column 18",
+      "line": 6726,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1424,8 +1424,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6656, column 18",
-      "line": 6656,
+      "location": "line 6744, column 18",
+      "line": 6744,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1433,8 +1433,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6807, column 18",
-      "line": 6807,
+      "location": "line 6895, column 18",
+      "line": 6895,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1442,8 +1442,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6821, column 18",
-      "line": 6821,
+      "location": "line 6909, column 18",
+      "line": 6909,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1451,8 +1451,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 6912, column 18",
-      "line": 6912,
+      "location": "line 7000, column 18",
+      "line": 7000,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1460,8 +1460,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 7575, column 18",
-      "line": 7575,
+      "location": "line 7663, column 18",
+      "line": 7663,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1469,36 +1469,9 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 7711, column 18",
-      "line": 7711,
+      "location": "line 7799, column 18",
+      "line": 7799,
       "column": 18,
-      "token": "filePath",
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 7724, column 14",
-      "line": 7724,
-      "column": 14,
-      "token": "filePath",
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 7791, column 18",
-      "line": 7791,
-      "column": 18,
-      "token": "filePath",
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 7800, column 14",
-      "line": 7800,
-      "column": 14,
       "token": "filePath",
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -1514,8 +1487,35 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 9831, column 25",
-      "line": 9831,
+      "location": "line 7879, column 18",
+      "line": 7879,
+      "column": 18,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
+      "location": "line 7888, column 14",
+      "line": 7888,
+      "column": 14,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
+      "location": "line 7900, column 14",
+      "line": 7900,
+      "column": 14,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
+      "location": "line 9869, column 25",
+      "line": 9869,
       "column": 25,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -1523,8 +1523,8 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
-      "location": "line 9865, column 18",
-      "line": 9865,
+      "location": "line 9903, column 18",
+      "line": 9903,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
