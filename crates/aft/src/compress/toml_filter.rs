@@ -426,33 +426,51 @@ pub fn apply_filter_with_exit_code(
     output: &str,
     exit_code: Option<i32>,
 ) -> CompressionResult {
-    let stripped_ansi = if filter.strip_ansi {
-        crate::compress::generic::strip_ansi(output)
+    if filter.strip_ansi {
+        let stripped = crate::compress::generic::strip_ansi(output);
+        apply_filter_to_text(filter, &stripped, exit_code)
     } else {
-        output.to_string()
-    };
+        apply_filter_to_text(filter, output, exit_code)
+    }
+}
 
+pub(crate) fn apply_filter_with_exit_code_prestripped(
+    filter: &TomlFilter,
+    raw_output: &str,
+    stripped_output: &str,
+    exit_code: Option<i32>,
+) -> CompressionResult {
+    let output = if filter.strip_ansi {
+        stripped_output
+    } else {
+        raw_output
+    };
+    apply_filter_to_text(filter, output, exit_code)
+}
+
+fn apply_filter_to_text(
+    filter: &TomlFilter,
+    output: &str,
+    exit_code: Option<i32>,
+) -> CompressionResult {
     // Phase 1: line strip
-    let original_line_count = stripped_ansi.lines().count();
-    let kept: Vec<&str> = stripped_ansi
+    let original_line_count = output.lines().count();
+    let kept: Vec<&str> = output
         .lines()
         .filter(|line| !filter.strip.iter().any(|re| re.is_match(line)))
         .collect();
     let strip_removed_lines = kept.len() < original_line_count;
-    let after_strip = kept.join("\n");
-
     // Phase 2: shortcircuit (against the after-strip body)
-    let shortcircuit_safe = match exit_code {
-        Some(code) => code == 0,
-        None => !super::text_has_failure_signal(&after_strip),
-    };
-    if shortcircuit_safe {
-        if let (Some(when), Some(replacement)) =
-            (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
-        {
-            if when.is_match(&after_strip) {
-                return CompressionResult::new(replacement.clone());
-            }
+    if let (Some(when), Some(replacement)) =
+        (&filter.shortcircuit_when, &filter.shortcircuit_replacement)
+    {
+        let after_strip = kept.join("\n");
+        let shortcircuit_safe = match exit_code {
+            Some(code) => code == 0,
+            None => !super::text_has_failure_signal(&after_strip),
+        };
+        if shortcircuit_safe && when.is_match(&after_strip) {
+            return CompressionResult::new(replacement.clone());
         }
     }
 

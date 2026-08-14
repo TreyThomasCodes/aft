@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use toml_filter::{apply_filter_with_exit_code, FilterRegistry};
+use toml_filter::{apply_filter_with_exit_code_prestripped, FilterRegistry};
 use tree::TreeCompressor;
 use tsc::TscCompressor;
 use vitest::VitestCompressor;
@@ -378,11 +378,7 @@ pub fn compress_with_registry_exit_code(
     // runner that appeared before `|`.
     let dispatch_owned = match resolve_dispatch_target(command) {
         DispatchTarget::Pipeline(_) | DispatchTarget::ForceGeneric => {
-            return GenericCompressor.compress_with_exit_code(
-                command,
-                &stripped_for_generic,
-                exit_code,
-            );
+            return GenericCompressor::compress_stripped_output(&stripped_for_generic).into();
         }
         DispatchTarget::Command(cmd) => cmd,
     };
@@ -441,12 +437,17 @@ pub fn compress_with_registry_exit_code(
     // Tier 2: TOML filters. Pass raw output so `[ansi].strip = false` filters
     // can intentionally match escape sequences; `apply_filter` owns ANSI policy.
     if let Some(filter) = registry.lookup(dispatch_cmd) {
-        let result = apply_filter_with_exit_code(filter, output, exit_code);
+        let result = apply_filter_with_exit_code_prestripped(
+            filter,
+            output,
+            &stripped_for_generic,
+            exit_code,
+        );
         return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
     }
 
     // Tier 3: generic fallback.
-    GenericCompressor.compress_with_exit_code(command, &stripped_for_generic, exit_code)
+    GenericCompressor::compress_stripped_output(&stripped_for_generic).into()
 }
 
 fn compressors_in_dispatch_order() -> [&'static dyn Compressor; 20] {
@@ -1501,6 +1502,23 @@ mod tests {
     fn single_pipeline_scanner_accepts_pipe_without_top_level_newline() {
         let pipeline = single_top_level_pipeline("false | tail -1").unwrap();
         assert_eq!(pipeline.segments.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_strips_ansi_once_for_generic_and_toml_tiers() {
+        let registry = toml_filter::build_registry(builtin_filters::ALL, None, None);
+        for (command, output) in [
+            ("custom-runner", "\u{1b}[32mline\u{1b}[0m\n"),
+            (
+                "docker build .",
+                "\u{1b}[32m#1 DONE 0.1s\u{1b}[0m\nretained line\n",
+            ),
+        ] {
+            generic::reset_ansi_strip_count();
+            let result = compress_with_registry(command, output, &registry);
+            assert!(!result.is_empty());
+            assert_eq!(generic::ansi_strip_count(), 1, "command: {command}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::compress::{CompressionResult, Compressor};
 
 pub fn strip_ansi(input: &str) -> String {
+    record_ansi_strip();
     let bytes = input.as_bytes();
     let mut output = String::with_capacity(input.len());
     let mut index = 0;
@@ -134,8 +135,35 @@ pub struct GenericCompressor;
 impl GenericCompressor {
     pub fn compress_output(output: &str) -> String {
         let stripped = strip_ansi(output);
-        dedup_consecutive(&stripped)
+        Self::compress_stripped_output(&stripped)
     }
+
+    pub(crate) fn compress_stripped_output(output: &str) -> String {
+        dedup_consecutive(output)
+    }
+}
+
+#[cfg(all(debug_assertions, test))]
+thread_local! {
+    static ANSI_STRIP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(debug_assertions, test))]
+fn record_ansi_strip() {
+    ANSI_STRIP_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(all(debug_assertions, test)))]
+fn record_ansi_strip() {}
+
+#[cfg(all(debug_assertions, test))]
+pub(crate) fn reset_ansi_strip_count() {
+    ANSI_STRIP_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(all(debug_assertions, test))]
+pub(crate) fn ansi_strip_count() -> usize {
+    ANSI_STRIP_COUNT.with(std::cell::Cell::get)
 }
 
 impl Compressor for GenericCompressor {
