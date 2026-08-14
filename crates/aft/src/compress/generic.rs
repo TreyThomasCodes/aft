@@ -143,25 +143,25 @@ impl GenericCompressor {
     }
 }
 
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 thread_local! {
     static ANSI_STRIP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 fn record_ansi_strip() {
     ANSI_STRIP_COUNT.with(|count| count.set(count.get() + 1));
 }
 
-#[cfg(not(all(debug_assertions, test)))]
+#[cfg(not(test))]
 fn record_ansi_strip() {}
 
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 pub(crate) fn reset_ansi_strip_count() {
     ANSI_STRIP_COUNT.with(|count| count.set(0));
 }
 
-#[cfg(all(debug_assertions, test))]
+#[cfg(test)]
 pub(crate) fn ansi_strip_count() -> usize {
     ANSI_STRIP_COUNT.with(std::cell::Cell::get)
 }
