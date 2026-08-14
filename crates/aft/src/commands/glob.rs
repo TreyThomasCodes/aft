@@ -143,16 +143,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_probe.as_secs_f64() * 1000.0,
         total_started.elapsed().as_secs_f64() * 1000.0,
     );
-    // Keep the lexically first results so output is deterministic across filesystems.
-    // Partitioning yields the same subset as sorting the entire list first while
-    // avoiding a full O(n log n) sort when a broad glob returns thousands of paths.
+    // Glob's public contract is newest-first. Sort before truncating so the cap
+    // keeps the most recently modified matches instead of the lexically first.
+    sort_paths_by_mtime_desc(&mut files);
     let total = files.len();
     let result_truncated = total > MAX_GLOB_RESULTS;
     if result_truncated {
-        files.select_nth_unstable(MAX_GLOB_RESULTS);
         files.truncate(MAX_GLOB_RESULTS);
     }
-    files.sort();
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),

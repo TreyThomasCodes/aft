@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 
 use super::helpers::{user_config, AftProcess};
@@ -139,6 +140,72 @@ fn glob_fallback_small_tree_has_no_walk_truncated() {
     );
     assert_eq!(response["complete"], true);
     assert!(response.get("walk_truncated").is_none() || response["walk_truncated"] == false);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn glob_returns_newest_files_first_as_tool_contract_promises() {
+    let project = setup_project(&[
+        ("a-old.txt", "old\n"),
+        ("z-new.txt", "new\n"),
+        ("m-middle.txt", "middle\n"),
+    ]);
+    for (name, seconds) in [
+        ("a-old.txt", 1_700_000_000),
+        ("z-new.txt", 1_700_000_300),
+        ("m-middle.txt", 1_700_000_150),
+    ] {
+        set_file_mtime(
+            project.path().join(name),
+            FileTime::from_unix_time(seconds, 0),
+        )
+        .expect("set fixture mtime");
+    }
+
+    let expected = ["z-new.txt", "m-middle.txt", "a-old.txt"]
+        .map(|name| canonical_path_string(&project.path().join(name)));
+    let observed_mtimes = expected
+        .iter()
+        .map(|path| {
+            fs::metadata(path)
+                .expect("read fixture metadata")
+                .modified()
+                .expect("read fixture mtime")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        observed_mtimes.windows(2).all(|pair| pair[0] > pair[1]),
+        "fixture mtimes must be strictly newest-first"
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "glob-mtime-order",
+            "command": "glob",
+            "pattern": "*.txt",
+        }),
+    );
+
+    assert_eq!(
+        response["success"], true,
+        "glob should succeed: {response:?}"
+    );
+    let actual = response["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|path| path.as_str().expect("file path"))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "glob must return newest files first");
+    assert_eq!(
+        response["text"], "3 files matching *.txt\n\nz-new.txt\nm-middle.txt\na-old.txt",
+        "agent-facing glob text must use the same newest-first order"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
