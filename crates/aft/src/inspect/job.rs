@@ -654,14 +654,14 @@ pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
 }
 
 /// Whether a project-relative path is an actual automated-test file (unit /
-/// integration / spec), as opposed to product code. Used by `aft_search` to hide
-/// test files by default (the `include_tests` param shows them).
+/// integration / spec), as opposed to product code. Search uses this to hide test
+/// files by default; inspect uses it to distinguish test-origin references from
+/// production usage without excluding the test files from analysis.
 ///
-/// This is intentionally SEPARATE from `is_test_support_file`: dead_code and
-/// unused_exports must NOT use it, because a symbol called only from a test file
-/// is still live via that caller. Matching is high-precision to avoid hiding
-/// product code — filename conventions plus the `__tests__` directory segment,
-/// not bare `test`/`spec` directory names which collide with product modules.
+/// This is intentionally SEPARATE from `is_test_support_file`: test-support files
+/// are reporting noise excluded by path, while real tests remain scanned and can
+/// move otherwise-dead production symbols into the test-only bucket. Matching is
+/// high-precision to avoid hiding real product code.
 pub(crate) fn is_test_file(relative_path: &str) -> bool {
     let normalized = relative_path.replace('\\', "/");
 

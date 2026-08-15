@@ -31,6 +31,7 @@ const BACKEND_TREESITTER: &str = "treesitter";
 const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
 const PROVENANCE_NAME_MATCH: &str = "name_match";
 const PROVENANCE_TYPE_MATCH: &str = "type_match";
+const PROVENANCE_VALUE_REF: &str = "value_ref";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -1948,6 +1949,7 @@ struct DbFileIndex {
     export_aliases: HashMap<String, String>,
     node_by_scoped: HashMap<String, String>,
     node_by_bare: HashMap<String, String>,
+    node_kind_by_id: HashMap<String, String>,
     module_targets: HashMap<String, Option<String>>,
     reexports: Vec<ReexportIndex>,
 }
@@ -6851,6 +6853,12 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
+    raw_refs.extend(build_value_ref_refs(
+        &rel_path,
+        &data,
+        &node_by_scoped,
+        &import_dependencies,
+    ));
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
@@ -6984,9 +6992,40 @@ fn build_call_refs(
     node_by_scoped: &HashMap<String, String>,
     import_dependencies: &BTreeSet<String>,
 ) -> Vec<RawRef> {
+    build_callable_refs(
+        rel_path,
+        &data.calls_by_symbol,
+        node_by_scoped,
+        import_dependencies,
+        "call",
+    )
+}
+
+fn build_value_ref_refs(
+    rel_path: &str,
+    data: &FileCallData,
+    node_by_scoped: &HashMap<String, String>,
+    import_dependencies: &BTreeSet<String>,
+) -> Vec<RawRef> {
+    build_callable_refs(
+        rel_path,
+        &data.value_refs_by_symbol,
+        node_by_scoped,
+        import_dependencies,
+        "value_ref",
+    )
+}
+
+fn build_callable_refs(
+    rel_path: &str,
+    sites_by_symbol: &HashMap<String, Vec<callgraph::CallSite>>,
+    node_by_scoped: &HashMap<String, String>,
+    import_dependencies: &BTreeSet<String>,
+    kind: &str,
+) -> Vec<RawRef> {
     let mut refs = Vec::new();
     let mut ordinal = 0usize;
-    let mut symbols: Vec<_> = data.calls_by_symbol.iter().collect();
+    let mut symbols: Vec<_> = sites_by_symbol.iter().collect();
     symbols.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (caller_symbol, call_sites) in symbols {
         let caller_node = node_by_scoped.get(caller_symbol).cloned();
@@ -6994,7 +7033,7 @@ fn build_call_refs(
             ordinal += 1;
             let ref_id = ref_id(&[
                 rel_path,
-                "call",
+                kind,
                 caller_symbol,
                 &call_site.line.to_string(),
                 &call_site.byte_start.to_string(),
@@ -7007,7 +7046,7 @@ fn build_call_refs(
                 caller_node: caller_node.clone(),
                 caller_symbol: Some(caller_symbol.clone()),
                 caller_file: rel_path.to_string(),
-                kind: "call".to_string(),
+                kind: kind.to_string(),
                 short_name: Some(call_site.callee_name.clone()),
                 full_ref: Some(call_site.full_callee.clone()),
                 module_path: None,
@@ -7571,7 +7610,7 @@ fn surface_fingerprint(
 }
 
 fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
-    if raw.kind != "call" {
+    if !matches!(raw.kind.as_str(), "call" | "value_ref") {
         return Ok(ResolvedRef {
             dependencies: raw.dependencies.clone(),
             raw,
@@ -7617,6 +7656,21 @@ fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
 
     dependencies.insert(target_file.clone());
     let target_node = index.node_for_symbol(&target_file, &target_symbol);
+    if raw.kind == "value_ref"
+        && !target_node
+            .as_deref()
+            .is_some_and(|node_id| index.node_is_callable(&target_file, node_id))
+    {
+        return Ok(ResolvedRef {
+            raw,
+            status: "unresolved".to_string(),
+            target_node: None,
+            target_file: None,
+            target_symbol: None,
+            dependencies,
+            edge: None,
+        });
+    }
     let source_node = raw.caller_node.clone();
     let edge = if let Some(source_node) = source_node {
         if target_file == caller_file
@@ -7630,7 +7684,7 @@ fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
                 target_node: target_node.clone(),
                 target_file: target_file.clone(),
                 target_symbol: target_symbol.clone(),
-                kind: "call".to_string(),
+                kind: raw.kind.clone(),
                 line: raw.line,
             })
         }
@@ -8362,6 +8416,13 @@ impl<'a> ProjectIndex<'a> {
                 .or_else(|| file.node_by_bare.get(symbol).cloned())
         })
     }
+
+    fn node_is_callable(&self, rel_path: &str, node_id: &str) -> bool {
+        self.files
+            .get(rel_path)
+            .and_then(|file| file.node_kind_by_id.get(node_id))
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+    }
 }
 
 impl DbFileIndex {
@@ -8374,6 +8435,11 @@ impl DbFileIndex {
                 .entry(node.name.clone())
                 .or_insert(node.id.clone());
         }
+        let node_kind_by_id = extract
+            .nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.kind.clone()))
+            .collect();
         let mut export_aliases = HashMap::new();
         for raw_ref in &extract.raw_refs {
             if raw_ref.kind == "export_alias" {
@@ -8408,6 +8474,7 @@ impl DbFileIndex {
             export_aliases,
             node_by_scoped,
             node_by_bare,
+            node_kind_by_id,
             module_targets,
             reexports,
         }
@@ -8434,6 +8501,7 @@ fn load_db_file_indexes(
                 export_aliases: HashMap::new(),
                 node_by_scoped: HashMap::new(),
                 node_by_bare: HashMap::new(),
+                node_kind_by_id: HashMap::new(),
                 module_targets: HashMap::new(),
                 reexports: Vec::new(),
             },
@@ -8441,7 +8509,7 @@ fn load_db_file_indexes(
     }
 
     let mut node_stmt = tx.prepare(
-        "SELECT file_path, id, name, scoped_name, exported, is_default_export FROM nodes",
+        "SELECT file_path, id, name, scoped_name, kind, exported, is_default_export FROM nodes",
     )?;
     let nodes = node_stmt.query_map([], |row| {
         Ok((
@@ -8449,12 +8517,13 @@ fn load_db_file_indexes(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)? != 0,
+            row.get::<_, String>(4)?,
             row.get::<_, i64>(5)? != 0,
+            row.get::<_, i64>(6)? != 0,
         ))
     })?;
     for row in nodes {
-        let (file_path, id, name, scoped_name, exported, is_default_export) = row?;
+        let (file_path, id, name, scoped_name, kind, exported, is_default_export) = row?;
         let file = files
             .entry(file_path.clone())
             .or_insert_with(|| DbFileIndex {
@@ -8464,6 +8533,7 @@ fn load_db_file_indexes(
                 export_aliases: HashMap::new(),
                 node_by_scoped: HashMap::new(),
                 node_by_bare: HashMap::new(),
+                node_kind_by_id: HashMap::new(),
                 module_targets: HashMap::new(),
                 reexports: Vec::new(),
             });
@@ -8475,7 +8545,8 @@ fn load_db_file_indexes(
             file.default_export = Some(scoped_name.clone());
         }
         file.node_by_scoped.insert(scoped_name, id.clone());
-        file.node_by_bare.entry(name).or_insert(id);
+        file.node_by_bare.entry(name).or_insert(id.clone());
+        file.node_kind_by_id.insert(id, kind);
     }
     let file_keys: HashSet<String> = files.keys().cloned().collect();
     // Persisted caller extracts supply import targets. Only reexports from other
@@ -8807,7 +8878,7 @@ fn insert_resolved_ref_prepared(
         resolved.target_node,
         resolved.target_file,
         resolved.target_symbol,
-        PROVENANCE_TREESITTER,
+        ref_provenance(raw),
     ])?;
     if let Some(edge) = &resolved.edge {
         statements.edge.execute(params![
@@ -8819,7 +8890,7 @@ fn insert_resolved_ref_prepared(
             edge.target_symbol,
             edge.kind,
             edge.line as i64,
-            PROVENANCE_TREESITTER,
+            ref_provenance(raw),
         ])?;
     }
     Ok(())
@@ -8919,6 +8990,14 @@ fn insert_file_dependencies(
     Ok(())
 }
 
+fn ref_provenance(raw: &RawRef) -> &'static str {
+    if raw.kind == "value_ref" {
+        PROVENANCE_VALUE_REF
+    } else {
+        PROVENANCE_TREESITTER
+    }
+}
+
 fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
     let raw = &resolved.raw;
     debug_assert!(resolved.dependencies.is_superset(&raw.dependencies));
@@ -8949,7 +9028,7 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
             resolved.target_node,
             resolved.target_file,
             resolved.target_symbol,
-            PROVENANCE_TREESITTER,
+            ref_provenance(raw),
         ],
     )?;
     if let Some(edge) = &resolved.edge {
@@ -8967,7 +9046,7 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
                 edge.target_symbol,
                 edge.kind,
                 edge.line as i64,
-                PROVENANCE_TREESITTER,
+                ref_provenance(raw),
             ],
         )?;
     }
@@ -13965,6 +14044,7 @@ export function leaf() {}
             lang: LangId::TypeScript,
             data: FileCallData {
                 calls_by_symbol: HashMap::new(),
+                value_refs_by_symbol: HashMap::new(),
                 exported_symbols: Vec::new(),
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,
@@ -14732,6 +14812,7 @@ mod reexport_resolution_tests {
             export_aliases: HashMap::new(),
             node_by_scoped: HashMap::new(),
             node_by_bare: HashMap::new(),
+            node_kind_by_id: HashMap::new(),
             module_targets: HashMap::new(),
             reexports: reexport_targets
                 .iter()

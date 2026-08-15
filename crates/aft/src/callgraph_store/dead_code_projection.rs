@@ -18,7 +18,8 @@ use crate::symbols::SymbolKind;
 
 use super::{
     database_ready, lang_from_label, projection_write_revision, CallGraphStoreError, Result,
-    BACKEND_TREESITTER, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, TOP_LEVEL_SYMBOL,
+    BACKEND_TREESITTER, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, PROVENANCE_VALUE_REF,
+    TOP_LEVEL_SYMBOL,
 };
 
 #[cfg(test)]
@@ -243,9 +244,9 @@ fn outbound_calls_from_store(
                 COALESCE(e.provenance, r.provenance)
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
-         LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = 'call'
+         LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
          LEFT JOIN nodes tn ON tn.id = e.target_node
-         WHERE r.kind = 'call'
+         WHERE r.kind IN ('call', 'value_ref')
          ORDER BY r.caller_file, n.name, r.line, r.byte_start, r.byte_end, r.ref_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -267,6 +268,11 @@ fn outbound_calls_from_store(
     let mut stale_caller_nodes = 0usize;
     for row in rows {
         let row = row?;
+        if row.provenance == PROVENANCE_VALUE_REF
+            && !matches!(row.status.as_str(), "resolved" | "resolved_local")
+        {
+            continue;
+        }
         let caller_file = paths.resolve(&row.caller_file);
         let (caller_symbol, stale_caller_node) = caller_symbol_from_row(&row);
         if stale_caller_node {
@@ -340,6 +346,7 @@ fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
         || provenance.is_some_and(|provenance| {
             provenance == PROVENANCE_TYPE_MATCH
+                || provenance == PROVENANCE_VALUE_REF
                 || (provenance != PROVENANCE_NAME_MATCH
                     && (provenance.contains("treesitter") || provenance.contains("resolver")))
         })
@@ -589,11 +596,13 @@ impl NamedTarget {
 
 fn run(typed: &TypedTarget) {
     local_target();
+    let _ = callback_target;
     typed.typed_edge();
     unknown.named_edge();
 }
 
 fn local_target() {}
+fn callback_target() {}
 "#,
         )
         .expect("write provenance fixture");
@@ -605,6 +614,7 @@ fn local_target() {}
         let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
 
         assert_call_with_provenance(&snapshot, "local_target", PROVENANCE_TREESITTER);
+        assert_call_with_provenance(&snapshot, "callback_target", PROVENANCE_VALUE_REF);
         assert_call_with_provenance(&snapshot, "typed_edge", PROVENANCE_TYPE_MATCH);
         assert_call_with_provenance(&snapshot, "named_edge", PROVENANCE_NAME_MATCH);
     }

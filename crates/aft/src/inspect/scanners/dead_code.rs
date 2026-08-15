@@ -13,7 +13,8 @@ use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
     canonicalize_normalized, dead_code_skipped_language, is_test_file, is_test_support_file,
-    language_name, CALLGRAPH_PROVENANCE_REEXPORT, DISPATCHED_CALLEE_SEPARATOR,
+    language_name, CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER,
+    DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -29,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 3;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 4;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
 const RUST_MACRO_REF_SHAPE_CALL: &str = "call";
 const RUST_MACRO_REF_SHAPE_METHOD: &str = "method";
@@ -53,6 +54,7 @@ struct FileAnalysis {
     raw_reexports: Vec<RawReexportContribution>,
     attribute_entry_points: Vec<String>,
     macro_token_refs: Vec<MacroTokenRefContribution>,
+    cfg_test_ranges: Vec<RustCfgTestRange>,
     type_ref_names: BTreeSet<String>,
 }
 
@@ -61,6 +63,18 @@ struct RustMacroToken<'a> {
     text: &'a str,
     kind: &'a str,
     line: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RustCfgTestRange {
+    start_line: u32,
+    end_line: u32,
+}
+
+impl RustCfgTestRange {
+    fn contains(self, line: u32) -> bool {
+        self.start_line <= line && line <= self.end_line
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +196,13 @@ impl DeadCodeFileAnalyzer {
         } else {
             Vec::new()
         };
+        let cfg_test_ranges = if lang == LangId::Rust {
+            tree.as_ref()
+                .map(|tree| rust_cfg_test_ranges(&source, tree.root_node()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         FileAnalysis {
             raw_imports,
@@ -189,6 +210,7 @@ impl DeadCodeFileAnalyzer {
             raw_reexports,
             attribute_entry_points,
             macro_token_refs,
+            cfg_test_ranges,
             type_ref_names,
         }
     }
@@ -383,6 +405,7 @@ fn gather_file_contribution(
         raw_reexports,
         attribute_entry_points,
         macro_token_refs,
+        cfg_test_ranges,
         type_ref_names,
     } = file_analyzer.analyze_file(file, oxc_facts.is_some());
 
@@ -420,6 +443,9 @@ fn gather_file_contribution(
     }
     if !attribute_entry_points.is_empty() {
         payload["attribute_entry_points"] = json!(attribute_entry_points);
+    }
+    if !cfg_test_ranges.is_empty() {
+        payload["cfg_test_ranges"] = json!(cfg_test_ranges);
     }
     if let Some(facts) = oxc_facts {
         payload["provenance"] = json!(OXC_PROVENANCE);
@@ -607,6 +633,11 @@ fn materialize_dead_code_contributions(
                         project_root,
                         call,
                         &contribution.file,
+                        is_test_file(&contribution.file)
+                            || contribution
+                                .cfg_test_ranges
+                                .iter()
+                                .any(|range| range.contains(call.line)),
                         &exported_symbols_by_file,
                         &files_by_exported_symbol,
                     )
@@ -791,6 +822,7 @@ fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
             .then_with(|| left.symbol.cmp(&right.symbol))
             .then_with(|| left.line.cmp(&right.line))
             .then_with(|| left.provenance.cmp(&right.provenance))
+            .then_with(|| left.test_origin.cmp(&right.test_origin))
     });
     internal_calls.dedup_by(|left, right| {
         left.caller_symbol == right.caller_symbol
@@ -798,6 +830,7 @@ fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
             && left.symbol == right.symbol
             && left.line == right.line
             && left.provenance == right.provenance
+            && left.test_origin == right.test_origin
     });
 }
 
@@ -809,9 +842,16 @@ fn aggregate_materialized_dead_code_contributions(
     drill_down_limit: Option<usize>,
     scanned_files: usize,
 ) -> serde_json::Value {
-    let edges_by_source = edges_by_source(parsed);
+    let all_edges_by_source = edges_by_source(parsed, false);
+    let production_edges_by_source = edges_by_source(parsed, true);
     let dispatched_method_names = collect_dispatched_method_names_by_language(parsed);
-    let reachable = reachable_exports(parsed, &edges_by_source, &dispatched_method_names);
+    let reachable = reachable_exports(parsed, &all_edges_by_source, &dispatched_method_names);
+    let production_reachable = reachable_exports(
+        parsed,
+        &production_edges_by_source,
+        &dispatched_method_names,
+    );
+    let test_only_callers = test_only_callers_by_target(parsed);
     let referenced_type_names = collect_referenced_type_names(parsed);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
@@ -909,6 +949,31 @@ fn aggregate_materialized_dead_code_contributions(
                 }
             } else {
                 let node = (contribution.file.clone(), export.symbol.clone());
+                if !is_test_file(&contribution.file)
+                    && !is_public_api_file
+                    && !export.is_entry_point
+                    && !production_reachable.contains(&node)
+                    && test_only_callers.contains_key(&node)
+                {
+                    let item = json!({
+                        "file": contribution.file,
+                        "symbol": export.symbol,
+                        "kind": export.kind,
+                        "line": export.line,
+                        "provenance": CALLGRAPH_PROVENANCE_TREESITTER,
+                        "used_by": test_only_callers.get(&node).cloned().unwrap_or_default(),
+                    });
+                    if generated_file {
+                        let mut item = item;
+                        item["generated"] = json!(true);
+                        generated_count += 1;
+                        generated_items.push(item);
+                    } else {
+                        test_only_count += 1;
+                        test_only_items.push(item);
+                    }
+                    continue;
+                }
                 if reachable.contains(&node)
                     || is_public_api_file
                     || dispatch_liveness_keeps_export_live(
@@ -1057,11 +1122,15 @@ fn dead_code_honesty_fields(
 
 fn edges_by_source(
     contributions: &[DeadCodeContribution],
+    exclude_test_origins: bool,
 ) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
     let mut edges: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
 
     for contribution in contributions {
         for call in &contribution.internal_calls {
+            if exclude_test_origins && call.test_origin == Some(true) {
+                continue;
+            }
             // Keep EVERY resolved edge, regardless of whether the target is an
             // exported symbol. Liveness must traverse through private
             // intermediaries (a private router/helper that forwards a root to a
@@ -1079,6 +1148,34 @@ fn edges_by_source(
     }
 
     edges
+}
+
+fn test_only_callers_by_target(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<ExportNode, Vec<String>> {
+    let mut callers: BTreeMap<ExportNode, (bool, BTreeSet<String>)> = BTreeMap::new();
+    for contribution in contributions {
+        for call in &contribution.internal_calls {
+            let Some(test_origin) = call.test_origin else {
+                continue;
+            };
+            let target = (call.file.clone(), call.symbol.clone());
+            let summary = callers
+                .entry(target)
+                .or_insert_with(|| (true, BTreeSet::new()));
+            if test_origin {
+                summary.1.insert(contribution.file.clone());
+            } else {
+                summary.0 = false;
+            }
+        }
+    }
+    callers
+        .into_iter()
+        .filter_map(|(target, (all_test, files))| {
+            (all_test && !files.is_empty()).then(|| (target, files.into_iter().collect()))
+        })
+        .collect()
 }
 
 fn collect_dispatched_method_names_by_language(
@@ -1294,6 +1391,7 @@ fn project_internal_call(
     project_root: &Path,
     call: &CallgraphOutboundCall,
     caller_file: &str,
+    test_origin: bool,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<InternalCall> {
@@ -1322,6 +1420,7 @@ fn project_internal_call(
         symbol,
         line: call.line,
         provenance: call.provenance.clone(),
+        test_origin: Some(test_origin),
     })
 }
 
@@ -1348,6 +1447,7 @@ fn resolve_macro_token_liveness_edges(
             symbol,
             line: reference.line,
             provenance: MACRO_TOKEN_LIVENESS_PROVENANCE.to_string(),
+            test_origin: None,
         });
     }
     sort_dedup_internal_calls(&mut calls);
@@ -1776,6 +1876,103 @@ fn rust_raw_import_contributions(
             namespace_import: None,
         })
         .collect()
+}
+
+fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTestRange> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "mod_item" | "function_item" | "impl_item")
+            && rust_node_has_cfg_test_attribute(source, node)
+        {
+            ranges.push(RustCfgTestRange {
+                start_line: node.start_position().row as u32 + 1,
+                end_line: node.end_position().row as u32 + 1,
+            });
+        }
+
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
+    ranges.dedup();
+    ranges
+}
+
+fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -> bool {
+    let mut previous = node.prev_sibling();
+    while let Some(attribute) = previous {
+        match attribute.kind() {
+            "attribute_item" => {
+                let compact = source[attribute.byte_range()]
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>();
+                if compact
+                    .strip_prefix("#[cfg(")
+                    .and_then(|inner| inner.strip_suffix(")]"))
+                    .is_some_and(cfg_predicate_requires_test)
+                {
+                    return true;
+                }
+                previous = attribute.prev_sibling();
+            }
+            "line_comment" | "block_comment" => previous = attribute.prev_sibling(),
+            _ => break,
+        }
+    }
+    false
+}
+
+fn cfg_predicate_requires_test(predicate: &str) -> bool {
+    if predicate == "test" {
+        return true;
+    }
+    if let Some(inner) = predicate
+        .strip_prefix("all(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        return split_cfg_predicates(inner)
+            .into_iter()
+            .any(cfg_predicate_requires_test);
+    }
+    if let Some(inner) = predicate
+        .strip_prefix("any(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        let predicates = split_cfg_predicates(inner);
+        return !predicates.is_empty() && predicates.into_iter().all(cfg_predicate_requires_test);
+    }
+    false
+}
+
+fn split_cfg_predicates(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(input[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
 }
 
 fn rust_macro_token_refs(source: &str, root: tree_sitter::Node) -> Vec<MacroTokenRefContribution> {
@@ -2338,6 +2535,7 @@ fn resolve_reexport_fact_edge(
                     symbol: target_symbol,
                     line,
                     provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
+                    test_origin: None,
                 }]
             })
             .unwrap_or_default()
@@ -2503,6 +2701,7 @@ fn reexport_edges_for_all_target_symbols(
                 symbol: resolved_symbol,
                 line,
                 provenance: CALLGRAPH_PROVENANCE_REEXPORT.to_string(),
+                test_origin: None,
             });
         }
     }
@@ -3188,6 +3387,8 @@ struct DeadCodeContribution {
     #[serde(default)]
     attribute_entry_points: Vec<String>,
     #[serde(default)]
+    cfg_test_ranges: Vec<RustCfgTestRange>,
+    #[serde(default)]
     oxc_facts: Option<OxcFactsContribution>,
     #[serde(default)]
     internal_calls: Vec<InternalCallContribution>,
@@ -3293,6 +3494,8 @@ struct InternalCallContribution {
     caller_symbol: String,
     file: String,
     symbol: String,
+    #[serde(default)]
+    test_origin: Option<bool>,
 }
 
 impl From<InternalCall> for InternalCallContribution {
@@ -3301,6 +3504,7 @@ impl From<InternalCall> for InternalCallContribution {
             caller_symbol: call.caller_symbol,
             file: call.file,
             symbol: call.symbol,
+            test_origin: call.test_origin,
         }
     }
 }
@@ -3312,6 +3516,7 @@ struct InternalCall {
     symbol: String,
     line: u32,
     provenance: String,
+    test_origin: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -3428,6 +3633,17 @@ mod tests {
             .outcome
             .expect("scan succeeds")
             .aggregate
+    }
+
+    #[test]
+    fn cfg_test_predicate_requires_every_possible_branch_to_be_test_only() {
+        assert!(cfg_predicate_requires_test("test"));
+        assert!(cfg_predicate_requires_test("all(unix,test)"));
+        assert!(cfg_predicate_requires_test(
+            "any(all(test,unix),all(test,windows))"
+        ));
+        assert!(!cfg_predicate_requires_test("any(test,unix)"));
+        assert!(!cfg_predicate_requires_test("not(test)"));
     }
 
     fn aggregate_has_item(aggregate: &serde_json::Value, file: &str, symbol: &str) -> bool {

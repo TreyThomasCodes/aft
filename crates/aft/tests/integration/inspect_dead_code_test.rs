@@ -143,6 +143,18 @@ fn aggregate_has_item(success: &InspectScanSuccess, file: &str, symbol: &str) ->
         .any(|item| item["file"] == file && item["symbol"] == symbol)
 }
 
+fn aggregate_test_only_item<'a>(
+    success: &'a InspectScanSuccess,
+    file: &str,
+    symbol: &str,
+) -> Option<&'a serde_json::Value> {
+    success.aggregate["test_only_items"]
+        .as_array()
+        .expect("test-only dead-code items")
+        .iter()
+        .find(|item| item["file"] == file && item["symbol"] == symbol)
+}
+
 fn aggregate_has_item_kind(
     success: &InspectScanSuccess,
     file: &str,
@@ -1182,6 +1194,165 @@ impl NeverConstructed {
 }
 
 #[test]
+fn rust_value_refs_and_cfg_test_callers_are_cold_deterministic() {
+    let (_temp_dir, root, paths) = fixture_project(&[
+        (
+            "src/main.rs",
+            r#"mod handlers;
+
+fn main() {
+    run();
+}
+
+fn run() {
+    let lease = Some(());
+    let _ = lease.map(crate::handlers::value_live);
+    let _ = crate::handlers::NotCallback;
+}
+"#,
+        ),
+        (
+            "src/handlers.rs",
+            r#"pub struct NotCallback;
+pub fn value_live(_: ()) {}
+pub fn planted_dead() {}
+pub fn shadowed() {}
+pub fn shadow_parameter(shadowed: fn()) { consume(shadowed); }
+pub fn shadow_pattern(maybe: Option<fn()>) {
+    if let Some(shadowed) = maybe { consume(shadowed); }
+}
+pub fn test_only_write() {}
+pub fn test_file_only() {}
+fn consume(_: fn()) {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn writes_only_in_tests() {
+        crate::handlers::test_only_write();
+    }
+}
+"#,
+        ),
+        (
+            "src/handlers_test.rs",
+            r#"fn test_file_caller() {
+    crate::handlers::test_file_only();
+}
+"#,
+        ),
+    ]);
+    let project_root = std::fs::canonicalize(&root).expect("canonical fixture root");
+
+    let first_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-one");
+    let first_outbound = outbound_call_set_bytes(&first_snapshot);
+    let first_success = scan(job(
+        &project_root,
+        first_snapshot.files.clone(),
+        Some(first_snapshot.clone()),
+    ));
+
+    let second_snapshot = projected_snapshot_from_store(&project_root, &paths, ".store-two");
+    let second_outbound = outbound_call_set_bytes(&second_snapshot);
+    let second_success = scan(job(
+        &project_root,
+        second_snapshot.files.clone(),
+        Some(second_snapshot),
+    ));
+
+    assert_eq!(
+        first_outbound, second_outbound,
+        "projected refs must be byte-identical across cold builds"
+    );
+    assert_eq!(
+        first_success.aggregate["count"], second_success.aggregate["count"],
+        "headline dead-code count must be deterministic across cold builds"
+    );
+    assert_eq!(
+        first_success.aggregate["test_only_count"], second_success.aggregate["test_only_count"],
+        "test-only dead-code count must be deterministic across cold builds"
+    );
+
+    let value_target = target(&project_root, "src/handlers.rs", "value_live");
+    let test_only_target = target(&project_root, "src/handlers.rs", "test_only_write");
+    assert!(
+        first_snapshot
+            .outbound_calls
+            .iter()
+            .any(|call| call.target == test_only_target
+                && call.caller_symbol.ends_with("writes_only_in_tests")),
+        "cfg(test) caller must be present in the projected graph: {:#?}",
+        first_snapshot.outbound_calls
+    );
+    let handler_facts = first_success
+        .contributions
+        .iter()
+        .find(|contribution| contribution.contribution["file"] == "src/handlers.rs")
+        .expect("handler contribution");
+    assert!(
+        handler_facts.contribution["cfg_test_ranges"]
+            .as_array()
+            .is_some_and(|ranges| !ranges.is_empty()),
+        "cfg(test) source ranges must be persisted: {:#}",
+        handler_facts.contribution
+    );
+    assert!(
+        first_snapshot.outbound_calls.iter().any(|call| {
+            call.target == value_target
+                && call.caller_symbol == "run"
+                && call.provenance == "value_ref"
+        }),
+        "function-as-value reference must project as a resolved value_ref: {:#?}",
+        first_snapshot.outbound_calls
+    );
+    assert!(
+        first_snapshot
+            .outbound_calls
+            .iter()
+            .all(|call| { call.provenance != "value_ref" || !call.target.contains("NotCallback") }),
+        "value paths that resolve to non-function items must not project: {:#?}",
+        first_snapshot.outbound_calls
+    );
+    assert!(
+        !aggregate_has_item(&first_success, "src/handlers.rs", "value_live"),
+        "value-position referenced function must be live: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/handlers.rs", "planted_dead"),
+        "genuinely dead function is the planted negative control: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        aggregate_has_item(&first_success, "src/handlers.rs", "shadowed"),
+        "a shadowing parameter must not create a value_ref edge to the function item: {:#}",
+        first_success.aggregate
+    );
+    assert!(
+        !aggregate_has_item(&first_success, "src/handlers.rs", "test_only_write"),
+        "cfg(test)-only target must leave the headline bucket: {:#}",
+        first_success.aggregate
+    );
+    let test_only = aggregate_test_only_item(&first_success, "src/handlers.rs", "test_only_write")
+        .unwrap_or_else(|| {
+            panic!(
+                "missing cfg(test)-only finding: {:#}",
+                first_success.aggregate
+            )
+        });
+    assert_eq!(test_only["used_by"], json!(["src/handlers.rs"]));
+    let test_file_only =
+        aggregate_test_only_item(&first_success, "src/handlers.rs", "test_file_only")
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing test-file-only finding: {:#}",
+                    first_success.aggregate
+                )
+            });
+    assert_eq!(test_file_only["used_by"], json!(["src/handlers_test.rs"]));
+}
+
+#[test]
 fn inspect_dead_code_keeps_go_sort_interface_methods_live() {
     let (_temp_dir, root, paths) = fixture_project(&[(
         "src/main.go",
@@ -1356,7 +1527,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/app.ts".to_string(),
             json!({
                 "file": "src/app.ts",
-                "facts_format_version": 3,
+                "facts_format_version": 4,
                 "generated": false,
                 "exports": [
                     {"symbol": "main", "kind": "function", "line": 2}
@@ -1371,7 +1542,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/barrel.ts".to_string(),
             json!({
                 "file": "src/barrel.ts",
-                "facts_format_version": 3,
+                "facts_format_version": 4,
                 "generated": false,
                 "exports": [
                     {"symbol": "Result", "kind": "re_export", "line": 1}
@@ -1385,7 +1556,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/foo.rs".to_string(),
             json!({
                 "file": "src/foo.rs",
-                "facts_format_version": 3,
+                "facts_format_version": 4,
                 "generated": false,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
@@ -1397,7 +1568,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/lib.rs".to_string(),
             json!({
                 "file": "src/lib.rs",
-                "facts_format_version": 3,
+                "facts_format_version": 4,
                 "generated": false,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
@@ -1416,7 +1587,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/service.ts".to_string(),
             json!({
                 "file": "src/service.ts",
-                "facts_format_version": 3,
+                "facts_format_version": 4,
                 "generated": false,
                 "exports": [
                     {"symbol": "Service", "kind": "class", "line": 1},
@@ -1472,7 +1643,7 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
         contribution.contribution,
         json!({
             "file": "src/foo.ts",
-            "facts_format_version": 3,
+            "facts_format_version": 4,
                 "generated": false,
             "exports": [
                 {"symbol": "Foo", "kind": "class", "line": 1},

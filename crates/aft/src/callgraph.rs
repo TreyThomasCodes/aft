@@ -14,9 +14,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
-use crate::calls::extract_calls_full;
 #[cfg(test)]
 use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
+use crate::calls::{extract_calls_full, extract_rust_value_references};
 #[cfg(test)]
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -157,6 +157,9 @@ pub struct SymbolMeta {
 pub struct FileCallData {
     /// Map from symbol name → list of call sites within that symbol's body.
     pub calls_by_symbol: HashMap<String, Vec<CallSite>>,
+    /// Rust function items referenced as values, grouped by containing symbol.
+    /// These do not participate in callgraph navigation.
+    pub value_refs_by_symbol: HashMap<String, Vec<CallSite>>,
     /// Names of exported symbols in this file.
     pub exported_symbols: Vec<String>,
     /// Per-symbol metadata (kind, exported, signature).
@@ -930,6 +933,26 @@ fn collect_calls_by_symbol(
     lang: LangId,
     symbols: &[Symbol],
 ) -> HashMap<String, Vec<CallSite>> {
+    attribute_sites_to_symbols(
+        source,
+        symbols,
+        extract_calls_full(source, root, 0, source.len(), lang),
+    )
+}
+
+fn collect_rust_value_refs_by_symbol(
+    source: &str,
+    root: Node<'_>,
+    symbols: &[Symbol],
+) -> HashMap<String, Vec<CallSite>> {
+    attribute_sites_to_symbols(source, symbols, extract_rust_value_references(source, root))
+}
+
+fn attribute_sites_to_symbols(
+    source: &str,
+    symbols: &[Symbol],
+    raw_sites: Vec<(String, String, u32, usize, usize)>,
+) -> HashMap<String, Vec<CallSite>> {
     let line_index = SourceLineIndex::new(source);
     let mut ranges = symbols
         .iter()
@@ -951,9 +974,7 @@ fn collect_calls_by_symbol(
     let mut active_ranges = Vec::<usize>::new();
     let mut next_range = 0usize;
 
-    for (full, short, line, byte_start, byte_end) in
-        extract_calls_full(source, root, 0, source.len(), lang)
-    {
+    for (full, short, line, byte_start, byte_end) in raw_sites {
         // AST preorder gives nondecreasing call starts. Expire by start only:
         // an outer call can end past a range that still contains a nested call.
         active_ranges.retain(|range_index| ranges[*range_index].byte_end > byte_start);
@@ -1023,6 +1044,11 @@ fn build_file_data_from_source_with_lang(
 
     let root = tree.root_node();
     let mut calls_by_symbol = collect_calls_by_symbol(&source, root, lang, &symbols);
+    let value_refs_by_symbol = if lang == LangId::Rust {
+        collect_rust_value_refs_by_symbol(&source, root, &symbols)
+    } else {
+        HashMap::new()
+    };
 
     let default_export = find_default_export(&source, root, path, lang);
 
@@ -1104,7 +1130,9 @@ fn build_file_data_from_source_with_lang(
                 entry_point_attribute: None,
             });
     }
-    if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL) {
+    if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
+        || value_refs_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
+    {
         symbol_metadata
             .entry(TOP_LEVEL_SYMBOL.to_string())
             .or_insert(SymbolMeta {
@@ -1124,6 +1152,7 @@ fn build_file_data_from_source_with_lang(
 
     Ok(FileCallData {
         calls_by_symbol,
+        value_refs_by_symbol,
         exported_symbols,
         symbol_metadata,
         default_export_symbol: default_export.map(|export| export.symbol),
@@ -2972,6 +3001,7 @@ def right():
         );
         let file_data = FileCallData {
             calls_by_symbol: HashMap::new(),
+            value_refs_by_symbol: HashMap::new(),
             exported_symbols: vec!["total_disk_bytes".to_string()],
             symbol_metadata,
             default_export_symbol: None,

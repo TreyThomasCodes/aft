@@ -487,6 +487,227 @@ fn clean_type_reference_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Extract Rust function paths used as values rather than called directly.
+///
+/// The call graph stores these separately from calls so navigation remains
+/// call-only while dead-code reachability can follow callbacks passed to APIs
+/// such as `map` and `unwrap_or_else`.
+pub fn extract_rust_value_references(
+    source: &str,
+    root: tree_sitter::Node,
+) -> Vec<(String, String, u32, usize, usize)> {
+    let mut results = Vec::new();
+    collect_rust_value_references(root, source, &mut results, 0);
+    results
+}
+
+fn collect_rust_value_references(
+    node: tree_sitter::Node,
+    source: &str,
+    results: &mut Vec<(String, String, u32, usize, usize)>,
+    depth: u32,
+) {
+    if matches!(node.kind(), "identifier" | "scoped_identifier")
+        && !rust_path_is_nested(&node)
+        && rust_path_is_value_position(&node)
+    {
+        let full = source[node.byte_range()].trim();
+        let short = full.rsplit("::").next().unwrap_or(full).trim();
+        if !full.is_empty()
+            && !short.is_empty()
+            && (node.kind() != "identifier" || !rust_bare_identifier_is_shadowed(&node, source))
+        {
+            results.push((
+                full.to_string(),
+                short.to_string(),
+                node.start_position().row as u32 + 1,
+                node.start_byte(),
+                node.end_byte(),
+            ));
+        }
+    }
+
+    if depth >= MAX_AST_WALK_DEPTH {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_rust_value_references(cursor.node(), source, results, depth + 1);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn rust_path_is_nested(node: &tree_sitter::Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier" | "generic_function"
+        )
+    })
+}
+
+fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| same_node(&function, &current))
+        {
+            return false;
+        }
+
+        let is_selected_field = |field: &str| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|child| same_node(&child, &current))
+        };
+        match parent.kind() {
+            "arguments" | "array_expression" | "tuple_expression" => return true,
+            "let_declaration" if is_selected_field("value") => return true,
+            "assignment_expression" if is_selected_field("right") => return true,
+            "field_initializer" if is_selected_field("value") => return true,
+            "shorthand_field_initializer" => return true,
+            "return_expression" | "break_expression" => return true,
+            "parenthesized_expression"
+            | "reference_expression"
+            | "unary_expression"
+            | "await_expression"
+            | "try_expression" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) -> bool {
+    let name = &source[node.byte_range()];
+    let mut current = *node;
+
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "function_item" | "closure_expression" => {
+                if parent
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| rust_pattern_binds_name(parameters, source, name))
+                {
+                    return true;
+                }
+            }
+            "match_arm" => {
+                if parent
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
+                {
+                    return true;
+                }
+            }
+            "for_expression" => {
+                if parent
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
+                    && parent
+                        .child_by_field_name("body")
+                        .is_some_and(|body| node_contains(&body, node))
+                {
+                    return true;
+                }
+            }
+            "if_expression" | "while_expression" => {
+                let body = parent
+                    .child_by_field_name("consequence")
+                    .or_else(|| parent.child_by_field_name("body"));
+                if body.is_some_and(|body| node_contains(&body, node))
+                    && parent
+                        .child_by_field_name("condition")
+                        .is_some_and(|condition| {
+                            rust_let_condition_binds_name(condition, source, name)
+                        })
+                {
+                    return true;
+                }
+            }
+            "block" => {
+                let mut sibling = current.prev_named_sibling();
+                while let Some(previous) = sibling {
+                    if previous.kind() == "let_declaration"
+                        && previous
+                            .child_by_field_name("pattern")
+                            .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
+                    {
+                        return true;
+                    }
+                    sibling = previous.prev_named_sibling();
+                }
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+
+    false
+}
+
+fn rust_let_condition_binds_name(
+    condition: tree_sitter::Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    if condition.kind() == "let_condition"
+        && condition
+            .child_by_field_name("pattern")
+            .or_else(|| condition.named_child(0))
+            .is_some_and(|pattern| rust_pattern_binds_name(pattern, source, name))
+    {
+        return true;
+    }
+
+    let mut cursor = condition.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if rust_let_condition_binds_name(cursor.node(), source, name) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn rust_pattern_binds_name(node: tree_sitter::Node<'_>, source: &str, name: &str) -> bool {
+    if node.kind() == "identifier" && &source[node.byte_range()] == name {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if rust_pattern_binds_name(cursor.node(), source, name) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn same_node(left: &tree_sitter::Node<'_>, right: &tree_sitter::Node<'_>) -> bool {
+    left.id() == right.id()
+}
+
+fn node_contains(container: &tree_sitter::Node<'_>, node: &tree_sitter::Node<'_>) -> bool {
+    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+}
+
 /// Extract call expression names within a byte range of the AST.
 ///
 /// Walks all nodes in the tree, finds call_expression/call/macro_invocation
@@ -786,6 +1007,102 @@ fn caller(obj: *Obj) void {
         assert_symbol_has_call(&data, "caller", "foo", "foo");
         assert_symbol_has_call(&data, "caller", "obj.method", "method");
         assert_symbol_has_call(&data, "caller", "std.debug.print", "print");
+    }
+
+    #[test]
+    fn extracts_rust_function_paths_in_value_positions_but_not_direct_calls() {
+        let source = r#"
+fn callback() {}
+
+fn run() {
+    let assigned = callback;
+    let tupled = (callback,);
+    let arrayed = [callback];
+    let holder = Holder { callback };
+    consume(crate::callback, assigned, tupled, arrayed, holder);
+    callback();
+}
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        let refs = extract_rust_value_references(source, tree.root_node());
+        let names = refs
+            .iter()
+            .map(|(full, _, _, _, _)| full.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"crate::callback"), "value refs: {refs:#?}");
+        assert_eq!(
+            names.iter().filter(|name| **name == "callback").count(),
+            4,
+            "assignment, tuple, array, and shorthand field should be recorded; refs: {refs:#?}"
+        );
+    }
+
+    #[test]
+    fn rust_value_reference_does_not_bind_shadowing_parameter_or_local() {
+        let source = r#"
+fn callback() {}
+fn consume(_: fn()) {}
+
+fn parameter(callback: fn()) {
+    consume(callback);
+}
+
+fn local() {
+    let callback = || {};
+    consume(callback);
+}
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        let refs = extract_rust_value_references(source, tree.root_node());
+
+        assert!(
+            refs.iter().all(|(_, short, _, _, _)| short != "callback"),
+            "shadowing bindings must not resolve to the function item: {refs:#?}"
+        );
+    }
+
+    #[test]
+    fn rust_value_reference_respects_pattern_bindings_and_lexical_scope() {
+        let source = r#"
+fn callback() {}
+fn consume(_: fn()) {}
+
+fn run(maybe: Option<fn()>, callbacks: Vec<fn()>) {
+    if let Some(callback) = maybe {
+        consume(callback);
+    }
+    match maybe {
+        Some(callback) => consume(callback),
+        None => {}
+    }
+    for callback in callbacks {
+        consume(callback);
+    }
+    let mut values = callbacks;
+    while let Some(callback) = values.pop() {
+        consume(callback);
+    }
+    {
+        let callback = || {};
+        consume(callback);
+    }
+    consume(callback);
+}
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        let refs = extract_rust_value_references(source, tree.root_node());
+        let callback_refs = refs
+            .iter()
+            .filter(|(_, short, _, _, _)| short == "callback")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            callback_refs.len(),
+            1,
+            "only the function item outside the closed shadowing scope is a value ref: {refs:#?}"
+        );
+        assert_eq!(callback_refs[0].2, 24);
     }
 
     #[test]

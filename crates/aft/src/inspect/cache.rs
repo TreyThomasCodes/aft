@@ -165,7 +165,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// resolved non-type import explicitly points back to the same file.
 /// v31: TODO extraction now reads parser comment nodes and ignores marker-like
 /// text in strings, changing aggregate verdicts for unchanged source files.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 31;
+/// v32: Rust dead-code reachability follows function items referenced as values,
+/// and callers inside cfg(test) regions move otherwise-dead targets into the
+/// test-only bucket.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 32;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -2809,6 +2812,7 @@ mod tests {
                     "name": "Widget",
                     "shape": "struct"
                 }],
+                "cfg_test_ranges": [{"start_line": 10, "end_line": 20}],
                 "type_ref_names": ["Widget"],
             }),
         )
@@ -2839,12 +2843,16 @@ mod tests {
             decoded.contribution["macro_token_refs"][0]["shape"],
             "struct"
         );
+        assert_eq!(
+            decoded.contribution["cfg_test_ranges"][0],
+            serde_json::json!({"start_line": 10, "end_line": 20})
+        );
         assert!(decoded.type_ref_names.contains("Widget"));
         assert_eq!(
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 31);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 32);
     }
 
     #[test]
