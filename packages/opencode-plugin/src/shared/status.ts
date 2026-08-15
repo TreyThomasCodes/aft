@@ -11,21 +11,18 @@ export interface StatusCompression {
 }
 
 /**
- * The agent status-bar glance — `[AFT E· W· | D· U· C· | T·]`. `errors`/
- * `warnings` are live LSP diagnostics for files touched this session; the
- * Tier-2 trio (`dead_code`/`unused_exports`/`duplicates`) plus `todos` come
- * from the last completed background scan. `tier2_stale` marks those Tier-2
- * counts as predating the latest edit. Null in the snapshot until the Tier-2
- * cache is populated at least once (no fabricated zeros).
+ * Human health categories from the status snapshot. Each category is optional:
+ * a missing value was not proven, so renderers must omit it instead of treating
+ * absence as a clean zero.
  */
 export interface StatusBar {
-  errors: number;
-  warnings: number;
-  dead_code: number;
-  unused_exports: number;
-  duplicates: number;
-  todos: number;
-  tier2_stale: boolean;
+  errors?: number;
+  warnings?: number;
+  dead_code?: number;
+  unused_exports?: number;
+  duplicates?: number;
+  todos?: number;
+  tier2_stale?: boolean;
 }
 
 export interface AftStatusSnapshot {
@@ -95,11 +92,7 @@ export interface AftStatusSnapshot {
   };
   /** Compression aggregate passthrough; rendering is added separately. */
   compression?: StatusCompression;
-  /**
-   * Agent status-bar counts (E/W/D/U/C/T). Undefined until the Tier-2 cache
-   * is populated at least once — the sidebar hides the Code Health section
-   * until then so it never shows fabricated zeros.
-   */
+  /** Human health counts. Each unproven category stays absent rather than zero. */
   status_bar?: StatusBar;
   /**
    * Human-readable explanation for a synthetic snapshot (e.g.
@@ -155,19 +148,32 @@ function readCompression(value: unknown): StatusCompression | undefined {
 }
 
 function readStatusBar(value: unknown): StatusBar | undefined {
-  // Null until Tier-2 is populated — the Rust snapshot emits JSON null, which
-  // is not an object, so this returns undefined and the sidebar hides the
-  // Code Health section (no fabricated zeros).
   if (typeof value !== "object" || value === null) return undefined;
   const bar = asRecord(value);
+  const errors = readOptionalNumber(bar.errors);
+  const warnings = readOptionalNumber(bar.warnings);
+  const deadCode = readOptionalNumber(bar.dead_code);
+  const unusedExports = readOptionalNumber(bar.unused_exports);
+  const duplicates = readOptionalNumber(bar.duplicates);
+  const todos = readOptionalNumber(bar.todos);
+  if (
+    errors === null &&
+    warnings === null &&
+    deadCode === null &&
+    unusedExports === null &&
+    duplicates === null &&
+    todos === null
+  ) {
+    return undefined;
+  }
   return {
-    errors: readNumber(bar.errors),
-    warnings: readNumber(bar.warnings),
-    dead_code: readNumber(bar.dead_code),
-    unused_exports: readNumber(bar.unused_exports),
-    duplicates: readNumber(bar.duplicates),
-    todos: readNumber(bar.todos),
-    tier2_stale: readBoolean(bar.tier2_stale),
+    ...(errors !== null ? { errors } : {}),
+    ...(warnings !== null ? { warnings } : {}),
+    ...(deadCode !== null ? { dead_code: deadCode } : {}),
+    ...(unusedExports !== null ? { unused_exports: unusedExports } : {}),
+    ...(duplicates !== null ? { duplicates } : {}),
+    ...(todos !== null ? { todos } : {}),
+    ...(bar.tier2_stale === true ? { tier2_stale: true } : {}),
   };
 }
 
@@ -362,16 +368,18 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
 
   if (status.status_bar) {
     const sb = status.status_bar;
-    lines.push(
-      "",
-      `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
-      `- errors: ${formatCount(sb.errors)}`,
-      `- warnings: ${formatCount(sb.warnings)}`,
-      `- dead code: ${formatCount(sb.dead_code)}`,
-      `- unused exports: ${formatCount(sb.unused_exports)}`,
-      `- duplicates: ${formatCount(sb.duplicates)}`,
-      `- todos: ${formatCount(sb.todos)}`,
-    );
+    const rows = [
+      ["errors", sb.errors],
+      ["warnings", sb.warnings],
+      ["dead code", sb.dead_code],
+      ["unused exports", sb.unused_exports],
+      ["duplicates", sb.duplicates],
+      ["todos", sb.todos],
+    ].filter((row): row is [string, number] => typeof row[1] === "number");
+    if (rows.length > 0) {
+      lines.push("", `Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      for (const [label, value] of rows) lines.push(`- ${label}: ${formatCount(value)}`);
+    }
   }
 
   lines.push(
@@ -471,16 +479,18 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
 
   if (status.status_bar) {
     const sb = status.status_bar;
-    lines.push(
-      "",
-      `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`,
-      `- **Errors:** ${formatCount(sb.errors)}`,
-      `- **Warnings:** ${formatCount(sb.warnings)}`,
-      `- **Dead code:** ${formatCount(sb.dead_code)}`,
-      `- **Unused exports:** ${formatCount(sb.unused_exports)}`,
-      `- **Duplicates:** ${formatCount(sb.duplicates)}`,
-      `- **TODOs:** ${formatCount(sb.todos)}`,
-    );
+    const rows = [
+      ["Errors", sb.errors],
+      ["Warnings", sb.warnings],
+      ["Dead code", sb.dead_code],
+      ["Unused exports", sb.unused_exports],
+      ["Duplicates", sb.duplicates],
+      ["TODOs", sb.todos],
+    ].filter((row): row is [string, number] => typeof row[1] === "number");
+    if (rows.length > 0) {
+      lines.push("", `### Code Health${sb.tier2_stale ? " (~ stale)" : ""}`);
+      for (const [label, value] of rows) lines.push(`- **${label}:** ${formatCount(value)}`);
+    }
   }
 
   lines.push(

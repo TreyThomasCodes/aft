@@ -194,7 +194,7 @@ export function collapsedCompressionValue(
   return `${formatCount(savings_tokens)} / ${pct}%`;
 }
 
-export type HealthLightTone = "ok" | "warn" | "err";
+export type HealthLightTone = "ok" | "warn" | "err" | "muted";
 
 // Degraded-mode reason → human-readable hint. Distinct strings per reason
 // because the UX direction is different: "home_root" tells the user to open a
@@ -216,26 +216,31 @@ export function degradedReasonLabel(reason: string): string {
 }
 
 export interface HealthLights {
-  // Diagnostics: red if any errors, yellow if any warnings, else green.
   diagnostics: HealthLightTone;
-  // Code cruft: yellow if there is any dead code, unused export, or duplicate,
-  // green when zero. Never red — cruft is not a build failure.
   code: HealthLightTone;
-  // TODOs: yellow if any, else green.
   todos: HealthLightTone;
 }
 
-// Three traffic lights for the collapsed view, replacing the cramped
-// `E· W· | D· U· C· | T·` string. Returns null until populated.
+// Missing categories are intentionally muted: a green light requires an
+// explicit zero for every category that feeds that light.
 export function collapsedHealthLights(statusBar: StatusBar | undefined): HealthLights | null {
   if (!statusBar) return null;
   const diagnostics: HealthLightTone =
-    statusBar.errors > 0 ? "err" : statusBar.warnings > 0 ? "warn" : "ok";
-  const code: HealthLightTone =
-    statusBar.dead_code > 0 || statusBar.unused_exports > 0 || statusBar.duplicates > 0
-      ? "warn"
-      : "ok";
-  const todos: HealthLightTone = statusBar.todos > 0 ? "warn" : "ok";
+    statusBar.errors !== undefined && statusBar.errors > 0
+      ? "err"
+      : statusBar.warnings !== undefined && statusBar.warnings > 0
+        ? "warn"
+        : statusBar.errors === 0 && statusBar.warnings === 0
+          ? "ok"
+          : "muted";
+  const codeValues = [statusBar.dead_code, statusBar.unused_exports, statusBar.duplicates];
+  const code: HealthLightTone = codeValues.some((value) => value !== undefined && value > 0)
+    ? "warn"
+    : codeValues.every((value) => value === 0)
+      ? "ok"
+      : "muted";
+  const todos: HealthLightTone =
+    statusBar.todos === undefined ? "muted" : statusBar.todos > 0 ? "warn" : "ok";
   return { diagnostics, code, todos };
 }
 
@@ -766,54 +771,62 @@ const SidebarContent = (props: {
             </>
           )}
 
-          {/* Code Health — the agent status-bar glance, surfaced for users.
-          Hidden until the Tier-2 cache is populated (status_bar undefined),
-          so it never shows fabricated zeros. Errors/warnings are live LSP
-          diagnostics; D/U/C/T come from the last background scan. A `~` on
-          the section header flags the Tier-2 counts as predating the latest
-          edit. */}
+          {/* Human health values are optional. A category stays absent until the
+          server proves it, rather than appearing as a clean zero. */}
           {prefs().sections.codeHealth && statusBar() && (
             <>
               <SectionHeader
                 theme={props.theme}
                 title={statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}
               />
-              <StatRow
-                theme={props.theme}
-                label="Errors"
-                value={formatCount(statusBar()!.errors)}
-                tone={statusBar()!.errors > 0 ? "err" : "muted"}
-              />
-              <StatRow
-                theme={props.theme}
-                label="Warnings"
-                value={formatCount(statusBar()!.warnings)}
-                tone={statusBar()!.warnings > 0 ? "warn" : "muted"}
-              />
-              <StatRow
-                theme={props.theme}
-                label="Dead Code"
-                value={formatCount(statusBar()!.dead_code)}
-                tone="muted"
-              />
-              <StatRow
-                theme={props.theme}
-                label="Unused Exports"
-                value={formatCount(statusBar()!.unused_exports)}
-                tone="muted"
-              />
-              <StatRow
-                theme={props.theme}
-                label="Duplicates"
-                value={formatCount(statusBar()!.duplicates)}
-                tone="muted"
-              />
-              <StatRow
-                theme={props.theme}
-                label="TODOs"
-                value={formatCount(statusBar()!.todos)}
-                tone="muted"
-              />
+              {statusBar()!.errors !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="Errors"
+                  value={formatCount(statusBar()!.errors)}
+                  tone={statusBar()!.errors! > 0 ? "err" : "muted"}
+                />
+              )}
+              {statusBar()!.warnings !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="Warnings"
+                  value={formatCount(statusBar()!.warnings)}
+                  tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
+                />
+              )}
+              {statusBar()!.dead_code !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="Dead Code"
+                  value={formatCount(statusBar()!.dead_code)}
+                  tone="muted"
+                />
+              )}
+              {statusBar()!.unused_exports !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="Unused Exports"
+                  value={formatCount(statusBar()!.unused_exports)}
+                  tone="muted"
+                />
+              )}
+              {statusBar()!.duplicates !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="Duplicates"
+                  value={formatCount(statusBar()!.duplicates)}
+                  tone="muted"
+                />
+              )}
+              {statusBar()!.todos !== undefined && (
+                <StatRow
+                  theme={props.theme}
+                  label="TODOs"
+                  value={formatCount(statusBar()!.todos)}
+                  tone="muted"
+                />
+              )}
             </>
           )}
 

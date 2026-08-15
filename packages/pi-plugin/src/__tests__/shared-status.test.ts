@@ -78,6 +78,18 @@ describe("shared status helpers", () => {
     expect(formatStatusDialogMessage(status)).not.toContain("Code Health");
   });
 
+  test("pi_status_omits_unproven_health_categories_instead_of_coercing_zero", () => {
+    const status = coerceAftStatus({ status_bar: { errors: 7 } });
+
+    expect(status.status_bar).toEqual({ errors: 7 });
+    const dialog = formatStatusDialogMessage(status);
+    const markdown = formatStatusMarkdown(status);
+    expect(dialog).toContain("- errors: 7");
+    expect(dialog).not.toContain("- warnings:");
+    expect(markdown).toContain("- **Errors:** 7");
+    expect(markdown).not.toContain("- **Warnings:**");
+  });
+
   test("formatBytes handles zero, fractions, and large units", () => {
     expect(formatBytes(0)).toBe("0 B");
     expect(formatBytes(512)).toBe("512 B");

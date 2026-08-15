@@ -77,7 +77,6 @@ import {
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
-import { clearStatusBarSession, statusBarSuffixForSession } from "./status-bar-inject.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import {
@@ -1138,7 +1137,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // sessions, while in-flight bash aborts now use bash_abort_inflight.
       if (eventType === "session.deleted" && sessionID) {
         inspectTier2Idle.clear(sessionID);
-        clearStatusBarSession(sessionID);
         // Release this session's transport routes (subc: tool + bg_events;
         // standalone: no-op). Best-effort — never block the event hook.
         void pool.closeSession(input.directory, sessionID).catch(() => {});
@@ -1264,8 +1262,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       await sendIgnoredMessage(input.client, commandInput.sessionID, formatStatusMarkdown(status));
       throwSentinel(commandInput.command);
     },
-    // Post-process tool output: append bash hints, drain in-turn background
-    // completions, and append the agent status bar. (UI title/diff metadata is
+    // Post-process tool output: append bash hints and drain in-turn background
+    // completions. (UI title/diff metadata is
     // now returned directly from each tool's execute() — OpenCode's fromPlugin
     // preserves it — so the old metadata-store merge is gone; see #96.)
     "tool.execute.after": async (
@@ -1287,19 +1285,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         { ctx, directory: sessionDir, sessionID: toolInput.sessionID },
         output,
       );
-      // Agent status bar — IDE-style health glance, appended on emit-on-change.
-      // Read from the active bridge (no spawn); the Rust side keeps counts current.
-      // Force it on aft_inspect: the bar IS that call's summary line, so it must
-      // always show even if counts are unchanged since the last emit.
-      if (output.output !== undefined) {
-        const activeBridge = ctx.pool.getActiveBridgeForRoot(sessionDir);
-        const suffix = statusBarSuffixForSession(
-          toolInput.sessionID,
-          activeBridge?.getStatusBar(),
-          toolInput.tool === "aft_inspect",
-        );
-        if (suffix) output.output += suffix;
-      }
     },
     config: async (config: { command?: Record<string, unknown> } | undefined) => {
       // Defensive guard: if OpenCode passes undefined or a non-object,

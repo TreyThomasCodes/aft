@@ -84,8 +84,22 @@ describe("coerceAftStatus", () => {
       ...baseResponse,
       status_bar: null,
     } as unknown as Record<string, unknown>);
-
     expect(status.status_bar).toBeUndefined();
+  });
+
+  test("omits unproven health categories instead of coercing them to zero", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      status_bar: { errors: 7 },
+    } as unknown as Record<string, unknown>);
+
+    expect(status.status_bar).toEqual({ errors: 7 });
+    const dialog = formatStatusDialogMessage(status);
+    const markdown = formatStatusMarkdown(status);
+    expect(dialog).toContain("- errors: 7");
+    expect(dialog).not.toContain("- warnings:");
+    expect(markdown).toContain("- **Errors:** 7");
+    expect(markdown).not.toContain("- **Warnings:**");
   });
 });
 

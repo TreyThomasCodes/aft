@@ -47,7 +47,6 @@ import {
   type RootGeneration,
 } from "./lifecycle-registry.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
-import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 import type {
   AftProjectTransport,
   AftTransportOptions,
@@ -724,7 +723,6 @@ function reliftReply(reply: unknown): Record<string, unknown> {
  * client, opening+caching a route per `(root, harness, session)`.
  */
 class SubcTransport implements AftProjectTransport {
-  private lastStatusBar: StatusBarCounts | undefined;
   private cachedStatus: StatusSnapshot | null = null;
 
   constructor(
@@ -746,21 +744,12 @@ class SubcTransport implements AftProjectTransport {
     return this.pool.getConcretePoolId();
   }
 
-  getStatusBar(): StatusBarCounts | undefined {
-    return this.lastStatusBar;
-  }
-
   getCachedStatus(): StatusSnapshot | null {
     return this.cachedStatus;
   }
 
   cacheStatusSnapshot(snapshot: StatusSnapshot): void {
     this.cachedStatus = snapshot;
-  }
-
-  private captureStatusBar(response: Record<string, unknown>): void {
-    const parsed = parseStatusBarCounts(response.status_bar);
-    if (parsed) this.lastStatusBar = parsed;
   }
 
   private identityFor(session: string | undefined): BindIdentity {
@@ -794,9 +783,7 @@ class SubcTransport implements AftProjectTransport {
       onProgress,
       this.generation,
     );
-    const result = reliftReply(reply) as ToolCallResult;
-    this.captureStatusBar(result);
-    return result;
+    return reliftReply(reply) as ToolCallResult;
   }
 
   /**
@@ -830,9 +817,7 @@ class SubcTransport implements AftProjectTransport {
       onProgress,
       this.generation,
     );
-    const response = reliftReply(reply);
-    this.captureStatusBar(response);
-    return response;
+    return reliftReply(reply);
   }
 
   private splitOptions(options?: ToolCallOptions): {

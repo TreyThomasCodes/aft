@@ -30,7 +30,6 @@ describe("BinaryBridge toolCall transport", () => {
       id: "42",
       success: true,
       text: "agent output",
-      status_bar: { errors: 0, warnings: 1 },
       bg_completions: [{ task_id: "bg-1", status: "completed", exit_code: 0, command: "echo ok" }],
       preview_diff: "diff --git a/file b/file",
     };
@@ -57,7 +56,7 @@ describe("BinaryBridge toolCall transport", () => {
     ]);
     expect(result).toBe(rawResponse);
     expect(result.text).toBe("agent output");
-    expect(result.status_bar).toEqual({ errors: 0, warnings: 1 });
+    expect(result).not.toHaveProperty("status_bar");
     expect(result.bg_completions).toEqual(rawResponse.bg_completions);
     expect(result.preview_diff).toBe(rawResponse.preview_diff);
   });

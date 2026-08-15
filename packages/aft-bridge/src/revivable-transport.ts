@@ -241,10 +241,6 @@ class RevivableProjectTransport implements AftProjectTransport {
     return this.projectRoot;
   }
 
-  getStatusBar() {
-    return this.owner.currentBridge(this.projectRoot)?.getStatusBar();
-  }
-
   getCachedStatus() {
     return this.owner.currentBridge(this.projectRoot)?.getCachedStatus() ?? null;
   }
