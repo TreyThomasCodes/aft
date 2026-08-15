@@ -137,7 +137,10 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
             case.label
         );
         if case.label == "glob_matches" {
-            assert_eq!(normalized_actual_text, glob_mtimes.expected_text());
+            assert_eq!(
+                normalized_actual_text.replace('\\', "/"),
+                glob_mtimes.expected_text()
+            );
         }
 
         let mut expected_envelope = direct_response;

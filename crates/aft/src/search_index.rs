@@ -3752,20 +3752,29 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// Sort paths newest-first by mtime, falling back to normalized display-path order.
 ///
 /// The stable root keeps equal-mtime ordering independent of an absolute project
-/// directory, so equivalent projects produce the same relative-path order.
+/// directory, so equivalent projects produce the same relative-path order. Root
+/// and candidate copies are canonicalized only for key construction so Windows
+/// verbatim and clean forms compare alike without changing the returned paths.
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
     use std::collections::HashMap;
+    let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
         mtimes
             .entry(path.clone())
             .or_insert_with(|| path_modified_time(path));
-        display_paths
-            .entry(path.clone())
-            .or_insert_with(|| normalized_display_sort_key(Some(stable_root), path));
+        display_paths.entry(path.clone()).or_insert_with(|| {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                stable_root.join(path)
+            };
+            let comparison_path = crate::inspect::job::canonicalize_normalized(&resolved);
+            normalized_display_sort_key(Some(&stable_root), &comparison_path)
+        });
     }
     paths.sort_by(|left, right| {
         let left_mtime = mtimes.get(left).and_then(|v| *v);
@@ -6826,6 +6835,25 @@ mod tests {
             .map(|name| dir.path().join(name))
             .to_vec();
         assert_eq!(paths, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sort_paths_by_mtime_desc_normalizes_comparison_paths_without_rewriting_results() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let canonical_root = fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+        let tied_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let canonical_first = canonical_root.join("a-first.rs");
+        let clean_last = dir.path().join("z-last.rs");
+        for path in [&canonical_first, &clean_last] {
+            fs::write(path, "// tied\n").expect("write fixture");
+            filetime::set_file_mtime(path, tied_mtime).expect("pin fixture mtime");
+        }
+        let mut paths = vec![clean_last.clone(), canonical_first.clone()];
+
+        sort_paths_by_mtime_desc(&mut paths, &canonical_root);
+
+        assert_eq!(paths, vec![canonical_first, clean_last]);
     }
 
     /// Regression: v0.15.2 — sort_paths_by_mtime_desc panicked when files
