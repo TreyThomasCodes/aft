@@ -1,0 +1,145 @@
+{
+  "campaign_edits": [
+    "Cargo.lock",
+    "crates/aft/Cargo.toml",
+    "crates/aft/src/alert_records.rs",
+    "crates/aft/src/alert_render.rs",
+    "crates/aft/src/alert_state.rs",
+    "crates/aft/src/commands/health_digest.rs",
+    "crates/aft/src/commands/inspect.rs",
+    "crates/aft/src/commands/mod.rs",
+    "crates/aft/src/context.rs",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/lsp/manager.rs",
+    "crates/aft/src/main.rs",
+    "crates/aft/src/response_finalize.rs",
+    "crates/aft/tests/alert_block_finalization.rs",
+    "crates/aft/tests/alert_fleet_compose.rs",
+    "crates/aft/tests/alert_observation.rs",
+    "crates/aft/tests/alert_records.rs",
+    "crates/aft/tests/fixtures/alert_block/cross_root.json",
+    "crates/aft/tests/fixtures/alert_fleet_compose/composition.json",
+    "crates/aft/tests/fixtures/alert_fleet_compose/slice_map.json",
+    "crates/aft/tests/fixtures/alert_records/five_turn_reentry.json",
+    "crates/aft/tests/fixtures/alert_records/session_end_with_pending_disappearance.json",
+    "crates/aft/tests/fixtures/health_digest/canonical-operation.txt",
+    "crates/aft/tests/health_digest.rs",
+    "crates/aft/tests/slice_fence.rs",
+    "crates/aft/tests/status_counts_inspect_seams.rs",
+    "packages/aft-bridge/src/__tests__/status-bar.test.ts",
+    "packages/aft-bridge/src/__tests__/subc-transport.test.ts",
+    "packages/aft-bridge/src/__tests__/transport.test.ts",
+    "packages/aft-bridge/src/bridge.ts",
+    "packages/aft-bridge/src/index.ts",
+    "packages/aft-bridge/src/revivable-transport.ts",
+    "packages/aft-bridge/src/status-bar.ts",
+    "packages/aft-bridge/src/subc-transport.ts",
+    "packages/aft-bridge/src/transport.ts",
+    "packages/opencode-plugin/src/__tests__/e2e/helpers.ts",
+    "packages/opencode-plugin/src/__tests__/shared-status.test.ts",
+    "packages/opencode-plugin/src/__tests__/status-bar-inject.test.ts",
+    "packages/opencode-plugin/src/__tests__/tui-sidebar-compression.test.tsx",
+    "packages/opencode-plugin/src/index.ts",
+    "packages/opencode-plugin/src/shared/status.ts",
+    "packages/opencode-plugin/src/status-bar-inject.ts",
+    "packages/opencode-plugin/src/tui/index.tsx",
+    "packages/opencode-plugin/src/tui/sidebar.tsx",
+    "packages/pi-plugin/src/__tests__/shared-status.test.ts",
+    "packages/pi-plugin/src/__tests__/status-bar-inject.test.ts",
+    "packages/pi-plugin/src/index.ts",
+    "packages/pi-plugin/src/shared/status.ts",
+    "packages/pi-plugin/src/status-bar-inject.ts"
+  ],
+  "slices": [
+    {
+      "id": "alert-observation-ingestion",
+      "files": [
+        "crates/aft/src/alert_state.rs",
+        "crates/aft/src/context.rs",
+        "crates/aft/src/lsp/manager.rs",
+        "crates/aft/tests/alert_observation.rs"
+      ]
+    },
+    {
+      "id": "status-counts-and-inspect-seams",
+      "files": [
+        "crates/aft/src/commands/inspect.rs",
+        "crates/aft/tests/status_counts_inspect_seams.rs"
+      ]
+    },
+    {
+      "id": "passive-surface-retirement",
+      "files": [
+        "packages/aft-bridge/src/__tests__/status-bar.test.ts",
+        "packages/aft-bridge/src/__tests__/subc-transport.test.ts",
+        "packages/aft-bridge/src/__tests__/transport.test.ts",
+        "packages/aft-bridge/src/bridge.ts",
+        "packages/aft-bridge/src/index.ts",
+        "packages/aft-bridge/src/revivable-transport.ts",
+        "packages/aft-bridge/src/status-bar.ts",
+        "packages/aft-bridge/src/subc-transport.ts",
+        "packages/aft-bridge/src/transport.ts",
+        "packages/opencode-plugin/src/__tests__/e2e/helpers.ts",
+        "packages/opencode-plugin/src/__tests__/shared-status.test.ts",
+        "packages/opencode-plugin/src/__tests__/status-bar-inject.test.ts",
+        "packages/opencode-plugin/src/__tests__/tui-sidebar-compression.test.tsx",
+        "packages/opencode-plugin/src/index.ts",
+        "packages/opencode-plugin/src/shared/status.ts",
+        "packages/opencode-plugin/src/status-bar-inject.ts",
+        "packages/opencode-plugin/src/tui/index.tsx",
+        "packages/opencode-plugin/src/tui/sidebar.tsx",
+        "packages/pi-plugin/src/__tests__/shared-status.test.ts",
+        "packages/pi-plugin/src/__tests__/status-bar-inject.test.ts",
+        "packages/pi-plugin/src/index.ts",
+        "packages/pi-plugin/src/shared/status.ts",
+        "packages/pi-plugin/src/status-bar-inject.ts"
+      ]
+    },
+    {
+      "id": "health-digest",
+      "files": [
+        "crates/aft/src/commands/health_digest.rs",
+        "crates/aft/src/commands/mod.rs",
+        "crates/aft/src/main.rs",
+        "crates/aft/tests/fixtures/health_digest/canonical-operation.txt",
+        "crates/aft/tests/health_digest.rs"
+      ]
+    },
+    {
+      "id": "alert-observation-logging",
+      "files": [
+        "Cargo.lock",
+        "crates/aft/Cargo.toml",
+        "crates/aft/src/alert_records.rs",
+        "crates/aft/src/lib.rs",
+        "crates/aft/tests/alert_records.rs",
+        "crates/aft/tests/fixtures/alert_records/five_turn_reentry.json",
+        "crates/aft/tests/fixtures/alert_records/session_end_with_pending_disappearance.json"
+      ]
+    },
+    {
+      "id": "alert-finalization",
+      "files": [
+        "crates/aft/src/alert_render.rs",
+        "crates/aft/src/response_finalize.rs",
+        "crates/aft/tests/alert_block_finalization.rs",
+        "crates/aft/tests/fixtures/alert_block/cross_root.json"
+      ]
+    },
+    {
+      "id": "fleet-compose-and-fence-goldens",
+      "files": [
+        "crates/aft/tests/alert_fleet_compose.rs",
+        "crates/aft/tests/fixtures/alert_fleet_compose/composition.json",
+        "crates/aft/tests/fixtures/alert_fleet_compose/slice_map.json",
+        "crates/aft/tests/slice_fence.rs"
+      ]
+    }
+  ],
+  "main_changes": [
+    {
+      "file": "crates/aft/src/main.rs",
+      "target": "health.digest registration arm"
+    }
+  ]
+}

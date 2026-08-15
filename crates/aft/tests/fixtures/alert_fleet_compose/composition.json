@@ -1,0 +1,27 @@
+{
+  "assertions": [
+    {
+      "id": "server-rendered alert bytes compose around the fleet line",
+      "target": "alert-composition"
+    },
+    {
+      "id": "fleet inputs continue to receive proven values",
+      "target": "fleet-values-computation"
+    }
+  ],
+  "fleet_line": "E2 W1 | D3 U4 C5 | T6",
+  "without_fleet": {
+    "response_text": "ordinary output\n\n<system-reminder>\nNew error in src/lib.rs:7: E0308 mismatched types\nNew error in src/other.rs:4: cannot infer type\n(+2 more)\n</system-reminder>"
+  },
+  "with_fleet": {
+    "response_text": "ordinary output\n\n<system-reminder>\nNew error in src/lib.rs:7: E0308 mismatched types\nNew error in src/other.rs:4: cannot infer type\n(+2 more)\n</system-reminder>"
+  },
+  "shown_alert_identities": [
+    "src/lib.rs:7:E0308 mismatched types",
+    "src/other.rs:4:cannot infer type"
+  ],
+  "counted_only_alert_identities": [
+    "src/third.rs:9:borrowed value does not live long enough",
+    "src/fourth.rs:2:unresolved import"
+  ]
+}
