@@ -307,7 +307,11 @@ pub fn run_tool_call(
         trace.mark_translate_done();
     }
 
-    let mut response = dispatch(raw_req, app_ctx);
+    let mut response = if raw_req.command == "inspect" {
+        crate::commands::inspect::handle_inspect_tool_call(&raw_req, app_ctx)
+    } else {
+        dispatch(raw_req, app_ctx)
+    };
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_execute_done();
     }

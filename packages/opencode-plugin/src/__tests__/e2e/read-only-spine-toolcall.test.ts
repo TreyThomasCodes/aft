@@ -156,9 +156,12 @@ export function runReadOnlySpineToolcallSuite(
         createToolContext(h),
       );
 
+      expect(output).toContain("FRESH");
+      expect(output).toContain("wait-stamp:");
+      expect(output).toContain("completed phases:");
       expect(output).toContain("TODOs: 1");
       expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
-    });
+    }, 90_000);
 
     test("aft_outline returns single-file Text output through tool_call", async () => {
       const h = await harness();

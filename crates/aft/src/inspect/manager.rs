@@ -93,6 +93,7 @@ impl Tier2RunSubmission {
 struct Tier2ReuseOptions {
     force_rescan_paths: BTreeSet<PathBuf>,
     allow_callgraph_cold_build: bool,
+    require_callgraph_snapshot: bool,
 }
 
 impl Tier2ReuseOptions {
@@ -106,6 +107,7 @@ impl Default for Tier2ReuseOptions {
         Self {
             force_rescan_paths: BTreeSet::new(),
             allow_callgraph_cold_build: true,
+            require_callgraph_snapshot: false,
         }
     }
 }
@@ -618,11 +620,13 @@ impl InspectManager {
         &self,
         job: &InspectJob,
         allow_cold_build: bool,
+        build_if_missing: bool,
         refresh_paths: &[PathBuf],
     ) -> Option<Arc<CallgraphSnapshot>> {
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,
+            build_if_missing,
             refresh_paths,
             Some(self),
         )
@@ -856,6 +860,44 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
+        self.tier2_run_with_reuse_blocking_once(snapshot, category, caller_scope, false)
+    }
+
+    /// Run a Tier-2 category for a blocking request that requires fresh results.
+    /// Unlike compatibility callers, this retries a temporarily unavailable
+    /// callgraph instead of accepting that incomplete scan as the final result.
+    pub fn tier2_run_with_reuse_blocking_fresh(
+        self: &Arc<Self>,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+    ) -> JobOutcome {
+        let first = self.tier2_run_with_reuse_blocking_once(
+            snapshot.clone(),
+            category,
+            caller_scope.clone(),
+            category == InspectCategory::DeadCode,
+        );
+        if category == InspectCategory::DeadCode
+            && first.payload().is_some_and(|payload| {
+                payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+            })
+        {
+            // A blocking caller can attach to a background scan that started
+            // before the callgraph was ready. Retry once under the blocking
+            // policy so that transient result cannot become the terminal payload.
+            return self.tier2_run_with_reuse_blocking_once(snapshot, category, caller_scope, true);
+        }
+        first
+    }
+
+    fn tier2_run_with_reuse_blocking_once(
+        self: &Arc<Self>,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+        require_callgraph_snapshot: bool,
+    ) -> JobOutcome {
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -877,7 +919,13 @@ impl InspectManager {
             Err(message) => return JobOutcome::Failed { message },
         };
         if claimed {
-            self.spawn_tier2_reuse_job(job, Tier2ReuseOptions::default());
+            self.spawn_tier2_reuse_job(
+                job,
+                Tier2ReuseOptions {
+                    require_callgraph_snapshot,
+                    ..Tier2ReuseOptions::default()
+                },
+            );
         }
 
         self.wait_for_tier2_reuse(&key, &caller_scope, cache.as_ref(), waiter_rx, &snapshot)
@@ -1363,12 +1411,34 @@ impl InspectManager {
 
         let mut updates = Tier2ContributionUpdates::default();
         let mut scan_by_relative = BTreeMap::<String, PathBuf>::new();
+        let require_callgraph_refresh =
+            if job.category == InspectCategory::DeadCode && options.require_callgraph_snapshot {
+                !cache
+                    .get_aggregated_for_config(&job.key, job.config.as_ref())
+                    .map_err(|error| error.to_string())?
+                    .is_some_and(|aggregate| {
+                        aggregate
+                            .get("callgraph_available")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    })
+            } else {
+                false
+            };
         let mut callgraph_refresh_paths = options
             .force_rescan_paths
             .iter()
             .filter(|path| callgraph_store_indexes_path(path))
             .cloned()
             .collect::<BTreeSet<_>>();
+        if require_callgraph_refresh {
+            callgraph_refresh_paths.extend(
+                current_by_relative
+                    .values()
+                    .filter(|path| callgraph_store_indexes_path(path))
+                    .cloned(),
+            );
+        }
         let mut aggregate_job = job.clone();
 
         for record in cached_records {
@@ -1444,6 +1514,7 @@ impl InspectManager {
                 scan_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
                     &scan_job,
                     options.allow_callgraph_cold_build,
+                    options.require_callgraph_snapshot,
                     &callgraph_refresh_files,
                 );
                 phases.snapshot += snapshot_started.elapsed();
@@ -1554,6 +1625,7 @@ impl InspectManager {
                         .build_tier2_callgraph_snapshot_with_refresh(
                             &rescan_job,
                             options.allow_callgraph_cold_build,
+                            options.require_callgraph_snapshot,
                             &callgraph_refresh_files,
                         );
                     phases.snapshot += snapshot_started.elapsed();
@@ -1620,9 +1692,16 @@ impl InspectManager {
             aggregate_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
                 &aggregate_job,
                 options.allow_callgraph_cold_build,
+                options.require_callgraph_snapshot,
                 &callgraph_refresh_files,
             );
             phases.snapshot += snapshot_started.elapsed();
+        }
+        if options.require_callgraph_snapshot
+            && aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job.callgraph_snapshot.is_none()
+        {
+            return Err("dead_code callgraph did not complete".to_string());
         }
         let rollup_started = Instant::now();
         let contributions = load_contributions(cache, &aggregate_job)?;
@@ -2152,7 +2231,7 @@ fn build_tier2_callgraph_snapshot(
     job: &InspectJob,
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
-    build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, &[], None)
+    build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, false, &[], None)
 }
 
 #[cfg(test)]
@@ -2161,12 +2240,59 @@ fn build_tier2_callgraph_snapshot_with_refresh(
     allow_cold_build: bool,
     refresh_paths: &[PathBuf],
 ) -> Option<Arc<CallgraphSnapshot>> {
-    build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, refresh_paths, None)
+    build_tier2_callgraph_snapshot_with_refresh_inner(
+        job,
+        allow_cold_build,
+        false,
+        refresh_paths,
+        None,
+    )
+}
+
+fn open_or_build_blocking_callgraph_store(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    allow_cold_build: bool,
+    refresh_paths: &[PathBuf],
+) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
+    if let Some(store) =
+        CallGraphStore::open_ready_repairing(callgraph_dir.clone(), project_root.clone())?
+    {
+        return Ok(Some(store));
+    }
+    if !allow_cold_build || refresh_paths.is_empty() {
+        return Ok(None);
+    }
+
+    match CallGraphStore::cold_build_with_lease(
+        callgraph_dir.clone(),
+        project_root.clone(),
+        refresh_paths,
+    ) {
+        Ok((store, _)) => Ok(Some(store)),
+        Err(error @ CallGraphStoreError::Unavailable(_)) => {
+            // Another actor may own the cold build. A blocking inspect waits for
+            // its publication instead of turning that transient into a clean zero.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Some(store) = CallGraphStore::open_ready_repairing(
+                    callgraph_dir.clone(),
+                    project_root.clone(),
+                )? {
+                    return Ok(Some(store));
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
     allow_cold_build: bool,
+    build_if_missing: bool,
     refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
 ) -> Option<Arc<CallgraphSnapshot>> {
@@ -2234,9 +2360,8 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     }
 
     for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
-        // Background refresh may rebuild call graphs for moved project roots.
-        // Direct inspect cannot trigger that rebuild, so it opens without repair
-        // and reports callgraph_unavailable when a rebuild is needed.
+        // Paths without an explicit refresh stay read-only. Blocking inspect
+        // supplies root files when it must produce a cold callgraph snapshot.
         let projection_store = if refresh_paths.is_empty() || !job.callgraph_writer {
             let store = match CallGraphStore::open_readonly(
                 callgraph_dir.clone(),
@@ -2263,7 +2388,14 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             };
             ProjectionStore::ReadOnly(store)
         } else {
-            let store = match if allow_cold_build {
+            let store = match if build_if_missing {
+                open_or_build_blocking_callgraph_store(
+                    callgraph_dir.clone(),
+                    job.project_root.clone(),
+                    allow_cold_build,
+                    refresh_paths,
+                )
+            } else if allow_cold_build {
                 CallGraphStore::open_ready_repairing(
                     callgraph_dir.clone(),
                     job.project_root.clone(),
@@ -4342,10 +4474,10 @@ export function bannerUnused() {}
         let (projections, _observer_reset) = count_projections();
 
         let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("first projection");
         let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("cached projection");
 
         assert!(
@@ -4378,7 +4510,7 @@ export function bannerUnused() {}
             callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
 
         let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("initial projection");
         let writer = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
             .expect("open writer")
@@ -4402,7 +4534,7 @@ export function bannerUnused() {}
         drop(writer);
 
         let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("refreshed readonly projection");
         assert!(
             !first
@@ -4435,7 +4567,7 @@ export function bannerUnused() {}
             callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
 
         let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("initial projection");
         let before = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone())
             .expect("open initial reader")
@@ -4461,7 +4593,7 @@ export function bannerUnused() {}
         drop(published);
 
         let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("replacement projection");
         assert!(
             !first
@@ -4491,7 +4623,7 @@ export function bannerUnused() {}
         let (projections, _observer_reset) = count_projections();
 
         let first = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("initial projection");
         manager.evict_idle_caches();
         assert_eq!(
@@ -4501,7 +4633,7 @@ export function bannerUnused() {}
             "idle artifact eviction must release the root projection slot"
         );
         let second = manager
-            .build_tier2_callgraph_snapshot_with_refresh(&job, false, &[])
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("reloaded projection");
 
         assert!(
@@ -4606,6 +4738,7 @@ export function bannerUnused() {}
                 Tier2ReuseOptions {
                     force_rescan_paths: [deleted.clone()].into_iter().collect(),
                     allow_callgraph_cold_build: true,
+                    require_callgraph_snapshot: false,
                 },
             )
             .outcome

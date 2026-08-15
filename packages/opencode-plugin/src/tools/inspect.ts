@@ -85,10 +85,10 @@ function firstString(...values: unknown[]): string | undefined {
 
 function terminalKind(response: Record<string, unknown>): InspectTerminalKind | undefined {
   for (const value of [
+    response.inspect_terminal,
     response.terminal,
     response.outcome,
     response.inspect_outcome,
-    response.inspect_terminal,
     response.status,
   ]) {
     if (typeof value !== "string") continue;
@@ -140,9 +140,13 @@ export function parseInspectTerminal(payload: unknown): InspectTerminal | undefi
     response.waitStamp,
     response.blocking_wait_stamp,
   );
-  const phaseSource = kind === "FRESH" ? (waitStamp ?? response) : response;
   const phases = parseInspectPhaseEntries(
-    phaseSource.phases ?? response.completed_phases ?? response.completedPhases,
+    kind === "FRESH"
+      ? (waitStamp?.phases ??
+          response.completed_phases ??
+          response.completedPhases ??
+          response.phases)
+      : (response.completed_phases ?? response.completedPhases ?? response.phases),
   );
 
   if (kind !== "PHASE-FAILED") {

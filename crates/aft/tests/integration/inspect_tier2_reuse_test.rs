@@ -218,6 +218,32 @@ fn aggregate_contains_symbol(
 }
 
 #[test]
+fn blocking_dead_code_builds_a_cold_callgraph_snapshot() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let root = temp_dir.path().join("blocking-dead-code");
+    fs::create_dir_all(&root).expect("create project");
+    write_file(&root, "package.json", r#"{"main":"src/main.ts"}"#);
+    write_file(
+        &root,
+        "src/main.ts",
+        "export function entry(): void {}\nexport function plantedDead(): void {}\n",
+    );
+    let inspect_dir = temp_dir.path().join("cache/inspect");
+    let project_key = artifact_cache_key_for_test(&root);
+    aft::root_cache::configure_artifact_access(&root, &project_key, false);
+    let manager = Arc::new(InspectManager::new());
+
+    let outcome = manager.tier2_run_with_reuse_blocking_fresh(
+        snapshot(&root, &inspect_dir),
+        InspectCategory::DeadCode,
+        aft::inspect::JobScope::for_project(root),
+    );
+    let payload = outcome.payload().expect("blocking scan is fresh");
+
+    assert_eq!(payload["callgraph_available"], true);
+}
+
+#[test]
 fn inspect_dead_code_framework_route_exports_are_live_but_route_helpers_remain_dead() {
     struct Case {
         name: &'static str,

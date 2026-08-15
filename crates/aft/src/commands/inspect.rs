@@ -20,16 +20,55 @@ const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_with_diagnostics(req, ctx, false)
+    handle_inspect_payload(req, ctx, false, false)
 }
 
-/// Deferred inspections collect diagnostics for the entire root, even without
-/// an explicit response scope. Synchronous compatibility requests retain the
-/// scanner's existing warm working set behavior.
-fn handle_inspect_with_diagnostics(
+pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
+    let phase_log = InspectPhaseLog::for_request(req.id.clone());
+    let snapshot = match inspect_preflight(req, ctx) {
+        Ok(snapshot) => snapshot,
+        Err(response) => {
+            let detail = response
+                .data
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                InspectTerminal::PhaseFailed {
+                    failed_phase: None,
+                    failure_reason: "root_resolution_failed",
+                    failure_detail: detail,
+                },
+            );
+        }
+    };
+    let applicability = {
+        let lsp = ctx.lsp();
+        lsp.resolve_applicable_servers_for_root(&snapshot.project_root, &snapshot.config)
+    };
+    match applicability {
+        Ok(applicability) => run_blocking_inspect_body(req, ctx, applicability, phase_log),
+        Err(error) => build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: None,
+                failure_reason: applicability_failure_reason(&error),
+                failure_detail: Some(applicability_failure_detail(error)),
+            },
+        ),
+    }
+}
+
+/// Blocking inspections collect diagnostics for the entire root, even without
+/// an explicit response scope. Scope controls rendered results, not freshness.
+fn handle_inspect_payload(
     req: &RawRequest,
     ctx: &AppContext,
     force_root_diagnostics: bool,
+    applicability_is_empty: bool,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -65,7 +104,12 @@ fn handle_inspect_with_diagnostics(
         let scope = scope.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(manager.tier2_run_with_reuse_blocking(snapshot, category, scope));
+            let outcome = if force_root_diagnostics {
+                manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
+            } else {
+                manager.tier2_run_with_reuse_blocking(snapshot, category, scope)
+            };
+            let _ = tx.send(outcome);
         });
         tier2_receivers.insert(category, rx);
     }
@@ -81,6 +125,7 @@ fn handle_inspect_with_diagnostics(
                 &snapshot,
                 &scope,
                 scope_was_provided || force_root_diagnostics,
+                applicability_is_empty,
             )
         } else if category.is_tier2() {
             if let Some(rx) = tier2_receivers.remove(category) {
@@ -106,8 +151,8 @@ fn handle_inspect_with_diagnostics(
 }
 
 /// Register one inspect completion whose poll closure only observes the result
-/// channel. The payload body stays in `handle_inspect`, so fresh-only payload
-/// validation remains owned by the scanner-freshness layer.
+/// channel. Keep payload construction and checks that require newly scanned data
+/// in `handle_inspect_payload` and the scanners that produce those results.
 pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
@@ -166,7 +211,7 @@ pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> Dispat
     let shutdown_log = phase_log.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let response = run_deferred_inspect_body(&request, ctx, applicability, phase_log);
+        let response = run_blocking_inspect_body(&request, &ctx, applicability, phase_log);
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {
@@ -216,9 +261,9 @@ fn inspect_shutdown_terminal(
     })
 }
 
-fn run_deferred_inspect_body(
+fn run_blocking_inspect_body(
     req: &RawRequest,
-    ctx: Arc<AppContext>,
+    ctx: &AppContext,
     applicability: ApplicableServerSnapshot,
     phase_log: InspectPhaseLog,
 ) -> Response {
@@ -264,7 +309,7 @@ fn run_deferred_inspect_body(
             ))
         })
         .collect::<Vec<_>>();
-    let response = handle_inspect_with_diagnostics(req, &ctx, true);
+    let response = handle_inspect_payload(req, ctx, true, applicability.server_keys.is_empty());
     for phase in quiescence {
         phase.complete();
     }
@@ -320,8 +365,7 @@ fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'stati
     match error {
         ApplicabilityResolutionError::MissingExecutable { .. } => "missing_executable",
         ApplicabilityResolutionError::RootUnreadable { .. }
-        | ApplicabilityResolutionError::CachedSpawnFailure { .. }
-        | ApplicabilityResolutionError::NoApplicableServer { .. } => {
+        | ApplicabilityResolutionError::CachedSpawnFailure { .. } => {
             "applicability_resolution_failed"
         }
     }
@@ -339,9 +383,6 @@ fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
             "cached failure for {}: {result:?}",
             server_key.kind.id_str()
         ),
-        ApplicabilityResolutionError::NoApplicableServer { root } => {
-            format!("no applicable LSP server for {}", root.display())
-        }
     }
 }
 
