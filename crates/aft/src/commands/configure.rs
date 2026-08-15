@@ -5182,6 +5182,100 @@ mod tests {
     }
 
     #[test]
+    fn reconfigure_invalidates_path_restriction_root_memo() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first_root = workspace.path().join("first-root");
+        let second_root = workspace.path().join("second-root");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first_file = first_root.join("first.txt");
+        let second_file = second_root.join("second.txt");
+        std::fs::write(&first_file, "first").unwrap();
+        std::fs::write(&second_file, "second").unwrap();
+        let ctx = test_context();
+        let request = |root: &std::path::Path| {
+            configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "restrict_to_project_root": true,
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            }))
+        };
+
+        assert!(handle_configure_for_test(&request(&first_root), &ctx).success);
+        assert_eq!(
+            ctx.validate_path("first-root", &first_file)
+                .expect("first root validates"),
+            std::fs::canonicalize(&first_file).unwrap()
+        );
+        assert!(!ctx.path_restriction_root_memo_is_empty_for_test());
+
+        assert!(handle_configure_for_test(&request(&second_root), &ctx).success);
+        assert!(
+            ctx.path_restriction_root_memo_is_empty_for_test(),
+            "committing a different configured project root must clear the old root memo"
+        );
+        assert_eq!(
+            ctx.validate_path("second-root", &second_file)
+                .expect("second root validates after reconfigure"),
+            std::fs::canonicalize(&second_file).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconfigure_recanonicalizes_configured_root_after_target_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first_target = workspace.path().join("first-target");
+        let second_target = workspace.path().join("second-target");
+        let intermediate_root = workspace.path().join("intermediate-root");
+        let configured_root = workspace.path().join("configured-root");
+        std::fs::create_dir_all(&first_target).unwrap();
+        std::fs::create_dir_all(&second_target).unwrap();
+        std::fs::create_dir_all(&intermediate_root).unwrap();
+        std::os::unix::fs::symlink(&first_target, &configured_root).unwrap();
+        std::fs::write(first_target.join("inside.txt"), "first").unwrap();
+        std::fs::write(second_target.join("inside.txt"), "second").unwrap();
+        let ctx = test_context();
+        let request = |root: &std::path::Path| {
+            configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "restrict_to_project_root": true,
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            }))
+        };
+
+        assert!(handle_configure_for_test(&request(&configured_root), &ctx).success);
+        assert_eq!(
+            ctx.validate_path("first-target", std::path::Path::new("inside.txt"))
+                .expect("first target validates"),
+            std::fs::canonicalize(first_target.join("inside.txt")).unwrap()
+        );
+        assert!(handle_configure_for_test(&request(&intermediate_root), &ctx).success);
+
+        // The first target deliberately stays present, so only reconfigure
+        // invalidation—not the missing-target refresh—can discard its memo entry.
+        std::fs::remove_file(&configured_root).unwrap();
+        std::os::unix::fs::symlink(&second_target, &configured_root).unwrap();
+        assert!(handle_configure_for_test(&request(&configured_root), &ctx).success);
+
+        assert_eq!(
+            ctx.validate_path("second-target", std::path::Path::new("inside.txt"))
+                .expect("new target validates after reconfigure"),
+            std::fs::canonicalize(second_target.join("inside.txt")).unwrap()
+        );
+    }
+
+    #[test]
     fn configure_reuses_cached_worktree_probe_until_forced_to_reprobe() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();

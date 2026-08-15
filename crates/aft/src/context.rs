@@ -942,6 +942,15 @@ struct PathRestrictionContext {
     path_for_resolution: PathBuf,
 }
 
+/// Per-context memo for the configured project root used by containment checks.
+///
+/// `resolved_root` is the bare output from `fs::canonicalize`; it must not be
+/// lexically normalized because it remains in the filesystem identity domain.
+struct PathRestrictionRootMemo {
+    configured_root: PathBuf,
+    resolved_root: PathBuf,
+}
+
 /// Normalize a path by resolving `.` and `..` components lexically,
 /// without touching the filesystem. This prevents path traversal
 /// attacks when `fs::canonicalize` fails (e.g. for non-existent paths).
@@ -1469,6 +1478,12 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
+    /// Per-root-actor memo for containment checks. The key is the configured
+    /// root's exact `PathBuf` spelling, so reconfiguration never reuses a
+    /// canonical root selected for another configured value.
+    path_restriction_root_memo: parking_lot::Mutex<Option<PathRestrictionRootMemo>>,
+    #[cfg(test)]
+    path_restriction_root_canonicalizations: AtomicUsize,
     force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,
     pub harness: parking_lot::Mutex<Option<Harness>>,
     canonical_cache_root: parking_lot::Mutex<Option<PathBuf>>,
@@ -1847,6 +1862,9 @@ impl AppContext {
             backup: parking_lot::Mutex::new(BackupStore::new()),
             checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
+            path_restriction_root_memo: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            path_restriction_root_canonicalizations: AtomicUsize::new(0),
             force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),
             harness: parking_lot::Mutex::new(None),
             canonical_cache_root: parking_lot::Mutex::new(None),
@@ -3154,10 +3172,32 @@ impl AppContext {
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
         let next = Arc::new(config);
-        match self.config.write() {
-            Ok(mut guard) => *guard = next,
-            Err(poisoned) => *poisoned.into_inner() = next,
+        let project_root_changed = {
+            let mut guard = self
+                .config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Compare the configured spelling, not a normalized equivalent:
+            // that spelling is the memo key for containment-root resolution.
+            let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
+                != next.project_root.as_ref().map(|root| root.as_os_str());
+            *guard = next;
+            changed
+        };
+        if project_root_changed {
+            self.path_restriction_root_memo.lock().take();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_restriction_root_memo_is_empty_for_test(&self) -> bool {
+        self.path_restriction_root_memo.lock().is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_restriction_root_canonicalizations_for_test(&self) -> usize {
+        self.path_restriction_root_canonicalizations
+            .load(Ordering::SeqCst)
     }
 
     /// Clone-mutate-publish the current configuration without returning a guard.
@@ -6068,6 +6108,32 @@ impl AppContext {
         ))
     }
 
+    fn resolved_path_restriction_root(&self, root: &Path) -> PathBuf {
+        let mut memo = self.path_restriction_root_memo.lock();
+        if let Some(cached) = memo.as_ref() {
+            if cached.configured_root.as_os_str() == root.as_os_str()
+                && cached.resolved_root.exists()
+            {
+                return cached.resolved_root.clone();
+            }
+        }
+
+        // A cache hit performs one `exists` stat instead of walking the root's
+        // symlink chain. If the resolved root disappears, retry canonicalization
+        // so deletion and recreation can choose its new identity. A retargeted
+        // configured-root symlink whose previous target still exists is the
+        // residual window until reconfigure or that target disappears.
+        #[cfg(test)]
+        self.path_restriction_root_canonicalizations
+            .fetch_add(1, Ordering::SeqCst);
+        let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        *memo = Some(PathRestrictionRootMemo {
+            configured_root: root.to_path_buf(),
+            resolved_root: resolved_root.clone(),
+        });
+        resolved_root
+    }
+
     fn path_restriction_context(
         &self,
         req_id: &str,
@@ -6092,7 +6158,7 @@ impl AppContext {
         drop(config);
 
         let raw_root = root.clone();
-        let resolved_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let resolved_root = self.resolved_path_restriction_root(&root);
         let path_for_resolution = if path.is_relative() {
             raw_root.join(path)
         } else {
@@ -6757,6 +6823,63 @@ mod force_restrict_tests {
             serde_json::to_value(err).unwrap()["code"],
             "path_outside_root"
         );
+    }
+
+    #[test]
+    fn path_restriction_root_memo_canonicalizes_once_for_1000_validations() {
+        let root = TempDir::new().expect("root tempdir");
+        let target = root.path().join("target.txt");
+        std::fs::write(&target, "inside").expect("write target");
+        let ctx = test_context(Some(root.path().to_path_buf()), true);
+
+        for request in 0..1_000 {
+            let validated = ctx
+                .validate_path(&format!("memo-{request}"), &target)
+                .expect("in-root path validates");
+            assert_eq!(validated, std::fs::canonicalize(&target).unwrap());
+        }
+
+        assert_eq!(
+            ctx.path_restriction_root_canonicalizations_for_test(),
+            1,
+            "the configured root should be canonicalized once instead of once per validation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_restriction_root_memo_recanonicalizes_after_cached_target_disappears() {
+        let workspace = TempDir::new().expect("workspace tempdir");
+        let first_target = workspace.path().join("first-target");
+        let second_target = workspace.path().join("second-target");
+        let configured_root = workspace.path().join("configured-root");
+        std::fs::create_dir_all(&first_target).expect("create first target");
+        std::fs::create_dir_all(&second_target).expect("create second target");
+        std::os::unix::fs::symlink(&first_target, &configured_root)
+            .expect("create configured-root symlink");
+        std::fs::write(first_target.join("inside.txt"), "first").expect("write first target");
+
+        let ctx = test_context(Some(configured_root.clone()), true);
+        assert_eq!(
+            ctx.validate_path("first-target", Path::new("inside.txt"))
+                .expect("first target validates"),
+            std::fs::canonicalize(first_target.join("inside.txt")).unwrap()
+        );
+
+        // Keep the configured PathBuf unchanged while replacing its resolved
+        // target. The missing cached target must cause a new canonicalization.
+        std::fs::remove_dir_all(&first_target).expect("remove first target");
+        std::fs::remove_file(&configured_root).expect("remove old root symlink");
+        std::os::unix::fs::symlink(&second_target, &configured_root)
+            .expect("recreate configured-root symlink");
+        std::fs::write(second_target.join("inside.txt"), "second").expect("write second target");
+
+        assert_eq!(
+            ctx.validate_path("second-target", Path::new("inside.txt"))
+                .expect("second target validates"),
+            std::fs::canonicalize(second_target.join("inside.txt")).unwrap()
+        );
+        assert_eq!(ctx.path_restriction_root_canonicalizations_for_test(), 2);
     }
 
     #[test]
