@@ -1,0 +1,8 @@
+{
+  "session_id": "opencode-session-ending",
+  "dispatch_root": "/work/ledger",
+  "producer_key": "rust-analyzer",
+  "identity_fingerprint": "diag-ending",
+  "lifecycle_episode_id": "episode-ending-1",
+  "observation_ordinal": 2
+}
