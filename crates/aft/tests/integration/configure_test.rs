@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
 #[cfg(unix)]
 use super::helpers::warm_executable;
+use super::helpers::{user_config, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()

@@ -24,9 +24,9 @@ use aft::watcher_filter::WatcherDispatchEvent;
 use lsp_types::FileChangeType;
 use tempfile::tempdir;
 
-use super::helpers::AftProcess;
 #[cfg(unix)]
 use super::helpers::warm_executable;
+use super::helpers::AftProcess;
 
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")

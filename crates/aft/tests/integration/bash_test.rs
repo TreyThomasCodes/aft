@@ -1,6 +1,6 @@
-use super::helpers::{user_config, AftProcess};
 #[cfg(unix)]
 use super::helpers::warm_executable;
+use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
 fn shell_quote_path(path: &std::path::Path) -> String {
