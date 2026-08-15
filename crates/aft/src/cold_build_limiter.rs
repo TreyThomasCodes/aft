@@ -306,6 +306,9 @@ impl ColdBuildLimiter {
 
     /// Expose recorded admissions to internal tests and harness code so they
     /// can verify limiter behavior without parsing log output.
+    // Read by the admission tests today; the blocking-inspect wait-stamp assembly
+    // consumes these events once the inspect-path slice lands.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn admission_events(&self) -> Vec<ColdBuildAdmissionEvent> {
         self.admission_state
             .lock()
