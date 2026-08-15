@@ -16,12 +16,40 @@ struct ParityCase {
     arguments: Value,
 }
 
+#[derive(Clone, Copy)]
+enum GlobMtimeProfile {
+    Distinct,
+    Equal,
+}
+
+impl GlobMtimeProfile {
+    fn expected_text(self) -> &'static str {
+        match self {
+            Self::Distinct => {
+                "5 files matching **/*.txt\n\nsrc/read.txt\nsrc/edit_ambiguous.txt\nsrc/search.txt\nsrc/edit.txt\nsrc/patch.txt"
+            }
+            Self::Equal => {
+                "5 files matching **/*.txt\n\nsrc/edit.txt\nsrc/edit_ambiguous.txt\nsrc/patch.txt\nsrc/read.txt\nsrc/search.txt"
+            }
+        }
+    }
+}
+
 #[test]
 fn tool_call_matches_direct_spine_envelopes() {
+    run_tool_call_parity(GlobMtimeProfile::Distinct, parity_cases());
+}
+
+#[test]
+fn tool_call_glob_matches_direct_spine_with_equal_mtimes() {
+    run_tool_call_parity(GlobMtimeProfile::Equal, vec![glob_parity_case()]);
+}
+
+fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
     let direct_project = tempfile::tempdir().expect("direct temp project");
     let tool_call_project = tempfile::tempdir().expect("tool_call temp project");
-    create_fixture_project(direct_project.path());
-    create_fixture_project(tool_call_project.path());
+    create_fixture_project(direct_project.path(), glob_mtimes);
+    create_fixture_project(tool_call_project.path(), glob_mtimes);
 
     let mut direct_aft = AftProcess::spawn();
     let mut tool_call_aft = AftProcess::spawn();
@@ -32,7 +60,7 @@ fn tool_call_matches_direct_spine_envelopes() {
         "cfg-tool-call",
     );
 
-    for case in parity_cases() {
+    for case in cases {
         let request_id = format!("tool-call-parity-{}", case.label);
         let direct_request = direct_request(
             &request_id,
@@ -93,20 +121,24 @@ fn tool_call_matches_direct_spine_envelopes() {
         let actual_text = tool_call_response["text"]
             .as_str()
             .unwrap_or_else(|| panic!("tool_call response missing text for {}", case.label));
+        let normalized_expected_text = normalize_text(
+            &expected_text,
+            direct_project.path(),
+            direct_aft.cache_dir(),
+        );
+        let normalized_actual_text = normalize_text(
+            actual_text,
+            tool_call_project.path(),
+            tool_call_aft.cache_dir(),
+        );
         assert_eq!(
-            normalize_text(
-                &expected_text,
-                direct_project.path(),
-                direct_aft.cache_dir()
-            ),
-            normalize_text(
-                actual_text,
-                tool_call_project.path(),
-                tool_call_aft.cache_dir()
-            ),
+            normalized_expected_text, normalized_actual_text,
             "formatted text mismatch for {}",
             case.label
         );
+        if case.label == "glob_matches" {
+            assert_eq!(normalized_actual_text, glob_mtimes.expected_text());
+        }
 
         let mut expected_envelope = direct_response;
         expected_envelope
@@ -686,6 +718,14 @@ fn tool_call_rejects_missing_or_invalid_name() {
     assert!(aft.shutdown().success());
 }
 
+fn glob_parity_case() -> ParityCase {
+    ParityCase {
+        label: "glob_matches",
+        tool: "glob",
+        arguments: json!({"pattern": "**/*.txt", "path": "src"}),
+    }
+}
+
 fn parity_cases() -> Vec<ParityCase> {
     vec![
         ParityCase {
@@ -698,11 +738,7 @@ fn parity_cases() -> Vec<ParityCase> {
             tool: "grep",
             arguments: json!({"pattern": "needle", "path": "src"}),
         },
-        ParityCase {
-            label: "glob_matches",
-            tool: "glob",
-            arguments: json!({"pattern": "**/*.txt", "path": "src"}),
-        },
+        glob_parity_case(),
         ParityCase {
             label: "search_literal",
             tool: "search",
@@ -780,7 +816,7 @@ fn parity_cases() -> Vec<ParityCase> {
     ]
 }
 
-fn create_fixture_project(root: &Path) {
+fn create_fixture_project(root: &Path, glob_mtimes: GlobMtimeProfile) {
     fs::create_dir_all(root.join("src")).expect("create src dir");
     fs::create_dir_all(root.join("docs")).expect("create docs dir");
     fs::write(
@@ -789,16 +825,6 @@ fn create_fixture_project(root: &Path) {
     )
     .expect("write read fixture");
     fs::write(root.join("src/search.txt"), "another needle\n").expect("write search fixture");
-    // Pin identical mtimes on the grep fixtures: the direct and tool_call
-    // envelopes come from two separately-created projects, and grep orders by
-    // mtime-desc with a path tiebreak. Without pinning, one project's writes
-    // can straddle a filesystem timestamp tick while the other's tie, making
-    // the two orderings legitimately differ.
-    let grep_fixture_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-    for fixture in ["src/read.txt", "src/search.txt"] {
-        filetime::set_file_mtime(root.join(fixture), grep_fixture_mtime)
-            .expect("pin grep fixture mtime");
-    }
     fs::write(root.join("src/edit.txt"), "replace old value\n").expect("write edit fixture");
     fs::write(root.join("src/edit_ambiguous.txt"), "same same\n")
         .expect("write ambiguous edit fixture");
@@ -820,6 +846,24 @@ fn create_fixture_project(root: &Path) {
     .expect("write zoom multi-target fixture");
     fs::write(root.join("docs/zoom.md"), "# Zoom Doc\n\nIntro line\n")
         .expect("write zoom docs fixture");
+
+    // The parity processes use separate project directories, while glob's public
+    // order depends on metadata. Give corresponding files the same profile so the
+    // test compares dispatch routes rather than filesystem timestamp granularity.
+    for (fixture, distinct_offset) in [
+        ("src/read.txt", 500),
+        ("src/edit_ambiguous.txt", 400),
+        ("src/search.txt", 300),
+        ("src/edit.txt", 200),
+        ("src/patch.txt", 100),
+    ] {
+        let offset = match glob_mtimes {
+            GlobMtimeProfile::Distinct => distinct_offset,
+            GlobMtimeProfile::Equal => 0,
+        };
+        let mtime = filetime::FileTime::from_unix_time(1_700_000_000 + offset, 0);
+        filetime::set_file_mtime(root.join(fixture), mtime).expect("pin glob fixture mtime");
+    }
 }
 
 fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {

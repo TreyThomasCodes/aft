@@ -145,7 +145,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
-    sort_paths_by_mtime_desc(&mut files);
+    sort_paths_by_mtime_desc(&mut files, &project_root);
     let total = files.len();
     let result_truncated = total > MAX_GLOB_RESULTS;
     if result_truncated {
@@ -249,7 +249,6 @@ fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
             deduped.push(file);
         }
     }
-    sort_paths_by_mtime_desc(&mut deduped);
     deduped
 }
 

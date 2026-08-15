@@ -3682,7 +3682,7 @@ where
     }
 
     if sort_by_mtime {
-        sort_paths_by_mtime_desc(&mut files);
+        sort_paths_by_mtime_desc(&mut files, filter_root);
     }
     Ok(files)
 }
@@ -3751,17 +3751,11 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 
 /// Sort paths newest-first by mtime, falling back to normalized display-path order.
 ///
-/// Pre-v0.15.2 this called `path_modified_time(...)` directly inside the
-/// `sort_by()` closure. That made the comparator non-deterministic — a
-/// `stat()` syscall for the same path can return different values across
-/// invocations (file edited mid-sort, file deleted, OS clock adjustments,
-/// concurrent file-watcher activity), and Rust's slice::sort panics at
-/// runtime when it detects a non-total-order comparator. CI hit this on
-/// a Pi e2e test where the bridge invalidated files in parallel with grep.
-///
-/// Fix: snapshot mtimes ONCE into a HashMap before sorting, then look up
-/// from the map inside the closure. Pure function ⇒ guaranteed total order.
-pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
+/// The stable root keeps equal-mtime ordering independent of an absolute project
+/// directory, so equivalent projects produce the same relative-path order.
+/// Metadata and display keys are snapshotted before sorting: the comparator must
+/// remain a total order even if files change or disappear during the sort.
+pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
     use std::collections::HashMap;
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
@@ -3771,7 +3765,7 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
             .or_insert_with(|| path_modified_time(path));
         display_paths
             .entry(path.clone())
-            .or_insert_with(|| normalized_display_sort_key(None, path));
+            .or_insert_with(|| normalized_display_sort_key(Some(stable_root), path));
     }
     paths.sort_by(|left, right| {
         let left_mtime = mtimes.get(left).and_then(|v| *v);
@@ -3787,6 +3781,7 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf]) {
         right_mtime
             .cmp(&left_mtime)
             .then_with(|| left_display.cmp(right_display))
+            .then_with(|| left.cmp(right))
     });
 }
 
@@ -6812,6 +6807,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sort_paths_by_mtime_desc_uses_root_relative_tiebreak() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let tied_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let mut paths = ["z-last.rs", "a-first.rs", "m-middle.rs"]
+            .map(|name| {
+                let path = dir.path().join(name);
+                fs::write(&path, format!("// {name}\n")).expect("write fixture");
+                filetime::set_file_mtime(&path, tied_mtime).expect("pin fixture mtime");
+                path
+            })
+            .to_vec();
+
+        sort_paths_by_mtime_desc(&mut paths, dir.path());
+
+        let expected = ["a-first.rs", "m-middle.rs", "z-last.rs"]
+            .map(|name| dir.path().join(name))
+            .to_vec();
+        assert_eq!(paths, expected);
+    }
+
     /// Regression: v0.15.2 — sort_paths_by_mtime_desc panicked when files
     /// changed between cmp() calls.
     ///
@@ -6849,7 +6865,7 @@ mod tests {
         // residual non-determinism. Pre-fix: panic. Post-fix: stable.
         for _ in 0..50 {
             let mut copy = paths.clone();
-            sort_paths_by_mtime_desc(&mut copy);
+            sort_paths_by_mtime_desc(&mut copy, dir.path());
             assert_eq!(copy.len(), paths.len());
         }
     }

@@ -586,7 +586,7 @@ fn bounded_fallback_walk_files_with_limits(
         }
     }
 
-    sort_paths_by_mtime_desc(&mut files);
+    sort_paths_by_mtime_desc(&mut files, filter_root);
     FallbackWalkOutcome {
         files,
         walk_truncated,
