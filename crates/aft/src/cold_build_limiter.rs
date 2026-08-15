@@ -97,6 +97,8 @@ pub(crate) struct ColdBuildAdmissionRequest {
 }
 
 impl ColdBuildAdmissionRequest {
+    // Constructed by tests today; the inspect-path slice mints requests once it lands.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(request_id: impl Into<String>, class: ColdBuildAdmissionClass) -> Self {
         Self {
             request_id: request_id.into(),
@@ -124,6 +126,9 @@ pub(crate) struct ColdBuildAdmissionEvent {
 /// permit has been acquired. The second check closes the gap before a build can
 /// start: a newly cancelled request returns the permit without emitting an
 /// admission event.
+// Read by the cancellation tests today; the inspect-path slice routes its
+// blocking acquisition through this wrapper once it lands.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn acquire_blocking_while_cancellable_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
