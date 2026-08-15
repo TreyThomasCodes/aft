@@ -11,6 +11,7 @@ use lsp_types::{
     TextDocumentIdentifier, TextDocumentItem, VersionedTextDocumentIdentifier,
 };
 
+use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::client::{LspClient, LspEvent, ServerState};
@@ -40,6 +41,13 @@ fn server_key_for_definition(
             kind: def.kind.clone(),
             root,
         })
+}
+
+fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
+    left.kind
+        .id_str()
+        .cmp(right.kind.id_str())
+        .then(left.root.cmp(&right.root))
 }
 
 /// Outcome of attempting to ensure a server is running for a single matching
@@ -150,15 +158,20 @@ impl EnsureServerOutcomes {
 /// honest tri-state payload (`success: true` + `complete: bool` + named
 /// gap fields per `crates/aft/src/protocol.rs`).
 ///
-/// `diagnostics` only contains entries from servers that proved freshness
-/// (version-match preferred, epoch-fallback for unversioned servers).
-/// Pre-edit cached entries are NEVER included — that's the whole point of
-/// this type.
+/// `diagnostics` only contains entries from servers that proved freshness.
+/// `accepted_snapshots` preserves that same result per producer and document
+/// version so alert consumers never infer a partition from flattened output.
+/// Pre-edit cached entries and unversioned reports are NEVER included.
 #[derive(Debug, Clone, Default)]
 pub struct PostEditWaitOutcome {
-    /// Authoritative diagnostics from servers whose response we verified is for
-    /// the post-edit document version. Reports produced while rust-analyzer is
-    /// still warming remain pending until its quiescence signal arrives.
+    /// Complete, per-producer accepted snapshots. This includes a snapshot
+    /// with an empty diagnostics list when a live server authoritatively found
+    /// the edited document clean; pending, exited, warming, and unversioned
+    /// producers do not appear here.
+    pub accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
+    /// Authoritative diagnostics flattened only for the legacy response body.
+    /// Consumers that preserve producer partitions must use
+    /// `accepted_snapshots` instead.
     pub diagnostics: Vec<StoredDiagnostic>,
     /// Servers we expected to publish but didn't before the deadline.
     /// Reported to the agent via `pending_lsp_servers` so they understand
@@ -274,6 +287,12 @@ pub struct PullWorkspaceResult {
 pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
     pub diagnostics_changed: bool,
+    /// Complete snapshots accepted from document-version-verified publishes
+    /// emitted by already-live, quiescent producers. Runtime consumers must
+    /// retain each producer's snapshot until they construct an
+    /// `AcceptedObservation` that records those producer-specific results;
+    /// flattening the snapshots would erase producer ownership.
+    pub accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
     pub has_more: bool,
 }
 
@@ -890,9 +909,9 @@ impl LspManager {
     /// Returns: `Vec<(ServerKey, target_version)>`. `target_version` is the
     /// `version` field on the `VersionedTextDocumentIdentifier` we just sent
     /// (post-bump). For freshly-opened documents (`didOpen`) the version is
-    /// `0`. Servers that don't honor versioned text document sync will not
-    /// echo this back on `publishDiagnostics`; the caller is expected to
-    /// fall back to the epoch-delta path for those.
+    /// `0`. Servers that do not echo a document version cannot prove a report
+    /// describes this edit, so post-edit observation leaves them pending rather
+    /// than accepting a report merely because it arrived after the edit.
     pub fn notify_file_changed_versioned(
         &mut self,
         file_path: &Path,
@@ -915,10 +934,22 @@ impl LspManager {
         content: &str,
         config: &Config,
     ) -> Result<(), LspError> {
+        self.notify_file_changed_if_running_versioned(file_path, content, config)
+            .map(|_| ())
+    }
+
+    /// Notify only already-live servers and retain the document versions that
+    /// prove a subsequent diagnostics report belongs to this post-edit wait.
+    /// Unlike `notify_file_changed_versioned`, this path never starts a server.
+    pub fn notify_file_changed_if_running_versioned(
+        &mut self,
+        file_path: &Path,
+        content: &str,
+        config: &Config,
+    ) -> Result<Vec<(ServerKey, i32)>, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         let server_keys = self.running_server_keys_for_file(&canonical_path, config);
         self.notify_file_changed_for_server_keys(canonical_path, content, server_keys)
-            .map(|_| ())
     }
 
     fn notify_file_changed_for_server_keys(
@@ -1208,6 +1239,7 @@ impl LspManager {
     pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
         let mut events = Vec::new();
         let mut diagnostics_changed = false;
+        let mut accepted_snapshots = Vec::new();
         while events.len() < max_events {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
@@ -1215,12 +1247,16 @@ impl LspManager {
             if self.handle_event(&event).is_some() {
                 diagnostics_changed = true;
             }
+            if let Some(snapshot) = self.accepted_live_publish_snapshot(&event) {
+                accepted_snapshots.push(snapshot);
+            }
             events.push(event);
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         DrainedLspEvents {
             events,
             diagnostics_changed,
+            accepted_snapshots,
             has_more,
         }
     }
@@ -1280,7 +1316,7 @@ impl LspManager {
         {
             fresh.insert(key.clone(), diagnostics);
         }
-        Self::post_edit_outcome(vec![key], fresh, Vec::new())
+        Self::post_edit_outcome(vec![(key, target_version)], fresh, Vec::new())
     }
 
     fn authoritative_post_edit_diagnostics(
@@ -1516,14 +1552,7 @@ impl LspManager {
         wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
         self.post_edit_waiters.remove(&wait.waiter_id);
-        Self::post_edit_outcome(
-            wait.expected_versions
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect(),
-            wait.fresh,
-            wait.exited,
-        )
+        Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited)
     }
 
     /// Wait for fresh per-server diagnostics matching the just-sent document
@@ -1561,15 +1590,30 @@ impl LspManager {
     }
 
     fn post_edit_outcome(
-        expected: Vec<ServerKey>,
-        fresh: HashMap<ServerKey, Vec<StoredDiagnostic>>,
+        mut expected: Vec<(ServerKey, i32)>,
+        mut fresh: HashMap<ServerKey, Vec<StoredDiagnostic>>,
         exited: Vec<ServerKey>,
     ) -> PostEditWaitOutcome {
-        let pending = expected
-            .into_iter()
-            .filter(|key| !fresh.contains_key(key) && !exited.contains(key))
-            .collect();
-        let mut diagnostics = fresh.into_values().flatten().collect::<Vec<_>>();
+        expected.sort_by(|(left, _), (right, _)| server_key_sort(left, right));
+
+        let mut accepted_snapshots = Vec::new();
+        let mut pending_servers = Vec::new();
+        for (server_key, document_version) in expected {
+            if let Some(diagnostics) = fresh.remove(&server_key) {
+                accepted_snapshots.push(AcceptedDiagnosticSnapshot::new(
+                    server_key,
+                    document_version,
+                    diagnostics,
+                ));
+            } else if !exited.contains(&server_key) {
+                pending_servers.push(server_key);
+            }
+        }
+
+        let mut diagnostics = accepted_snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.diagnostics.iter().cloned())
+            .collect::<Vec<_>>();
         diagnostics.sort_by(|left, right| {
             left.file
                 .cmp(&right.file)
@@ -1579,8 +1623,9 @@ impl LspManager {
         });
 
         PostEditWaitOutcome {
+            accepted_snapshots,
             diagnostics,
-            pending_servers: pending,
+            pending_servers,
             exited_servers: exited,
         }
     }
@@ -2223,6 +2268,51 @@ impl LspManager {
         saw_file_diagnostics
     }
 
+    fn accepted_live_publish_snapshot(
+        &self,
+        event: &LspEvent,
+    ) -> Option<AcceptedDiagnosticSnapshot> {
+        let LspEvent::Notification {
+            server_kind,
+            root,
+            method,
+            params: Some(params),
+        } = event
+        else {
+            return None;
+        };
+        if method != "textDocument/publishDiagnostics" {
+            return None;
+        }
+
+        let publish_params =
+            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone()).ok()?;
+        let file = uri_to_path(&publish_params.uri)?;
+        let server_key = ServerKey {
+            kind: server_kind.clone(),
+            root: root.clone(),
+        };
+        let client = self.clients.get(&server_key)?;
+        if client.state() != ServerState::Ready || client.diagnostics_are_provisional() {
+            return None;
+        }
+        let document_version = self.documents.get(&server_key)?.version(&file)?;
+        let entry = self
+            .diagnostics
+            .entries_for_file(&file)
+            .into_iter()
+            .find_map(|(stored_key, entry)| (stored_key == &server_key).then_some(entry))?;
+        if entry.stale || entry.provisional || entry.version != Some(document_version) {
+            return None;
+        }
+
+        Some(AcceptedDiagnosticSnapshot::new(
+            server_key,
+            document_version,
+            entry.diagnostics.clone(),
+        ))
+    }
+
     fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
         let published_file = match event {
             LspEvent::Notification {
@@ -2286,11 +2376,10 @@ impl LspManager {
         {
             let file = uri_to_path(&publish_params.uri)?;
             let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
-            // v0.17.3: store with real ServerKey { kind, root } and capture
-            // the document `version` (when the server provided one) so the
-            // post-edit waiter can reject stale publishes deterministically
-            // via version-match (preferred) or epoch-delta (fallback). The
-            // earlier `publish_with_kind` path silently dropped both.
+            // Store with the real ServerKey and the published document version
+            // so observation sources can accept only reports that prove which
+            // in-memory document state they describe. The earlier
+            // `publish_with_kind` path silently dropped both facts.
             let key = ServerKey { kind: server, root };
             let provisional = self
                 .clients
