@@ -22,6 +22,10 @@ use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Respons
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
+/// Continuous wake producers must not keep the scheduler mutex across an
+/// unbounded receiver drain; health probes and submitters get a lock turn
+/// between batches.
+const SCHEDULER_EVENT_BATCH_CAP: usize = 64;
 pub(crate) const MAINTENANCE_QUEUE_CAP: usize = 512;
 
 /// Scheduler lane for command-handler execution.
@@ -1767,24 +1771,16 @@ fn scheduler_loop(
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
 ) {
     while let Ok(event) = event_rx.recv() {
-        let mut shutdown = false;
+        let shutdown;
         {
             let mut state = state.lock();
-            note_completion_event(&event, &completed_interactive, &completed_maintenance);
-            shutdown |= process_scheduler_event(event, &mut state);
-            while !shutdown {
-                match event_rx.try_recv() {
-                    Ok(event) => {
-                        note_completion_event(
-                            &event,
-                            &completed_interactive,
-                            &completed_maintenance,
-                        );
-                        shutdown |= process_scheduler_event(event, &mut state)
-                    }
-                    Err(_) => break,
-                }
-            }
+            shutdown = process_scheduler_event_batch(
+                event,
+                &event_rx,
+                &mut state,
+                &completed_interactive,
+                &completed_maintenance,
+            );
 
             if !shutdown {
                 dispatch_runnable(&mut state, &heavy, &run_tx, &nonrunnable_dispatches);
@@ -1796,6 +1792,26 @@ fn scheduler_loop(
             break;
         }
     }
+}
+
+fn process_scheduler_event_batch(
+    first: SchedulerEvent,
+    event_rx: &Receiver<SchedulerEvent>,
+    state: &mut SchedulerState,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) -> bool {
+    let mut event = Some(first);
+    for _ in 0..SCHEDULER_EVENT_BATCH_CAP {
+        let Some(current) = event.take().or_else(|| event_rx.try_recv().ok()) else {
+            break;
+        };
+        note_completion_event(&current, completed_interactive, completed_maintenance);
+        if process_scheduler_event(current, state) {
+            return true;
+        }
+    }
+    false
 }
 
 fn note_completion_event(

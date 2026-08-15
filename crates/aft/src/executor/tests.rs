@@ -90,6 +90,28 @@ fn recv_async(rx: tokio::sync::oneshot::Receiver<Response>, awaited: &str) -> Re
 }
 
 #[test]
+fn scheduler_event_batch_leaves_excess_wakes_for_the_next_lock_turn() {
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    for _ in 0..=SCHEDULER_EVENT_BATCH_CAP {
+        event_tx.send(SchedulerEvent::Wake).expect("queue wake");
+    }
+    let config = ExecutorConfig::default().effective();
+    let mut state = SchedulerState::new(config);
+    let completed_interactive = AtomicU64::new(0);
+    let completed_maintenance = AtomicU64::new(0);
+    let first = event_rx.recv().expect("first wake");
+
+    assert!(!process_scheduler_event_batch(
+        first,
+        &event_rx,
+        &mut state,
+        &completed_interactive,
+        &completed_maintenance,
+    ));
+    assert_eq!(event_rx.len(), 1);
+}
+
+#[test]
 fn actor_contexts_returns_registered_contexts() {
     let executor = test_executor(2, 1, 1, 2);
     let (_dir_a, root_a) = test_root("contexts-a");

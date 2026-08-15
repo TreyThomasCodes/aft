@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::hashline::apply::RegisterStore;
 use crate::hashline::snapshot::SnapshotStore;
@@ -161,20 +161,62 @@ impl HashlineBinding {
     }
 }
 
+/// Keep each condition variable beside the only mutex it may ever wait on.
+/// A registry-wide condition variable cannot drain multiple session mutexes:
+/// `std::sync::Condvar` permanently binds to the first mutex it observes.
+#[derive(Debug)]
+struct BindingSlot {
+    binding: Mutex<HashlineBinding>,
+    drain: Condvar,
+}
+
+impl BindingSlot {
+    fn new(binding: HashlineBinding) -> Self {
+        Self {
+            binding: Mutex::new(binding),
+            drain: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashlineBinding> {
+        self.binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn drain_in_flight(&self) {
+        let mut binding = self.lock();
+        while binding.in_flight > 0 {
+            binding = self
+                .drain
+                .wait(binding)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release_guard(&self) {
+        {
+            let mut binding = self.lock();
+            binding.in_flight = binding.in_flight.saturating_sub(1);
+        }
+        self.drain.notify_all();
+    }
+}
+
 /// Shared handle to an installed binding. Capture one per request.
 #[derive(Clone, Debug)]
 pub struct BindingHandle {
-    inner: Arc<Mutex<HashlineBinding>>,
+    inner: Arc<BindingSlot>,
 }
 
 impl BindingHandle {
     pub fn with_binding<R>(&self, f: impl FnOnce(&HashlineBinding) -> R) -> R {
-        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.inner.lock();
         f(&guard)
     }
 
     pub fn with_binding_mut<R>(&self, f: impl FnOnce(&mut HashlineBinding) -> R) -> R {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.inner.lock();
         f(&mut guard)
     }
 
@@ -191,7 +233,6 @@ impl BindingHandle {
 /// the rebind drain refcount.
 pub struct BindingGuard {
     handle: BindingHandle,
-    registry: Weak<BindingRegistryInner>,
 }
 
 impl BindingGuard {
@@ -214,25 +255,17 @@ impl BindingGuard {
 
 impl Drop for BindingGuard {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade() {
-            registry.release_guard(&self.handle);
-        } else {
-            // Registry gone: still decrement local refcount so tests that drop
-            // the registry after guards do not leave a poisoned counter.
-            let mut binding = self.handle.inner.lock().unwrap_or_else(|p| p.into_inner());
-            binding.in_flight = binding.in_flight.saturating_sub(1);
-        }
+        self.handle.inner.release_guard();
     }
 }
 
 struct BindingRegistryInner {
     state: Mutex<RegistryState>,
-    drain: Condvar,
 }
 
 #[derive(Default)]
 struct RegistryState {
-    bindings: HashMap<SessionKey, Arc<Mutex<HashlineBinding>>>,
+    bindings: HashMap<SessionKey, Arc<BindingSlot>>,
 }
 
 /// Process-wide (or test-local) registry of session hashline bindings.
@@ -251,7 +284,6 @@ impl BindingRegistry {
         Self {
             inner: Arc::new(BindingRegistryInner {
                 state: Mutex::new(RegistryState::default()),
-                drain: Condvar::new(),
             }),
         }
     }
@@ -295,19 +327,14 @@ impl BindingRegistry {
         // takes the binding lock and signals the drain condition variable.
         let mut state = self.lock();
         let existing = state.bindings.get(&key).cloned();
-        let previous_effective = existing.as_ref().map(|binding| {
-            binding
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .effective()
-        });
+        let previous_effective = existing.as_ref().map(|binding| binding.lock().effective());
         after_existing_read();
 
         let (stores_cleared, stores_preserved) = if let Some(existing) = existing {
             if previous_effective != Some(effective) {
                 self.drain_in_flight(&existing);
                 {
-                    let mut binding = existing.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut binding = existing.lock();
                     binding.configured_enabled = request.configured_enabled;
                     binding.edit_slot_survives = request.edit_slot_survives;
                     binding.effective = effective;
@@ -317,7 +344,7 @@ impl BindingRegistry {
                 (true, false)
             } else {
                 {
-                    let mut binding = existing.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut binding = existing.lock();
                     binding.configured_enabled = request.configured_enabled;
                     binding.edit_slot_survives = request.edit_slot_survives;
                     // effective unchanged; stores preserved.
@@ -326,7 +353,7 @@ impl BindingRegistry {
                 (false, true)
             }
         } else {
-            let binding = Arc::new(Mutex::new(HashlineBinding::new(key.clone(), request)));
+            let binding = Arc::new(BindingSlot::new(HashlineBinding::new(key.clone(), request)));
             state.bindings.insert(key, binding);
             (false, false)
         };
@@ -353,15 +380,12 @@ impl BindingRegistry {
             let state = self.lock();
             let arc = state.bindings.get(&key)?.clone();
             {
-                let mut binding = arc.lock().unwrap_or_else(|p| p.into_inner());
+                let mut binding = arc.lock();
                 binding.in_flight = binding.in_flight.saturating_add(1);
             }
             BindingHandle { inner: arc }
         };
-        Some(BindingGuard {
-            handle,
-            registry: Arc::downgrade(&self.inner),
-        })
+        Some(BindingGuard { handle })
     }
 
     /// Look up without incrementing the in-flight refcount (diagnostics only).
@@ -401,25 +425,8 @@ impl BindingRegistry {
         self.len() == 0
     }
 
-    fn drain_in_flight(&self, binding: &Arc<Mutex<HashlineBinding>>) {
-        let mut guard = binding.lock().unwrap_or_else(|p| p.into_inner());
-        while guard.in_flight > 0 {
-            guard = self
-                .inner
-                .drain
-                .wait(guard)
-                .unwrap_or_else(|p| p.into_inner());
-        }
-    }
-}
-
-impl BindingRegistryInner {
-    fn release_guard(&self, handle: &BindingHandle) {
-        {
-            let mut binding = handle.inner.lock().unwrap_or_else(|p| p.into_inner());
-            binding.in_flight = binding.in_flight.saturating_sub(1);
-        }
-        self.drain.notify_all();
+    fn drain_in_flight(&self, binding: &Arc<BindingSlot>) {
+        binding.drain_in_flight();
     }
 }
 
@@ -435,6 +442,40 @@ mod tests {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn draining_two_sessions_uses_each_sessions_mutex_partner() {
+        let registry = BindingRegistry::new();
+        let root = Path::new("/tmp/hashline-condvar-partners");
+        registry.register(
+            root,
+            "first",
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        registry.register(
+            root,
+            "second",
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        let first = registry.peek(root, "first").expect("first binding");
+        let second = registry.peek(root, "second").expect("second binding");
+
+        for handle in [&first, &second] {
+            let guard = handle.inner.lock();
+            let (_guard, timeout) = handle
+                .inner
+                .drain
+                .wait_timeout(guard, Duration::from_millis(1))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(timeout.timed_out());
+        }
+    }
 
     #[test]
     fn concurrent_same_session_registration_serializes_read_compare_write() {
