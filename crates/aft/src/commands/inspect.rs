@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
+use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
 use crate::inspect::{
@@ -65,6 +66,11 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         tier2_receivers.insert(category, rx);
     }
 
+    // A blocking inspection is an explicit diagnostics observation source. Keep
+    // accepted producer snapshots intact until the inspect response is built;
+    // flattened category payloads cannot recover producer ownership.
+    let accepted_snapshots = ctx.lsp().drain_events().accepted_snapshots;
+
     let mut force_paths_completed = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut tier2_refresh_needed = false;
@@ -118,23 +124,18 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     refresh_status_bar_counts(ctx, &outcomes);
+    record_blocking_inspect_observations(ctx, req, &snapshot, accepted_snapshots);
 
     let payload = build_inspect_payload(&snapshot, &outcomes, &sections, top_k, ctx);
     Response::success(&req.id, payload)
 }
 
-/// Refresh the agent status-bar's last-known Tier-2 + todos counts from the
-/// outcomes just computed. Tier-2 counts come from whatever the read-only cache
-/// returned (Fresh or Stale-cached); a Stale/Pending outcome marks them stale
-/// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
-/// they're read live from the LSP store at attach time.
+/// Feed fleet-status values from inspect outcomes. Only a verified payload
+/// supplies a category count; pending or failed categories remain absent in the
+/// truthful values state instead of being replaced with zero.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
-    // Per-category count: `Some` only when the category actually produced data
-    // (Fresh, or Stale with a cached aggregate — `JobOutcome::payload()` returns
-    // `None` for Pending/Failed/Stale-without-cache). A `None` category is left
-    // untouched downstream rather than overwritten with a fabricated `0`, and
-    // the bar stays suppressed until all three categories hold a real value, so
-    // a partially-completed cold scan never lies about project health (#1).
+    // `JobOutcome::payload()` exposes only Fresh data or a stat-verified stale
+    // cache, so an unavailable category cannot overwrite a proven value.
     let count_of = |category: InspectCategory| -> Option<usize> {
         outcomes
             .get(&category)
@@ -167,6 +168,37 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
         todos,
         any_tier2_stale,
     );
+}
+
+/// A blocking `aft_inspect` may update alert state only from accepted snapshots
+/// whose document versions were verified. Other inspect operations compute
+/// payloads or fleet values and must not update alert state.
+fn record_blocking_inspect_observations(
+    ctx: &AppContext,
+    req: &RawRequest,
+    snapshot: &InspectSnapshot,
+    accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
+) {
+    if accepted_snapshots.is_empty() {
+        return;
+    }
+
+    let batch = match AcceptedObservationBatch::from_diagnostic_snapshots(
+        req.session(),
+        &snapshot.project_root,
+        accepted_snapshots,
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            crate::slog_warn!(
+                "[inspect:diagnostics] omitted duplicate producer observation batch: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = ctx.accept_alert_observation_batch(&batch) {
+        crate::slog_warn!("[inspect:diagnostics] failed to accept observation batch: {error}");
+    }
 }
 
 pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -1627,9 +1659,14 @@ mod status_bar_refresh_tests {
             ]),
         );
 
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, None);
+        assert_eq!(values.unused_exports, None);
+        assert_eq!(values.duplicates, None);
+        assert_eq!(values.todos, None);
         assert!(
             ctx.status_bar_counts().is_none(),
-            "Pending Tier-2 must leave the bar unpopulated (no fabricated zeros)"
+            "Pending Tier-2 must leave the legacy projection unpopulated"
         );
     }
 
@@ -1677,11 +1714,11 @@ mod status_bar_refresh_tests {
                 ),
             ]),
         );
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 7);
-        assert_eq!(counts.unused_exports, 3);
-        assert_eq!(counts.duplicates, 1);
-        assert!(!counts.tier2_stale);
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, Some(7));
+        assert_eq!(values.unused_exports, Some(3));
+        assert_eq!(values.duplicates, Some(1));
+        assert!(!values.tier2_stale);
     }
 
     // Stale-WITH-cache populates (last-known counts) and marks the bar stale.
@@ -1702,11 +1739,11 @@ mod status_bar_refresh_tests {
                 (InspectCategory::Duplicates, stale_cache(2)),
             ]),
         );
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 12);
-        assert_eq!(counts.unused_exports, 4);
-        assert_eq!(counts.duplicates, 2);
-        assert!(counts.tier2_stale);
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, Some(12));
+        assert_eq!(values.unused_exports, Some(4));
+        assert_eq!(values.duplicates, Some(2));
+        assert!(values.tier2_stale);
     }
 
     // A single category (others Pending) must NOT surface the bar — the core
@@ -1723,9 +1760,56 @@ mod status_bar_refresh_tests {
                 },
             )]),
         );
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, Some(9));
+        assert_eq!(values.unused_exports, None);
+        assert_eq!(values.duplicates, None);
         assert!(
             ctx.status_bar_counts().is_none(),
-            "one real category must not surface a bar with fabricated U0 C0"
+            "one real category must not surface a legacy projection with fabricated zeroes"
+        );
+    }
+
+    #[test]
+    fn accepted_blocking_inspect_snapshot_establishes_alert_baseline() {
+        use crate::alert_state::{AlertPartitionKey, ProducerKey};
+        use crate::lsp::registry::ServerKind;
+        use crate::lsp::roots::ServerKey;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().to_path_buf();
+        let ctx = ctx();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft"),
+            ctx.config(),
+            ctx.symbol_cache(),
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "inspect-observation",
+            "command": "inspect",
+            "session_id": "session",
+        }))
+        .expect("request parses");
+        let server = ServerKey {
+            kind: ServerKind::Rust,
+            root: root.clone(),
+        };
+        let partition =
+            AlertPartitionKey::new("session", &root, ProducerKey::from_server_key(&server));
+
+        record_blocking_inspect_observations(
+            &ctx,
+            &req,
+            &snapshot,
+            vec![AcceptedDiagnosticSnapshot::new(server, 1, Vec::new())],
+        );
+
+        assert!(
+            ctx.alert_state_for_test()
+                .partition(&partition)
+                .is_some_and(|partition| partition.baseline_established),
+            "the accepted producer snapshot must establish its alert baseline"
         );
     }
 }

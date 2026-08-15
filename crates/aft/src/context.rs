@@ -10,6 +10,9 @@ use notify::RecommendedWatcher;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::alert_state::{
+    AcceptedObservationBatch, AcceptedObservationResult, AlertDeltaState, ObservationError,
+};
 use crate::artifact_owner::{
     ArtifactOwnerLease, ArtifactOwnerLeaseRegistration, ArtifactOwnerMode, ArtifactOwnerStatus,
 };
@@ -231,13 +234,9 @@ impl SubcLifecycleAdmission {
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
 
-/// Agent status-bar counts — the IDE-style "status bar" surfaced to the agent
-/// on every tool result (emit-on-change). `errors`/`warnings` are read LIVE
-/// from the continuously-drained LSP diagnostics store; the Tier-2 counts
-/// (`dead_code`/`unused_exports`/`duplicates`) and `todos` are last-known,
-/// refreshed when `aft_inspect` runs or a background Tier-2 scan completes.
-/// `tier2_stale` marks the Tier-2 counts as not-yet-reconciled with the latest
-/// edits (rendered with a `~` marker so the agent never reads them as live).
+/// Numeric projection for consumers that still require the legacy status-bar
+/// shape. It is derived from [`StatusBarCountValues`], which preserves whether
+/// each category is present instead of converting missing values to zero.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusBarCounts {
     pub errors: usize,
@@ -247,6 +246,39 @@ pub struct StatusBarCounts {
     pub duplicates: usize,
     pub todos: usize,
     pub tier2_stale: bool,
+}
+
+/// Proven status values. A missing category has not produced a trustworthy
+/// value and remains absent instead of being converted to a clean zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusBarCountValues {
+    pub errors: Option<usize>,
+    pub warnings: Option<usize>,
+    pub dead_code: Option<usize>,
+    pub unused_exports: Option<usize>,
+    pub duplicates: Option<usize>,
+    pub todos: Option<usize>,
+    pub tier2_stale: bool,
+}
+
+impl StatusBarCountValues {
+    fn legacy_projection(&self) -> Option<StatusBarCounts> {
+        let [Some(dead_code), Some(unused_exports), Some(duplicates)] =
+            [self.dead_code, self.unused_exports, self.duplicates]
+        else {
+            return None;
+        };
+
+        Some(StatusBarCounts {
+            errors: self.errors.unwrap_or_default(),
+            warnings: self.warnings.unwrap_or_default(),
+            dead_code,
+            unused_exports,
+            duplicates,
+            todos: self.todos.unwrap_or_default(),
+            tier2_stale: self.tier2_stale,
+        })
+    }
 }
 
 /// Last-known Tier-2 + todos counts, refreshed off the hot path. `errors` and
@@ -280,7 +312,34 @@ struct StatusBarCache {
     diagnostics_generation: u64,
     tier2_generation: u64,
     tsconfig_generation: u64,
-    counts: Option<StatusBarCounts>,
+    counts: Option<StatusBarCountValues>,
+}
+
+/// Deduplicates emissions of the legacy numeric status-bar projection. It only
+/// sees the projection derived from truthful values, so missing categories are
+/// not converted to zero in the underlying state.
+#[derive(Debug, Default)]
+struct LegacyStatusBarEmission(RwLock<Option<StatusBarCounts>>);
+
+impl LegacyStatusBarEmission {
+    fn should_emit(&self, counts: &StatusBarCounts) -> bool {
+        let mut last = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.as_ref() == Some(counts) {
+            return false;
+        }
+        *last = Some(counts.clone());
+        true
+    }
+
+    fn clear(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1610,11 +1669,15 @@ pub struct AppContext {
     /// Present only for daemon-bound actors. Standalone NDJSON contexts never
     /// acquire a status-holder transport and therefore keep the solo bar path.
     fleet_status_client: RwLock<Option<crate::fleet_status::FleetStatusClient>>,
-    /// Last status-bar payload attached to a tool response for this project root.
-    /// Deduping here (not in a process-global static) lets daemon roots emit the
-    /// same counts independently.
-    status_bar_last_emitted: RwLock<Option<StatusBarCounts>>,
+    /// Temporary state used to avoid repeatedly emitting the legacy status-bar
+    /// response fields. It is no longer needed once those fields are removed.
+    status_bar_last_emitted: LegacyStatusBarEmission,
+    /// The omission-preserving source of truth. Legacy projections never enter
+    /// this cache, so a cache hit cannot recreate an absent category as zero.
     status_bar_cached: RwLock<StatusBarCache>,
+    /// Authoritative diagnostics observations are retained per session and
+    /// producer. Only explicit observation sources may mutate this state.
+    alert_state: parking_lot::Mutex<AlertDeltaState>,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
     #[cfg(unix)]
@@ -1954,8 +2017,9 @@ impl AppContext {
             progress_sender: Arc::clone(&progress_sender),
             status_emitter,
             fleet_status_client: RwLock::new(None),
-            status_bar_last_emitted: RwLock::new(None),
+            status_bar_last_emitted: LegacyStatusBarEmission::default(),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
+            alert_state: parking_lot::Mutex::new(AlertDeltaState::default()),
             compression_aggregates,
             bash_background,
             #[cfg(unix)]
@@ -1979,10 +2043,10 @@ impl AppContext {
         context
     }
 
-    /// Current agent status-bar counts. Generation identities are checked before
-    /// project scoping or tsconfig membership work, so unchanged responses reuse
-    /// the last honest aggregate from the continuously drained stores.
-    pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
+    /// Current omission-preserving status values. Generation identities are
+    /// checked before project scoping or tsconfig-membership work, so a cache hit
+    /// faithfully reuses each category's presence or absence.
+    pub fn status_bar_count_values(&self) -> StatusBarCountValues {
         let tier2 = self
             .status_bar_tier2
             .read()
@@ -2002,7 +2066,10 @@ impl AppContext {
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return cached.counts.clone();
+                return cached
+                    .counts
+                    .clone()
+                    .expect("a valid status-count cache carries truthful values");
             }
         }
 
@@ -2013,43 +2080,37 @@ impl AppContext {
             .counts
             .as_ref()
             .map(|counts| (counts.errors, counts.warnings));
-        let counts = match (tier2.dead_code, tier2.unused_exports, tier2.duplicates) {
-            (Some(dead_code), Some(unused_exports), Some(duplicates)) => {
-                let ((current_errors, current_warnings), provisional) =
-                    match self.canonical_cache_root_opt() {
-                        Some(root) => {
-                            // The cache root is identity-domain (bare-canonical,
-                            // verbatim on Windows) while diagnostics store keys are
-                            // normalized; normalize a comparison-local copy or the
-                            // starts_with filter drops every diagnostic.
-                            let root = crate::inspect::job::normalize_path(&root);
-                            let mut membership = self.tsconfig_membership.lock();
-                            lsp.filtered_error_warning_counts_with_provisional(|file| {
-                                file.starts_with(&root) && !membership.should_skip_diagnostics(file)
-                            })
-                        }
-                        None => lsp.warm_error_warning_counts_with_provisional(),
-                    };
-                // A warming report can replace an older authoritative entry. Do
-                // not turn that transient gap into E/W=0; keep the last values until
-                // the server first becomes quiescent, ending the warming phase and
-                // making its latest report authoritative.
-                let (errors, warnings) = if provisional {
-                    previous_authoritative.unwrap_or((current_errors, current_warnings))
-                } else {
-                    (current_errors, current_warnings)
-                };
-                Some(StatusBarCounts {
-                    errors,
-                    warnings,
-                    dead_code,
-                    unused_exports,
-                    duplicates,
-                    todos: tier2.todos.unwrap_or(0),
-                    tier2_stale: tier2.stale,
-                })
-            }
-            _ => None,
+        let ((current_errors, current_warnings), provisional) =
+            match self.canonical_cache_root_opt() {
+                Some(root) => {
+                    // The cache root is identity-domain (bare-canonical, verbatim on
+                    // Windows) while diagnostics store keys are normalized; normalize a
+                    // comparison-local copy or the starts_with filter drops every diagnostic.
+                    let root = crate::inspect::job::normalize_path(&root);
+                    let mut membership = self.tsconfig_membership.lock();
+                    lsp.filtered_error_warning_counts_with_provisional(|file| {
+                        file.starts_with(&root) && !membership.should_skip_diagnostics(file)
+                    })
+                }
+                None => lsp.warm_error_warning_counts_with_provisional(),
+            };
+        let (errors, warnings) = if provisional {
+            // A warming report cannot prove current E/W values. Preserve a prior
+            // authoritative pair when available; otherwise omit both categories.
+            previous_authoritative.unwrap_or((None, None))
+        } else if lsp.has_any_diagnostic_reports() {
+            (Some(current_errors), Some(current_warnings))
+        } else {
+            (None, None)
+        };
+        let counts = StatusBarCountValues {
+            errors,
+            warnings,
+            dead_code: tier2.dead_code,
+            unused_exports: tier2.unused_exports,
+            duplicates: tier2.duplicates,
+            todos: tier2.todos,
+            tier2_stale: tier2.stale,
         };
 
         *self
@@ -2060,9 +2121,15 @@ impl AppContext {
             diagnostics_generation,
             tier2_generation: tier2.generation,
             tsconfig_generation,
-            counts: counts.clone(),
+            counts: Some(counts.clone()),
         };
         counts
+    }
+
+    /// Provides legacy numeric status-bar fields to callers that still require
+    /// them. The truthful accessor above remains the source of category presence.
+    pub fn status_bar_counts(&self) -> Option<StatusBarCounts> {
+        self.status_bar_count_values().legacy_projection()
     }
 
     pub(crate) fn try_health_summary(&self) -> RootHealthSummary {
@@ -2184,16 +2251,25 @@ impl AppContext {
         self.try_health_summary().into_snapshot(project_root)
     }
 
+    /// Deduplicates emissions of the legacy status-bar response section. This
+    /// compatibility method is no longer needed when responses omit that section.
     pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
-        let mut last = self
-            .status_bar_last_emitted
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.as_ref() == Some(counts) {
-            return false;
-        }
-        *last = Some(counts.clone());
-        true
+        self.status_bar_last_emitted.should_emit(counts)
+    }
+
+    /// Record an atomic batch of complete per-producer diagnostics observations.
+    /// Callers must construct the batch from a source that proved the document
+    /// version; passive count reads have no access to this mutation boundary.
+    pub fn accept_alert_observation_batch(
+        &self,
+        batch: &AcceptedObservationBatch,
+    ) -> Result<Vec<AcceptedObservationResult>, ObservationError> {
+        self.alert_state.lock().accept_batch(batch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alert_state_for_test(&self) -> AlertDeltaState {
+        self.alert_state.lock().clone()
     }
 
     /// Invalidate the status-bar tsconfig-membership cache. Called from the
@@ -2218,8 +2294,11 @@ impl AppContext {
             .status_bar_tier2
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // No-op before the first full populate (nothing real to mark stale).
-        if tier2.dead_code.is_some() && tier2.unused_exports.is_some() && tier2.duplicates.is_some()
+        // No-op before the first proven count (nothing real to mark stale).
+        if tier2.dead_code.is_some()
+            || tier2.unused_exports.is_some()
+            || tier2.duplicates.is_some()
+            || tier2.todos.is_some()
         {
             let changed = !tier2.stale;
             tier2.stale = true;
@@ -3329,10 +3408,7 @@ impl AppContext {
                 generation,
                 ..StatusBarTier2::default()
             };
-            *self
-                .status_bar_last_emitted
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.status_bar_last_emitted.clear();
         }
     }
 
@@ -8424,21 +8500,34 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn status_bar_counts_none_until_tier2_populated() {
+    fn truthful_values_omit_unproven_categories_while_legacy_projection_stays_hidden() {
         let ctx = ctx();
-        // No scan has run yet — never surface a bar claiming "0 dead code".
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.errors, None);
+        assert_eq!(values.warnings, None);
+        assert_eq!(values.dead_code, None);
+        assert_eq!(values.unused_exports, None);
+        assert_eq!(values.duplicates, None);
+        assert_eq!(values.todos, None);
         assert!(ctx.status_bar_counts().is_none());
 
         ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 5);
-        assert_eq!(counts.unused_exports, 3);
-        assert_eq!(counts.duplicates, 7);
-        assert_eq!(counts.todos, 2);
-        assert!(!counts.tier2_stale);
-        // Errors/warnings are read live from an empty LSP store → 0.
-        assert_eq!(counts.errors, 0);
-        assert_eq!(counts.warnings, 0);
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, Some(5));
+        assert_eq!(values.unused_exports, Some(3));
+        assert_eq!(values.duplicates, Some(7));
+        assert_eq!(values.todos, Some(2));
+        assert_eq!(values.errors, None, "no analyzer report is not a clean E0");
+        assert_eq!(
+            values.warnings, None,
+            "no analyzer report is not a clean W0"
+        );
+        assert!(!values.tier2_stale);
+
+        let legacy = ctx
+            .status_bar_counts()
+            .expect("legacy projection is populated");
+        assert_eq!((legacy.errors, legacy.warnings), (0, 0));
     }
 
     #[test]
@@ -8455,6 +8544,10 @@ mod status_bar_tests {
 
         ctx.set_canonical_cache_root(second_root);
 
+        let values = ctx.status_bar_count_values();
+        assert_eq!(values.dead_code, None);
+        assert_eq!(values.unused_exports, None);
+        assert_eq!(values.duplicates, None);
         assert!(
             ctx.status_bar_counts().is_none(),
             "counts from the previous root must not appear in a newly bound root"
@@ -8462,28 +8555,39 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn partial_tier2_does_not_fabricate_zeros() {
+    fn partial_tier2_keeps_proven_categories_and_cache_hit_preserves_omissions() {
         let ctx = ctx();
-        // Only dead_code has completed (the slow first serial category); the
-        // other two are still in flight. The bar must stay suppressed rather
-        // than render `D5 U0 C0` with fabricated zeros (#1).
         ctx.update_status_bar_tier2(Some(5), None, None, None, true);
-        assert!(
-            ctx.status_bar_counts().is_none(),
-            "bar must not surface until all three Tier-2 categories are real"
-        );
 
-        // Second category completes — still incomplete, still suppressed.
-        ctx.update_status_bar_tier2(None, Some(3), None, None, true);
+        let first = ctx.status_bar_count_values();
+        assert_eq!(first.dead_code, Some(5));
+        assert_eq!(first.unused_exports, None);
+        assert_eq!(first.duplicates, None);
+        assert_eq!(first.todos, None);
+        assert!(first.tier2_stale);
         assert!(ctx.status_bar_counts().is_none());
 
-        // Final category completes → bar surfaces with all real counts, and
-        // none of them were ever fabricated.
+        let cached = ctx.status_bar_count_values();
+        assert_eq!(cached, first, "a cache hit must preserve every omission");
+        let cache = ctx
+            .status_bar_cached
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(cache.valid);
+        assert_eq!(cache.counts.as_ref(), Some(&first));
+        drop(cache);
+
+        ctx.update_status_bar_tier2(None, Some(3), None, None, true);
+        let partial = ctx.status_bar_count_values();
+        assert_eq!(partial.dead_code, Some(5));
+        assert_eq!(partial.unused_exports, Some(3));
+        assert_eq!(partial.duplicates, None);
+
         ctx.update_status_bar_tier2(None, None, Some(7), None, false);
-        let counts = ctx.status_bar_counts().expect("all three real now");
-        assert_eq!(counts.dead_code, 5);
-        assert_eq!(counts.unused_exports, 3);
-        assert_eq!(counts.duplicates, 7);
+        let complete = ctx.status_bar_count_values();
+        assert_eq!(complete.dead_code, Some(5));
+        assert_eq!(complete.unused_exports, Some(3));
+        assert_eq!(complete.duplicates, Some(7));
     }
 
     #[test]
@@ -8492,9 +8596,9 @@ mod status_bar_tests {
         ctx.update_status_bar_tier2(Some(1), Some(1), Some(1), Some(9), false);
         // A background-scan refresh passes todos=None → todo count preserved.
         ctx.update_status_bar_tier2(Some(2), Some(2), Some(2), None, false);
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.todos, 9);
-        assert_eq!(counts.dead_code, 2);
+        let counts = ctx.status_bar_count_values();
+        assert_eq!(counts.todos, Some(9));
+        assert_eq!(counts.dead_code, Some(2));
     }
 
     #[test]
@@ -8504,26 +8608,25 @@ mod status_bar_tests {
         // A refresh that only recomputed dead_code preserves the other two
         // real counts rather than overwriting them with a fabricated 0.
         ctx.update_status_bar_tier2(Some(11), None, None, None, false);
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 11);
-        assert_eq!(counts.unused_exports, 20);
-        assert_eq!(counts.duplicates, 30);
+        let counts = ctx.status_bar_count_values();
+        assert_eq!(counts.dead_code, Some(11));
+        assert_eq!(counts.unused_exports, Some(20));
+        assert_eq!(counts.duplicates, Some(30));
     }
 
     #[test]
-    fn mark_stale_sets_flag_only_after_populate() {
+    fn mark_stale_sets_flag_after_any_proven_category() {
         let ctx = ctx();
-        // No-op before first populate.
         ctx.mark_status_bar_tier2_stale();
-        assert!(ctx.status_bar_counts().is_none());
+        assert!(!ctx.status_bar_count_values().tier2_stale);
 
-        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), Some(0), false);
+        ctx.update_status_bar_tier2(Some(4), None, None, None, false);
         ctx.mark_status_bar_tier2_stale();
-        assert!(ctx.status_bar_counts().expect("populated").tier2_stale);
+        assert!(ctx.status_bar_count_values().tier2_stale);
 
-        // A completed scan clears stale.
-        ctx.update_status_bar_tier2(Some(4), Some(0), Some(0), None, false);
-        assert!(!ctx.status_bar_counts().expect("populated").tier2_stale);
+        // A completed scan clears stale without changing omitted categories.
+        ctx.update_status_bar_tier2(Some(4), None, None, None, false);
+        assert!(!ctx.status_bar_count_values().tier2_stale);
     }
 
     // End-to-end wiring: a diagnostic for a file inflates the status-bar `E`
