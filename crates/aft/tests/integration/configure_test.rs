@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, warm_executable, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -245,10 +245,13 @@ fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
     let ruff = bin_dir.join("ruff");
     std::fs::write(
         &ruff,
-        "#!/bin/sh\nprintf executed > \"$RUFF_CANARY\"\nprintf 'ruff 0.1.1\\n'\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf executed > \"$RUFF_CANARY\"; printf 'ruff 0.1.1\\n'; fi\n",
     )
     .unwrap();
     std::fs::set_permissions(&ruff, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The `--version` branch writes the canary, so use the inert probe mode
+    // and leave the test's later assertion about AFT's version check intact.
+    warm_executable(&ruff, &["--warmup"]);
 
     let path = empty_path();
     let mut aft = AftProcess::spawn_with_env(&[

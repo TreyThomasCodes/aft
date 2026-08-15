@@ -38,6 +38,7 @@ mod edit_append_test;
 mod edit_match_test;
 mod edit_test;
 mod error_path_test;
+mod executable_warm_test;
 mod exported_boost_test;
 mod extract_function_test;
 mod extract_tokens_test;

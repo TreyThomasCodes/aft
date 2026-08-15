@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-use super::helpers::{fixture_path, user_config, AftProcess};
+use super::helpers::{fixture_path, user_config, warm_executable, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")
@@ -38,6 +38,7 @@ fn install_executable(dir: &std::path::Path, name: &str, script: &str) -> PathBu
     let mut perms = fs::metadata(&tool).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&tool, perms).unwrap();
+    warm_executable(&tool, &["--version"]);
     tool
 }
 

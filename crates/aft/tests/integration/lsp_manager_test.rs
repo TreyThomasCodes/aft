@@ -14,6 +14,8 @@ use lsp_types::FileChangeType;
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+use super::helpers::warm_executable;
+
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")
         .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
@@ -165,6 +167,7 @@ fn executable_protocol_server_script() -> PathBuf {
             permissions.set_mode(0o755);
             fs::set_permissions(&script, permissions).expect("chmod protocol server");
         }
+        warm_executable(&script, &["--version"]);
         script
     }
 }

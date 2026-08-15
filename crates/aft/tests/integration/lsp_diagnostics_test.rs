@@ -24,7 +24,7 @@ use aft::watcher_filter::WatcherDispatchEvent;
 use lsp_types::FileChangeType;
 use tempfile::tempdir;
 
-use super::helpers::AftProcess;
+use super::helpers::{warm_executable, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")
@@ -329,6 +329,8 @@ sys.stderr.flush()
         permissions.set_mode(0o755);
         fs::set_permissions(&script, permissions).expect("chmod crashing lsp script");
     }
+    #[cfg(not(windows))]
+    warm_executable(&script, &["--version"]);
     #[cfg(not(windows))]
     script
 }

@@ -8,7 +8,7 @@ use std::process::Command;
 
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, warm_executable, AftProcess};
 
 // ============================================================================
 // Helpers
@@ -48,6 +48,7 @@ fn install_tsc_stub(dir: &std::path::Path, file_name: &str) {
         let mut perms = fs::metadata(&stub).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&stub, perms).unwrap();
+        warm_executable(&stub, &["--version"]);
     }
 
     #[cfg(windows)]
@@ -355,6 +356,9 @@ fn format_integration_ruff_old_version_is_gated_at_format_time() {
     )
     .unwrap();
     fs::set_permissions(&ruff, fs::Permissions::from_mode(0o755)).unwrap();
+    // The `--version` branch writes the canary checked below, so warm through
+    // the fixture's inert branch before AFT performs the real version probe.
+    warm_executable(&ruff, &["--warmup"]);
 
     let target = dir.join("format_ruff_old.py");
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
@@ -400,6 +404,7 @@ fn format_integration_oxfmt_config_runs_oxfmt() {
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&stub, &["--version"]);
 
     let target = dir.join("format_oxfmt.ts");
     let _ = fs::remove_file(&target);
@@ -440,6 +445,7 @@ fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&stub, &["--version"]);
 
     let target = dir.join("format_oxfmt_ignored.ts");
     let _ = fs::remove_file(&target);
@@ -843,6 +849,7 @@ fn validate_full_nonzero_without_diagnostics_reports_error() {
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&stub, &["--version"]);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);

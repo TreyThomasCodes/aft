@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::json;
 use tempfile::tempdir;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, warm_executable, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -120,7 +120,10 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
         .unwrap()
         .to_string_lossy()
         .to_string();
-    std::fs::copy(&fake_server, fake_bin_dir.join(&fake_binary_name)).unwrap();
+    let installed_fake_server = fake_bin_dir.join(&fake_binary_name);
+    std::fs::copy(&fake_server, &installed_fake_server).unwrap();
+    // The fake LSP has no CLI probe; closed stdin makes its protocol loop exit.
+    warm_executable(&installed_fake_server, &[]);
 
     let mut aft = AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1"))]);
     let configure = aft.send(

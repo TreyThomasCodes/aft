@@ -10,7 +10,7 @@ use aft::harness::Harness;
 use rusqlite::Connection;
 
 #[cfg(unix)]
-use super::helpers::AftProcess;
+use super::helpers::{warm_executable, AftProcess};
 
 const SESSION: &str = "backup-dual-write-session";
 const PROJECT_KEY: &str = "backup-project-key";
@@ -288,6 +288,7 @@ fn backup_restore_preserves_unix_permissions() {
     let mut store = BackupStore::new();
     let file = temp_file(project.path(), "executable.sh", "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&file, &["--version"]);
 
     store.snapshot(SESSION, &file, "executable").unwrap();
     fs::write(&file, "changed\n").unwrap();
@@ -310,6 +311,7 @@ fn legacy_db_row_without_restore_meta_reads_mode_from_sidecar() {
         "#!/bin/sh\nexit 0\n",
     );
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&file, &["--version"]);
     store.snapshot(SESSION, &file, "legacy executable").unwrap();
 
     let summary = fetch_rows(&conn, "").pop().unwrap();
@@ -353,6 +355,7 @@ fn binary_db_fallback_restores_mode_without_sidecar() {
     let storage = tempfile::tempdir().unwrap();
     let file = temp_file(project.path(), "tool.sh", "#!/bin/sh\necho ORIGINAL\n");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&file, &["--version"]);
     let configure = |id: &str| {
         serde_json::json!({
             "id": id,

@@ -26,6 +26,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const EXECUTABLE_WARM_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many trailing stderr lines the exit-timeout panic keeps in memory for
 /// the flake-queue forensics message. Mirrors the LSP client's stderr tail
 /// (crates/aft/src/lsp/client.rs) so the two read identically.
@@ -51,6 +53,58 @@ pub fn disable_in_process_file_watcher() {
     DISABLE_IN_PROCESS_FILE_WATCHER.call_once(|| unsafe {
         std::env::set_var("AFT_TEST_DISABLE_FILE_WATCHER", "1");
     });
+}
+
+/// Pay macOS's first-exec assessment while a test fixture is still in setup.
+///
+/// Test fixtures frequently create a new executable inode and then invoke it
+/// inside a short product timeout. macOS may assess that first execution long
+/// after the file is written, so run the fixture once before the timed path.
+/// Callers choose arguments that their fixture handles quickly and without
+/// changing the assertion state; the helper always supplies closed stdin and
+/// discards output and exit status.
+///
+/// The warm is advisory. On macOS the spawn runs in a worker thread and this
+/// function returns after two minutes even if a security assessment is wedged.
+/// Other platforms do nothing because they do not have this assessment delay.
+pub fn warm_executable(path: &Path, args: &[&str]) {
+    #[cfg(target_os = "macos")]
+    {
+        let path = path.to_path_buf();
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let _ = std::thread::Builder::new()
+            .name("aft-test-exec-warm".to_string())
+            .spawn(move || {
+                let result = (|| -> std::io::Result<()> {
+                    let mut child = Command::new(path)
+                        .args(args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?;
+                    let deadline = Instant::now() + EXECUTABLE_WARM_TIMEOUT;
+
+                    loop {
+                        match child.try_wait()? {
+                            Some(_) => return Ok(()),
+                            None if Instant::now() >= deadline => {
+                                let _ = child.kill();
+                                return Ok(());
+                            }
+                            None => std::thread::sleep(Duration::from_millis(10)),
+                        }
+                    }
+                })();
+                let _ = done_tx.send(result);
+            });
+
+        let _ = done_rx.recv_timeout(EXECUTABLE_WARM_TIMEOUT);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (path, args);
 }
 
 enum StdoutEvent {

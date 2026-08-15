@@ -1,4 +1,4 @@
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, warm_executable, AftProcess};
 
 #[cfg(unix)]
 fn shell_quote_path(path: &std::path::Path) -> String {
@@ -13,6 +13,7 @@ fn write_executable_shim(path: &std::path::Path, body: &str) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).unwrap();
+    warm_executable(path, &["--version"]);
 }
 
 #[cfg(unix)]
@@ -79,13 +80,6 @@ fi
 eval "$2"
 "#,
     );
-
-    // Pay the macOS first-exec assessment for the freshly written shims HERE,
-    // in setup. The login-shell probe inside aft runs under a 3s timeout; on a
-    // busy syspolicyd the first exec of a new inode can take longer than
-    // that, which times out the probe and fails the test spuriously.
-    let _ = std::process::Command::new(&fake_shell).status();
-    let _ = std::process::Command::new(&tool_path).status();
 
     let daemon_path = format!(
         "/opt/homebrew/bin:/usr/local/bin:{}:{}:/usr/bin:/bin",
