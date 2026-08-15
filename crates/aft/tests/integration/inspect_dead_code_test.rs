@@ -99,7 +99,14 @@ fn outbound(
 }
 
 fn target(root: &Path, file: &str, symbol: &str) -> String {
-    format!("{}::{symbol}", root.join(file).display())
+    // Join per component so "src/handlers.rs" becomes a native path on every
+    // platform; a raw join would keep the forward slash inside the Windows path
+    // and never match the scanner's all-native-separator output.
+    let mut path = root.to_path_buf();
+    for component in file.split('/') {
+        path.push(component);
+    }
+    format!("{}::{symbol}", path.display())
 }
 
 fn scan(job: InspectJob) -> InspectScanSuccess {
