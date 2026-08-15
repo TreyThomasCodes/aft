@@ -183,7 +183,6 @@ const CAPTURED_FIRST_PARTY_READ_ENVELOPE: Record<string, unknown> = {
   structuredContent: {
     id: "read-fixture-1",
     success: true,
-    status_bar: { errors: 0, warnings: 1 },
     bg_completions: [{ task_id: "bash-fixture-1" }],
     text: "export function readFixture(): string { return 'captured'; }\n",
   },
@@ -204,7 +203,6 @@ describe("SubcTransport.toolCall", () => {
         id: "req-1",
         success: true,
         text: "rendered output",
-        status_bar: { errors: 0, warnings: 1 },
         bg_completions: [{ task_id: "bash-1" }],
       }),
     );
@@ -219,21 +217,12 @@ describe("SubcTransport.toolCall", () => {
       name: "read",
       arguments: { filePath: "a.ts" },
     });
-    // structuredContent re-lifted: sidecars survive as flat top-level fields.
+    // The adapter promotes supported fields to the top-level result, preserving
+    // background completions while excluding the retired status_bar field.
     expect(result.success).toBe(true);
     expect(result.text).toBe("rendered output");
-    expect(result.status_bar).toEqual({ errors: 0, warnings: 1 });
+    expect(result).not.toHaveProperty("status_bar");
     expect(result.bg_completions).toEqual([{ task_id: "bash-1" }]);
-    // getStatusBar captured + normalized the counts from the response (full shape).
-    expect(pool.getBridge(TEST_PROJECT_ROOT).getStatusBar()).toEqual({
-      errors: 0,
-      warnings: 1,
-      dead_code: 0,
-      unused_exports: 0,
-      duplicates: 0,
-      todos: 0,
-      tier2_stale: false,
-    });
   });
 
   test("carries plugin edit registration outside agent arguments", async () => {

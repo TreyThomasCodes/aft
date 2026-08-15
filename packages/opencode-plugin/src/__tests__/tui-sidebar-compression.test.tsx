@@ -205,11 +205,19 @@ describe("collapsedHealthLights (collapsed Code Health traffic lights)", () => {
     expect(collapsedHealthLights(undefined)).toBeNull();
   });
 
-  test("all green on a clean bar", () => {
+  test("all green on a fully proven clean bar", () => {
     expect(collapsedHealthLights(bar())).toEqual({
       diagnostics: "ok",
       code: "ok",
       todos: "ok",
+    });
+  });
+
+  test("missing categories stay muted instead of appearing clean", () => {
+    expect(collapsedHealthLights({ errors: 0 })).toEqual({
+      diagnostics: "muted",
+      code: "muted",
+      todos: "muted",
     });
   });
 

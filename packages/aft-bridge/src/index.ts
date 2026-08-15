@@ -172,16 +172,6 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
-// --- agent status bar (shared by both plugin hosts) ---
-export type { StatusBarCounts, StatusBarEmitState } from "./status-bar.js";
-export {
-  createStatusBarEmitState,
-  formatStatusBar,
-  parseStatusBarCounts,
-  STATUS_BAR_HEARTBEAT_CALLS,
-  shouldEmitStatusBar,
-  statusBarLine,
-} from "./status-bar.js";
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,

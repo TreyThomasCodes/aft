@@ -486,7 +486,6 @@ function trackSubcSessions(
   };
   return {
     getCwd: () => bridge.getCwd(),
-    getStatusBar: () => bridge.getStatusBar(),
     getCachedStatus: () => bridge.getCachedStatus(),
     cacheStatusSnapshot: (snapshot) => bridge.cacheStatusSnapshot(snapshot),
     send: async (command, params = {}, options) => {

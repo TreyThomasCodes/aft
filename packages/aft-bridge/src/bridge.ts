@@ -9,7 +9,6 @@ import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logg
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
-import { parseStatusBarCounts, type StatusBarCounts } from "./status-bar.js";
 import type {
   AftProjectTransport,
   ToolCallArguments,
@@ -430,13 +429,6 @@ export class BinaryBridge implements AftProjectTransport {
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Updated after every successfully parsed stdout frame from the child. */
   private lastChildActivityAt = 0;
-  /**
-   * Latest agent status-bar counts seen on any `data.status_bar` envelope. The
-   * Rust bridge attaches current counts to (almost) every response; we cache
-   * the freshest so the per-tool after-hook can render the bar without extra
-   * plumbing per call. `undefined` until the first attach (no scan yet).
-   */
-  private lastStatusBar: StatusBarCounts | undefined;
   /** Consecutive non-bash-style request timeouts without an id-matched response. */
   private consecutiveRequestTimeouts = 0;
   private errorPrefix: string;
@@ -1173,12 +1165,6 @@ export class BinaryBridge implements AftProjectTransport {
 
   private spawnProcess(triggeringSessionId?: string): void {
     this._retiringDueToBinaryChange = false;
-    // A freshly-spawned process has published no diagnostics yet, so its warm
-    // E/W set is empty. Drop the cached status bar from any prior process here
-    // (covers initial spawn, crash auto-restart, and version-swap respawn) so a
-    // dead process's stale counts are never re-emitted on the next tool result
-    // before the new process repopulates them (#6).
-    this.lastStatusBar = undefined;
     if (triggeringSessionId) {
       this.sessionLogVia(
         triggeringSessionId,
@@ -1495,7 +1481,6 @@ export class BinaryBridge implements AftProjectTransport {
         this.consecutiveRequestTimeouts = 0;
         this.scheduleRestartCountReset();
         this.accountForBashTaskResponse(entry.command, response);
-        this.captureStatusBar(response);
         entry.resolve(response);
       } else if (typeof response.type === "string") {
         this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
@@ -1521,26 +1506,6 @@ export class BinaryBridge implements AftProjectTransport {
     if (command === "bash" && response.success !== false) {
       this.outstandingBackgroundTaskIds.add(taskId);
     }
-  }
-
-  /**
-   * Cache the agent status-bar counts from a response. The Rust `Response.data`
-   * is `#[serde(flatten)]`, so the attached `status_bar` object lands at the
-   * TOP LEVEL of the wire envelope (`response.status_bar`), not nested under a
-   * `data` key — same as `bg_completions`.
-   */
-  private captureStatusBar(response: Record<string, unknown>): void {
-    const parsed = parseStatusBarCounts(response.status_bar);
-    if (parsed) this.lastStatusBar = parsed;
-  }
-
-  /**
-   * Latest agent status-bar counts seen on any response, or `undefined` before
-   * the first attach (no inspect scan has populated Tier-2 yet). The per-tool
-   * after-hook reads this and applies emit-on-change gating.
-   */
-  getStatusBar(): StatusBarCounts | undefined {
-    return this.lastStatusBar;
   }
 
   private handleTimeout(triggeringSessionId?: string): void {

@@ -1,6 +1,5 @@
 import type { BridgeRequestOptions, StatusSnapshot } from "./bridge.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
-import type { StatusBarCounts } from "./status-bar.js";
 
 export type ToolCallArguments = Record<string, unknown>;
 
@@ -11,7 +10,6 @@ export interface ToolCallResult extends Record<string, unknown> {
   success: boolean;
   code?: string;
   message?: string;
-  status_bar?: unknown;
   bg_completions?: unknown;
 }
 
@@ -43,7 +41,6 @@ export interface AftProjectTransport {
     options?: ToolCallOptions,
   ): Promise<ToolCallResult>;
   getCwd(): string;
-  getStatusBar(): StatusBarCounts | undefined;
   getCachedStatus(): StatusSnapshot | null;
   cacheStatusSnapshot(snapshot: StatusSnapshot): void;
 }
