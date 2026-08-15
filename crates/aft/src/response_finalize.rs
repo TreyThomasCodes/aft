@@ -1,7 +1,14 @@
+#[path = "alert_render.rs"]
+pub mod alert_render;
+
+use std::path::Path;
+
 use crate::context::AppContext;
 use crate::protocol::Response;
 
-/// Apply finalizers in the established response order: background completions first, then status bar counts.
+/// Finalize a direct protocol response that has no dispatch-root provenance. Agent-visible
+/// finalization must use [`finalize_response_for_dispatch_root`] so alert delivery never infers
+/// a root from the session context.
 pub fn finalize_response(
     response: &mut Response,
     ctx: &AppContext,
@@ -11,6 +18,8 @@ pub fn finalize_response(
     finalize_response_with_bg_completions(response, ctx, session_id, attach_command, true);
 }
 
+/// Compatibility finalization for direct protocol responses without explicit dispatch-root
+/// provenance. Agent-visible responses use [`finalize_response_for_dispatch_root`].
 pub fn finalize_response_with_bg_completions(
     response: &mut Response,
     ctx: &AppContext,
@@ -21,7 +30,67 @@ pub fn finalize_response_with_bg_completions(
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
-    attach_status_bar(response, ctx, session_id, attach_command);
+    let _ = publish_fleet_status(response, ctx, session_id);
+
+    // The pre-tool-call protocol has no dispatch-root provenance or agent-visible text. Keep its
+    // legacy envelope seam isolated from terminal agent responses while older direct fixtures
+    // migrate to explicit-root finalization.
+    if response.data.get("text").is_none() {
+        attach_status_bar(response, ctx, session_id, attach_command);
+    }
+}
+
+/// Finalize an agent-visible response using the root selected by dispatch. The finalizer owns
+/// the alert transition and never reads `ctx.config().project_root` for alert state.
+pub fn finalize_response_for_dispatch_root(
+    response: &mut Response,
+    ctx: &AppContext,
+    alerts: &mut alert_render::AlertEngine,
+    session_id: &str,
+    dispatch_root: &Path,
+    attach_command: &str,
+    allow_bg_completions: bool,
+) {
+    if allow_bg_completions {
+        attach_bg_completions(response, ctx, session_id, attach_command);
+    }
+    let _ = publish_fleet_status(response, ctx, session_id);
+    attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
+}
+
+fn attach_alert_block(
+    response: &mut Response,
+    alerts: &mut alert_render::AlertEngine,
+    session_id: &str,
+    dispatch_root: &Path,
+    command: &str,
+) {
+    let Some(text) = response
+        .data
+        .as_object_mut()
+        .and_then(|data| data.get_mut("text"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+
+    // A response can pass through a structured transport as well as its terminal adapter.
+    // Refuse a second server reminder rather than consuming an alert behind a duplicate block.
+    if text.contains("<system-reminder>") {
+        return;
+    }
+    let Some(alert) = alerts.finalize(session_id, dispatch_root, command) else {
+        return;
+    };
+    let joined = if text.is_empty() {
+        alert.text
+    } else {
+        format!("{text}\n\n{}", alert.text)
+    };
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("text".to_string(), serde_json::Value::String(joined));
+    }
 }
 
 pub enum DispatchOutcome {
@@ -169,50 +238,24 @@ fn holder_owns_status_bar(plane_live: bool, harness: Option<&crate::harness::Har
     plane_live && matches!(harness, Some(crate::harness::Harness::Opencode))
 }
 
-/// Attach the agent status-bar counts to the response envelope so the plugin
-/// after-hook can surface the IDE-style status bar (emit-on-change). Skips
-/// internal/transport commands that don't represent agent tool calls (their
-/// responses never reach the agent, and bash-lifecycle commands fire rapidly).
-/// `errors`/`warnings` are read live from the LSP store. Tier-2 and todo counts
-/// come from a cached snapshot, so the payload stays omitted until that snapshot
-/// has been populated.
-pub fn attach_status_bar(
+/// Publish the retained fleet status segment. Agent-facing status-bar envelope insertion is
+/// intentionally absent: reminder rendering below is the only agent response finalizer.
+fn publish_fleet_status(
     response: &mut Response,
     ctx: &AppContext,
     session_id: &str,
-    command: &str,
-) {
-    // Cross-root indexed searches report on a borrowed project, so attaching the
-    // session project's diagnostics footer would falsely attribute unrelated
-    // counts to the external results. The command sets this private marker and
-    // the finalizer removes it before the response reaches the caller.
+) -> Option<bool> {
+    // Cross-root indexed searches currently suppress fleet status. Remove the private marker
+    // before publishing the response so it cannot appear in a response envelope.
     if response
         .data
         .as_object_mut()
         .and_then(|data| data.remove("_aft_suppress_status_bar"))
         .is_some()
     {
-        return;
+        return None;
     }
-    if matches!(
-        command,
-        "configure"
-            | "ping"
-            | "version"
-            | "status"
-            | "bash_abort_inflight"
-            | "bash_status"
-            | "bash_write"
-            | "bash_promote"
-            | "bash_wait_detach"
-            | "bash_regex_match"
-            | "bash_drain_completions"
-            | "bash_notify"
-            | "bash_unnotify"
-            | "bash_ack_completions"
-    ) {
-        return;
-    }
+
     let local_counts = ctx.status_bar_counts();
     let harness = ctx.harness_opt();
     let plane_live = ctx.fleet_status_client().is_some_and(|client| {
@@ -230,10 +273,28 @@ pub fn attach_status_bar(
             .unwrap_or_default();
         client.publish(project_root, &harness_label, session_id, &aft_text)
     });
+    Some(plane_live)
+}
+
+/// Retired envelope helper retained for direct legacy test fixtures. Production finalization
+/// calls `publish_fleet_status` and cannot emit this field.
+pub fn attach_status_bar(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    command: &str,
+) {
+    if alert_render::is_excluded_finalization_command(command) {
+        return;
+    }
+    let Some(plane_live) = publish_fleet_status(response, ctx, session_id) else {
+        return;
+    };
+    let harness = ctx.harness_opt();
     if holder_owns_status_bar(plane_live, harness.as_ref()) {
         return;
     }
-    let Some(counts) = local_counts else {
+    let Some(counts) = ctx.status_bar_counts() else {
         return;
     };
     if !ctx.should_emit_status_bar(&counts) {
