@@ -4,6 +4,7 @@ use std::sync::{mpsc, Arc};
 
 use serde_json::{Map, Value};
 
+use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
 use crate::inspect::{
@@ -141,6 +142,12 @@ fn handle_inspect_payload(
         outcomes.insert(*category, outcome);
     }
 
+    // Truthful fleet-status values update from whatever this collection proved,
+    // even when the freshness gate below refuses the payload: a verified count
+    // stays verified, and pending or failed categories remain absent rather
+    // than reading as zero.
+    refresh_status_bar_counts(ctx, &outcomes);
+
     let payloads = match fresh_payloads(&outcomes) {
         Ok(payloads) => payloads,
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
@@ -261,6 +268,77 @@ fn inspect_shutdown_terminal(
     })
 }
 
+/// Feed fleet-status values from inspect outcomes. Only a verified payload
+/// supplies a category count; pending or failed categories remain absent in the
+/// truthful values state instead of being replaced with zero.
+fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
+    // `JobOutcome::payload()` exposes only Fresh data or a stat-verified stale
+    // cache, so an unavailable category cannot overwrite a proven value.
+    let count_of = |category: InspectCategory| -> Option<usize> {
+        outcomes
+            .get(&category)
+            .and_then(JobOutcome::payload)
+            .and_then(|payload| available_count_from_payload(category, payload))
+    };
+    let any_tier2_stale = [
+        InspectCategory::DeadCode,
+        InspectCategory::UnusedExports,
+        InspectCategory::Duplicates,
+    ]
+    .iter()
+    .any(|category| {
+        matches!(
+            outcomes.get(category),
+            Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. })
+        )
+    });
+    let todos = outcomes
+        .get(&InspectCategory::Todos)
+        .and_then(JobOutcome::payload)
+        .and_then(|payload| payload.get("count"))
+        .and_then(Value::as_u64)
+        .map(|count| count as usize);
+
+    ctx.update_status_bar_tier2(
+        count_of(InspectCategory::DeadCode),
+        count_of(InspectCategory::UnusedExports),
+        count_of(InspectCategory::Duplicates),
+        todos,
+        any_tier2_stale,
+    );
+}
+
+/// A blocking `aft_inspect` may update alert state only from accepted snapshots
+/// whose document versions were verified. Other inspect operations compute
+/// payloads or fleet values and must not update alert state.
+fn record_blocking_inspect_observations(
+    ctx: &AppContext,
+    req: &RawRequest,
+    snapshot: &InspectSnapshot,
+    accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
+) {
+    if accepted_snapshots.is_empty() {
+        return;
+    }
+
+    let batch = match AcceptedObservationBatch::from_diagnostic_snapshots(
+        req.session(),
+        &snapshot.project_root,
+        accepted_snapshots,
+    ) {
+        Ok(batch) => batch,
+        Err(error) => {
+            crate::slog_warn!(
+                "[inspect:diagnostics] omitted duplicate producer observation batch: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = ctx.accept_alert_observation_batch(&batch) {
+        crate::slog_warn!("[inspect:diagnostics] failed to accept observation batch: {error}");
+    }
+}
+
 fn run_blocking_inspect_body(
     req: &RawRequest,
     ctx: &AppContext,
@@ -309,7 +387,15 @@ fn run_blocking_inspect_body(
             ))
         })
         .collect::<Vec<_>>();
+    // A blocking inspection is an explicit diagnostics observation source. Keep
+    // accepted producer snapshots intact until the inspect response is built;
+    // flattened category payloads cannot recover producer ownership.
+    let accepted_snapshots = ctx.lsp().drain_events().accepted_snapshots;
+    let inspect_snapshot = build_snapshot(ctx).ok();
     let response = handle_inspect_payload(req, ctx, true, applicability.server_keys.is_empty());
+    if let Some(inspect_snapshot) = &inspect_snapshot {
+        record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
+    }
     for phase in quiescence {
         phase.complete();
     }
@@ -459,53 +545,6 @@ fn build_inspect_terminal(
             }
         }
     }
-}
-
-/// Refresh the agent status-bar's last-known Tier-2 + todos counts from the
-/// outcomes just computed. Tier-2 counts come from whatever the read-only cache
-/// returned (Fresh or Stale-cached); a Stale/Pending outcome marks them stale
-/// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
-/// they're read live from the LSP store at attach time.
-#[allow(dead_code)]
-fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
-    // Per-category count: `Some` only when the category actually produced data
-    // (Fresh, or Stale with a cached aggregate — `JobOutcome::payload()` returns
-    // `None` for Pending/Failed/Stale-without-cache). A `None` category is left
-    // untouched downstream rather than overwritten with a fabricated `0`, and
-    // the bar stays suppressed until all three categories hold a real value, so
-    // a partially-completed cold scan never lies about project health (#1).
-    let count_of = |category: InspectCategory| -> Option<usize> {
-        outcomes
-            .get(&category)
-            .and_then(JobOutcome::payload)
-            .and_then(|payload| available_count_from_payload(category, payload))
-    };
-    let any_tier2_stale = [
-        InspectCategory::DeadCode,
-        InspectCategory::UnusedExports,
-        InspectCategory::Duplicates,
-    ]
-    .iter()
-    .any(|category| {
-        matches!(
-            outcomes.get(category),
-            Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. })
-        )
-    });
-    let todos = outcomes
-        .get(&InspectCategory::Todos)
-        .and_then(JobOutcome::payload)
-        .and_then(|payload| payload.get("count"))
-        .and_then(Value::as_u64)
-        .map(|count| count as usize);
-
-    ctx.update_status_bar_tier2(
-        count_of(InspectCategory::DeadCode),
-        count_of(InspectCategory::UnusedExports),
-        count_of(InspectCategory::Duplicates),
-        todos,
-        any_tier2_stale,
-    );
 }
 
 pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response {
