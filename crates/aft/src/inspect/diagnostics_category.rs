@@ -7,8 +7,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
-    EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot, PullFileOutcome,
-    PullFileResult, ServerAttemptResult,
+    EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot, PullFileOutcome, PullFileResult,
+    ServerAttemptResult,
 };
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
@@ -77,10 +77,13 @@ pub(crate) fn run_diagnostics_category(
     scope: &JobScope,
     scope_was_provided: bool,
 ) -> JobOutcome {
-    let _ = scope_was_provided;
-    // Inspect establishes diagnostic freshness over the canonical root; `scope`
-    // only narrows the detail rendered from that root-wide collection.
-    let collection = collect_scoped_diagnostics(ctx, snapshot, scope);
+    let collection = if scope_was_provided {
+        // A deferred inspection can collect diagnostics for the entire root
+        // without an explicit scope. Scope filters rendered results, not work.
+        collect_scoped_diagnostics(ctx, snapshot, scope)
+    } else {
+        collect_warm_working_set(ctx, snapshot)
+    };
 
     if collection.is_complete() {
         JobOutcome::Fresh {
@@ -269,7 +272,12 @@ fn collect_scoped_file(
 
     let expected = push_fallback_servers
         .iter()
-        .map(|key| (key.clone(), pre_push_snapshot.get(key).copied().unwrap_or_default()))
+        .map(|key| {
+            (
+                key.clone(),
+                pre_push_snapshot.get(key).copied().unwrap_or_default(),
+            )
+        })
         .collect::<Vec<(ServerKey, PreEditSnapshot)>>();
     wait_for_inspect_diagnostics_without_manager_lock(ctx, &canonical, &expected);
 

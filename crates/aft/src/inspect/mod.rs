@@ -27,7 +27,7 @@ pub use job::{
 };
 pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
 pub use phase_log::{
-    format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId, InspectPhaseLog,
-    InspectPhaseLogSnapshot,
+    format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,
+    InspectPhaseLog, InspectPhaseLogSnapshot,
 };
 pub use tier2_scheduler::{Tier2RefreshScheduler, Tier2TriggerReason};
