@@ -784,6 +784,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
         "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
+        aft::commands::health_digest::HEALTH_DIGEST_OPERATION => {
+            aft::commands::health_digest::handle_health_digest(&req, ctx)
+        }
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
         "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),

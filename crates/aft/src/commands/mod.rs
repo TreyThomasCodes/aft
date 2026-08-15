@@ -29,6 +29,7 @@ pub mod extract_function;
 pub mod glob;
 pub mod grep;
 pub mod hashline;
+pub mod health_digest;
 pub mod impact;
 pub mod inline_symbol;
 pub mod inspect;
