@@ -1,5 +1,5 @@
 /**
- * aft_inspect — codebase health snapshot.
+ * aft_inspect — blocking-fresh codebase health inspection.
  */
 
 import type {
@@ -10,7 +10,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callBridge, callToolCall, isEmptyParam, textResult } from "./_shared.js";
+import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
@@ -28,13 +28,13 @@ const InspectParams = Type.Object({
   sections: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())], {
       description:
-        "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
+        "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
     }),
   ),
   scope: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())], {
       description:
-        "Restrict scan/results to paths under this scope (file or directory, absolute or relative to project root). Tier 1 scopes the scan; Tier 2 scans project-wide and applies scope as a result filter.",
+        "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not reduce the blocking-fresh verification work.",
     }),
   ),
   topK: Type.Optional(
@@ -48,14 +48,24 @@ const InspectParams = Type.Object({
 });
 
 type StringOrStringArray = string | string[];
+export type InspectTerminalKind = "FRESH" | "INTERRUPTED" | "PHASE-FAILED";
 
-const TIER2_INSPECT_CATEGORIES = new Set(["dead_code", "unused_exports", "duplicates", "cycles"]);
-const INSPECT_TIER2_RUN_TIMEOUT_MS = 5 * 60_000;
-// Pi has no session.idle hook like OpenCode, so on-demand Tier 2 warmups are
-// rate-limited per bridge/category to the same default idle window (4 minutes).
-const INSPECT_TIER2_MIN_TRIGGER_INTERVAL_MS = 4 * 60_000;
-const runningTier2Categories = new WeakMap<object, Set<string>>();
-const lastTier2TriggerAtByBridge = new WeakMap<object, Map<string, number>>();
+/** A completed inspect phase, normalized once for every terminal outcome. */
+export interface InspectPhaseEntry {
+  id: string;
+  producer?: string;
+  category?: string;
+  alsoSatisfied: string[];
+}
+
+export interface InspectTerminal {
+  kind: InspectTerminalKind;
+  phases: InspectPhaseEntry[];
+  waitStampText?: string;
+  failedPhase?: InspectPhaseEntry;
+  failureReason?: string;
+  failureDetail?: string;
+}
 
 function normalizeStringOrArray(value: unknown): StringOrStringArray | undefined {
   return isEmptyParam(value) ? undefined : (value as StringOrStringArray);
@@ -95,62 +105,162 @@ function validateOptionalTopK(value: unknown): number | undefined {
   return value;
 }
 
-function diagnosticsServerSummary(section: Record<string, unknown>): string {
-  const pending = Array.isArray(section.servers_pending)
-    ? section.servers_pending.filter((item): item is string => typeof item === "string")
-    : [];
-  const notInstalled = Array.isArray(section.servers_not_installed)
-    ? section.servers_not_installed.filter((item): item is string => typeof item === "string")
-    : [];
-  const parts: string[] = [];
-  if (pending.length > 0) parts.push(`pending: ${pending.join(", ")}`);
-  if (notInstalled.length > 0) parts.push(`not installed: ${notInstalled.join(", ")}`);
-  return parts.length > 0 ? parts.join("; ") : "none reported";
+function terminalKind(response: Record<string, unknown>): InspectTerminalKind | undefined {
+  for (const value of [
+    response.terminal,
+    response.outcome,
+    response.inspect_outcome,
+    response.inspect_terminal,
+    response.status,
+  ]) {
+    if (typeof value !== "string") continue;
+    const normalized = value.toUpperCase().replaceAll("_", "-");
+    if (normalized === "FRESH" || normalized === "INTERRUPTED" || normalized === "PHASE-FAILED") {
+      return normalized;
+    }
+  }
+  return undefined;
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> | undefined {
+  for (const value of values) {
+    const record = asRecord(value);
+    if (record) return record;
+  }
+  return undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const text = asString(value);
+    if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+/**
+ * Parse phase entries shared by all terminal outcomes. If also_satisfied is
+ * omitted, store it as an empty list so callers can always treat it as a list.
+ */
+export function parseInspectPhaseEntries(value: unknown): InspectPhaseEntry[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((candidate) => {
+    const entry = asRecord(candidate);
+    const id = asString(entry?.id);
+    if (!id) return [];
+    const alsoSatisfied = Array.isArray(entry?.also_satisfied)
+      ? entry.also_satisfied.filter((category): category is string => typeof category === "string")
+      : [];
+    return [
+      {
+        id,
+        producer: asString(entry?.producer),
+        category: asString(entry?.category),
+        alsoSatisfied,
+      },
+    ];
+  });
+}
+
+/**
+ * Use the same phase parser for every terminal outcome. Alternate discriminator
+ * spellings keep older payload encodings compatible with the canonical shape.
+ */
+export function parseInspectTerminal(payload: unknown): InspectTerminal | undefined {
+  const response = asRecord(payload);
+  if (!response) return undefined;
+  const kind = terminalKind(response);
+  if (!kind) return undefined;
+
+  const waitStamp = firstRecord(
+    response.wait_stamp,
+    response.waitStamp,
+    response.blocking_wait_stamp,
+  );
+  const phaseSource = kind === "FRESH" ? (waitStamp ?? response) : response;
+  const phases = parseInspectPhaseEntries(
+    phaseSource.phases ?? response.completed_phases ?? response.completedPhases,
+  );
+
+  if (kind !== "PHASE-FAILED") {
+    return {
+      kind,
+      phases,
+      waitStampText:
+        kind === "FRESH" ? firstString(waitStamp?.text, waitStamp?.human_text) : undefined,
+    };
+  }
+
+  const failedPhaseRecord = asRecord(response.failed_phase);
+  const failedPhaseId = firstString(failedPhaseRecord?.id, response.failed_phase);
+  const failedPhase = failedPhaseId
+    ? parseInspectPhaseEntries([
+        {
+          id: failedPhaseId,
+          producer: firstString(
+            failedPhaseRecord?.producer,
+            response.failed_phase_producer,
+            response.producer,
+          ),
+          category: firstString(
+            failedPhaseRecord?.category,
+            response.failed_phase_category,
+            response.category,
+          ),
+        },
+      ])[0]
+    : undefined;
+
+  return {
+    kind,
+    phases,
+    failedPhase,
+    failureReason: asString(response.failure_reason),
+    failureDetail: asString(response.failure_detail),
+  };
+}
+
+function formatPhase(entry: InspectPhaseEntry): string {
+  const details = [
+    entry.producer ? `producer: ${entry.producer}` : undefined,
+    entry.category ? `category: ${entry.category}` : undefined,
+    entry.alsoSatisfied.length > 0
+      ? `also satisfied: ${entry.alsoSatisfied.join(", ")}`
+      : undefined,
+  ].filter((detail): detail is string => Boolean(detail));
+  return details.length > 0 ? `${entry.id} (${details.join("; ")})` : entry.id;
+}
+
+/** Render every taxonomy field instead of reducing non-fresh terminals to an error. */
+export function renderInspectTerminal(terminal: InspectTerminal, serverText?: string): string {
+  const lines: string[] = [terminal.kind];
+  if (terminal.kind === "FRESH") {
+    lines.push(`wait-stamp: ${terminal.waitStampText ?? "not supplied"}`);
+  }
+  if (terminal.kind === "PHASE-FAILED") {
+    if (terminal.failedPhase) lines.push(`failed phase: ${formatPhase(terminal.failedPhase)}`);
+    lines.push(`failure reason: ${terminal.failureReason ?? "not supplied"}`);
+    if (terminal.failureDetail) lines.push(`failure detail: ${terminal.failureDetail}`);
+  }
+  lines.push(
+    terminal.phases.length > 0
+      ? `completed phases:\n${terminal.phases.map((phase) => `- ${formatPhase(phase)}`).join("\n")}`
+      : "completed phases: none",
+  );
+  if (serverText?.trim()) lines.push(serverText);
+  return lines.join("\n");
 }
 
 function diagnosticsSummaryPart(summary: Record<string, unknown> | undefined): string | undefined {
   const section = asRecord(summary?.diagnostics);
   if (!section) return undefined;
-
   const errors = asNumber(section.errors);
   const warnings = asNumber(section.warnings);
   const info = asNumber(section.info);
   const hints = asNumber(section.hints);
-  const hasCounts = [errors, warnings, info, hints].some((value) => value !== undefined);
-  const counts = `${errors ?? 0} errors/${warnings ?? 0} warnings/${info ?? 0} info/${hints ?? 0} hints`;
-  const status = asString(section.status);
-  const provisionalCounts = asRecord(section.provisional_counts);
-  const provisionalValues = provisionalCounts
-    ? [
-        asNumber(provisionalCounts.errors),
-        asNumber(provisionalCounts.warnings),
-        asNumber(provisionalCounts.info),
-        asNumber(provisionalCounts.hints),
-      ]
-    : [];
-  const provisionalText = provisionalCounts
-    ? ` (${provisionalValues[0] ?? 0} errors/${provisionalValues[1] ?? 0} warnings/${provisionalValues[2] ?? 0} info/${provisionalValues[3] ?? 0} hints)`
-    : "";
-  const provisionalFraming = `provisional — analyzer not ready; counts excluded from E/W${provisionalText}`;
-
-  // Partial result: keep the leads visible, but make it impossible to read
-  // their counts as authoritative compiler health.
-  if (status === "pending") {
-    return `diagnostics ${provisionalFraming} — still pending (servers: ${diagnosticsServerSummary(section)}); wait for the LSP update and use the next normal aft_inspect, not repeated polling`;
-  }
-  if (status === "incomplete") {
-    return `diagnostics ${provisionalFraming} (incomplete — servers: ${diagnosticsServerSummary(section)})`;
-  }
-
-  if (provisionalCounts) {
-    return `diagnostics ${provisionalFraming}`;
-  }
-
-  if (hasCounts) {
-    return `diagnostics ${counts}`;
-  }
-
-  return undefined;
+  if (![errors, warnings, info, hints].some((value) => value !== undefined)) return undefined;
+  return `diagnostics ${errors ?? 0} errors/${warnings ?? 0} warnings/${info ?? 0} info/${hints ?? 0} hints`;
 }
 
 function diagnosticLocation(diagnostic: Record<string, unknown>): string {
@@ -164,34 +274,22 @@ function diagnosticLocation(diagnostic: Record<string, unknown>): string {
 
 function diagnosticsDetailSection(
   details: Record<string, unknown> | undefined,
-  summary: Record<string, unknown> | undefined,
 ): string | undefined {
   const diagnostics = asRecords(details?.diagnostics);
   if (diagnostics.length === 0) return undefined;
-
-  const diagnosticsSummary = asRecord(summary?.diagnostics);
-  const provisional =
-    asString(diagnosticsSummary?.status) === "pending" ||
-    asString(diagnosticsSummary?.status) === "incomplete" ||
-    asRecord(diagnosticsSummary?.provisional_counts) !== undefined;
-  const lines = [
-    provisional
-      ? "diagnostics (provisional — analyzer not ready; counts excluded from E/W)"
-      : "diagnostics",
-  ];
-  for (const diagnostic of diagnostics) {
-    const severity = asString(diagnostic.severity) ?? "information";
-    const message = asString(diagnostic.message) ?? "(no message)";
-    const source = asString(diagnostic.source);
-    const suffix = source ? ` [${source}]` : "";
-    lines.push(`- ${diagnosticLocation(diagnostic)} ${severity} ${message}${suffix}`);
-  }
-  return lines.join("\n");
+  return [
+    "diagnostics",
+    ...diagnostics.map((diagnostic) => {
+      const severity = asString(diagnostic.severity) ?? "information";
+      const message = asString(diagnostic.message) ?? "(no message)";
+      const source = asString(diagnostic.source);
+      return `- ${diagnosticLocation(diagnostic)} ${severity} ${message}${source ? ` [${source}]` : ""}`;
+    }),
+  ].join("\n");
 }
 
 function countFrom(summary: Record<string, unknown> | undefined, key: string): number | undefined {
-  const section = asRecord(summary?.[key]);
-  return asNumber(section?.count);
+  return asNumber(asRecord(summary?.[key])?.count);
 }
 
 function tier2SummaryPart(
@@ -201,10 +299,7 @@ function tier2SummaryPart(
 ): string {
   const section = asRecord(summary?.[key]);
   const count = asNumber(section?.count);
-  if (count !== undefined) return `${label} ${count}`;
-
-  const status = asString(section?.status);
-  return `${label} ${status ?? "unavailable"}`;
+  return count !== undefined ? `${label} ${count}` : `${label} unavailable`;
 }
 
 /** Short basename for a `path:line-line` duplicate occurrence. */
@@ -213,123 +308,51 @@ function shortDupOccurrence(entry: string): string {
   return path?.split("/").pop() ?? entry;
 }
 
-/**
- * Compact TUI preview of the highest-signal Tier-2 findings (the ranked `top`
- * field), so the one-glance view shows what to act on, not just totals.
- */
 function tier2TopPreview(
   summary: Record<string, unknown> | undefined,
   theme: Theme,
 ): string | undefined {
   const lines: string[] = [];
-
-  const dup = asRecord(summary?.duplicates);
-  const dupTop = Array.isArray(dup?.top) ? dup.top : [];
+  const dupTop = Array.isArray(asRecord(summary?.duplicates)?.top)
+    ? (asRecord(summary?.duplicates)?.top as unknown[])
+    : [];
   for (const group of dupTop) {
     const record = asRecord(group);
     const files = Array.isArray(record?.files) ? record.files : [];
     const cost = asNumber(record?.cost);
     if (files.length < 2) continue;
-    const a = shortDupOccurrence(String(files[0]));
-    const b = shortDupOccurrence(String(files[1]));
-    lines.push(`  dup ${a} ↔ ${b}${cost !== undefined ? ` (${cost})` : ""}`);
+    lines.push(
+      `  dup ${shortDupOccurrence(String(files[0]))} ↔ ${shortDupOccurrence(String(files[1]))}${cost !== undefined ? ` (${cost})` : ""}`,
+    );
   }
-
   for (const [key, label] of [
     ["dead_code", "dead"],
     ["unused_exports", "unused"],
   ] as const) {
-    const section = asRecord(summary?.[key]);
-    const top = Array.isArray(section?.top) ? section.top : [];
+    const top = Array.isArray(asRecord(summary?.[key])?.top)
+      ? (asRecord(summary?.[key])?.top as unknown[])
+      : [];
     for (const item of top) {
       const record = asRecord(item);
       const file = asString(record?.file);
       const symbol = asString(record?.symbol);
-      if (!file || !symbol) continue;
-      lines.push(`  ${label} ${symbol} (${file.split("/").pop()})`);
+      if (file && symbol) lines.push(`  ${label} ${symbol} (${file.split("/").pop()})`);
     }
   }
-
-  if (lines.length === 0) return undefined;
-  return `${theme.fg("muted", "top findings:")}\n${lines.join("\n")}`;
-}
-
-function tier2RefreshCategories(response: Record<string, unknown>): string[] {
-  const scannerState = asRecord(response.scanner_state);
-  const categories = new Set<string>();
-
-  for (const key of ["pending_categories", "stale_categories"] as const) {
-    const values = scannerState?.[key];
-    if (!Array.isArray(values)) continue;
-
-    for (const category of values) {
-      if (typeof category === "string" && TIER2_INSPECT_CATEGORIES.has(category)) {
-        categories.add(category);
-      }
-    }
-  }
-
-  return [...categories];
-}
-
-function runPendingTier2Categories(
-  bridge: ReturnType<typeof bridgeFor>,
-  categories: string[],
-  extCtx: ExtensionContext,
-): void {
-  const now = Date.now();
-  const running = runningTier2Categories.get(bridge) ?? new Set<string>();
-  const lastTriggerAt = lastTier2TriggerAtByBridge.get(bridge) ?? new Map<string, number>();
-  const toRun = categories.filter((category) => {
-    if (running.has(category)) return false;
-    const previousTriggerAt = lastTriggerAt.get(category);
-    return (
-      previousTriggerAt === undefined ||
-      previousTriggerAt + INSPECT_TIER2_MIN_TRIGGER_INTERVAL_MS <= now
-    );
-  });
-  if (toRun.length === 0) return;
-
-  for (const category of toRun) {
-    running.add(category);
-    lastTriggerAt.set(category, now);
-  }
-  runningTier2Categories.set(bridge, running);
-  lastTier2TriggerAtByBridge.set(bridge, lastTriggerAt);
-
-  void callBridge(bridge, "inspect_tier2_run", { categories: toRun }, extCtx, {
-    transportTimeoutMs: INSPECT_TIER2_RUN_TIMEOUT_MS,
-  })
-    .catch(() => {
-      // Quiet background warmup: a later aft_inspect call can retry after the cooldown.
-    })
-    .finally(() => {
-      const active = runningTier2Categories.get(bridge);
-      if (!active) return;
-      for (const category of toRun) {
-        active.delete(category);
-      }
-      if (active.size === 0) {
-        runningTier2Categories.delete(bridge);
-      }
-    });
+  return lines.length > 0
+    ? `${theme.fg("muted", "top findings:")}\n${lines.join("\n")}`
+    : undefined;
 }
 
 /** Exported for renderer unit tests. */
 export function buildInspectSections(payload: unknown, theme: Theme): string[] {
+  const terminal = parseInspectTerminal(payload);
+  if (terminal) return [renderInspectTerminal(terminal, asString(asRecord(payload)?.text))];
+
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No inspect snapshot available.")];
-
   const summary = asRecord(response.summary);
   const metrics = asRecord(summary?.metrics);
-  const scannerState = asRecord(response.scanner_state);
-  const stale = Array.isArray(scannerState?.stale_categories)
-    ? scannerState.stale_categories.length
-    : 0;
-  const pending = Array.isArray(scannerState?.pending_categories)
-    ? scannerState.pending_categories.length
-    : 0;
-
   const parts = [
     `todos ${countFrom(summary, "todos") ?? 0}`,
     diagnosticsSummaryPart(summary),
@@ -339,20 +362,9 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
     tier2SummaryPart(summary, "duplicates", "duplicates"),
     tier2SummaryPart(summary, "cycles", "cycles"),
   ].filter((part): part is string => Boolean(part));
-
   const sections = [theme.fg("accent", parts.join(" · "))];
-  if (stale > 0 || pending > 0) {
-    sections.push(
-      theme.fg(
-        "warning",
-        `scanner state: ${stale} stale · ${pending} pending. Treat stale_categories/pending_categories as stale or incomplete cache state. AFT schedules a Tier-2 refresh after its next idle or inspect-triggered background run; use one later normal aft_inspect after that refresh, not a polling loop`,
-      ),
-    );
-  }
-
   const topPreview = tier2TopPreview(summary, theme);
   if (topPreview) sections.push(topPreview);
-
   const details = asRecord(response.details);
   if (details) {
     const names = Object.keys(details);
@@ -361,10 +373,9 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
         ? `details: ${names.join(", ")}`
         : theme.fg("muted", "No drill-down details returned."),
     );
-    const diagnosticsDetails = diagnosticsDetailSection(details, summary);
+    const diagnosticsDetails = diagnosticsDetailSection(details);
     if (diagnosticsDetails) sections.push(diagnosticsDetails);
   }
-
   const text = asString(response.text);
   if (text) sections.push(text);
   return sections;
@@ -397,8 +408,15 @@ export function renderInspectResult(
   theme: Theme,
   context: RenderContextLike,
 ) {
+  const payload = extractStructuredPayload(result);
+  const terminal = parseInspectTerminal(payload);
+  if (terminal)
+    return renderSections(
+      [renderInspectTerminal(terminal, asString(asRecord(payload)?.text))],
+      context,
+    );
   if (context.isError) return renderErrorResult(result, "inspect failed", theme, context);
-  return renderSections(buildInspectSections(extractStructuredPayload(result), theme), context);
+  return renderSections(buildInspectSections(payload, theme), context);
 }
 
 export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -406,18 +424,12 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_inspect",
     label: "inspect",
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Pi may still trigger a deduped background warmup for categories that remain pending. Rust module cycles are out of scope for `cycles`.\n\n" +
+      "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
+      "Use `scope=` to narrow returned results. It does not reduce the fresh verification work. Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     parameters: InspectParams,
-    async execute(
-      _toolCallId: string,
-      params: Static<typeof InspectParams>,
-      _signal,
-      _onUpdate,
-      extCtx,
-    ) {
+    async execute(_toolCallId, params: Static<typeof InspectParams>, _signal, _onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const sections = normalizeStringOrArray(params.sections);
       const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
@@ -426,13 +438,11 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       if (sections !== undefined) rawArgs.sections = sections;
       if (scope !== undefined) rawArgs.scope = scope;
       if (topK !== undefined) rawArgs.topK = topK;
-      const response = await callToolCall(bridge, "inspect", rawArgs, extCtx, {
-        keepBridgeOnTimeout: true,
-      });
-      if (response.success === false) {
+      const response = await callToolCall(bridge, "inspect", rawArgs, extCtx);
+      const terminal = parseInspectTerminal(response);
+      if (terminal) return textResult(renderInspectTerminal(terminal, response.text), response);
+      if (response.success === false)
         throw new Error(response.text || response.message || "inspect failed");
-      }
-      runPendingTier2Categories(bridge, tier2RefreshCategories(response), extCtx);
       return textResult(response.text, response);
     },
     renderCall(args, theme, context) {

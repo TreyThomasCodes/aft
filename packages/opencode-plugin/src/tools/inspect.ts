@@ -7,8 +7,25 @@ import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./p
 const z = tool.schema;
 
 type ToolArg = ToolDefinition["args"][string];
-
 type StringOrStringArray = string | string[];
+export type InspectTerminalKind = "FRESH" | "INTERRUPTED" | "PHASE-FAILED";
+
+/** A completed inspect phase, normalized once for every terminal outcome. */
+export interface InspectPhaseEntry {
+  id: string;
+  producer?: string;
+  category?: string;
+  alsoSatisfied: string[];
+}
+
+export interface InspectTerminal {
+  kind: InspectTerminalKind;
+  phases: InspectPhaseEntry[];
+  waitStampText?: string;
+  failedPhase?: InspectPhaseEntry;
+  failureReason?: string;
+  failureDetail?: string;
+}
 
 function arg(schema: unknown): ToolArg {
   return schema as ToolArg;
@@ -38,6 +55,163 @@ async function resolveAndGateScope(
     if (denial) return { scope: undefined, denial };
   }
   return { scope: Array.isArray(scope) ? resolved : resolved[0] };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function firstRecord(...values: unknown[]): Record<string, unknown> | undefined {
+  for (const value of values) {
+    const record = asRecord(value);
+    if (record) return record;
+  }
+  return undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const text = asString(value);
+    if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+function terminalKind(response: Record<string, unknown>): InspectTerminalKind | undefined {
+  for (const value of [
+    response.terminal,
+    response.outcome,
+    response.inspect_outcome,
+    response.inspect_terminal,
+    response.status,
+  ]) {
+    if (typeof value !== "string") continue;
+    const normalized = value.toUpperCase().replaceAll("_", "-");
+    if (normalized === "FRESH" || normalized === "INTERRUPTED" || normalized === "PHASE-FAILED") {
+      return normalized;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Parse phase entries shared by all terminal outcomes. If also_satisfied is
+ * omitted, store it as an empty list so callers can always treat it as a list.
+ */
+export function parseInspectPhaseEntries(value: unknown): InspectPhaseEntry[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((candidate) => {
+    const entry = asRecord(candidate);
+    const id = asString(entry?.id);
+    if (!id) return [];
+    const alsoSatisfied = Array.isArray(entry?.also_satisfied)
+      ? entry.also_satisfied.filter((category): category is string => typeof category === "string")
+      : [];
+    return [
+      {
+        id,
+        producer: asString(entry?.producer),
+        category: asString(entry?.category),
+        alsoSatisfied,
+      },
+    ];
+  });
+}
+
+/**
+ * Use the same phase parser for every terminal outcome. Alternate discriminator
+ * spellings keep older payload encodings compatible with the canonical shape.
+ */
+export function parseInspectTerminal(payload: unknown): InspectTerminal | undefined {
+  const response = asRecord(payload);
+  if (!response) return undefined;
+  const kind = terminalKind(response);
+  if (!kind) return undefined;
+
+  const waitStamp = firstRecord(
+    response.wait_stamp,
+    response.waitStamp,
+    response.blocking_wait_stamp,
+  );
+  const phaseSource = kind === "FRESH" ? (waitStamp ?? response) : response;
+  const phases = parseInspectPhaseEntries(
+    phaseSource.phases ?? response.completed_phases ?? response.completedPhases,
+  );
+
+  if (kind !== "PHASE-FAILED") {
+    return {
+      kind,
+      phases,
+      waitStampText:
+        kind === "FRESH" ? firstString(waitStamp?.text, waitStamp?.human_text) : undefined,
+    };
+  }
+
+  const failedPhaseRecord = asRecord(response.failed_phase);
+  const failedPhaseId = firstString(failedPhaseRecord?.id, response.failed_phase);
+  const failedPhase = failedPhaseId
+    ? parseInspectPhaseEntries([
+        {
+          id: failedPhaseId,
+          producer: firstString(
+            failedPhaseRecord?.producer,
+            response.failed_phase_producer,
+            response.producer,
+          ),
+          category: firstString(
+            failedPhaseRecord?.category,
+            response.failed_phase_category,
+            response.category,
+          ),
+        },
+      ])[0]
+    : undefined;
+
+  return {
+    kind,
+    phases,
+    failedPhase,
+    failureReason: asString(response.failure_reason),
+    failureDetail: asString(response.failure_detail),
+  };
+}
+
+function formatPhase(entry: InspectPhaseEntry): string {
+  const details = [
+    entry.producer ? `producer: ${entry.producer}` : undefined,
+    entry.category ? `category: ${entry.category}` : undefined,
+    entry.alsoSatisfied.length > 0
+      ? `also satisfied: ${entry.alsoSatisfied.join(", ")}`
+      : undefined,
+  ].filter((detail): detail is string => Boolean(detail));
+  return details.length > 0 ? `${entry.id} (${details.join("; ")})` : entry.id;
+}
+
+/** Render every taxonomy field instead of reducing non-fresh terminals to an error. */
+export function renderInspectTerminal(terminal: InspectTerminal, serverText?: string): string {
+  const lines: string[] = [terminal.kind];
+  if (terminal.kind === "FRESH") {
+    lines.push(`wait-stamp: ${terminal.waitStampText ?? "not supplied"}`);
+  }
+  if (terminal.kind === "PHASE-FAILED") {
+    if (terminal.failedPhase) lines.push(`failed phase: ${formatPhase(terminal.failedPhase)}`);
+    lines.push(`failure reason: ${terminal.failureReason ?? "not supplied"}`);
+    if (terminal.failureDetail) lines.push(`failure detail: ${terminal.failureDetail}`);
+  }
+  lines.push(
+    terminal.phases.length > 0
+      ? `completed phases:\n${terminal.phases.map((phase) => `- ${formatPhase(phase)}`).join("\n")}`
+      : "completed phases: none",
+  );
+  if (serverText?.trim()) lines.push(serverText);
+  return lines.join("\n");
 }
 
 export interface InspectToolConfig {
@@ -83,9 +257,7 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
   };
 
   const clearAll = (): void => {
-    for (const timer of timers.values()) {
-      clearTimer(timer);
-    }
+    for (const timer of timers.values()) clearTimer(timer);
     timers.clear();
   };
 
@@ -111,8 +283,8 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Codebase health snapshot. One call returns summary stats for: TODOs, diagnostics, file/symbol metrics, dead code, unused exports, code duplicates, and TS/JS import cycles. Pass `sections` for per-category drill-down details.\n\n" +
-      "Categories run in tiers — Tier 1 (todos, metrics) return synchronously from cache. Tier 2 (dead_code, unused_exports, duplicates, cycles) waits for a fresh reuse scan up to a short deadline; if a category is still scanning the response reports `complete: false` with `pending_categories: [...]` rather than a fabricated clean count. Rust module cycles are out of scope for `cycles`.\n\n" +
+      "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
+      "Use `scope=` to narrow returned results. It does not reduce the fresh verification work. Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     args: {
@@ -121,7 +293,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode.",
+            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
           ),
       ),
       scope: arg(
@@ -129,7 +301,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Restrict scan/results to paths under this scope (file or directory, absolute or relative to project root). Tier 1 scopes the scan; Tier 2 scans project-wide and applies scope as a result filter.",
+            "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not reduce the blocking-fresh verification work.",
           ),
       ),
       topK: arg(
@@ -146,24 +318,18 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       const sections = normalizeStringOrArray(args.sections);
       const scoped = await resolveAndGateScope(ctx, context, normalizeStringOrArray(args.scope));
       if (scoped.denial) return permissionDeniedResponse(scoped.denial);
-      const scope = scoped.scope;
-      const topK = args.topK === undefined || args.topK === null ? undefined : args.topK;
-
       const rawArgs: Record<string, unknown> = {};
       if (sections !== undefined) rawArgs.sections = sections;
-      if (scope !== undefined) rawArgs.scope = scope;
-      if (topK !== undefined) rawArgs.topK = topK;
-      const response = await callToolCall(ctx, context, "inspect", rawArgs, {
-        keepBridgeOnTimeout: true,
-      });
-      if (response.success === false) {
+      if (scoped.scope !== undefined) rawArgs.scope = scoped.scope;
+      if (args.topK !== undefined && args.topK !== null) rawArgs.topK = args.topK;
+      const response = await callToolCall(ctx, context, "inspect", rawArgs);
+      const terminal = parseInspectTerminal(response);
+      if (terminal) return renderInspectTerminal(terminal, response.text);
+      if (response.success === false)
         throw new Error((response.message as string) || "inspect failed");
-      }
       return response.text;
     },
   };
 
-  return {
-    aft_inspect: inspectTool,
-  };
+  return { aft_inspect: inspectTool };
 }
