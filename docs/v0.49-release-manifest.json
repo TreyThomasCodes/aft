@@ -241,5 +241,70 @@
     "policy": "Claim exactly one invalidation only when a production cache key is observable and changes exactly once.",
     "when_unobservable": "Record the atomic agent-surface transition only; do not fabricate an invalidation count.",
     "production_key_required_for_count": true
-  }
+  },
+  "campaign_entries": [
+    {
+      "entry_key": "blocking-fresh-inspect-plugin-release",
+      "tool_copy": {
+        "paths": [
+          "packages/pi-plugin/src/tools/inspect.ts",
+          "packages/opencode-plugin/src/tools/inspect.ts"
+        ],
+        "blocking_fresh": true,
+        "wait_stamp": true,
+        "scope_result_narrowing": true,
+        "alert_channel": true
+      },
+      "pi_follow_up_retirement": {
+        "removed": true,
+        "retired_path": [
+          "tier2RefreshCategories",
+          "runPendingTier2Categories",
+          "inspect_tier2_run",
+          "INSPECT_TIER2_MIN_TRIGGER_INTERVAL_MS",
+          "INSPECT_TIER2_RUN_TIMEOUT_MS",
+          "runningTier2Categories",
+          "lastTier2TriggerAtByBridge"
+        ]
+      },
+      "terminal_shape_consumption": {
+        "pi": true,
+        "opencode": true,
+        "shared_phase_entry_shape": "{id, producer?, category?, also_satisfied?: [category,...]}",
+        "preflight_failure_reason_preserved": true
+      },
+      "prefix_cache_bust": {
+        "required": true,
+        "cache_key_revision": "blocking-fresh-inspect-plugin-release-r3fold"
+      },
+      "opencode_inspect_follow_up_sweep": {
+        "searched_surface": [
+          "packages/opencode-plugin/src/tools/inspect.ts",
+          "packages/opencode-plugin/src/index.ts",
+          "packages/opencode-plugin/src/__tests__/inspect.test.ts"
+        ],
+        "revision": "87bb80ee42fbeb5697a9ae03ffc212023fd5b62d",
+        "result": "No aft_inspect terminal handler starts, polls, retries, or sends inspect_tier2_run. The separately scheduled session-idle maintenance path remains outside terminal handling."
+      },
+      "no_new_knob_sweep": {
+        "searched_surface": {
+          "configuration_key_table": "packages/aft-bridge/src/config-keys.ts",
+          "environment_readers_reachable_from_blocking_inspect": [
+            "packages/pi-plugin/src/tools/inspect.ts",
+            "packages/opencode-plugin/src/tools/inspect.ts",
+            "packages/aft-bridge/src/command-timeouts.ts"
+          ],
+          "cli_flag_table": "crates/aft/src/cli/mod.rs",
+          "aft_inspect_tool_parameter_schemas": [
+            "packages/pi-plugin/src/tools/inspect.ts",
+            "packages/opencode-plugin/src/tools/inspect.ts",
+            "crates/aft/src/subc_tool_schemas.json"
+          ]
+        },
+        "revision": "87bb80ee42fbeb5697a9ae03ffc212023fd5b62d",
+        "result": "No new configuration key, environment override, CLI flag, or aft_inspect parameter was added."
+      },
+      "health_digest_agent_tool_description_change": false
+    }
+  ]
 }
