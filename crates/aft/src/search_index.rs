@@ -873,16 +873,14 @@ impl SearchIndex {
         let delta = Arc::make_mut(&mut self.delta);
         for (trigram, filter) in file.trigram_map {
             let postings = delta.postings.entry(trigram).or_default();
-            postings.push(Posting {
-                file_id,
-                next_mask: filter.next_mask,
-                loc_mask: filter.loc_mask,
-            });
-            if postings.len() > 1
-                && postings[postings.len() - 2].file_id > postings[postings.len() - 1].file_id
-            {
-                postings.sort_unstable_by_key(|p| p.file_id);
-            }
+            insert_delta_posting(
+                postings,
+                Posting {
+                    file_id,
+                    next_mask: filter.next_mask,
+                    loc_mask: filter.loc_mask,
+                },
+            );
             file_trigrams.push(trigram);
         }
 
@@ -1643,8 +1641,10 @@ impl SearchIndexSnapshot {
         budget: Duration,
     ) -> GrepResult {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
-        self.search_grep_profiled_with_filters_and_limits(
+        let query = decompose_grep_pattern(pattern);
+        self.search_grep_profiled_with_filters_and_query_and_limits(
             pattern,
+            &query,
             &filters,
             search_root,
             max_results,
@@ -1664,13 +1664,12 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
-        self.search_grep_profiled_with_filters_and_limits(
+        self.search_grep_profiled_with_filters(
             pattern,
             &filters,
             search_root,
             max_results,
             path_exclusion,
-            None,
         )
     }
 
@@ -1682,8 +1681,34 @@ impl SearchIndexSnapshot {
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
-        self.search_grep_profiled_with_filters_and_limits(
+        let query_started = Instant::now();
+        let query = decompose_grep_pattern(pattern);
+        let query_decomposition = query_started.elapsed();
+        let (result, mut timings) = self.search_grep_profiled_with_filters_and_query(
             pattern,
+            &query,
+            filters,
+            search_root,
+            max_results,
+            path_exclusion,
+        );
+        timings.trigram_lookup += query_decomposition;
+        (result, timings)
+    }
+
+    /// Search with a query decomposed once by the caller and reused across roots.
+    pub(crate) fn search_grep_profiled_with_filters_and_query(
+        &self,
+        pattern: &CompiledPattern,
+        query: &RegexQuery,
+        filters: &PathFilters,
+        search_root: &Path,
+        max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_filters_and_query_and_limits(
+            pattern,
+            query,
             filters,
             search_root,
             max_results,
@@ -1692,9 +1717,10 @@ impl SearchIndexSnapshot {
         )
     }
 
-    fn search_grep_profiled_with_filters_and_limits(
+    fn search_grep_profiled_with_filters_and_query_and_limits(
         &self,
         pattern: &CompiledPattern,
+        query: &RegexQuery,
         filters: &PathFilters,
         search_root: &Path,
         max_results: usize,
@@ -1709,21 +1735,8 @@ impl SearchIndexSnapshot {
         let search_root = canonicalize_for_search_membership(search_root);
 
         let trigram_started = Instant::now();
-        let raw_pattern = pattern.raw_pattern_for_trigrams();
-        let query = match pattern {
-            CompiledPattern::Regex {
-                case_insensitive: true,
-                ..
-            } => {
-                // RegexBuilder applies this flag outside the raw pattern. Parse the
-                // same effective regex so Unicode folds such as `K` matching `K` do
-                // not become false mandatory trigrams.
-                decompose_regex(&format!("(?i:{raw_pattern})"))
-            }
-            _ => decompose_regex(&raw_pattern),
-        };
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
-        let candidate_ids = self.candidates(&query);
+        let candidate_ids = self.candidates(query);
         let trigram_lookup = trigram_started.elapsed();
 
         let candidate_filter_started = Instant::now();
@@ -3207,6 +3220,35 @@ fn pread_exact(file: &File, mut offset: u64, mut buffer: &mut [u8]) -> std::io::
     Ok(())
 }
 
+/// Insert a delta posting without disturbing the sorted-id invariant required by
+/// posting-list intersection. Git diff order is independent of file ID order, so
+/// re-sorting the entire list after every inversion scales poorly for shared trigrams.
+fn insert_delta_posting(postings: &mut Vec<Posting>, posting: Posting) {
+    if postings
+        .last()
+        .is_none_or(|last| last.file_id < posting.file_id)
+    {
+        postings.push(posting);
+        return;
+    }
+
+    let insertion_index = postings.partition_point(|existing| existing.file_id < posting.file_id);
+    debug_assert!(postings
+        .get(insertion_index)
+        .is_none_or(|existing| existing.file_id != posting.file_id));
+    postings.insert(insertion_index, posting);
+}
+
+#[cfg(test)]
+fn insert_delta_posting_full_sort_reference(postings: &mut Vec<Posting>, posting: Posting) {
+    postings.push(posting);
+    if postings.len() > 1
+        && postings[postings.len() - 2].file_id > postings[postings.len() - 1].file_id
+    {
+        postings.sort_unstable_by_key(|posting| posting.file_id);
+    }
+}
+
 fn intersect_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     let mut merged = Vec::with_capacity(left.len().min(right.len()));
     let mut left_index = 0;
@@ -3253,6 +3295,22 @@ fn union_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     merged.extend_from_slice(&left[left_index..]);
     merged.extend_from_slice(&right[right_index..]);
     merged
+}
+
+pub(crate) fn decompose_grep_pattern(pattern: &CompiledPattern) -> RegexQuery {
+    let raw_pattern = pattern.raw_pattern_for_trigrams();
+    match pattern {
+        CompiledPattern::Regex {
+            case_insensitive: true,
+            ..
+        } => {
+            // RegexBuilder applies this flag outside the raw pattern. Parse the
+            // same effective regex so Unicode folds such as `K` matching `K` do
+            // not become false mandatory trigrams.
+            decompose_regex(&format!("(?i:{raw_pattern})"))
+        }
+        _ => decompose_regex(&raw_pattern),
+    }
 }
 
 pub fn decompose_regex(pattern: &str) -> RegexQuery {
@@ -6817,6 +6875,127 @@ mod tests {
             sort_grep_matches_by_mtime_desc(&mut copy, dir.path());
             assert_eq!(copy.len(), matches.len());
         }
+    }
+
+    #[test]
+    fn out_of_order_delta_refresh_matches_full_sort_reference() {
+        const FILES: u32 = 1_024;
+        let shared_trigram = pack_trigram(b's', b'h', b'r');
+        let mut optimized = Vec::new();
+        let mut reference = Vec::new();
+
+        for file_id in (0..FILES).rev() {
+            let posting = Posting {
+                file_id,
+                next_mask: 0,
+                loc_mask: 0,
+            };
+            insert_delta_posting(&mut optimized, posting.clone());
+            insert_delta_posting_full_sort_reference(&mut reference, posting);
+        }
+
+        assert_eq!(
+            optimized, reference,
+            "delta postings must stay file-id sorted"
+        );
+
+        let mut index = SearchIndex::new();
+        let files = Arc::make_mut(&mut index.files);
+        for file_id in 0..FILES {
+            files.push(FileEntry {
+                path: PathBuf::from(format!("/delta/file-{file_id:04}.rs")),
+                size: 0,
+                modified: UNIX_EPOCH,
+                content_hash: cache_freshness::zero_hash(),
+            });
+        }
+        Arc::make_mut(&mut index.delta)
+            .postings
+            .insert(shared_trigram, optimized);
+
+        let actual = index.candidates(&RegexQuery {
+            and_trigrams: vec![shared_trigram],
+            ..RegexQuery::default()
+        });
+        let expected = reference
+            .into_iter()
+            .map(|posting| posting.file_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_vec(&actual).expect("serialize candidates"),
+            serde_json::to_vec(&expected).expect("serialize reference candidates"),
+            "candidate IDs must match the full-sort reference byte-for-byte"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode issue #219 delta insertion performance probe"]
+    fn issue_219_delta_insertion_perf_probe() {
+        const FILES: u32 = 1_024;
+        const SAMPLES: usize = 9;
+        const ITERATIONS: usize = 8;
+
+        let reference_once = || {
+            let mut postings = Vec::with_capacity(FILES as usize);
+            for file_id in (0..FILES).rev() {
+                insert_delta_posting_full_sort_reference(
+                    &mut postings,
+                    Posting {
+                        file_id,
+                        next_mask: 0,
+                        loc_mask: 0,
+                    },
+                );
+            }
+            std::hint::black_box(postings);
+        };
+        let optimized_once = || {
+            let mut postings = Vec::with_capacity(FILES as usize);
+            for file_id in (0..FILES).rev() {
+                insert_delta_posting(
+                    &mut postings,
+                    Posting {
+                        file_id,
+                        next_mask: 0,
+                        loc_mask: 0,
+                    },
+                );
+            }
+            std::hint::black_box(postings);
+        };
+
+        let mut reference_ns = Vec::with_capacity(SAMPLES);
+        let mut optimized_ns = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn()| {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    operation();
+                }
+                started.elapsed().as_nanos() / ITERATIONS as u128
+            };
+            if sample % 2 == 0 {
+                reference_ns.push(measure(&reference_once));
+                optimized_ns.push(measure(&optimized_once));
+            } else {
+                optimized_ns.push(measure(&optimized_once));
+                reference_ns.push(measure(&reference_once));
+            }
+        }
+        reference_ns.sort_unstable();
+        optimized_ns.sort_unstable();
+        let reference_median = reference_ns[SAMPLES / 2];
+        let optimized_median = optimized_ns[SAMPLES / 2];
+        let speedup = reference_median as f64 / optimized_median as f64;
+
+        eprintln!(
+            "issue #219 delta insertion: files={FILES} samples={SAMPLES} iterations={ITERATIONS}"
+        );
+        eprintln!("full-sort ns/refresh samples: {reference_ns:?}");
+        eprintln!("binary-insert ns/refresh samples: {optimized_ns:?}");
+        eprintln!(
+            "median: full-sort={reference_median}ns binary-insert={optimized_median}ns speedup={speedup:.2}x"
+        );
     }
 }
 

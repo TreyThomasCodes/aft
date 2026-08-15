@@ -15,10 +15,10 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, has_any_project_file_from, read_searchable_text, resolve_search_scope,
-    sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc, try_read_with_budget, GrepMatch,
-    GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
-    INTERACTIVE_ARTIFACT_READ_BUDGET,
+    build_path_filters, decompose_grep_pattern, has_any_project_file_from, read_searchable_text,
+    resolve_search_scope, sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc,
+    try_read_with_budget, GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult,
+    IndexStatus, PathFilters, RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -44,6 +44,8 @@ pub struct GrepParams {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GrepExecutionPhaseTimings {
     pub snapshot_acquire: Duration,
+    /// Regex decomposition is paid once per grep request, not once per root.
+    pub query_decomposition: Duration,
     pub query: GrepQueryPhaseTimings,
     pub indexed_scope_has_files: Option<bool>,
 }
@@ -193,16 +195,22 @@ pub(crate) fn execute_profiled_with_filters(
     filters: &PathFilters,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
     let project_root = project_root(ctx);
+    let query_started = Instant::now();
+    let query = decompose_grep_pattern(pattern);
+    let query_decomposition = query_started.elapsed();
     if scope.roots.len() == 1 {
-        return execute_root_profiled(
+        let (result, mut phases) = execute_root_profiled(
             ctx,
             pattern,
+            &query,
             &scope.roots[0],
             params,
             filters,
             params.max_results,
             &project_root,
         );
+        phases.query_decomposition = query_decomposition;
+        return (result, phases);
     }
 
     let mut results = Vec::new();
@@ -211,6 +219,7 @@ pub(crate) fn execute_profiled_with_filters(
         let (result, root_phases) = execute_root_profiled(
             ctx,
             pattern,
+            &query,
             root,
             params,
             filters,
@@ -224,9 +233,11 @@ pub(crate) fn execute_profiled_with_filters(
             phases = Some(root_phases);
         }
     }
+    let mut phases = phases.unwrap_or_default();
+    phases.query_decomposition = query_decomposition;
     (
         merge_grep_results(results, &project_root, params.max_results),
-        phases.unwrap_or_default(),
+        phases,
     )
 }
 
@@ -285,6 +296,7 @@ fn resolve_roots(
 fn execute_root_profiled(
     ctx: &AppContext,
     pattern: &CompiledPattern,
+    query: &RegexQuery,
     root: &ResolvedRoot,
     params: &GrepParams,
     filters: &PathFilters,
@@ -333,19 +345,21 @@ fn execute_root_profiled(
         let scope_started = Instant::now();
         let indexed_scope_has_files = snapshot.has_file_in_scope(&root.search_root);
         let scope_elapsed = scope_started.elapsed();
-        let (result, mut query) = snapshot.search_grep_profiled_with_filters(
+        let (result, mut query_timings) = snapshot.search_grep_profiled_with_filters_and_query(
             pattern,
+            query,
             filters,
             &root.search_root,
             max_results,
             params.path_exclusion,
         );
-        query.post_filter += scope_elapsed;
+        query_timings.post_filter += scope_elapsed;
         return (
             result,
             GrepExecutionPhaseTimings {
                 snapshot_acquire,
-                query,
+                query_decomposition: Duration::ZERO,
+                query: query_timings,
                 indexed_scope_has_files: Some(indexed_scope_has_files),
             },
         );
@@ -1277,5 +1291,200 @@ mod tests {
         for matched in compiled.find_iter(content.as_bytes()) {
             let _ = line_details(content, &starts, matched.start());
         }
+    }
+
+    fn compiled_regex(pattern: &str) -> CompiledPattern {
+        match crate::pattern_compile::compile(
+            pattern,
+            crate::pattern_compile::CompileOpts::default(),
+        ) {
+            crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+            other => panic!("compile regex {pattern:?}: {other:?}"),
+        }
+    }
+
+    fn grep_result_bytes(result: &GrepResult) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "matches": result.matches.iter().map(|matched| serde_json::json!({
+                "file": matched.file,
+                "line": matched.line,
+                "column": matched.column,
+                "line_text": matched.line_text,
+                "match_text": matched.match_text,
+            })).collect::<Vec<_>>(),
+            "total_matches": result.total_matches,
+            "files_searched": result.files_searched,
+            "files_with_matches": result.files_with_matches,
+            "index_status": result.index_status.as_str(),
+            "truncated": result.truncated,
+            "fully_degraded": result.fully_degraded,
+            "engine_capped": result.engine_capped,
+            "walk_truncated": result.walk_truncated,
+        }))
+        .expect("serialize grep result projection")
+    }
+
+    #[test]
+    fn multi_root_shared_query_matches_per_root_query_bytes() {
+        let project = tempfile::tempdir().expect("project");
+        let root_names = ["api", "cli", "daemon", "worker"];
+        let roots = root_names
+            .iter()
+            .map(|name| {
+                let root = project.path().join(name);
+                std::fs::create_dir_all(&root).expect("create root");
+                std::fs::write(
+                    root.join("service.rs"),
+                    "fn needle_alpha_12() {}\nfn needle_beta_34() {}\n",
+                )
+                .expect("write fixture");
+                std::fs::canonicalize(root).expect("canonicalize root")
+            })
+            .collect::<Vec<_>>();
+        let pattern = compiled_regex(r"needle_(?:alpha|beta)_\d+");
+        let filters = PathFilters::default();
+        let params = GrepParams {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_results: 100,
+            path_exclusion: None,
+        };
+        let scope = GrepScope {
+            roots: roots
+                .iter()
+                .map(|root| ResolvedRoot {
+                    search_root: root.clone(),
+                    filter_root: project.path().to_path_buf(),
+                    use_index: true,
+                    is_external: false,
+                })
+                .collect(),
+            multi_root: true,
+            per_root_max: 200,
+        };
+        let index =
+            crate::search_index::SearchIndex::build_with_limit_serial(project.path(), 1_048_576);
+        let snapshot = index.snapshot();
+        let expected = merge_grep_results(
+            scope
+                .roots
+                .iter()
+                .map(|root| {
+                    snapshot
+                        .search_grep_profiled_with_filters(
+                            &pattern,
+                            &filters,
+                            &root.search_root,
+                            scope.per_root_max,
+                            None,
+                        )
+                        .0
+                })
+                .collect(),
+            project.path(),
+            params.max_results,
+        );
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        *ctx.search_index().write().expect("lock search index") = Some(index);
+
+        let (actual, phases) =
+            execute_profiled_with_filters(&ctx, &pattern, &scope, &params, &filters);
+
+        assert_eq!(
+            grep_result_bytes(&actual),
+            grep_result_bytes(&expected),
+            "shared query search must preserve the legacy per-root result bytes"
+        );
+        assert!(
+            !phases.query_decomposition.is_zero(),
+            "the indexed request must record its one-time query decomposition"
+        );
+    }
+
+    /// Manual release-mode probe for a warm indexed TypeScript corpus searched across four roots.
+    #[test]
+    #[ignore = "manual release-mode issue #219 multi-root query performance probe"]
+    fn issue_219_multi_root_query_reuse_perf_probe() {
+        const ROOTS: usize = 4;
+        const FILES_PER_ROOT: usize = 1_000;
+        const SAMPLES: usize = 9;
+        const ITERATIONS: usize = 300;
+
+        let project_root = PathBuf::from("/tmp/aft-issue-219-multi-root");
+        let mut index = crate::search_index::SearchIndex::new();
+        let roots = (0..ROOTS)
+            .map(|root_index| project_root.join(format!("packages/root-{root_index}")))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            for file_index in 0..FILES_PER_ROOT {
+                index.index_file(
+                    &root.join(format!("src/module-{file_index:04}.ts")),
+                    b"export const indexed_value = 'warm corpus';\n",
+                );
+            }
+        }
+        let snapshot = index.snapshot();
+        let pattern =
+            compiled_regex(r"(?:(?:parse|format|validate)_[A-Za-z0-9_]+_)?issue_219_never_present");
+        let filters = PathFilters::default();
+
+        let per_root_once = || {
+            for root in &roots {
+                let result = snapshot
+                    .search_grep_profiled_with_filters(&pattern, &filters, root, 100, None)
+                    .0;
+                std::hint::black_box(result.total_matches);
+            }
+        };
+        let shared_query_once = || {
+            let query = decompose_grep_pattern(&pattern);
+            for root in &roots {
+                let result = snapshot
+                    .search_grep_profiled_with_filters_and_query(
+                        &pattern, &query, &filters, root, 100, None,
+                    )
+                    .0;
+                std::hint::black_box(result.total_matches);
+            }
+        };
+
+        let mut per_root_ns = Vec::with_capacity(SAMPLES);
+        let mut shared_query_ns = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let measure = |operation: &dyn Fn()| {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    operation();
+                }
+                started.elapsed().as_nanos() / ITERATIONS as u128
+            };
+            if sample % 2 == 0 {
+                per_root_ns.push(measure(&per_root_once));
+                shared_query_ns.push(measure(&shared_query_once));
+            } else {
+                shared_query_ns.push(measure(&shared_query_once));
+                per_root_ns.push(measure(&per_root_once));
+            }
+        }
+        per_root_ns.sort_unstable();
+        shared_query_ns.sort_unstable();
+        let per_root_median = per_root_ns[SAMPLES / 2];
+        let shared_query_median = shared_query_ns[SAMPLES / 2];
+        let speedup = per_root_median as f64 / shared_query_median as f64;
+
+        eprintln!(
+            "issue #219 multi-root regex query: roots={ROOTS} files_per_root={FILES_PER_ROOT} samples={SAMPLES} iterations={ITERATIONS}"
+        );
+        eprintln!("per-root decomposition ns/op samples: {per_root_ns:?}");
+        eprintln!("shared decomposition ns/op samples: {shared_query_ns:?}");
+        eprintln!(
+            "median: per-root={per_root_median}ns shared={shared_query_median}ns speedup={speedup:.2}x"
+        );
     }
 }

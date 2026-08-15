@@ -109,8 +109,9 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let text = format_grep_text(&result, &project_root);
     let post_filter_format = phases.query.post_filter + format_started.elapsed();
     crate::slog_debug!(
-        "perf grep phases: snapshot_acquire={:.3}ms trigram_lookup={:.3}ms pread_verify={:.3}ms candidates={} bytes={} post_filter/format={:.3}ms scope_probe={:.3}ms total={:.3}ms",
+        "perf grep phases: snapshot_acquire={:.3}ms query_decomposition={:.3}ms trigram_lookup={:.3}ms pread_verify={:.3}ms candidates={} bytes={} post_filter/format={:.3}ms scope_probe={:.3}ms total={:.3}ms",
         phases.snapshot_acquire.as_secs_f64() * 1000.0,
+        phases.query_decomposition.as_secs_f64() * 1000.0,
         phases.query.trigram_lookup.as_secs_f64() * 1000.0,
         phases.query.pread_verify.as_secs_f64() * 1000.0,
         phases.query.candidate_count,
