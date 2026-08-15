@@ -1,0 +1,62 @@
+{
+  "session_id": "opencode-session-42",
+  "dispatch_root": "/work/ledger",
+  "first_block": {
+    "block_id": "block-first",
+    "response_id": "response-1",
+    "identities": [
+      {
+        "producer_key": "rust-analyzer",
+        "fingerprint": "diag-a",
+        "file_path": "src/lib.rs",
+        "line": 17,
+        "severity": "error",
+        "code": "E0308",
+        "wording_form": "attributed",
+        "representation": "shown",
+        "lifecycle_episode_id": "episode-a-1"
+      },
+      {
+        "producer_key": "rust-analyzer",
+        "fingerprint": "diag-b",
+        "file_path": "src/main.rs",
+        "line": 29,
+        "severity": "error",
+        "code": "E0425",
+        "wording_form": "neutral",
+        "representation": "counted_only",
+        "lifecycle_episode_id": "episode-b-1"
+      }
+    ]
+  },
+  "reentry_block": {
+    "block_id": "block-reentry",
+    "response_id": "response-4",
+    "identities": [
+      {
+        "producer_key": "rust-analyzer",
+        "fingerprint": "diag-a",
+        "file_path": "src/lib.rs",
+        "line": 17,
+        "severity": "error",
+        "code": "E0308",
+        "wording_form": "neutral",
+        "representation": "shown",
+        "lifecycle_episode_id": "episode-a-2"
+      },
+      {
+        "producer_key": "rust-analyzer",
+        "fingerprint": "diag-b",
+        "file_path": "src/main.rs",
+        "line": 29,
+        "severity": "error",
+        "code": "E0425",
+        "wording_form": "neutral",
+        "representation": "counted_only",
+        "lifecycle_episode_id": "episode-b-2"
+      }
+    ]
+  },
+  "first_disappearance_observation_ordinal": 2,
+  "second_disappearance_observation_ordinal": 5
+}
