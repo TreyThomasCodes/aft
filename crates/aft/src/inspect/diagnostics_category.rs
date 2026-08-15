@@ -1,8 +1,6 @@
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
-use serde_json::Value;
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
 use crate::config::Config;
@@ -14,28 +12,6 @@ use crate::lsp::manager::{
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
-
-/// How long a SCOPED diagnostics pull waits for the LSP server to become ready
-/// and publish before reporting `pending`. Only the scoped (active-pull) path
-/// uses this — no-scope warm reads never wait.
-///
-/// 1s was too short for a cold language server: `ensure_server_for_file_detailed`
-/// spawns the server asynchronously, so the first scoped call on a fresh bridge
-/// almost always hit the deadline before the server finished initializing and
-/// returned `pending`, forcing the agent to re-run. When an agent explicitly
-/// scopes to a file it is asking "what's wrong with this" — it should get the
-/// answer in one call. 8s covers typical tsserver/rust-analyzer cold start while
-/// staying well under the 30s bridge transport timeout. The wait is bounded and
-/// only the FIRST scoped call per server pays the cold-start cost (subsequent
-/// calls hit a warm server). Tradeoff: diagnostics run on the single-threaded
-/// dispatch loop (the LSP manager is `!Send`), so this wait blocks other requests
-/// on the same bridge for its duration — acceptable because it is bounded and
-/// cold-start-only. A genuinely slow/unresponsive server still falls back to an
-/// honest `pending` at the deadline. For a directory scope the budget is shared
-/// across files, so the first cold file warms the server and the rest resolve
-/// within the remaining budget (or are reported truncated, honestly).
-const INSPECT_DIAGNOSTICS_DEADLINE: Duration = Duration::from_secs(8);
-const SCOPED_FILE_CAP: usize = 200;
 
 #[derive(Debug, Clone)]
 struct CollectedDiagnostic {
@@ -49,12 +25,8 @@ struct DiagnosticsCollection {
     server_ran: bool,
     servers_pending: BTreeSet<String>,
     servers_not_installed: BTreeSet<String>,
-    scope_truncated: bool,
-    /// Number of scoped files whose extension has NO registered LSP server.
-    /// These files will never produce diagnostics — distinct from "pending"
-    /// (a server is running but hasn't reported yet). Without this, a scope of
-    /// only unsupported file types reported `status: "pending"` forever,
-    /// implying results were still coming when none ever would.
+    /// An explicit unsupported file prevents the inspected set from being
+    /// mechanically verified, even though it does not have a server to wait on.
     files_without_server: usize,
 }
 
@@ -92,12 +64,12 @@ impl Drop for ScopedInspectDocuments<'_> {
     }
 }
 
-/// Main-thread implementation for the `diagnostics` inspect category.
+/// Collect diagnostics for the explicit inspect path.
 ///
-/// The LSP manager is owned by `AppContext` and is part of the serial LSP/status
-/// lane, so this category must never be dispatched through the rayon inspect
-/// worker pool. `handle_inspect` calls this directly, alongside the Tier-1 reads,
-/// while Tier-2 categories keep using the cache/worker path.
+/// A collection becomes Fresh only after all pending, unavailable, or otherwise
+/// unverified diagnostic sources have been resolved. If any such condition
+/// remains, the command emits a terminal non-fresh response instead of
+/// serializing zero counts or cache-state fields.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
@@ -110,8 +82,12 @@ pub(crate) fn run_diagnostics_category(
         collect_warm_working_set(ctx, snapshot)
     };
 
-    JobOutcome::Fresh {
-        payload: collection.into_payload(snapshot),
+    if collection.is_complete() {
+        JobOutcome::Fresh {
+            payload: collection.into_payload(snapshot),
+        }
+    } else {
+        JobOutcome::Pending { in_flight: true }
     }
 }
 
@@ -163,44 +139,17 @@ fn collect_scoped_diagnostics(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
 ) -> DiagnosticsCollection {
-    collect_scoped_diagnostics_until(
-        ctx,
-        snapshot,
-        scope,
-        Instant::now() + INSPECT_DIAGNOSTICS_DEADLINE,
-    )
-}
-
-fn collect_scoped_diagnostics_until(
-    ctx: &AppContext,
-    snapshot: &InspectSnapshot,
-    scope: &JobScope,
-    deadline: Instant,
-) -> DiagnosticsCollection {
     let config = ctx.config().clone();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     let scoped = scoped_lsp_files(snapshot, scope, &config, &mut tsconfig_membership);
-    let files = scoped.files;
     let mut collection = DiagnosticsCollection {
-        scope_truncated: scoped.truncated,
         files_without_server: scoped.explicit_files_without_server,
         ..DiagnosticsCollection::default()
     };
     let mut opened_documents = ScopedInspectDocuments::new(ctx);
 
-    for file in files {
-        if Instant::now() >= deadline {
-            collection.scope_truncated = true;
-            break;
-        }
-        collect_scoped_file(
-            ctx,
-            &config,
-            &file,
-            deadline,
-            &mut collection,
-            &mut opened_documents,
-        );
+    for file in scoped.files {
+        collect_scoped_file(ctx, &config, &file, &mut collection, &mut opened_documents);
         // Pull-only servers may leave didOpen diagnostics, telemetry, and log
         // notifications queued because they do not enter the push waiter.
         ctx.lsp().drain_events();
@@ -219,31 +168,15 @@ fn collect_scoped_diagnostics_until(
     collection
 }
 
-#[doc(hidden)]
-pub fn run_scoped_diagnostics_with_deadline_for_test(
-    ctx: &AppContext,
-    snapshot: &InspectSnapshot,
-    scope: &JobScope,
-    timeout: Duration,
-) -> JobOutcome {
-    let collection =
-        collect_scoped_diagnostics_until(ctx, snapshot, scope, Instant::now() + timeout);
-    JobOutcome::Fresh {
-        payload: collection.into_payload(snapshot),
-    }
-}
-
 fn collect_scoped_file(
     ctx: &AppContext,
     config: &Config,
     file: &Path,
-    deadline: Instant,
     collection: &mut DiagnosticsCollection,
     opened_documents: &mut ScopedInspectDocuments<'_>,
 ) {
-    // One canonical form across the LSP boundary: bare fs::canonicalize
-    // yields verbatim paths on Windows, which no longer match the
-    // normalized server keys and diagnostics-store paths.
+    // One canonical form across the LSP boundary: bare fs::canonicalize yields
+    // verbatim paths on Windows, which no longer match normalized server keys.
     let canonical = crate::inspect::job::canonicalize_normalized(file);
     let outcomes: EnsureServerOutcomes = {
         let mut lsp = ctx.lsp();
@@ -252,19 +185,10 @@ fn collect_scoped_file(
 
     record_attempt_gaps(&outcomes, collection);
     if outcomes.only_inapplicable_root_markers() {
-        // Every server registered for this file's extension failed the root
-        // marker check (e.g. a `.ts` file in a project with no `.oxlintrc.json`
-        // for oxlint). No applicable server will ever answer for this file, so
-        // count it as a no-server file — otherwise the status falls through to
-        // "pending" forever even after every truly-applicable server answered.
         collection.files_without_server += 1;
         return;
     }
     if outcomes.no_server_registered() || outcomes.successful.is_empty() {
-        // No-server files are already excluded from the candidate set by
-        // scoped_lsp_files (which counts explicit file-roots into
-        // files_without_server); reaching here means the server exists but
-        // isn't ready, which record_attempt_gaps already tracked.
         return;
     }
 
@@ -272,7 +196,6 @@ fn collect_scoped_file(
         let lsp = ctx.lsp();
         lsp.snapshot_pre_edit_state(&canonical)
     };
-
     let pull_results = {
         let mut lsp = ctx.lsp();
         match lsp.pull_file_diagnostics_tracked(&canonical, config) {
@@ -297,11 +220,6 @@ fn collect_scoped_file(
         record_pull_results(&outcomes.successful, &pull_results, collection);
     if push_fallback_servers.is_empty() {
         return;
-    }
-
-    if Instant::now() < deadline {
-        let mut lsp = ctx.lsp();
-        let _ = lsp.wait_for_file_diagnostics(&canonical, config, deadline);
     }
 
     let lsp = ctx.lsp();
@@ -422,12 +340,9 @@ fn scoped_warm_diagnostics(
 
 struct ScopedLspFiles {
     files: Vec<PathBuf>,
-    truncated: bool,
-    /// Count of explicit file-roots in the scope that have no registered LSP
-    /// server. Directory walks intentionally skip non-code files silently
-    /// (you don't want a `.md` in a walked dir flagged), but a scope that names
-    /// a specific file we cannot diagnose is a real "no server" signal the
-    /// agent must see — otherwise the status reads "pending" forever.
+    /// Count of explicit file roots with no registered LSP server. Directory
+    /// walks skip non-code files, but an explicitly requested unsupported file
+    /// prevents a fresh diagnostics claim.
     explicit_files_without_server: usize,
 }
 
@@ -444,7 +359,6 @@ fn scoped_lsp_files(
     };
 
     let mut files = BTreeSet::new();
-    let mut truncated = false;
     let mut explicit_files_without_server = 0usize;
     for root in roots {
         if root.is_file() {
@@ -483,88 +397,50 @@ fn scoped_lsp_files(
                 continue;
             }
             let path = entry.path();
-            if tsconfig_membership.should_skip_diagnostics(path) {
-                continue;
-            }
-            if servers_for_file(path, config).is_empty() {
+            if tsconfig_membership.should_skip_diagnostics(path)
+                || servers_for_file(path, config).is_empty()
+            {
                 continue;
             }
             files.insert(crate::inspect::job::canonicalize_normalized(path));
-            if files.len() >= SCOPED_FILE_CAP {
-                truncated = true;
-                break;
-            }
-        }
-        if truncated {
-            break;
         }
     }
 
     ScopedLspFiles {
         files: files.into_iter().collect(),
-        truncated,
         explicit_files_without_server,
     }
 }
 
 impl DiagnosticsCollection {
-    fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
-        self.sort_and_dedup();
-        let authoritative = severity_counts(&self.diagnostics);
-        let all = severity_counts_including_provisional(&self.diagnostics);
-        let provisional_only = severity_counts_provisional_only(&self.diagnostics);
-        let complete = self.server_ran
+    fn is_complete(&self) -> bool {
+        self.server_ran
             && self.servers_pending.is_empty()
             && self.servers_not_installed.is_empty()
-            && !self.scope_truncated;
-        let status = diagnostics_status(
-            complete,
-            self.scope_truncated,
-            &self.servers_not_installed,
-            &self.servers_pending,
-            self.files_without_server,
-        );
-        let counts_are_provisional = matches!(status, Some("incomplete" | "pending"));
-        let (errors, warnings, info, hints) = if counts_are_provisional {
-            (0, 0, 0, 0)
-        } else {
-            authoritative
-        };
-        let provisional_counts = if counts_are_provisional {
-            Some(all)
-        } else if provisional_only != (0, 0, 0, 0) {
-            Some(provisional_only)
-        } else {
-            None
-        };
+            && self.files_without_server == 0
+            && self
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.provisional)
+    }
+
+    fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
+        debug_assert!(self.is_complete());
+        self.sort_and_dedup();
+        let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self
             .diagnostics
             .iter()
             .map(|diagnostic| diagnostic_item(snapshot, diagnostic))
             .collect::<Vec<_>>();
 
-        let mut payload = serde_json::json!({
+        serde_json::json!({
             "errors": errors,
             "warnings": warnings,
             "info": info,
             "hints": hints,
-            "server_ran": self.server_ran,
-            "complete": complete,
-            "status": status,
-            "servers_pending": self.servers_pending.into_iter().collect::<Vec<_>>(),
-            "servers_not_installed": self.servers_not_installed.into_iter().collect::<Vec<_>>(),
-            "files_without_server": self.files_without_server,
             "items": items,
-        });
-        if let Some((errors, warnings, info, hints)) = provisional_counts {
-            payload["provisional_counts"] = serde_json::json!({
-                "errors": errors,
-                "warnings": warnings,
-                "info": info,
-                "hints": hints,
-            });
-        }
-        payload
+        })
     }
 
     fn sort_and_dedup(&mut self) {
@@ -596,47 +472,8 @@ impl DiagnosticsCollection {
     }
 }
 
-fn diagnostics_status(
-    complete: bool,
-    scope_truncated: bool,
-    servers_not_installed: &BTreeSet<String>,
-    servers_pending: &BTreeSet<String>,
-    files_without_server: usize,
-) -> Option<&'static str> {
-    if complete {
-        None
-    } else if scope_truncated || !servers_not_installed.is_empty() {
-        // Bounded gap: truncated scope, or a server exists but isn't installed.
-        Some("incomplete")
-    } else if !servers_pending.is_empty() {
-        // A registered server is running but hasn't reported yet — results are
-        // genuinely still coming.
-        Some("pending")
-    } else if files_without_server > 0 {
-        // No registered server matched the scoped file type(s). Nothing will
-        // ever arrive — report that honestly instead of "pending" forever.
-        Some("no_server")
-    } else {
-        // Not complete, but no pending server and no unsupported files either:
-        // treat as still-settling rather than asserting completeness.
-        Some("pending")
-    }
-}
-
 fn severity_counts(diagnostics: &[CollectedDiagnostic]) -> (usize, usize, usize, usize) {
     severity_counts_filtered(diagnostics, |diagnostic| !diagnostic.provisional)
-}
-
-fn severity_counts_including_provisional(
-    diagnostics: &[CollectedDiagnostic],
-) -> (usize, usize, usize, usize) {
-    severity_counts_filtered(diagnostics, |_| true)
-}
-
-fn severity_counts_provisional_only(
-    diagnostics: &[CollectedDiagnostic],
-) -> (usize, usize, usize, usize) {
-    severity_counts_filtered(diagnostics, |diagnostic| diagnostic.provisional)
 }
 
 fn severity_counts_filtered(
@@ -731,7 +568,7 @@ mod payload_count_tests {
                     end_line: 1,
                     end_column: 2,
                     severity: DiagnosticSeverity::Error,
-                    message: "warming result".into(),
+                    message: "verified result".into(),
                     code: None,
                     source: None,
                 },
@@ -743,43 +580,27 @@ mod payload_count_tests {
     }
 
     #[test]
-    fn pending_counts_are_provisional_and_authoritative_counts_are_zero() {
+    fn incomplete_collection_cannot_be_promoted_to_a_payload() {
         let mut collection = collection();
         collection.servers_pending.insert("rust-analyzer".into());
-        let payload = collection.into_payload(&snapshot());
-        assert_eq!(payload["status"], "pending");
-        assert_eq!(payload["errors"], 0);
-        assert_eq!(payload["warnings"], 0);
-        assert_eq!(payload["provisional_counts"]["errors"], 1);
-        assert_eq!(payload["provisional_counts"]["warnings"], 0);
+        assert!(!collection.is_complete());
     }
 
     #[test]
-    fn incomplete_counts_are_provisional_and_authoritative_counts_are_zero() {
+    fn provisional_collection_cannot_be_promoted_to_a_payload() {
         let mut collection = collection();
-        collection.scope_truncated = true;
-        let payload = collection.into_payload(&snapshot());
-        assert_eq!(payload["status"], "incomplete");
-        assert_eq!(payload["errors"], 0);
-        assert_eq!(payload["provisional_counts"]["errors"], 1);
+        collection.diagnostics[0].provisional = true;
+        assert!(!collection.is_complete());
     }
 
     #[test]
-    fn complete_counts_stay_at_the_authoritative_top_level() {
+    fn fresh_payload_contains_only_authoritative_counts_and_items() {
         let payload = collection().into_payload(&snapshot());
-        assert_eq!(payload["complete"], true);
         assert_eq!(payload["errors"], 1);
-        assert!(payload.get("provisional_counts").is_none());
-    }
-
-    #[test]
-    fn no_server_counts_stay_at_the_authoritative_top_level() {
-        let mut collection = collection();
-        collection.server_ran = false;
-        collection.files_without_server = 1;
-        let payload = collection.into_payload(&snapshot());
-        assert_eq!(payload["status"], "no_server");
-        assert_eq!(payload["errors"], 1);
+        assert_eq!(payload["warnings"], 0);
+        assert!(payload.get("server_ran").is_none());
+        assert!(payload.get("complete").is_none());
+        assert!(payload.get("status").is_none());
         assert!(payload.get("provisional_counts").is_none());
     }
 }

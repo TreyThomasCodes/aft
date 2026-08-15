@@ -90,25 +90,12 @@ impl Tier2RunSubmission {
 }
 
 #[derive(Debug, Clone)]
-pub struct DirectTier2RunOutcome {
-    pub outcome: JobOutcome,
-    pub force_paths_completed: bool,
-}
-
-#[derive(Debug, Clone)]
 struct Tier2ReuseOptions {
     force_rescan_paths: BTreeSet<PathBuf>,
     allow_callgraph_cold_build: bool,
 }
 
 impl Tier2ReuseOptions {
-    fn direct(paths: Vec<PathBuf>) -> Self {
-        Self {
-            force_rescan_paths: paths.into_iter().collect(),
-            allow_callgraph_cold_build: false,
-        }
-    }
-
     fn has_force_paths(&self) -> bool {
         !self.force_rescan_paths.is_empty()
     }
@@ -858,97 +845,42 @@ impl InspectManager {
         }
     }
 
-    pub fn tier2_run_with_reuse_direct(
+    /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
+    ///
+    /// The blocking inspect path must not turn an unfinished reuse job into a
+    /// partial response. A caller either receives the completed aggregate or a
+    /// failure from the worker; it never receives a timeout-shaped `Pending`.
+    pub fn tier2_run_with_reuse_blocking(
         self: &Arc<Self>,
         snapshot: InspectSnapshot,
         category: InspectCategory,
         caller_scope: JobScope,
-        deadline: Instant,
-        force_rescan_paths: Vec<PathBuf>,
-    ) -> DirectTier2RunOutcome {
+    ) -> JobOutcome {
         if let Err(outcome) = validate_tier2_read_category(category) {
-            return DirectTier2RunOutcome {
-                outcome,
-                force_paths_completed: false,
-            };
+            return outcome;
         }
         if !self.heavy_root_work_allowed() {
-            return DirectTier2RunOutcome {
-                outcome: JobOutcome::Failed {
-                    message: Self::heavy_root_work_block_message(category),
-                },
-                force_paths_completed: false,
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
             };
         }
         let cache = match self.cache_for_snapshot(&snapshot) {
             Ok(cache) => cache,
-            Err(message) => {
-                return DirectTier2RunOutcome {
-                    outcome: JobOutcome::Failed { message },
-                    force_paths_completed: false,
-                }
-            }
+            Err(message) => return JobOutcome::Failed { message },
         };
 
-        let must_run_forced_followup = !force_rescan_paths.is_empty();
-        loop {
-            let options = if must_run_forced_followup {
-                Tier2ReuseOptions::direct(force_rescan_paths.clone())
-            } else {
-                Tier2ReuseOptions::direct(Vec::new())
-            };
-            let job = self.tier2_reuse_job(snapshot.clone(), category, None);
-            let key = job.key.clone();
-            let (waiter_tx, waiter_rx) = bounded(1);
-            let claimed = match self.register_tier2_reuse_waiter(&key, waiter_tx) {
-                Ok(claimed) => claimed,
-                Err(message) => {
-                    return DirectTier2RunOutcome {
-                        outcome: JobOutcome::Failed { message },
-                        force_paths_completed: false,
-                    }
-                }
-            };
-            if claimed {
-                self.spawn_tier2_reuse_job(job, options);
-            }
-
-            let completed_force_run = claimed && must_run_forced_followup;
-            let outcome = self.wait_for_tier2_reuse_until(
-                &key,
-                &caller_scope,
-                cache.as_ref(),
-                waiter_rx,
-                &snapshot,
-                deadline,
-            );
-
-            delay_direct_force_followup_deadline_check_for_debug(&snapshot.project_root);
-            if must_run_forced_followup
-                && !claimed
-                && !matches!(outcome, JobOutcome::Pending { .. })
-            {
-                // The category was already in flight before this direct inspect
-                // could supply its forced paths. Wait for that scan to finish,
-                // then claim a follow-up reuse pass so the direct answer is based
-                // on the paths invalidated by the edit/watcher stream rather than
-                // on a possibly stat-fresh pre-existing scan. If the original scan
-                // used the whole deadline, the forced paths were not incorporated,
-                // so the honest direct result is still incomplete.
-                if Instant::now() < deadline {
-                    continue;
-                }
-                return DirectTier2RunOutcome {
-                    outcome: JobOutcome::Pending { in_flight: true },
-                    force_paths_completed: false,
-                };
-            }
-
-            return DirectTier2RunOutcome {
-                outcome,
-                force_paths_completed: completed_force_run,
-            };
+        let job = self.tier2_reuse_job(snapshot.clone(), category, None);
+        let key = job.key.clone();
+        let (waiter_tx, waiter_rx) = bounded(1);
+        let claimed = match self.register_tier2_reuse_waiter(&key, waiter_tx) {
+            Ok(claimed) => claimed,
+            Err(message) => return JobOutcome::Failed { message },
+        };
+        if claimed {
+            self.spawn_tier2_reuse_job(job, Tier2ReuseOptions::default());
         }
+
+        self.wait_for_tier2_reuse(&key, &caller_scope, cache.as_ref(), waiter_rx, &snapshot)
     }
 
     fn register_tier2_reuse_waiter(
@@ -1020,23 +952,15 @@ impl InspectManager {
         });
     }
 
-    fn wait_for_tier2_reuse_until(
+    fn wait_for_tier2_reuse(
         &self,
         key: &JobKey,
         caller_scope: &JobScope,
         cache: &(impl InspectCacheRead + ?Sized),
         waiter_rx: Receiver<JobOutcome>,
         snapshot: &InspectSnapshot,
-        deadline: Instant,
     ) -> JobOutcome {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return JobOutcome::Pending { in_flight: true };
-        };
-        if remaining.is_zero() {
-            return JobOutcome::Pending { in_flight: true };
-        }
-
-        match waiter_rx.recv_timeout(remaining) {
+        match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
                 outcome,
                 snapshot,
@@ -1044,12 +968,9 @@ impl InspectManager {
                 cache,
                 caller_scope,
             ),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                JobOutcome::Pending { in_flight: true }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                JobOutcome::Pending { in_flight: true }
-            }
+            Err(_) => JobOutcome::Failed {
+                message: "inspect Tier-2 worker disconnected before completion".to_string(),
+            },
         }
     }
 
@@ -1185,6 +1106,14 @@ impl InspectManager {
             .map(freshness_record_relative_key)
             .collect::<BTreeSet<_>>();
 
+        // The project walk is part of every identity check, including a negative
+        // verdict. It detects additions and removals that per-record metadata
+        // cannot observe, and gives all callers the same gitignore-aware file set.
+        let project_scope = JobScope::for_project(snapshot.project_root.clone());
+        let project_files = scope_files(&snapshot.project_root, &project_scope);
+        let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
+
+        let mut records_match = true;
         for record in &cached_records {
             let absolute = if record.file_path.is_absolute() {
                 record.file_path.clone()
@@ -1193,22 +1122,14 @@ impl InspectManager {
             };
             match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh { .. } => {}
-                ContributionFreshness::Stale | ContributionFreshness::Deleted => return Ok(false),
+                ContributionFreshness::Stale | ContributionFreshness::Deleted => {
+                    records_match = false;
+                }
             }
         }
 
-        // Detect files added since the cached aggregate was generated (and files
-        // that still exist but are no longer in the gitignore-aware project
-        // scope). This walk remains on the read path because the current API does
-        // not provide a watcher-maintained project file set, and additions cannot
-        // be detected from cached contribution records alone. Existing cached
-        // files are checked above first so ordinary edits/deletes can return stale
-        // without walking the project.
-        let project_scope = JobScope::for_project(snapshot.project_root.clone());
-        let project_files = scope_files(&snapshot.project_root, &project_scope);
-        let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
-
-        Ok(current_by_relative.len() == cached_relative.len()
+        Ok(records_match
+            && current_by_relative.len() == cached_relative.len()
             && current_by_relative
                 .keys()
                 .all(|relative| cached_relative.contains(relative)))
@@ -2129,23 +2050,6 @@ fn panic_tier2_reuse_for_debug(job: &InspectJob) {
             .is_some_and(|category| category == job.category.as_str());
         if should_panic {
             panic!("forced tier2 reuse panic for {}", job.category);
-        }
-    }
-}
-
-fn delay_direct_force_followup_deadline_check_for_debug(project_root: &Path) {
-    #[cfg(not(debug_assertions))]
-    let _ = project_root;
-    #[cfg(debug_assertions)]
-    {
-        if !env_project_root_matches("AFT_TEST_DIRECT_FORCE_FOLLOWUP_DELAY_ROOT", project_root) {
-            return;
-        }
-        if let Some(delay_ms) = std::env::var("AFT_TEST_DIRECT_FORCE_FOLLOWUP_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-        {
-            std::thread::sleep(Duration::from_millis(delay_ms));
         }
     }
 }
@@ -4699,7 +4603,10 @@ export function bannerUnused() {}
         let refreshed = manager
             .tier2_run_with_reuse_job_result_with_options(
                 delete_job,
-                Tier2ReuseOptions::direct(vec![deleted.clone()]),
+                Tier2ReuseOptions {
+                    force_rescan_paths: [deleted.clone()].into_iter().collect(),
+                    allow_callgraph_cold_build: true,
+                },
             )
             .outcome
             .expect("delete refresh dead_code scan succeeds")
