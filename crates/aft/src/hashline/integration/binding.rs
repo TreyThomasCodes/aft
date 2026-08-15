@@ -406,14 +406,18 @@ impl BindingRegistry {
     pub fn teardown(&self, root: impl AsRef<Path>, session_id: impl Into<String>) -> bool {
         let key = SessionKey::new(root.as_ref().to_path_buf(), session_id.into());
         let existing = {
-            let state = self.lock();
-            state.bindings.get(&key).cloned()
+            let mut state = self.lock();
+            state.bindings.remove(&key)
         };
-        if let Some(existing) = existing {
-            self.drain_in_flight(&existing);
-        }
-        let mut state = self.lock();
-        state.bindings.remove(&key).is_some()
+        let Some(existing) = existing else {
+            return false;
+        };
+
+        // Remove the slot before waiting so no new request can capture the
+        // binding while teardown is draining its existing guards. A concurrent
+        // registration may install a new slot without being removed afterward.
+        self.drain_in_flight(&existing);
+        true
     }
 
     /// Number of installed bindings (test/diagnostics).
@@ -475,6 +479,76 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(timeout.timed_out());
         }
+    }
+
+    #[test]
+    fn teardown_without_a_binding_returns_immediately() {
+        let registry = BindingRegistry::new();
+        assert!(!registry.teardown("/tmp/hashline-no-binding", "missing"));
+    }
+
+    #[test]
+    fn teardown_notifies_each_session_through_its_own_slot() {
+        let registry = Arc::new(BindingRegistry::new());
+        let root = Path::new("/tmp/hashline-session-drains");
+        for session in ["first", "second"] {
+            registry.register(
+                root,
+                session,
+                RegistrationRequest {
+                    configured_enabled: true,
+                    edit_slot_survives: true,
+                },
+            );
+        }
+        let first_guard = registry.capture(root, "first").expect("first guard");
+        let second_guard = registry.capture(root, "second").expect("second guard");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let first_registry = Arc::clone(&registry);
+        let first_done_tx = done_tx.clone();
+        let first_root = root.to_path_buf();
+        let first_teardown = thread::spawn(move || {
+            assert!(first_registry.teardown(&first_root, "first"));
+            first_done_tx.send("first").expect("signal first teardown");
+        });
+        let second_registry = Arc::clone(&registry);
+        let second_root = root.to_path_buf();
+        let second_teardown = thread::spawn(move || {
+            assert!(second_registry.teardown(&second_root, "second"));
+            done_tx.send("second").expect("signal second teardown");
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while (registry.peek(root, "first").is_some() || registry.peek(root, "second").is_some())
+            && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(registry.peek(root, "first").is_none());
+        assert!(registry.peek(root, "second").is_none());
+
+        drop(second_guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second teardown completes"),
+            "second"
+        );
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        drop(first_guard);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first teardown completes"),
+            "first"
+        );
+        first_teardown.join().expect("first teardown thread");
+        second_teardown.join().expect("second teardown thread");
     }
 
     #[test]
