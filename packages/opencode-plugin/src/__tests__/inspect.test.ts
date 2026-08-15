@@ -90,7 +90,7 @@ function createInspectHarness(
 function freshTerminal() {
   return {
     success: true,
-    terminal: "FRESH",
+    inspect_terminal: "fresh",
     text: "fresh result body",
     wait_stamp: {
       text: "waited: no; completed: stat_verification",
@@ -117,20 +117,20 @@ describe("aft_inspect tool", () => {
   test("parses shared entries for fresh, interrupted, and both failed forms", () => {
     const fresh = parseInspectTerminal(freshTerminal());
     const interrupted = parseInspectTerminal({
-      terminal: "INTERRUPTED",
-      phases: [{ id: "lsp_quiescence", producer: "rust_analyzer" }],
+      inspect_terminal: "interrupted",
+      completed_phases: [{ id: "lsp_quiescence", producer: "rust_analyzer" }],
     });
     const failed = parseInspectTerminal({
-      terminal: "PHASE-FAILED",
-      phases: [{ id: "callgraph_ready", category: "dead_code" }],
+      inspect_terminal: "phase_failed",
+      completed_phases: [{ id: "callgraph_ready", category: "dead_code" }],
       failed_phase: "callgraph_ready",
       category: "dead_code",
       failure_reason: "writer_lease_unavailable",
       failure_detail: "writer is busy",
     });
     const preflight = parseInspectTerminal({
-      terminal: "PHASE-FAILED",
-      phases: [],
+      inspect_terminal: "phase_failed",
+      completed_phases: [],
       failure_reason: "missing_executable",
     });
 
@@ -161,31 +161,32 @@ describe("aft_inspect tool", () => {
       freshTerminal(),
       {
         success: false,
-        terminal: "INTERRUPTED",
+        inspect_terminal: "interrupted",
         text: "interrupted result body",
-        phases: [{ id: "lsp_start", producer: "tsserver" }],
+        completed_phases: [{ id: "lsp_start", producer: "tsserver" }],
       },
       {
         success: false,
-        terminal: "PHASE-FAILED",
+        inspect_terminal: "phase_failed",
         text: "failure result body",
-        phases: [{ id: "tier2_rescan", category: "dead_code" }],
+        completed_phases: [{ id: "tier2_rescan", category: "dead_code" }],
         failed_phase: "tier2_rescan",
         category: "dead_code",
         failure_reason: "tier2_rescan_errored",
       },
       {
         success: false,
-        terminal: "PHASE-FAILED",
+        inspect_terminal: "phase_failed",
         text: "preflight result body",
-        phases: [],
+        completed_phases: [],
         failure_reason: "root_resolution_failed",
       },
     ]) {
       const { toolCallCalls, tools } = createInspectHarness(() => response);
       const result = await tools.aft_inspect.execute({}, createMockSdkContext());
 
-      expect(result).toContain(response.terminal);
+      const terminal = response.inspect_terminal.toUpperCase().replaceAll("_", "-");
+      expect(result).toContain(terminal);
       expect(toolCallCalls).toHaveLength(1);
       expect(toolCallCalls[0]).toMatchObject({ name: "inspect" });
       expect(toolCallCalls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");

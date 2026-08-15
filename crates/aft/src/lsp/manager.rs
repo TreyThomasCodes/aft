@@ -114,9 +114,6 @@ pub enum ApplicabilityResolutionError {
         server_key: ServerKey,
         result: ServerAttemptResult,
     },
-    NoApplicableServer {
-        root: PathBuf,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -568,8 +565,12 @@ impl LspManager {
         }
 
         if candidates.is_empty() {
-            return Err(ApplicabilityResolutionError::NoApplicableServer {
-                root: project_root.to_path_buf(),
+            // An empty applicability set has no diagnostics producer to start or
+            // wait for. Preserve that fact as a valid snapshot so inspect can
+            // satisfy the diagnostics phase vacuously.
+            return Ok(ApplicableServerSnapshot {
+                server_keys: Vec::new(),
+                candidates: Vec::new(),
             });
         }
 
@@ -3101,6 +3102,21 @@ mod inspect_path_tests {
         assert_eq!(snapshot.server_keys[0].kind.id_str(), "inspect-test");
         assert_eq!(manager.server_count(), 0);
         assert!(!manager.document_is_open_for_test(&root.join("input.inspectlang")));
+    }
+
+    #[test]
+    fn applicability_resolution_preserves_an_empty_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        std::fs::write(root.join("notes.txt"), "plain text\n").expect("fixture file");
+
+        let snapshot = LspManager::new()
+            .resolve_applicable_servers_for_root(&root, &Config::default())
+            .expect("an empty applicability set is valid");
+
+        assert!(snapshot.server_keys.is_empty());
+        assert!(snapshot.candidates.is_empty());
     }
 
     #[test]

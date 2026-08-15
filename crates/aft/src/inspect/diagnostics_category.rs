@@ -24,6 +24,7 @@ struct CollectedDiagnostic {
 struct DiagnosticsCollection {
     diagnostics: Vec<CollectedDiagnostic>,
     server_ran: bool,
+    applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
     servers_not_installed: BTreeSet<String>,
     /// An explicit unsupported file prevents the inspected set from being
@@ -76,8 +77,16 @@ pub(crate) fn run_diagnostics_category(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     scope_was_provided: bool,
+    applicability_is_empty: bool,
 ) -> JobOutcome {
-    let collection = if scope_was_provided {
+    let collection = if applicability_is_empty {
+        // No applicable producer means there is no diagnostic artifact to wait
+        // for; the empty category is authoritative for this applicability snapshot.
+        DiagnosticsCollection {
+            applicability_is_empty: true,
+            ..DiagnosticsCollection::default()
+        }
+    } else if scope_was_provided {
         // A deferred inspection can collect diagnostics for the entire root
         // without an explicit scope. Scope filters rendered results, not work.
         collect_scoped_diagnostics(ctx, snapshot, scope)
@@ -473,7 +482,7 @@ fn scoped_lsp_files(
 
 impl DiagnosticsCollection {
     fn is_complete(&self) -> bool {
-        self.server_ran
+        (self.server_ran || self.applicability_is_empty)
             && self.servers_pending.is_empty()
             && self.servers_not_installed.is_empty()
             && self.files_without_server == 0
@@ -636,6 +645,16 @@ mod payload_count_tests {
             server_ran: true,
             ..DiagnosticsCollection::default()
         }
+    }
+
+    #[test]
+    fn empty_applicability_is_vacuously_complete() {
+        let collection = DiagnosticsCollection {
+            applicability_is_empty: true,
+            ..DiagnosticsCollection::default()
+        };
+
+        assert!(collection.is_complete());
     }
 
     #[test]
