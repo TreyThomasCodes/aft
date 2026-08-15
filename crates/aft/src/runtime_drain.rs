@@ -2701,7 +2701,8 @@ pub(crate) fn configure_search_order_context_for_test(
         warm_callgraph_store: false,
         supersede_artifact_persistence: false,
         artifact_load_starts: Vec::new(),
-    });
+    })
+    .expect("test configure maintenance queue has capacity");
 
     let (search_tx, search_rx) = crossbeam_channel::unbounded();
     search_tx

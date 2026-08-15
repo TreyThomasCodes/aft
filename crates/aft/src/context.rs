@@ -2702,6 +2702,12 @@ impl AppContext {
             .insert((root, session_id))
     }
 
+    pub(crate) fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
+        self.configured_session_roots
+            .lock()
+            .contains(&(root.to_path_buf(), session_id.to_string()))
+    }
+
     /// Undo [`Self::note_configure_session_binding`] when the maintenance job
     /// carrying the session's bash replay was dropped as stale: the session has
     /// not actually been replayed, so its next bind must count as first again.
@@ -2805,8 +2811,20 @@ impl AppContext {
         !self.configure_maintenance_jobs.lock().is_empty() || !self.configure_warnings_rx.is_empty()
     }
 
-    pub(crate) fn enqueue_configure_maintenance(&self, job: ConfigureMaintenanceJob) {
-        self.configure_maintenance_jobs.lock().push_back(job);
+    pub(crate) fn configure_maintenance_has_capacity(&self) -> bool {
+        self.configure_maintenance_jobs.lock().len() < crate::executor::MAINTENANCE_QUEUE_CAP
+    }
+
+    pub(crate) fn enqueue_configure_maintenance(
+        &self,
+        job: ConfigureMaintenanceJob,
+    ) -> Result<(), ConfigureMaintenanceJob> {
+        let mut jobs = self.configure_maintenance_jobs.lock();
+        if jobs.len() >= crate::executor::MAINTENANCE_QUEUE_CAP {
+            return Err(job);
+        }
+        jobs.push_back(job);
+        Ok(())
     }
 
     pub(crate) fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {

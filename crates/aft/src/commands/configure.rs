@@ -743,8 +743,6 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
     // This is intentionally separate from artifact-cache-key memoization. The
     // cache key must validate the current HEAD, while worktree topology is
     // stable until the root's `.git` marker changes.
-    #[cfg(test)]
-    ctx.record_worktree_bridge_probe_spawn_for_test();
     let fail_closed_topology = || {
         let git_marker_is_file = project_root.join(".git").is_file();
         if git_marker_is_file {
@@ -755,6 +753,11 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
         }
         (git_marker_is_file, None)
     };
+    if configure_cancellation_requested() {
+        return fail_closed_topology();
+    }
+    #[cfg(test)]
+    ctx.record_worktree_bridge_probe_spawn_for_test();
     let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
@@ -765,6 +768,9 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
             "--git-common-dir",
         ])
         .output();
+    if configure_cancellation_requested() {
+        return fail_closed_topology();
+    }
     let Ok(output) = output else {
         return fail_closed_topology();
     };
@@ -1713,16 +1719,34 @@ fn configure_warm_key(
 /// a bind nobody is waiting for. Once the commit phase begins the token is
 /// sealed and later cancels are ignored, so `AppContext` is never abandoned
 /// half-mutated.
+fn configure_cancellation_requested() -> bool {
+    crate::executor::current_job_cancellation()
+        .is_some_and(|token| token.cancel_requested_before_commit())
+}
+
 fn configure_cancelled(req_id: &str) -> Option<Response> {
-    let token = crate::executor::current_job_cancellation()?;
-    if token.cancel_requested_before_commit() {
-        return Some(Response::error(
+    configure_cancellation_requested().then(|| {
+        Response::error(
             req_id,
             "request_cancelled",
             "configure cancelled: the requesting route was torn down or its bind deadline expired",
-        ));
-    }
-    None
+        )
+    })
+}
+
+fn configure_maintenance_backpressure(req_id: &str) -> Response {
+    Response::error_with_data(
+        req_id,
+        "maintenance_backpressure",
+        format!(
+            "configure maintenance queue reached its per-actor capacity of {} jobs",
+            crate::executor::MAINTENANCE_QUEUE_CAP
+        ),
+        json!({
+            "retryable": true,
+            "queue_cap": crate::executor::MAINTENANCE_QUEUE_CAP,
+        }),
+    )
 }
 
 pub(crate) const HASHLINE_DOWNGRADE_MESSAGE: &str =
@@ -1844,6 +1868,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         return cancelled;
     }
     let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
 
     let previous_config = ctx.config();
     let previous_project_root = previous_config.project_root.clone();
@@ -2077,6 +2104,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // Equivalent-configure fast path: same commit boundary as the full
         // path — session binding registration is a state mutation. The seal
         // races the canceller atomically; losing means abort without mutating.
+        let needs_session_maintenance =
+            !ctx.has_configure_session_binding(&canonical_cache_root, req.session());
+        if needs_session_maintenance && !ctx.configure_maintenance_has_capacity() {
+            return configure_maintenance_backpressure(&req.id);
+        }
         if let Some(token) = crate::executor::current_job_cancellation() {
             if !token.try_seal_committed() {
                 return Response::error(
@@ -2102,7 +2134,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         if first_session_bind {
             let storage_root =
                 crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-            ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
+            let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
                 generation,
                 root_path: root_path.clone(),
                 canonical_cache_root: canonical_cache_root.clone(),
@@ -2121,6 +2153,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 supersede_artifact_persistence: false,
                 artifact_load_starts: Vec::new(),
             });
+            if enqueue_result.is_err() {
+                ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+                return configure_maintenance_backpressure(&req.id);
+            }
             slog_debug!(
                 "equivalent configure registered session {} for generation {}",
                 req.session(),
@@ -2187,31 +2223,32 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let project_key = if artifact_key_needed {
-        Some(
-            match ctx.memoized_artifact_cache_key_for_configure(
-                &root_path,
-                &canonical_cache_root,
-                &storage_root,
-                git_common_dir.as_deref(),
-            ) {
-                Ok(key) => key,
-                Err(error) => {
-                    return Response::error_with_data(
-                        &req.id,
-                        "cache_key_probe_failed",
-                        error.to_string(),
-                        json!({
-                            "retryable": true,
-                            "root": error.root().display().to_string(),
-                            "detail": error.detail(),
-                        }),
-                    );
-                }
-            },
+    let project_key_result = artifact_key_needed.then(|| {
+        ctx.memoized_artifact_cache_key_for_configure(
+            &root_path,
+            &canonical_cache_root,
+            &storage_root,
+            git_common_dir.as_deref(),
         )
-    } else {
-        None
+    });
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
+    let project_key = match project_key_result {
+        Some(Ok(key)) => Some(key),
+        Some(Err(error)) => {
+            return Response::error_with_data(
+                &req.id,
+                "cache_key_probe_failed",
+                error.to_string(),
+                json!({
+                    "retryable": true,
+                    "root": error.root().display().to_string(),
+                    "detail": error.detail(),
+                }),
+            );
+        }
+        None => None,
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_phase("artifact_owner_claim");
@@ -2290,6 +2327,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // wins. Losing the race means a Goodbye/deadline cancel landed first and
     // its caller was told RunningSignalled, so abort WITHOUT mutating; winning
     // means later cancels see RunningCommitted and discard the completion.
+    if !ctx.configure_maintenance_has_capacity() {
+        return configure_maintenance_backpressure(&req.id);
+    }
     if let Some(token) = crate::executor::current_job_cancellation() {
         if !token.try_seal_committed() {
             return Response::error(
@@ -2484,7 +2524,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
     ctx.begin_configure_ack_phase("maintenance_enqueue");
-    ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
+    let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
@@ -2503,6 +2543,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         supersede_artifact_persistence: !equivalent_warm_config,
         artifact_load_starts,
     });
+    if enqueue_result.is_err() {
+        if first_session_bind {
+            ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+        }
+        return configure_maintenance_backpressure(&req.id);
+    }
 
     slog_info!("project root set: {}", root_path.display());
 
@@ -5323,6 +5369,78 @@ mod tests {
         assert!(handle_configure_for_test(&request(), &ctx).success);
         assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), 3);
         ctx.force_worktree_bridge_reprobe_for_test(false);
+    }
+
+    #[test]
+    fn configure_cancellation_aborts_slow_git_retry_cluster_within_bound() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&root);
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let probe_started = Arc::new(AtomicBool::new(false));
+        let _probe_guard =
+            crate::search_index::force_git_root_commit_probe_slow_transient_for_paths_for_test(
+                vec![canonical_root.clone()],
+                Duration::from_millis(150),
+                Arc::clone(&probe_started),
+            );
+
+        let ctx = Arc::new(test_context());
+        let executor = crate::executor::Executor::new();
+        let root_id = crate::path_identity::ProjectRootId::from_path(&canonical_root)
+            .expect("canonical project root id");
+        assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
+        let request = configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false,
+            }))],
+        }));
+        let request_id = request.id.clone();
+        let (response_rx, cancellation) = executor.submit_cancellable_async(
+            root_id.clone(),
+            crate::executor::Lane::Mutating,
+            request_id,
+            Box::new(move |ctx| super::handle_configure(&request, ctx)),
+        );
+
+        let probe_deadline = Instant::now() + Duration::from_secs(2);
+        while !probe_started.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < probe_deadline,
+                "stubbed git probe did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled_at = Instant::now();
+        assert_eq!(
+            executor.cancel_job(&root_id, &cancellation),
+            crate::executor::JobCancelOutcome::RunningSignalled
+        );
+
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build cancellation test runtime")
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(400), response_rx)
+                    .await
+                    .expect("configure cancellation must stop before the retry ladder finishes")
+                    .expect("configure completion sender")
+            });
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "request_cancelled");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(400),
+            "cancelled configure exceeded the bounded git-probe exit time"
+        );
     }
 
     #[test]

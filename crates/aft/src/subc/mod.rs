@@ -4559,64 +4559,78 @@ fn submit_maintenance_job(
         | MaintenanceDrainKind::Lsp
         | MaintenanceDrainKind::CompletionDrains => Lane::MaintenanceCommit,
     };
-    let rx = executor.submit_maintenance_async(
-        root_id,
-        lane,
-        request_id.clone(),
-        Box::new(move |ctx| {
-            let outcome = match kind {
-                MaintenanceDrainKind::Watcher => {
-                    let drained = runtime_drain::drain_watcher_events_bounded(
-                        ctx,
-                        runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
-                    );
-                    MaintenanceJobOutcome {
-                        empty_bg_sessions: Vec::new(),
-                        requeue_kind: drained.has_more.then_some(kind),
-                    }
+    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+        let outcome = match kind {
+            MaintenanceDrainKind::Watcher => {
+                let drained = runtime_drain::drain_watcher_events_bounded(
+                    ctx,
+                    runtime_drain::WATCHER_PATH_DRAIN_BATCH_CAP,
+                );
+                MaintenanceJobOutcome {
+                    empty_bg_sessions: Vec::new(),
+                    requeue_kind: drained.has_more.then_some(kind),
                 }
-                MaintenanceDrainKind::Lsp => {
-                    let drained = runtime_drain::drain_lsp_events_bounded(
-                        ctx,
-                        runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP,
-                    );
-                    MaintenanceJobOutcome {
-                        empty_bg_sessions: Vec::new(),
-                        requeue_kind: drained.has_more.then_some(kind),
-                    }
+            }
+            MaintenanceDrainKind::Lsp => {
+                let drained = runtime_drain::drain_lsp_events_bounded(
+                    ctx,
+                    runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP,
+                );
+                MaintenanceJobOutcome {
+                    empty_bg_sessions: Vec::new(),
+                    requeue_kind: drained.has_more.then_some(kind),
                 }
-                MaintenanceDrainKind::ConfigureTail => {
-                    runtime_drain::drain_deferred_configure_maintenance(ctx);
-                    runtime_drain::drain_configure_warning_events(ctx);
-                    MaintenanceJobOutcome::default()
+            }
+            MaintenanceDrainKind::ConfigureTail => {
+                runtime_drain::drain_deferred_configure_maintenance(ctx);
+                runtime_drain::drain_configure_warning_events(ctx);
+                MaintenanceJobOutcome::default()
+            }
+            MaintenanceDrainKind::CompletionDrains => {
+                runtime_drain::drain_search_index_events(ctx);
+                runtime_drain::drain_callgraph_store_events(ctx);
+                runtime_drain::drain_semantic_index_events(ctx);
+                runtime_drain::drain_semantic_refresh_events(ctx);
+                runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
+                let empty_bg_sessions = bg_sessions_to_check
+                    .into_iter()
+                    .filter(|(session, _)| {
+                        !ctx.bash_background()
+                            .has_completions_for_session(Some(session.as_str()))
+                    })
+                    .collect();
+                MaintenanceJobOutcome {
+                    empty_bg_sessions,
+                    requeue_kind: None,
                 }
-                MaintenanceDrainKind::CompletionDrains => {
-                    runtime_drain::drain_search_index_events(ctx);
-                    runtime_drain::drain_callgraph_store_events(ctx);
-                    runtime_drain::drain_semantic_index_events(ctx);
-                    runtime_drain::drain_semantic_refresh_events(ctx);
-                    runtime_drain::drain_inspect_events_for_generation(ctx, maintenance_generation);
-                    let empty_bg_sessions = bg_sessions_to_check
-                        .into_iter()
-                        .filter(|(session, _)| {
-                            !ctx.bash_background()
-                                .has_completions_for_session(Some(session.as_str()))
-                        })
-                        .collect();
-                    MaintenanceJobOutcome {
-                        empty_bg_sessions,
-                        requeue_kind: None,
-                    }
-                }
-            };
-            let requeued = outcome.requeue_kind.is_some();
-            let _ = outcome_tx.send(outcome);
-            Response::success(
-                response_id,
-                json!({ "drained": true, "kind": kind.label(), "requeued": requeued }),
-            )
-        }),
-    );
+            }
+        };
+        let requeued = outcome.requeue_kind.is_some();
+        let _ = outcome_tx.send(outcome);
+        Response::success(
+            response_id,
+            json!({ "drained": true, "kind": kind.label(), "requeued": requeued }),
+        )
+    });
+    let rx = match kind {
+        MaintenanceDrainKind::Watcher => executor.submit_coalescable_maintenance_async(
+            root_id,
+            lane,
+            request_id.clone(),
+            crate::executor::MaintenanceCoalesceKey::WatcherDrain,
+            job,
+        ),
+        MaintenanceDrainKind::Lsp => executor.submit_coalescable_maintenance_async(
+            root_id,
+            lane,
+            request_id.clone(),
+            crate::executor::MaintenanceCoalesceKey::LspDrain,
+            job,
+        ),
+        MaintenanceDrainKind::ConfigureTail | MaintenanceDrainKind::CompletionDrains => {
+            executor.submit_maintenance_async(root_id, lane, request_id.clone(), job)
+        }
+    };
     let completion_tx = completion_tx.clone();
     let completion_metrics = Arc::clone(metrics);
     tokio::spawn(async move {

@@ -217,6 +217,143 @@ fn cancel_queued_maintenance_preserves_interactive_work_and_actor() {
 }
 
 #[test]
+fn identical_queued_watcher_drains_coalesce_and_settle_both_receivers() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("coalesce-watcher-drains");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (blocker_started_tx, blocker_started_rx) = crossbeam_channel::bounded(1);
+    let (release_blocker_tx, release_blocker_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "maintenance-blocker".to_string(),
+        Box::new(move |_| {
+            blocker_started_tx.send(()).expect("signal blocker start");
+            release_blocker_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release maintenance blocker");
+            ok("maintenance-blocker")
+        }),
+    );
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("maintenance blocker starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let first_executed = Arc::clone(&executed);
+    let first = executor.submit_coalescable_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "watcher-drain-first".to_string(),
+        MaintenanceCoalesceKey::WatcherDrain,
+        Box::new(move |_| {
+            first_executed.fetch_add(1, Ordering::AcqRel);
+            ok("watcher-drain-first")
+        }),
+    );
+    let second_executed = Arc::clone(&executed);
+    let second = executor.submit_coalescable_maintenance_async(
+        root,
+        Lane::MaintenanceCommit,
+        "watcher-drain-second".to_string(),
+        MaintenanceCoalesceKey::WatcherDrain,
+        Box::new(move |_| {
+            second_executed.fetch_add(1, Ordering::AcqRel);
+            ok("watcher-drain-second")
+        }),
+    );
+
+    release_blocker_tx
+        .send(())
+        .expect("release maintenance blocker");
+    assert!(recv_async(blocker, "maintenance blocker completion").success);
+    let first_response = recv_async(first, "first watcher drain completion");
+    let second_response = recv_async(second, "coalesced watcher drain completion");
+
+    assert_eq!(
+        executed.load(Ordering::Acquire),
+        1,
+        "only the queued drain that owns the coalesced work may execute"
+    );
+    assert!(first_response.success);
+    assert!(!second_response.success);
+    assert_eq!(second_response.data["code"], "maintenance_cancelled");
+}
+
+#[test]
+fn maintenance_queue_cap_returns_typed_backpressure_without_silent_loss() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("maintenance-queue-cap");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (blocker_started_tx, blocker_started_rx) = crossbeam_channel::bounded(1);
+    let (release_blocker_tx, release_blocker_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "maintenance-cap-blocker".to_string(),
+        Box::new(move |_| {
+            blocker_started_tx.send(()).expect("signal blocker start");
+            release_blocker_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release maintenance cap blocker");
+            ok("maintenance-cap-blocker")
+        }),
+    );
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("maintenance cap blocker starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let mut admitted = Vec::with_capacity(MAINTENANCE_QUEUE_CAP);
+    for index in 0..MAINTENANCE_QUEUE_CAP {
+        let executed = Arc::clone(&executed);
+        admitted.push(executor.submit_maintenance_async(
+            root.clone(),
+            Lane::MaintenanceCommit,
+            format!("maintenance-cap-admitted-{index}"),
+            Box::new(move |_| {
+                executed.fetch_add(1, Ordering::AcqRel);
+                ok(format!("maintenance-cap-admitted-{index}"))
+            }),
+        ));
+    }
+    let overflow_executed = Arc::clone(&executed);
+    let overflow = executor.submit_maintenance_async(
+        root,
+        Lane::MaintenanceCommit,
+        "maintenance-cap-overflow".to_string(),
+        Box::new(move |_| {
+            overflow_executed.fetch_add(1, Ordering::AcqRel);
+            ok("maintenance-cap-overflow")
+        }),
+    );
+
+    let overflow_response = recv_async(overflow, "maintenance backpressure completion");
+    assert!(!overflow_response.success);
+    assert_eq!(overflow_response.data["code"], "maintenance_backpressure");
+    assert_eq!(
+        overflow_response.data["queue_cap"],
+        serde_json::json!(MAINTENANCE_QUEUE_CAP)
+    );
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+
+    release_blocker_tx
+        .send(())
+        .expect("release maintenance cap blocker");
+    assert!(recv_async(blocker, "maintenance cap blocker completion").success);
+    for receiver in admitted {
+        assert!(recv_async(receiver, "admitted maintenance completion").success);
+    }
+    assert_eq!(
+        executed.load(Ordering::Acquire),
+        MAINTENANCE_QUEUE_CAP,
+        "every admitted non-coalescable job must execute exactly once"
+    );
+}
+
+#[test]
 fn cross_actor_isolation() {
     let executor = test_executor(4, 2, 3, 2);
     let (_dir_a, root_a) = test_root("isolation-a");
@@ -1608,6 +1745,7 @@ fn starved_bind_promotes_over_pure_reads() {
         completion: CompletionSender::Sync(tx.clone()),
         queued_at: now - INTERACTIVE_WRITER_PROMOTION_AGE - Duration::from_secs(1),
         cancellation: None,
+        maintenance_coalesce_key: None,
     };
     let read_job = QueuedJob {
         request_id: "read-1".to_string(),
@@ -1616,6 +1754,7 @@ fn starved_bind_promotes_over_pure_reads() {
         completion: CompletionSender::Sync(tx),
         queued_at: now,
         cancellation: None,
+        maintenance_coalesce_key: None,
     };
     // Read arrived FIRST in arrival order; the starved bind must still win.
     actor.push_job(JobClass::Interactive, Lane::PureRead, read_job);
@@ -1648,6 +1787,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: now,
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
     actor.push_job(
@@ -1660,6 +1800,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             completion: CompletionSender::Sync(tx),
             queued_at: now,
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
 
@@ -1689,6 +1830,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
     actor.push_job(
@@ -1701,6 +1843,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             completion: CompletionSender::Sync(tx),
             queued_at: Instant::now(),
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
 
@@ -1985,6 +2128,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
     actor.push_job(
@@ -1997,6 +2141,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            maintenance_coalesce_key: None,
         },
     );
     actor.push_job(
@@ -2009,6 +2154,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx),
             queued_at: Instant::now(),
             cancellation: Some(m2_token.clone()),
+            maintenance_coalesce_key: None,
         },
     );
 

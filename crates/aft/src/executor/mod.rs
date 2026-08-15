@@ -4,7 +4,7 @@ mod single_flight;
 mod tests;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
@@ -22,6 +22,7 @@ use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Respons
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
+pub(crate) const MAINTENANCE_QUEUE_CAP: usize = 512;
 
 /// Scheduler lane for command-handler execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,6 +56,13 @@ pub enum Lane {
 pub enum JobClass {
     Interactive,
     Maintenance,
+}
+
+/// Idempotent maintenance drains that can share one queued execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MaintenanceCoalesceKey {
+    WatcherDrain,
+    LspDrain,
 }
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
@@ -772,6 +780,7 @@ impl Executor {
             job,
             CompletionSender::Async(completion_tx),
             Some(cancellation.clone()),
+            None,
         );
         (completion_rx, cancellation)
     }
@@ -834,14 +843,38 @@ impl Executor {
         request_id: String,
         job: ExecutorJob,
     ) -> oneshot::Receiver<Response> {
+        self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
+    }
+
+    pub(crate) fn submit_coalescable_maintenance_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        coalesce_key: MaintenanceCoalesceKey,
+        job: ExecutorJob,
+    ) -> oneshot::Receiver<Response> {
+        self.submit_maintenance_async_with_key(root_id, lane, request_id, job, Some(coalesce_key))
+    }
+
+    fn submit_maintenance_async_with_key(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+        coalesce_key: Option<MaintenanceCoalesceKey>,
+    ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
-        self.submit_with_completion(
+        self.submit_with_completion_cancellable(
             root_id,
             JobClass::Maintenance,
             lane,
             request_id,
             job,
             CompletionSender::Async(completion_tx),
+            None,
+            coalesce_key,
         );
         completion_rx
     }
@@ -856,7 +889,7 @@ impl Executor {
         completion: CompletionSender,
     ) {
         self.submit_with_completion_cancellable(
-            root_id, job_class, lane, request_id, job, completion, None,
+            root_id, job_class, lane, request_id, job, completion, None, None,
         );
     }
 
@@ -870,31 +903,57 @@ impl Executor {
         job: ExecutorJob,
         completion: CompletionSender,
         cancellation: Option<JobCancellation>,
+        maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
     ) {
         let command = job_command(job_class, lane);
         let mut job = Some(job);
         let mut completion = Some(completion);
+        let mut duplicate_victims = Vec::new();
 
         let response = {
             let mut state = self.inner.state.lock();
             match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
-                    actor.push_job(
-                        job_class,
-                        lane,
-                        QueuedJob {
-                            job: job.take().expect("executor job already queued"),
-                            completion: completion
-                                .take()
-                                .expect("executor completion already queued"),
-                            request_id: request_id.clone(),
-                            command,
-                            queued_at: Instant::now(),
-                            cancellation: cancellation.clone(),
-                        },
-                    );
-                    None
+                    let mut admission_error = None;
+                    if job_class == JobClass::Maintenance {
+                        if maintenance_coalesce_key
+                            .is_some_and(|key| actor.maintenance.has_maintenance_coalesce_key(key))
+                        {
+                            admission_error = Some(maintenance_cancelled_response(
+                                request_id.clone(),
+                                "maintenance drain coalesced behind an identical queued drain",
+                            ));
+                        } else {
+                            if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
+                                duplicate_victims =
+                                    actor.maintenance.remove_duplicate_maintenance_jobs();
+                            }
+                            if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
+                                admission_error =
+                                    Some(maintenance_backpressure_response(request_id.clone()));
+                            }
+                        }
+                    }
+
+                    if admission_error.is_none() {
+                        actor.push_job(
+                            job_class,
+                            lane,
+                            QueuedJob {
+                                job: job.take().expect("executor job already queued"),
+                                completion: completion
+                                    .take()
+                                    .expect("executor completion already queued"),
+                                request_id: request_id.clone(),
+                                command,
+                                queued_at: Instant::now(),
+                                cancellation: cancellation.clone(),
+                                maintenance_coalesce_key,
+                            },
+                        );
+                    }
+                    admission_error
                 }
                 None => Some(Response::error(
                     request_id.clone(),
@@ -903,6 +962,13 @@ impl Executor {
                 )),
             }
         };
+
+        for victim in duplicate_victims {
+            victim.completion.send(maintenance_cancelled_response(
+                victim.request_id,
+                "duplicate maintenance drain removed to preserve queue capacity",
+            ));
+        }
 
         if let Some(response) = response {
             if let Some(completion) = completion {
@@ -1404,6 +1470,54 @@ impl ClassQueues {
         self.order.len()
     }
 
+    fn has_maintenance_coalesce_key(&self, key: MaintenanceCoalesceKey) -> bool {
+        [
+            Lane::PureRead,
+            Lane::SerialLspStatus,
+            Lane::HeavyInit,
+            Lane::Mutating,
+            Lane::MaintenanceCommit,
+        ]
+        .into_iter()
+        .any(|lane| {
+            self.queue(lane)
+                .iter()
+                .any(|job| job.maintenance_coalesce_key == Some(key))
+        })
+    }
+
+    /// Remove only redundant idempotent drains while preserving survivor order.
+    fn remove_duplicate_maintenance_jobs(&mut self) -> Vec<QueuedJob> {
+        let mut seen = HashSet::new();
+        let mut lane_positions = [0usize; 5];
+        let mut duplicates = Vec::new();
+
+        for (order_position, lane) in self.order.iter().copied().enumerate() {
+            let lane_index = lane_index(lane);
+            let queue_position = lane_positions[lane_index];
+            lane_positions[lane_index] += 1;
+            let Some(key) = self
+                .queue(lane)
+                .get(queue_position)
+                .and_then(|job| job.maintenance_coalesce_key)
+            else {
+                continue;
+            };
+            if !seen.insert(key) {
+                duplicates.push((order_position, lane, queue_position));
+            }
+        }
+
+        let mut removed = Vec::with_capacity(duplicates.len());
+        for (order_position, lane, queue_position) in duplicates.into_iter().rev() {
+            self.order.remove(order_position);
+            if let Some(job) = self.queue_mut(lane).remove(queue_position) {
+                removed.push(job);
+            }
+        }
+        removed
+    }
+
     fn oldest_queued_at(&self) -> Option<Instant> {
         self.front_lane()
             .and_then(|lane| self.queue(lane).front().map(|job| job.queued_at))
@@ -1508,6 +1622,17 @@ struct QueuedJob {
     command: String,
     queued_at: Instant,
     cancellation: Option<JobCancellation>,
+    maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+}
+
+fn lane_index(lane: Lane) -> usize {
+    match lane {
+        Lane::PureRead => 0,
+        Lane::SerialLspStatus => 1,
+        Lane::HeavyInit => 2,
+        Lane::Mutating => 3,
+        Lane::MaintenanceCommit => 4,
+    }
 }
 
 fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
@@ -1532,6 +1657,25 @@ fn cancel_queued_job_queue(queue: &mut VecDeque<QueuedJob>) -> usize {
 
 fn job_command(job_class: JobClass, lane: Lane) -> String {
     format!("executor::{job_class:?}::{lane:?}")
+}
+
+fn maintenance_cancelled_response(
+    request_id: impl Into<String>,
+    message: impl Into<String>,
+) -> Response {
+    Response::error(request_id, "maintenance_cancelled", message)
+}
+
+fn maintenance_backpressure_response(request_id: impl Into<String>) -> Response {
+    Response::error_with_data(
+        request_id,
+        "maintenance_backpressure",
+        format!("maintenance queue reached its per-actor capacity of {MAINTENANCE_QUEUE_CAP} jobs"),
+        serde_json::json!({
+            "retryable": true,
+            "queue_cap": MAINTENANCE_QUEUE_CAP,
+        }),
+    )
 }
 
 fn actor_fatal_response(request_id: impl Into<String>) -> Response {

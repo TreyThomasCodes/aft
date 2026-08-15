@@ -3943,6 +3943,7 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
             );
             artifact_key_from_path_identity(project_root)
         }
+        RootCommitResolution::Cancelled => artifact_key_from_path_identity(project_root),
     };
     record_derived_cache_key(project_root, &key);
     key
@@ -3999,6 +4000,10 @@ pub fn artifact_cache_key_with_memo(
                 }),
             }
         }
+        RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
+            root: memo_root.to_path_buf(),
+            detail: "artifact cache key probe cancelled".to_string(),
+        }),
     }
 }
 
@@ -4237,7 +4242,14 @@ fn root_git_marker_state(project_root: &Path, git_common_dir: Option<&Path>) -> 
 /// fallback when the result is still ambiguous after retry.
 fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
     for attempt in 0..3u32 {
-        match git_root_commit_once(project_root) {
+        if root_commit_probe_cancelled() {
+            return RootCommitResolution::Cancelled;
+        }
+        let probe = git_root_commit_once(project_root);
+        if root_commit_probe_cancelled() {
+            return RootCommitResolution::Cancelled;
+        }
+        match probe {
             RootCommitProbe::Commit(commit) => return RootCommitResolution::Commit(commit),
             RootCommitProbe::NotARepo => return RootCommitResolution::NotARepo,
             RootCommitProbe::NoCommit => return RootCommitResolution::NotARepo,
@@ -4245,17 +4257,29 @@ fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
                 if attempt == 2 {
                     return RootCommitResolution::Failed(detail);
                 }
+                if root_commit_probe_cancelled() {
+                    return RootCommitResolution::Cancelled;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                if root_commit_probe_cancelled() {
+                    return RootCommitResolution::Cancelled;
+                }
             }
         }
     }
     RootCommitResolution::Failed("git root-commit probe retry loop exhausted".to_string())
 }
 
+fn root_commit_probe_cancelled() -> bool {
+    crate::executor::current_job_cancellation()
+        .is_some_and(|token| token.cancel_requested_before_commit())
+}
+
 enum RootCommitResolution {
     Commit(String),
     NotARepo,
     Failed(String),
+    Cancelled,
 }
 
 enum RootCommitProbe {
@@ -4367,6 +4391,21 @@ pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
             .iter()
             .any(|root| root == project_root)
             .then(|| RootCommitProbe::Transient((*detail).clone()))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn force_git_root_commit_probe_slow_transient_for_paths_for_test(
+    roots: Vec<PathBuf>,
+    delay: Duration,
+    started: Arc<AtomicBool>,
+) -> GitRootCommitProbeOverrideGuard {
+    install_git_root_commit_probe_override_for_test(move |project_root| {
+        roots.iter().any(|root| root == project_root).then(|| {
+            started.store(true, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            RootCommitProbe::Transient("stubbed slow git probe".to_string())
+        })
     })
 }
 
