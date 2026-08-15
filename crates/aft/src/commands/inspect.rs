@@ -1,19 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
-use crate::inspect::{
-    DirectTier2RunOutcome, InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope,
-};
+use crate::inspect::{InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope};
 use crate::protocol::{RawRequest, Response};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
-const DIRECT_TIER2_WAIT_BUDGET: Duration = Duration::from_secs(25);
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     let top_k = match parse_top_k(&req.params) {
@@ -36,90 +32,53 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let manager = ctx.inspect_manager();
-    let tier2_deadline = Instant::now() + direct_tier2_wait_budget(&snapshot.project_root);
-    let pending_tier2_paths = ctx.pending_tier2_paths();
     let mut tier2_receivers = BTreeMap::new();
-    for category in [
-        InspectCategory::DeadCode,
-        InspectCategory::UnusedExports,
-        InspectCategory::Duplicates,
-        InspectCategory::Cycles,
-    ] {
+    for category in InspectCategory::active()
+        .iter()
+        .copied()
+        .filter(|category| category.is_tier2())
+    {
         if !ctx.inspect_writer() {
             continue;
         }
         let manager = manager.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
-        let force_paths = pending_tier2_paths.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(manager.tier2_run_with_reuse_direct(
-                snapshot,
-                category,
-                scope,
-                tier2_deadline,
-                force_paths,
-            ));
+            let _ = tx.send(manager.tier2_run_with_reuse_blocking(snapshot, category, scope));
         });
         tier2_receivers.insert(category, rx);
     }
 
-    let mut force_paths_completed = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
-    let mut tier2_refresh_needed = false;
     for category in InspectCategory::active() {
         let outcome = if *category == InspectCategory::Diagnostics {
-            // Diagnostics are backed by the AppContext LSP manager and must stay
-            // on the serial LSP/status lane. Do not send them through
-            // InspectManager's rayon worker path.
+            // Diagnostics use the serial LSP lane rather than the inspect worker
+            // pool. A non-authoritative collection remains a non-fresh outcome;
+            // it is never converted into a partial inspect payload below.
             run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
         } else if category.is_tier2() {
-            let direct = if let Some(rx) = tier2_receivers.remove(category) {
-                receive_direct_tier2(rx, tier2_deadline)
+            if let Some(rx) = tier2_receivers.remove(category) {
+                receive_tier2_completion(rx)
             } else {
-                DirectTier2RunOutcome {
-                    outcome: manager.tier2_read_cached_readonly(
-                        snapshot.clone(),
-                        *category,
-                        scope.clone(),
-                    ),
-                    force_paths_completed: false,
-                }
-            };
-            if direct.force_paths_completed && matches!(direct.outcome, JobOutcome::Fresh { .. }) {
-                force_paths_completed.insert(*category);
+                // A read-only daemon may serve a cached aggregate only when the
+                // stat-verification path proves that artifact is still current.
+                manager.tier2_read_cached_readonly(snapshot.clone(), *category, scope.clone())
             }
-            if matches!(direct.outcome, JobOutcome::Pending { .. }) {
-                tier2_refresh_needed = true;
-            }
-            direct.outcome
         } else {
             manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };
         outcomes.insert(*category, outcome);
     }
 
-    if !pending_tier2_paths.is_empty()
-        && [
-            InspectCategory::DeadCode,
-            InspectCategory::UnusedExports,
-            InspectCategory::Duplicates,
-            InspectCategory::Cycles,
-        ]
-        .iter()
-        .all(|category| force_paths_completed.contains(category))
-    {
-        ctx.remove_pending_tier2_paths(pending_tier2_paths);
-    }
-
-    if tier2_refresh_needed {
-        ctx.request_tier2_refresh_pull();
-    }
+    let payloads = match fresh_payloads(&outcomes) {
+        Ok(payloads) => payloads,
+        Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
+    };
 
     refresh_status_bar_counts(ctx, &outcomes);
-
-    let payload = build_inspect_payload(&snapshot, &outcomes, &sections, top_k, ctx);
+    let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx);
     Response::success(&req.id, payload)
 }
 
@@ -294,48 +253,34 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     ))
 }
 
-fn direct_tier2_wait_budget(project_root: &Path) -> Duration {
-    if !env_project_root_matches("AFT_INSPECT_DIRECT_TIER2_DEADLINE_ROOT", project_root) {
-        return DIRECT_TIER2_WAIT_BUDGET;
-    }
-    std::env::var("AFT_INSPECT_DIRECT_TIER2_DEADLINE_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(DIRECT_TIER2_WAIT_BUDGET)
-}
-
-fn env_project_root_matches(var: &str, project_root: &Path) -> bool {
-    let Some(raw) = std::env::var_os(var) else {
-        return true;
-    };
-    let expected = PathBuf::from(raw);
-    let expected = std::fs::canonicalize(&expected).unwrap_or(expected);
-    let actual = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    expected == actual
-}
-
-fn receive_direct_tier2(
-    rx: std::sync::mpsc::Receiver<DirectTier2RunOutcome>,
-    deadline: Instant,
-) -> DirectTier2RunOutcome {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return DirectTier2RunOutcome {
-            outcome: JobOutcome::Pending { in_flight: true },
-            force_paths_completed: false,
-        };
-    };
-    if remaining.is_zero() {
-        return DirectTier2RunOutcome {
-            outcome: JobOutcome::Pending { in_flight: true },
-            force_paths_completed: false,
-        };
-    }
-
-    rx.recv_timeout(remaining).unwrap_or(DirectTier2RunOutcome {
-        outcome: JobOutcome::Pending { in_flight: true },
-        force_paths_completed: false,
+fn receive_tier2_completion(rx: std::sync::mpsc::Receiver<JobOutcome>) -> JobOutcome {
+    rx.recv().unwrap_or_else(|_| JobOutcome::Failed {
+        message: "inspect Tier-2 worker disconnected before completion".to_string(),
     })
+}
+
+fn fresh_payloads(
+    outcomes: &BTreeMap<InspectCategory, JobOutcome>,
+) -> Result<BTreeMap<InspectCategory, Value>, String> {
+    let mut payloads = BTreeMap::new();
+    for category in InspectCategory::active() {
+        match outcomes.get(category) {
+            Some(JobOutcome::Fresh { payload }) => {
+                payloads.insert(*category, payload.clone());
+            }
+            Some(JobOutcome::Stale { .. }) => {
+                return Err(format!("{} could not be stat-verified", category.as_str()));
+            }
+            Some(JobOutcome::Pending { .. }) => {
+                return Err(format!("{} did not complete", category.as_str()));
+            }
+            Some(JobOutcome::Failed { message }) => {
+                return Err(format!("{} failed: {message}", category.as_str()));
+            }
+            None => return Err(format!("{} did not produce an outcome", category.as_str())),
+        }
+    }
+    Ok(payloads)
 }
 
 fn parse_top_k(params: &Value) -> Result<usize, String> {
@@ -490,44 +435,24 @@ fn parse_scope(
 
 fn build_inspect_payload(
     snapshot: &InspectSnapshot,
-    outcomes: &BTreeMap<InspectCategory, JobOutcome>,
+    payloads: &BTreeMap<InspectCategory, Value>,
     sections: &Sections,
     top_k: usize,
     ctx: &AppContext,
 ) -> Value {
     let mut summary = Map::new();
     let mut details = Map::new();
-    let mut stale_categories = Vec::new();
-    let mut pending_categories = Vec::new();
-    let mut failed_categories = Vec::new();
 
     for category in InspectCategory::active() {
-        let outcome = outcomes.get(category);
-        if outcome.is_some_and(JobOutcome::is_stale) {
-            stale_categories.push(category.as_str().to_string());
-        }
-        if outcome.is_some_and(JobOutcome::is_pending) {
-            pending_categories.push(category.as_str().to_string());
-        }
-        if let Some(JobOutcome::Failed { message }) = outcome {
-            failed_categories.push(serde_json::json!({
-                "category": category.as_str(),
-                "message": message,
-            }));
-        }
-
-        let payload = outcome.and_then(JobOutcome::payload);
-        if *category == InspectCategory::Diagnostics
-            && diagnostics_payload_status(payload) == Some("pending")
-            && !pending_categories
-                .iter()
-                .any(|value| value == category.as_str())
-        {
-            pending_categories.push(category.as_str().to_string());
-        }
+        // `fresh_payloads` established this invariant before this emitter runs.
+        // Keeping the fresh payload separate from JobOutcome prevents accidental
+        // reintroduction of a stale or pending branch into a successful response.
+        let payload = payloads
+            .get(category)
+            .expect("all active categories have a fresh inspect payload");
         summary.insert(
             category.as_str().to_string(),
-            summary_for(*category, outcome),
+            summary_for(*category, payload),
         );
         if sections.includes(*category) {
             details.insert(
@@ -561,14 +486,8 @@ fn build_inspect_payload(
                 }
             }
         } else if *category == InspectCategory::Diagnostics {
-            // Diagnostics detail is always actionable — a bare count ("1 error")
-            // can't be fixed without the message + location, and this category
-            // is the replacement for the removed `lsp_diagnostics` tool. So
-            // include its drill-down even without an explicit `sections` request.
-            // Self-suppressing: only inserted when there's something to show, so
-            // the clean (E0/W0) payload stays identical to before (no `details`).
-            // Other Tier-2 categories stay `sections`-gated (their detail can be
-            // hundreds of rows and a count is a meaningful at-a-glance signal).
+            // Diagnostics detail is actionable even without an explicit section.
+            // `top_k` limits rows only; summaries are always computed in full.
             let detail = details_for(*category, payload, top_k);
             if detail.as_array().is_some_and(|items| !items.is_empty()) {
                 details.insert(category.as_str().to_string(), detail);
@@ -576,43 +495,17 @@ fn build_inspect_payload(
         }
     }
 
-    let complete = pending_categories.is_empty();
-    let incomplete_categories = pending_categories.clone();
-    let disabled_categories = InspectCategory::disabled()
-        .iter()
-        .map(|category| category.as_str())
-        .collect::<Vec<_>>();
-    let tier2_last_run = tier2_last_run(snapshot);
-
-    // Compact, line-oriented agent text (single source for both harnesses; the
-    // plugins prefer `response.text` and fall back to JSON only when absent).
-    // Renders the Tier-2 findings + todos + an honesty note. Diagnostics are
-    // appended by the plugin layer (it owns the partial/pending honesty logic),
-    // and the status bar is appended by the plugin's global hook — so neither
-    // is rendered here. Metrics and scanner_state stay in the JSON wire payload
-    // for the sidebar but are intentionally omitted from the agent text. Built
-    // before `summary`/`details` are moved into the payload below.
-    let text = render_inspect_text(
-        &summary,
-        &details,
-        &stale_categories,
-        &pending_categories,
-        &failed_categories,
-    );
-
+    let text = render_inspect_text(&summary, &details);
     let mut payload = serde_json::json!({
-        "complete": complete,
         "summary": Value::Object(summary),
         "text": text,
         "scanner_state": {
-            "complete": complete,
-            "incomplete_categories": incomplete_categories,
-            "tier2_last_run": tier2_last_run,
+            "tier2_last_run": tier2_last_run(snapshot),
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
-            "stale_categories": stale_categories,
-            "disabled_categories": disabled_categories,
-            "pending_categories": pending_categories,
-            "failed_categories": failed_categories,
+            "disabled_categories": InspectCategory::disabled()
+                .iter()
+                .map(|category| category.as_str())
+                .collect::<Vec<_>>(),
         }
     });
     if !details.is_empty() {
@@ -622,46 +515,11 @@ fn build_inspect_payload(
 }
 
 /// Render the compact agent-facing body. One source of truth for OpenCode + Pi.
-fn render_inspect_text(
-    summary: &Map<String, Value>,
-    details: &Map<String, Value>,
-    stale: &[String],
-    pending: &[String],
-    failed: &[Value],
-) -> String {
+fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value>) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    // Honesty note first, only when there's something incomplete to flag.
-    let mut notes: Vec<String> = Vec::new();
-    let mut has_stale_or_pending = false;
-    for cat in stale {
-        notes.push(format!("{cat} stale"));
-        has_stale_or_pending = true;
-    }
-    for cat in pending {
-        // Diagnostics pending is surfaced by the plugin's diagnostics line.
-        if cat != "diagnostics" {
-            notes.push(format!("{cat} pending"));
-            has_stale_or_pending = true;
-        }
-    }
-    for entry in failed {
-        if let Some(cat) = entry.get("category").and_then(Value::as_str) {
-            notes.push(format!("{cat} failed"));
-        }
-    }
-    if !notes.is_empty() {
-        let mut note = format!("note: {}", notes.join(", "));
-        // Bound the next observation: stale/pending is cache state, not a poll signal.
-        if has_stale_or_pending {
-            note.push_str(
-                ". Treat stale_categories/pending_categories as stale or incomplete cache state. AFT schedules a Tier-2 refresh after its next idle or inspect-triggered background run; use one later normal aft_inspect after that refresh, not a polling loop",
-            );
-        }
-        lines.push(note);
-    }
-
-    // Tier-2 findings, highest-signal first.
+    // This renderer receives only the verified payload map produced above. It
+    // therefore contains findings, never cache-state guidance or partial counts.
     render_group_category(&mut lines, "Duplicates", summary, details, "duplicates");
     render_cycles_category(&mut lines, summary, details);
     render_symbol_category(&mut lines, "Dead code", summary, details, "dead_code");
@@ -1253,105 +1111,55 @@ fn render_todos(
     }
 }
 
-fn summary_for(category: InspectCategory, outcome: Option<&JobOutcome>) -> Value {
-    let Some(outcome) = outcome else {
-        return status_summary("pending");
-    };
-    // Stale WITH a cached payload: surface the real last-known counts (the same
-    // numbers the status bar shows with its `~` marker) flagged `stale: true`,
-    // instead of a bare `{status:"stale"}` that throws the counts away and makes
-    // the body disagree with the bar. Staleness is still signaled — by the flag
-    // and the `note:` line. Pending / Failed / stale-without-cache carry no
-    // payload, so they keep the bare status sentinel.
-    if let JobOutcome::Stale {
-        cached: Some(payload),
-        ..
-    } = outcome
-    {
-        // Defensive: only surface counts when the cached payload actually has a
-        // real `count`. All Tier-2 stale categories are count-based, so a
-        // payload without one is malformed — fall through to the sentinel rather
-        // than render a fabricated `0` that would read as "clean".
-        if payload.get("count").and_then(Value::as_u64).is_some()
-            || payload.get("total_count").and_then(Value::as_u64).is_some()
-            || payload.get("top").is_some()
-        {
-            let mut summary = computed_summary_for(category, Some(payload));
-            if let Some(obj) = summary.as_object_mut() {
-                obj.insert("stale".to_string(), Value::Bool(true));
-            }
-            return summary;
-        }
-    }
-    if let Some(status) = outcome.summary_status() {
-        return status_summary(status);
-    }
-
-    computed_summary_for(category, outcome.payload())
+fn summary_for(category: InspectCategory, payload: &Value) -> Value {
+    computed_summary_for(category, payload)
 }
 
-fn status_summary(status: &'static str) -> Value {
-    serde_json::json!({ "status": status })
-}
-
-fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> Value {
+fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
     match category {
         InspectCategory::Diagnostics => diagnostics_summary_for(payload),
         InspectCategory::Metrics => serde_json::json!({
-            "files": payload.and_then(|p| p.get("files").or_else(|| p.pointer("/totals/file_count"))).and_then(Value::as_u64).unwrap_or(0),
-            "symbols": payload.and_then(|p| p.get("symbols").or_else(|| p.pointer("/totals/symbol_count"))).and_then(Value::as_u64).unwrap_or(0),
-            "loc": payload.and_then(|p| p.get("loc").or_else(|| p.pointer("/totals/loc"))).and_then(Value::as_u64).unwrap_or(0),
+            "files": payload.get("files").or_else(|| payload.pointer("/totals/file_count")).and_then(Value::as_u64).unwrap_or(0),
+            "symbols": payload.get("symbols").or_else(|| payload.pointer("/totals/symbol_count")).and_then(Value::as_u64).unwrap_or(0),
+            "loc": payload.get("loc").or_else(|| payload.pointer("/totals/loc")).and_then(Value::as_u64).unwrap_or(0),
         }),
         InspectCategory::Todos => serde_json::json!({
-            "count": count_from_payload(payload),
-            "by_kind": payload.and_then(|p| p.get("by_kind").or_else(|| p.get("by_marker"))).cloned().unwrap_or_else(|| serde_json::json!({})),
+            "count": count_from_payload(Some(payload)),
+            "by_kind": payload.get("by_kind").or_else(|| payload.get("by_marker")).cloned().unwrap_or_else(|| serde_json::json!({})),
         }),
-        InspectCategory::DeadCode => {
-            if payload
-                .and_then(|payload| payload.get("callgraph_available"))
-                .and_then(Value::as_bool)
-                == Some(false)
-            {
-                serde_json::json!({
-                    "status": "unavailable",
-                    "reason": "call graph building/retrying",
-                    "callgraph_available": false,
-                })
-            } else {
-                serde_json::json!({
-                    "count": count_from_payload(payload),
-                    "generated_count": generated_count_from_payload(payload),
-                    "total_count": total_count_from_payload(payload),
-                    "test_only_count": test_only_count_from_payload(payload),
-                    "by_language": payload.and_then(|p| p.get("by_language")).cloned().unwrap_or_else(|| serde_json::json!({})),
-                    "languages_skipped": payload.and_then(|p| p.get("languages_skipped")).cloned().unwrap_or_else(|| serde_json::json!([])),
-                    "top": top_preview_from_payload(payload),
-                    "generated_top": generated_top_from_payload(payload),
-                    "test_only_top": test_only_top_from_payload(payload),
-                })
-            }
-        }
+        InspectCategory::DeadCode => serde_json::json!({
+            "count": count_from_payload(Some(payload)),
+            "generated_count": generated_count_from_payload(Some(payload)),
+            "total_count": total_count_from_payload(Some(payload)),
+            "test_only_count": test_only_count_from_payload(Some(payload)),
+            "by_language": payload.get("by_language").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "languages_skipped": payload.get("languages_skipped").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "top": top_preview_from_payload(Some(payload)),
+            "generated_top": generated_top_from_payload(Some(payload)),
+            "test_only_top": test_only_top_from_payload(Some(payload)),
+        }),
         InspectCategory::UnusedExports => serde_json::json!({
-            "count": count_from_payload(payload),
-            "generated_count": generated_count_from_payload(payload),
-            "total_count": total_count_from_payload(payload),
-            "test_only_count": test_only_count_from_payload(payload),
-            "top": top_preview_from_payload(payload),
-            "generated_top": generated_top_from_payload(payload),
-            "test_only_top": test_only_top_from_payload(payload),
+            "count": count_from_payload(Some(payload)),
+            "generated_count": generated_count_from_payload(Some(payload)),
+            "total_count": total_count_from_payload(Some(payload)),
+            "test_only_count": test_only_count_from_payload(Some(payload)),
+            "top": top_preview_from_payload(Some(payload)),
+            "generated_top": generated_top_from_payload(Some(payload)),
+            "test_only_top": test_only_top_from_payload(Some(payload)),
         }),
         InspectCategory::Duplicates => {
             let mut section = Map::new();
             section.insert(
                 "count".to_string(),
-                serde_json::json!(count_from_payload(payload)),
+                serde_json::json!(count_from_payload(Some(payload))),
             );
             section.insert(
                 "total_groups".to_string(),
                 serde_json::json!(payload
-                    .and_then(|p| p.get("total_groups").or_else(|| p.get("groups_count")))
+                    .get("total_groups")
+                    .or_else(|| payload.get("groups_count"))
                     .and_then(Value::as_u64)
-                    .unwrap_or_else(|| count_from_payload(payload))),
+                    .unwrap_or_else(|| count_from_payload(Some(payload)))),
             );
             for key in [
                 "generated_count",
@@ -1368,98 +1176,38 @@ fn computed_summary_for(category: InspectCategory, payload: Option<&Value>) -> V
                 "mirror_suppressed_groups",
                 "marker_suppressed_groups",
             ] {
-                if let Some(value) = payload.and_then(|payload| payload.get(key)).cloned() {
+                if let Some(value) = payload.get(key).cloned() {
                     section.insert(key.to_string(), value);
                 }
             }
-            section.insert("top".to_string(), top_preview_from_payload(payload));
+            section.insert("top".to_string(), top_preview_from_payload(Some(payload)));
             section.insert(
                 "generated_top".to_string(),
-                generated_top_from_payload(payload),
+                generated_top_from_payload(Some(payload)),
             );
             Value::Object(section)
         }
         InspectCategory::Cycles => serde_json::json!({
-            "count": count_from_payload(payload),
-            "largest": payload.and_then(|p| p.get("largest")).and_then(Value::as_u64).unwrap_or(0),
+            "count": count_from_payload(Some(payload)),
+            "largest": payload.get("largest").and_then(Value::as_u64).unwrap_or(0),
         }),
-        _ => serde_json::json!({ "count": count_from_payload(payload) }),
+        _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
     }
 }
 
-fn diagnostics_payload_status(payload: Option<&Value>) -> Option<&str> {
-    payload
-        .and_then(|payload| payload.get("status"))
-        .and_then(Value::as_str)
-}
-
-fn diagnostics_summary_for(payload: Option<&Value>) -> Value {
-    let Some(payload) = payload else {
-        return status_summary("pending");
-    };
-
-    let complete = payload
-        .get("complete")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let server_ran = payload
-        .get("server_ran")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let provisional_counts = payload.get("provisional_counts").cloned();
-
-    if complete && server_ran {
-        let mut summary = serde_json::json!({
-            "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
-            "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-            "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
-            "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
-        });
-        if let Some(provisional_counts) = provisional_counts {
-            summary["provisional_counts"] = provisional_counts;
-        }
-        return summary;
-    }
-
-    // Incomplete and pending diagnostics have useful detail rows, but their
-    // severity counts are provisional and must never be mistaken for the
-    // authoritative E/W totals. Keep the count shape visible under
-    // `provisional_counts` while the top-level counts remain zero.
-    let mut summary = serde_json::json!({
+fn diagnostics_summary_for(payload: &Value) -> Value {
+    serde_json::json!({
         "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
         "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
         "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
         "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
-        "status": payload
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("pending"),
-        "servers_pending": payload
-            .get("servers_pending")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([])),
-        "servers_not_installed": payload
-            .get("servers_not_installed")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([])),
-        "files_without_server": payload
-            .get("files_without_server")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-    });
-    if let Some(provisional_counts) = provisional_counts {
-        summary["provisional_counts"] = provisional_counts;
-    }
-    summary
+    })
 }
 
-fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize) -> Value {
+fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Value {
     if category == InspectCategory::Metrics {
         return computed_summary_for(category, payload);
     }
-    let Some(payload) = payload else {
-        return serde_json::json!([]);
-    };
     let items = payload
         .get("items")
         .or_else(|| payload.get("groups"))
@@ -1470,20 +1218,14 @@ fn details_for(category: InspectCategory, payload: Option<&Value>, top_k: usize)
     }
 }
 
-fn test_only_details_for(payload: Option<&Value>, top_k: usize) -> Value {
-    let Some(payload) = payload else {
-        return serde_json::json!([]);
-    };
+fn test_only_details_for(payload: &Value, top_k: usize) -> Value {
     match payload.get("test_only_items").and_then(Value::as_array) {
         Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
         None => serde_json::json!([]),
     }
 }
 
-fn generated_details_for(payload: Option<&Value>, top_k: usize) -> Value {
-    let Some(payload) = payload else {
-        return serde_json::json!([]);
-    };
+fn generated_details_for(payload: &Value, top_k: usize) -> Value {
     match payload.get("generated_items").and_then(Value::as_array) {
         Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
         None => serde_json::json!([]),
@@ -1739,11 +1481,11 @@ mod render_text_tests {
     }
 
     fn render(summary: Value) -> String {
-        render_inspect_text(&summary_map(summary), &Map::new(), &[], &[], &[])
+        render_inspect_text(&summary_map(summary), &Map::new())
     }
 
     fn render_with_details(summary: Value, details: Value) -> String {
-        render_inspect_text(&summary_map(summary), &summary_map(details), &[], &[], &[])
+        render_inspect_text(&summary_map(summary), &summary_map(details))
     }
 
     #[test]
@@ -2056,86 +1798,204 @@ mod render_text_tests {
     }
 
     #[test]
-    fn pending_status_renders_status_not_count() {
+    fn fresh_text_never_renders_status_sentinels() {
         let text = render(serde_json::json!({
-            "duplicates": { "status": "pending" },
-            "dead_code": { "status": "stale" },
+            "duplicates": { "count": 1, "top": [] },
+            "dead_code": { "count": 1, "top": [] },
         }));
-        assert!(text.contains("Duplicates: pending"), "{text}");
-        assert!(text.contains("Dead code: stale"), "{text}");
+        assert!(!text.contains("pending"), "{text}");
+        assert!(!text.contains("stale"), "{text}");
     }
 
     #[test]
-    fn honesty_note_lists_incomplete_categories_only_when_present() {
-        let none = render_inspect_text(&Map::new(), &Map::new(), &[], &[], &[]);
-        assert!(!none.contains("note:"), "no note when all clear:\n{none}");
-
-        let text = render_inspect_text(
-            &summary_map(serde_json::json!({ "duplicates": { "count": 1, "top": [] } })),
-            &Map::new(),
-            &["dead_code".to_string()],
-            &["unused_exports".to_string(), "diagnostics".to_string()],
-            &[serde_json::json!({ "category": "duplicates", "message": "boom" })],
-        );
-        // diagnostics-pending is surfaced by the plugin diagnostics line, not here.
+    fn fresh_text_has_no_cache_state_note() {
+        let text = render_inspect_text(&Map::new(), &Map::new());
         assert!(
-            text.contains("note: dead_code stale, unused_exports pending, duplicates failed"),
-            "{text}"
+            !text.contains("note:"),
+            "fresh text must not describe partial state: {text}"
         );
-        assert!(
-            !text.contains("diagnostics pending"),
-            "diagnostics excluded from note:\n{text}"
-        );
-        // Note comes first.
-        assert!(text.starts_with("note:"), "note must lead:\n{text}");
     }
 
-    // Regression: a stale outcome WITH a cached payload must surface the real
-    // last-known counts (matching the status bar's `~D…` numbers) rather than a
-    // bare {status:"stale"} that drops them — body and bar must agree.
+    // Fresh summaries are derived only from verified category payloads.
     #[test]
-    fn stale_with_cache_summary_keeps_counts_and_flags_stale() {
-        let stale = JobOutcome::Stale {
-            cached: Some(serde_json::json!({ "count": 357, "by_language": { "rust": 214 } })),
-            in_flight: true,
-        };
-        let summary = summary_for(InspectCategory::DeadCode, Some(&stale));
+    fn fresh_summary_has_no_stale_flag() {
+        let payload = serde_json::json!({ "count": 357, "by_language": { "rust": 214 } });
+        let summary = summary_for(InspectCategory::DeadCode, &payload);
         assert_eq!(summary.get("count").and_then(Value::as_u64), Some(357));
-        assert_eq!(summary.get("stale").and_then(Value::as_bool), Some(true));
-        // Not the bare sentinel.
-        assert!(
-            summary.get("status").is_none(),
-            "stale-with-cache must not be a status sentinel: {summary}"
-        );
-
-        // And the rendered body shows the count, not "stale".
-        let text = render_inspect_text(
-            &summary_map(serde_json::json!({ "dead_code": summary })),
-            &Map::new(),
-            &["dead_code".to_string()],
-            &[],
-            &[],
-        );
-        assert!(
-            text.contains("Dead code: 357"),
-            "body must show cached count:\n{text}"
-        );
-        assert!(
-            text.contains("note: dead_code stale"),
-            "staleness still flagged:\n{text}"
-        );
+        assert!(summary.get("stale").is_none(), "{summary}");
+        assert!(summary.get("status").is_none(), "{summary}");
     }
 
-    // Stale WITHOUT a cache (never scanned, just invalidated) keeps the bare
-    // sentinel — there are no real counts to show.
+    // Diagnostics summaries retain only verified severity totals.
     #[test]
-    fn stale_without_cache_summary_is_status_sentinel() {
-        let stale = JobOutcome::Stale {
-            cached: None,
-            in_flight: true,
-        };
-        let summary = summary_for(InspectCategory::DeadCode, Some(&stale));
-        assert_eq!(summary.get("status").and_then(Value::as_str), Some("stale"));
-        assert!(summary.get("count").is_none());
+    fn diagnostics_summary_has_only_verified_counts() {
+        let summary = diagnostics_summary_for(&serde_json::json!({
+            "errors": 1,
+            "warnings": 2,
+            "info": 3,
+            "hints": 4,
+        }));
+        assert_eq!(
+            summary,
+            serde_json::json!({
+                "errors": 1,
+                "warnings": 2,
+                "info": 3,
+                "hints": 4,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod fresh_payload_tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::parser::SymbolCache;
+
+    fn snapshot() -> InspectSnapshot {
+        InspectSnapshot::new(
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/.aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        )
+    }
+
+    fn fresh_payloads_for_all_categories() -> BTreeMap<InspectCategory, Value> {
+        InspectCategory::active()
+            .iter()
+            .copied()
+            .map(|category| {
+                let payload = match category {
+                    InspectCategory::Diagnostics => serde_json::json!({
+                        "errors": 2,
+                        "warnings": 0,
+                        "info": 0,
+                        "hints": 0,
+                        "items": [
+                            { "file": "src/a.rs", "line": 1, "severity": "error" },
+                            { "file": "src/b.rs", "line": 2, "severity": "error" },
+                        ],
+                    }),
+                    InspectCategory::Metrics => serde_json::json!({
+                        "files": 2,
+                        "symbols": 3,
+                        "loc": 10,
+                    }),
+                    InspectCategory::Todos => serde_json::json!({ "count": 1, "by_kind": {} }),
+                    InspectCategory::DeadCode | InspectCategory::UnusedExports => {
+                        serde_json::json!({ "count": 1, "items": [] })
+                    }
+                    InspectCategory::Duplicates => serde_json::json!({ "count": 1, "groups": [] }),
+                    InspectCategory::Cycles => serde_json::json!({ "count": 0, "largest": 0 }),
+                    _ => unreachable!("only active categories are emitted"),
+                };
+                (category, payload)
+            })
+            .collect()
+    }
+
+    fn assert_no_banned_field(value: &Value) {
+        const BANNED_KEYS: &[&str] = &[
+            "provisional",
+            "provisional_counts",
+            "pending_categories",
+            "stale_categories",
+            "incomplete_categories",
+            "scope_truncated",
+            "servers_pending",
+            "servers_not_installed",
+            "files_without_server",
+            "failed_categories",
+            "complete",
+        ];
+
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_banned_field(value);
+                }
+            }
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    assert!(
+                        !BANNED_KEYS.contains(&key.as_str()),
+                        "banned inspect field {key} leaked into {value}"
+                    );
+                    assert!(key != "stale", "stale sentinel leaked into {value}");
+                    if key == "server_ran" {
+                        assert_ne!(
+                            value.as_bool(),
+                            Some(false),
+                            "unrun server leaked into payload"
+                        );
+                    }
+                    if key == "status" {
+                        assert!(
+                            !matches!(value.as_str(), Some("pending" | "stale" | "failed")),
+                            "partial category status leaked into payload: {value}"
+                        );
+                    }
+                    assert_no_banned_field(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn fresh_payload_is_recursive_banned_field_free_and_top_k_only_caps_rows() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &fresh_payloads_for_all_categories(),
+            &Sections::all(),
+            1,
+            &ctx,
+        );
+
+        // These containers are the minimum top-level fields required in the
+        // payload; the recursive walk still checks every descendant.
+        for container in ["scanner_state", "summary", "details"] {
+            assert!(
+                payload.get(container).is_some(),
+                "missing {container}: {payload}"
+            );
+        }
+        assert_no_banned_field(&payload);
+        assert_eq!(payload["summary"]["diagnostics"]["errors"], 2);
+        assert_eq!(
+            payload["details"]["diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(payload.get("topK").is_none());
+        assert!(payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn nonfresh_outcomes_cannot_reach_the_payload_emitter() {
+        let outcomes = InspectCategory::active()
+            .iter()
+            .copied()
+            .map(|category| {
+                let outcome = if category == InspectCategory::Diagnostics {
+                    JobOutcome::Pending { in_flight: true }
+                } else {
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({}),
+                    }
+                };
+                (category, outcome)
+            })
+            .collect();
+
+        assert!(fresh_payloads(&outcomes).is_err());
     }
 }
