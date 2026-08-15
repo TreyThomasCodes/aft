@@ -7,7 +7,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
-    EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
+    EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot, PullFileOutcome,
+    PullFileResult, ServerAttemptResult,
 };
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
@@ -76,11 +77,10 @@ pub(crate) fn run_diagnostics_category(
     scope: &JobScope,
     scope_was_provided: bool,
 ) -> JobOutcome {
-    let collection = if scope_was_provided {
-        collect_scoped_diagnostics(ctx, snapshot, scope)
-    } else {
-        collect_warm_working_set(ctx, snapshot)
-    };
+    let _ = scope_was_provided;
+    // Inspect establishes diagnostic freshness over the canonical root; `scope`
+    // only narrows the detail rendered from that root-wide collection.
+    let collection = collect_scoped_diagnostics(ctx, snapshot, scope);
 
     if collection.is_complete() {
         JobOutcome::Fresh {
@@ -91,6 +91,7 @@ pub(crate) fn run_diagnostics_category(
     }
 }
 
+#[allow(dead_code)]
 fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
@@ -141,14 +142,22 @@ fn collect_scoped_diagnostics(
 ) -> DiagnosticsCollection {
     let config = ctx.config().clone();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
-    let scoped = scoped_lsp_files(snapshot, scope, &config, &mut tsconfig_membership);
+    let whole_root = JobScope::from_roots(
+        snapshot.project_root.clone(),
+        vec![snapshot.project_root.clone()],
+    );
+    let scoped = scoped_lsp_files(snapshot, &whole_root, &config, &mut tsconfig_membership);
+    let mut files = scoped.files.into_iter().collect::<BTreeSet<_>>();
+    for root in scope.roots().iter().filter(|root| root.is_file()) {
+        files.insert(crate::inspect::job::canonicalize_normalized(root));
+    }
     let mut collection = DiagnosticsCollection {
         files_without_server: scoped.explicit_files_without_server,
         ..DiagnosticsCollection::default()
     };
     let mut opened_documents = ScopedInspectDocuments::new(ctx);
 
-    for file in scoped.files {
+    for file in files {
         collect_scoped_file(ctx, &config, &file, &mut collection, &mut opened_documents);
         // Pull-only servers may leave didOpen diagnostics, telemetry, and log
         // notifications queued because they do not enter the push waiter.
@@ -166,6 +175,38 @@ fn collect_scoped_diagnostics(
     collection.sort_and_dedup();
     drop(opened_documents);
     collection
+}
+
+/// Park on diagnostics without retaining the manager lock. Every state check
+/// is a short lock acquisition, so another LSP event drain can make progress.
+fn wait_for_inspect_diagnostics_without_manager_lock(
+    ctx: &AppContext,
+    file: &Path,
+    expected: &[(ServerKey, PreEditSnapshot)],
+) {
+    let wait = {
+        let mut lsp = ctx.lsp();
+        lsp.start_inspect_diagnostics_wait(file, expected)
+    };
+    loop {
+        if {
+            let mut lsp = ctx.lsp();
+            lsp.poll_inspect_diagnostics_wait(&wait, None)
+        } {
+            break;
+        }
+        let wake = wait.next_event();
+        if matches!(&wake, InspectDiagnosticsWake::Disconnected) {
+            break;
+        }
+        if {
+            let mut lsp = ctx.lsp();
+            lsp.poll_inspect_diagnostics_wait(&wait, Some(wake))
+        } {
+            break;
+        }
+    }
+    ctx.lsp().finish_inspect_diagnostics_wait(wait);
 }
 
 fn collect_scoped_file(
@@ -188,7 +229,11 @@ fn collect_scoped_file(
         collection.files_without_server += 1;
         return;
     }
-    if outcomes.no_server_registered() || outcomes.successful.is_empty() {
+    if outcomes.no_server_registered() {
+        collection.files_without_server += 1;
+        return;
+    }
+    if outcomes.successful.is_empty() {
         return;
     }
 
@@ -221,6 +266,12 @@ fn collect_scoped_file(
     if push_fallback_servers.is_empty() {
         return;
     }
+
+    let expected = push_fallback_servers
+        .iter()
+        .map(|key| (key.clone(), pre_push_snapshot.get(key).copied().unwrap_or_default()))
+        .collect::<Vec<(ServerKey, PreEditSnapshot)>>();
+    wait_for_inspect_diagnostics_without_manager_lock(ctx, &canonical, &expected);
 
     let lsp = ctx.lsp();
     for key in push_fallback_servers {

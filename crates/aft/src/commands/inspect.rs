@@ -1,12 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc};
 
 use serde_json::{Map, Value};
 
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::run_diagnostics_category;
-use crate::inspect::{InspectCache, InspectCategory, InspectSnapshot, JobOutcome, JobScope};
+use crate::inspect::{
+    format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
+    InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
+};
+use crate::lsp::manager::{
+    ApplicabilityResolutionError, ApplicableServerSnapshot, ApplicableServerStartError,
+};
 use crate::protocol::{RawRequest, Response};
+use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
@@ -77,9 +85,255 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
     };
 
-    refresh_status_bar_counts(ctx, &outcomes);
     let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx);
     Response::success(&req.id, payload)
+}
+
+/// Register one inspect completion whose poll closure only observes the result
+/// channel. The payload body stays in `handle_inspect`, so fresh-only payload
+/// validation remains owned by the scanner-freshness layer.
+pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let request_id = req.id.clone();
+    let phase_log = InspectPhaseLog::for_request(request_id.clone());
+    let snapshot = match inspect_preflight(req, &ctx) {
+        Ok(snapshot) => snapshot,
+        Err(response) => {
+            let detail = response.data.get("message").and_then(Value::as_str).map(str::to_owned);
+            return deferred_response(
+                request_id,
+                build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    InspectTerminal::PhaseFailed {
+                        failed_phase: None,
+                        failure_reason: "root_resolution_failed",
+                        failure_detail: detail,
+                    },
+                ),
+            );
+        }
+    };
+    let applicability = {
+        let lsp = ctx.lsp();
+        lsp.resolve_applicable_servers_for_root(&snapshot.project_root, &snapshot.config)
+    };
+    let applicability = match applicability {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return deferred_response(
+                request_id,
+                build_inspect_terminal(
+                    &req.id,
+                    &phase_log,
+                    InspectTerminal::PhaseFailed {
+                        failed_phase: None,
+                        failure_reason: applicability_failure_reason(&error),
+                        failure_detail: Some(applicability_failure_detail(error)),
+                    },
+                ),
+            );
+        }
+    };
+
+    let request = RawRequest {
+        id: req.id.clone(),
+        command: req.command.clone(),
+        lsp_hints: req.lsp_hints.clone(),
+        session_id: req.session_id.clone(),
+        params: req.params.clone(),
+    };
+    let completion_request_id = request_id.clone();
+    let shutdown_log = phase_log.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let response = run_deferred_inspect_body(&request, ctx, applicability, phase_log);
+        let _ = tx.send(response);
+    });
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id: completion_request_id,
+        session_id: String::new(),
+        attach_command: String::new(),
+        poll: Box::new(move |_| rx.try_recv().ok()),
+        on_shutdown: Some(inspect_shutdown_terminal(request_id, shutdown_log)),
+    })
+}
+
+fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
+    parse_top_k(&req.params).map_err(|message| invalid_request(&req.id, message))?;
+    parse_sections(req.params.get("sections")).map_err(|message| invalid_request(&req.id, message))?;
+    let snapshot = build_snapshot(ctx).map_err(|response| response.with_id(&req.id))?;
+    parse_scope(req, ctx, &snapshot.project_root)?;
+    Ok(snapshot)
+}
+
+fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let _ = tx.send(response);
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id,
+        session_id: String::new(),
+        attach_command: String::new(),
+        poll: Box::new(move |_| rx.try_recv().ok()),
+        on_shutdown: None,
+    })
+}
+
+fn inspect_shutdown_terminal(
+    request_id: String,
+    phase_log: InspectPhaseLog,
+) -> crate::response_finalize::PendingResponseShutdown {
+    Box::new(move |_| {
+        build_inspect_terminal(
+            &request_id,
+            &phase_log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: phase_log.in_flight_entry(),
+                failure_reason: "daemon_shutdown",
+                failure_detail: None,
+            },
+        )
+    })
+}
+
+fn run_deferred_inspect_body(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    applicability: ApplicableServerSnapshot,
+    phase_log: InspectPhaseLog,
+) -> Response {
+    let starts = applicability
+        .server_keys
+        .iter()
+        .map(|server| (server.clone(), phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server))))
+        .collect::<Vec<_>>();
+    if let Err(error) = {
+        let mut lsp = ctx.lsp();
+        lsp.start_applicable_servers(&applicability, ctx.config())
+    } {
+        finish_start_failure(starts, &error);
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: Some(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, &error.server_key)),
+                failure_reason: "server_start_failed",
+                failure_detail: Some(start_failure_detail(&error)),
+            },
+        );
+    }
+    for (_, phase) in starts {
+        phase.complete();
+    }
+
+    let quiescence = applicability
+        .server_keys
+        .iter()
+        .map(|server| phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspQuiescence, server)))
+        .collect::<Vec<_>>();
+    let response = handle_inspect(req, &ctx);
+    for phase in quiescence {
+        phase.complete();
+    }
+    if response.success {
+        build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Fresh(response.data))
+    } else {
+        build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: phase_log.in_flight_entry(),
+                failure_reason: "inspect_not_fresh",
+                failure_detail: response.data.get("message").and_then(Value::as_str).map(str::to_owned),
+            },
+        )
+    }
+}
+
+fn finish_start_failure(
+    starts: Vec<(crate::lsp::roots::ServerKey, crate::inspect::phase_log::InspectPhaseHandle)>,
+    error: &ApplicableServerStartError,
+) {
+    for (server, phase) in starts {
+        if server == error.server_key {
+            phase.fail(start_failure_detail(error));
+        } else {
+            phase.complete();
+        }
+    }
+}
+
+fn start_failure_detail(error: &ApplicableServerStartError) -> String {
+    match &error.result {
+        crate::lsp::manager::ServerAttemptResult::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
+        crate::lsp::manager::ServerAttemptResult::SpawnFailed { reason, .. } => reason.clone(),
+        crate::lsp::manager::ServerAttemptResult::NoRootMarker { .. }
+        | crate::lsp::manager::ServerAttemptResult::Ok { .. } => "server could not be started".to_string(),
+    }
+}
+
+fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'static str {
+    match error {
+        ApplicabilityResolutionError::MissingExecutable { .. } => "missing_executable",
+        ApplicabilityResolutionError::RootUnreadable { .. }
+        | ApplicabilityResolutionError::CachedSpawnFailure { .. }
+        | ApplicabilityResolutionError::NoApplicableServer { .. } => "applicability_resolution_failed",
+    }
+}
+
+fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
+    match error {
+        ApplicabilityResolutionError::RootUnreadable { root, reason } => format!("cannot resolve {}: {reason}", root.display()),
+        ApplicabilityResolutionError::MissingExecutable { server_key, binary } => format!("{binary} is required for {}", server_key.kind.id_str()),
+        ApplicabilityResolutionError::CachedSpawnFailure { server_key, result } => format!("cached failure for {}: {result:?}", server_key.kind.id_str()),
+        ApplicabilityResolutionError::NoApplicableServer { root } => format!("no applicable LSP server for {}", root.display()),
+    }
+}
+
+#[allow(dead_code)]
+enum InspectTerminal {
+    Fresh(Value),
+    Interrupted,
+    PhaseFailed {
+        failed_phase: Option<InspectPhaseEntry>,
+        failure_reason: &'static str,
+        failure_detail: Option<String>,
+    },
+}
+
+fn build_inspect_terminal(request_id: &str, log: &InspectPhaseLog, terminal: InspectTerminal) -> Response {
+    let (phases, blocking_waited) = log.terminal_inputs();
+    match terminal {
+        InspectTerminal::Fresh(mut payload) => {
+            let Some(payload) = payload.as_object_mut() else {
+                return Response::error(request_id, "inspect_terminal_invalid", "inspect payload was not an object");
+            };
+            payload.insert("inspect_terminal".to_string(), Value::String("fresh".to_string()));
+            payload.insert("wait_stamp".to_string(), serde_json::json!({
+                "text": format_wait_text(&phases, blocking_waited),
+                "phases": phases,
+            }));
+            Response::success(request_id, Value::Object(payload.clone()))
+        }
+        InspectTerminal::Interrupted => Response {
+            id: request_id.to_string(),
+            success: false,
+            data: serde_json::json!({"inspect_terminal": "interrupted", "completed_phases": phases}),
+        },
+        InspectTerminal::PhaseFailed { failed_phase, failure_reason, failure_detail } => {
+            let mut data = serde_json::json!({
+                "inspect_terminal": "phase_failed",
+                "completed_phases": phases,
+                "failure_reason": failure_reason,
+            });
+            if let Some(phase) = failed_phase {
+                data["failed_phase"] = serde_json::json!(phase.id);
+                if let Some(producer) = phase.producer { data["producer"] = Value::String(producer); }
+                if let Some(category) = phase.category { data["category"] = Value::String(category); }
+            }
+            if let Some(detail) = failure_detail { data["failure_detail"] = Value::String(detail); }
+            Response { id: request_id.to_string(), success: false, data }
+        }
+    }
 }
 
 /// Refresh the agent status-bar's last-known Tier-2 + todos counts from the
@@ -87,6 +341,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 /// returned (Fresh or Stale-cached); a Stale/Pending outcome marks them stale
 /// so the bar renders the `~` marker. Errors/warnings are NOT touched here —
 /// they're read live from the LSP store at attach time.
+#[allow(dead_code)]
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
     // Per-category count: `Some` only when the category actually produced data
     // (Fresh, or Stale with a cached aggregate — `JobOutcome::payload()` returns
@@ -1997,5 +2252,66 @@ mod fresh_payload_tests {
             .collect();
 
         assert!(fresh_payloads(&outcomes).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod deferred_terminal_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_preflight_uses_one_terminal_poll_response() {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ));
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "inspect-preflight",
+            "command": "inspect"
+        }))
+        .expect("request parses");
+        let mut deferred = match handle_inspect_deferred(&request, Arc::clone(&ctx)) {
+            DispatchOutcome::Deferred(pending) => pending,
+            DispatchOutcome::Immediate(_) => panic!("inspect must use the deferred seam"),
+        };
+        let response = (deferred.poll)(&ctx).expect("preflight terminal response");
+        assert!(!response.success);
+        assert!(response.data.get("failed_phase").is_none());
+        assert_eq!(response.data["failure_reason"], "root_resolution_failed");
+        assert!((deferred.poll)(&ctx).is_none(), "terminal response must be emitted once");
+    }
+
+    #[test]
+    fn terminal_builder_uses_one_phase_shape_for_all_outcomes() {
+        let log = InspectPhaseLog::for_request("inspect-terminal-shapes");
+        log.start(InspectPhaseEntry::category(
+            InspectPhaseId::StatVerification,
+            InspectCategory::DeadCode,
+        ))
+        .complete();
+        let fresh = build_inspect_terminal(
+            "inspect-terminal-shapes",
+            &log,
+            InspectTerminal::Fresh(serde_json::json!({})),
+        );
+        assert_eq!(fresh.data["wait_stamp"]["phases"][0]["id"], "stat_verification");
+        let interrupted = build_inspect_terminal(
+            "inspect-terminal-shapes",
+            &log,
+            InspectTerminal::Interrupted,
+        );
+        assert_eq!(interrupted.data["completed_phases"][0]["category"], "dead_code");
+        let failed = build_inspect_terminal(
+            "inspect-terminal-shapes",
+            &log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: None,
+                failure_reason: "missing_executable",
+                failure_detail: None,
+            },
+        );
+        assert_eq!(failed.data["completed_phases"][0]["id"], "stat_verification");
+        assert!(failed.data.get("failed_phase").is_none());
     }
 }

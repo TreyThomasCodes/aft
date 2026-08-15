@@ -2842,6 +2842,40 @@ fn scoped_diagnostics_closes_documents_after_collection() {
 }
 
 #[test]
+fn blocking_scoped_diagnostics_closes_every_document_it_opens() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-blocking-close\"\n");
+    let files = [
+        write_file(&root, "src/a.rs", "fn a() {}\n"),
+        write_file(&root, "src/b.rs", "fn b() {}\n"),
+    ];
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "200");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-blocking-close",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src",
+        }),
+    );
+    assert_eq!(response["success"], true, "response: {response:#}");
+    for file in &files {
+        assert!(
+            !ctx.lsp().document_is_open_for_test(file),
+            "blocking diagnostics must close every inspect-opened document"
+        );
+    }
+    let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", files.len());
+    assert!(closed.iter().any(|event| event["uri"] == file_uri(&files[0])));
+    assert!(closed.iter().any(|event| event["uri"] == file_uri(&files[1])));
+}
+
+#[test]
 fn inspect_command_diagnostics_missing_server_is_not_returned_as_a_zero_result() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-missing\"\n");
