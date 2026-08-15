@@ -8,7 +8,9 @@ use std::process::Command;
 
 use serde_json::json;
 
-use super::helpers::{user_config, warm_executable, AftProcess};
+use super::helpers::{user_config, AftProcess};
+#[cfg(unix)]
+use super::helpers::warm_executable;
 
 // ============================================================================
 // Helpers

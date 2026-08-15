@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-use super::helpers::{fixture_path, user_config, warm_executable, AftProcess};
+use super::helpers::{fixture_path, user_config, AftProcess};
+#[cfg(unix)]
+use super::helpers::warm_executable;
 
 fn fake_server_path() -> PathBuf {
     option_env!("CARGO_BIN_EXE_fake-lsp-server")

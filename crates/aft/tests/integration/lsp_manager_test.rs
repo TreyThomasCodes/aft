@@ -14,6 +14,7 @@ use lsp_types::FileChangeType;
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+#[cfg(unix)]
 use super::helpers::warm_executable;
 
 fn fake_server_path() -> PathBuf {
