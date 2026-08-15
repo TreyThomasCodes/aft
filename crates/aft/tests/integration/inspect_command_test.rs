@@ -2839,7 +2839,11 @@ fn scoped_diagnostics_closes_documents_after_collection() {
 #[test]
 fn blocking_scoped_diagnostics_closes_every_document_it_opens() {
     let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-blocking-close\"\n");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-blocking-close\"\n",
+    );
     let files = [
         write_file(&root, "src/a.rs", "fn a() {}\n"),
         write_file(&root, "src/b.rs", "fn b() {}\n"),
@@ -2866,8 +2870,12 @@ fn blocking_scoped_diagnostics_closes_every_document_it_opens() {
         );
     }
     let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", files.len());
-    assert!(closed.iter().any(|event| event["uri"] == file_uri(&files[0])));
-    assert!(closed.iter().any(|event| event["uri"] == file_uri(&files[1])));
+    assert!(closed
+        .iter()
+        .any(|event| event["uri"] == file_uri(&files[0])));
+    assert!(closed
+        .iter()
+        .any(|event| event["uri"] == file_uri(&files[1])));
 }
 
 #[test]

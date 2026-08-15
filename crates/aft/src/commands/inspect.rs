@@ -20,6 +20,17 @@ const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_inspect_with_diagnostics(req, ctx, false)
+}
+
+/// Deferred inspections collect diagnostics for the entire root, even without
+/// an explicit response scope. Synchronous compatibility requests retain the
+/// scanner's existing warm working set behavior.
+fn handle_inspect_with_diagnostics(
+    req: &RawRequest,
+    ctx: &AppContext,
+    force_root_diagnostics: bool,
+) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
         Err(message) => return invalid_request(&req.id, message),
@@ -65,7 +76,12 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             // Diagnostics use the serial LSP lane rather than the inspect worker
             // pool. A non-authoritative collection remains a non-fresh outcome;
             // it is never converted into a partial inspect payload below.
-            run_diagnostics_category(ctx, &snapshot, &scope, scope_was_provided)
+            run_diagnostics_category(
+                ctx,
+                &snapshot,
+                &scope,
+                scope_was_provided || force_root_diagnostics,
+            )
         } else if category.is_tier2() {
             if let Some(rx) = tier2_receivers.remove(category) {
                 receive_tier2_completion(rx)
@@ -98,7 +114,11 @@ pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> Dispat
     let snapshot = match inspect_preflight(req, &ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
-            let detail = response.data.get("message").and_then(Value::as_str).map(str::to_owned);
+            let detail = response
+                .data
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             return deferred_response(
                 request_id,
                 build_inspect_terminal(
@@ -160,7 +180,8 @@ pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> Dispat
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     parse_top_k(&req.params).map_err(|message| invalid_request(&req.id, message))?;
-    parse_sections(req.params.get("sections")).map_err(|message| invalid_request(&req.id, message))?;
+    parse_sections(req.params.get("sections"))
+        .map_err(|message| invalid_request(&req.id, message))?;
     let snapshot = build_snapshot(ctx).map_err(|response| response.with_id(&req.id))?;
     parse_scope(req, ctx, &snapshot.project_root)?;
     Ok(snapshot)
@@ -204,18 +225,26 @@ fn run_deferred_inspect_body(
     let starts = applicability
         .server_keys
         .iter()
-        .map(|server| (server.clone(), phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server))))
+        .map(|server| {
+            (
+                server.clone(),
+                phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server)),
+            )
+        })
         .collect::<Vec<_>>();
     if let Err(error) = {
         let mut lsp = ctx.lsp();
-        lsp.start_applicable_servers(&applicability, ctx.config())
+        lsp.start_applicable_servers(&applicability, &ctx.config())
     } {
         finish_start_failure(starts, &error);
         return build_inspect_terminal(
             &req.id,
             &phase_log,
             InspectTerminal::PhaseFailed {
-                failed_phase: Some(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, &error.server_key)),
+                failed_phase: Some(InspectPhaseEntry::lsp(
+                    InspectPhaseId::LspStart,
+                    &error.server_key,
+                )),
                 failure_reason: "server_start_failed",
                 failure_detail: Some(start_failure_detail(&error)),
             },
@@ -228,9 +257,14 @@ fn run_deferred_inspect_body(
     let quiescence = applicability
         .server_keys
         .iter()
-        .map(|server| phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspQuiescence, server)))
+        .map(|server| {
+            phase_log.start(InspectPhaseEntry::lsp(
+                InspectPhaseId::LspQuiescence,
+                server,
+            ))
+        })
         .collect::<Vec<_>>();
-    let response = handle_inspect(req, &ctx);
+    let response = handle_inspect_with_diagnostics(req, &ctx, true);
     for phase in quiescence {
         phase.complete();
     }
@@ -243,14 +277,21 @@ fn run_deferred_inspect_body(
             InspectTerminal::PhaseFailed {
                 failed_phase: phase_log.in_flight_entry(),
                 failure_reason: "inspect_not_fresh",
-                failure_detail: response.data.get("message").and_then(Value::as_str).map(str::to_owned),
+                failure_detail: response
+                    .data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             },
         )
     }
 }
 
 fn finish_start_failure(
-    starts: Vec<(crate::lsp::roots::ServerKey, crate::inspect::phase_log::InspectPhaseHandle)>,
+    starts: Vec<(
+        crate::lsp::roots::ServerKey,
+        crate::inspect::phase_log::InspectPhaseHandle,
+    )>,
     error: &ApplicableServerStartError,
 ) {
     for (server, phase) in starts {
@@ -264,10 +305,14 @@ fn finish_start_failure(
 
 fn start_failure_detail(error: &ApplicableServerStartError) -> String {
     match &error.result {
-        crate::lsp::manager::ServerAttemptResult::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
+        crate::lsp::manager::ServerAttemptResult::BinaryNotInstalled { binary } => {
+            format!("{binary} is unavailable")
+        }
         crate::lsp::manager::ServerAttemptResult::SpawnFailed { reason, .. } => reason.clone(),
         crate::lsp::manager::ServerAttemptResult::NoRootMarker { .. }
-        | crate::lsp::manager::ServerAttemptResult::Ok { .. } => "server could not be started".to_string(),
+        | crate::lsp::manager::ServerAttemptResult::Ok { .. } => {
+            "server could not be started".to_string()
+        }
     }
 }
 
@@ -276,16 +321,27 @@ fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'stati
         ApplicabilityResolutionError::MissingExecutable { .. } => "missing_executable",
         ApplicabilityResolutionError::RootUnreadable { .. }
         | ApplicabilityResolutionError::CachedSpawnFailure { .. }
-        | ApplicabilityResolutionError::NoApplicableServer { .. } => "applicability_resolution_failed",
+        | ApplicabilityResolutionError::NoApplicableServer { .. } => {
+            "applicability_resolution_failed"
+        }
     }
 }
 
 fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
     match error {
-        ApplicabilityResolutionError::RootUnreadable { root, reason } => format!("cannot resolve {}: {reason}", root.display()),
-        ApplicabilityResolutionError::MissingExecutable { server_key, binary } => format!("{binary} is required for {}", server_key.kind.id_str()),
-        ApplicabilityResolutionError::CachedSpawnFailure { server_key, result } => format!("cached failure for {}: {result:?}", server_key.kind.id_str()),
-        ApplicabilityResolutionError::NoApplicableServer { root } => format!("no applicable LSP server for {}", root.display()),
+        ApplicabilityResolutionError::RootUnreadable { root, reason } => {
+            format!("cannot resolve {}: {reason}", root.display())
+        }
+        ApplicabilityResolutionError::MissingExecutable { server_key, binary } => {
+            format!("{binary} is required for {}", server_key.kind.id_str())
+        }
+        ApplicabilityResolutionError::CachedSpawnFailure { server_key, result } => format!(
+            "cached failure for {}: {result:?}",
+            server_key.kind.id_str()
+        ),
+        ApplicabilityResolutionError::NoApplicableServer { root } => {
+            format!("no applicable LSP server for {}", root.display())
+        }
     }
 }
 
@@ -300,18 +356,32 @@ enum InspectTerminal {
     },
 }
 
-fn build_inspect_terminal(request_id: &str, log: &InspectPhaseLog, terminal: InspectTerminal) -> Response {
+fn build_inspect_terminal(
+    request_id: &str,
+    log: &InspectPhaseLog,
+    terminal: InspectTerminal,
+) -> Response {
     let (phases, blocking_waited) = log.terminal_inputs();
     match terminal {
         InspectTerminal::Fresh(mut payload) => {
             let Some(payload) = payload.as_object_mut() else {
-                return Response::error(request_id, "inspect_terminal_invalid", "inspect payload was not an object");
+                return Response::error(
+                    request_id,
+                    "inspect_terminal_invalid",
+                    "inspect payload was not an object",
+                );
             };
-            payload.insert("inspect_terminal".to_string(), Value::String("fresh".to_string()));
-            payload.insert("wait_stamp".to_string(), serde_json::json!({
-                "text": format_wait_text(&phases, blocking_waited),
-                "phases": phases,
-            }));
+            payload.insert(
+                "inspect_terminal".to_string(),
+                Value::String("fresh".to_string()),
+            );
+            payload.insert(
+                "wait_stamp".to_string(),
+                serde_json::json!({
+                    "text": format_wait_text(&phases, blocking_waited),
+                    "phases": phases,
+                }),
+            );
             Response::success(request_id, Value::Object(payload.clone()))
         }
         InspectTerminal::Interrupted => Response {
@@ -319,7 +389,11 @@ fn build_inspect_terminal(request_id: &str, log: &InspectPhaseLog, terminal: Ins
             success: false,
             data: serde_json::json!({"inspect_terminal": "interrupted", "completed_phases": phases}),
         },
-        InspectTerminal::PhaseFailed { failed_phase, failure_reason, failure_detail } => {
+        InspectTerminal::PhaseFailed {
+            failed_phase,
+            failure_reason,
+            failure_detail,
+        } => {
             let mut data = serde_json::json!({
                 "inspect_terminal": "phase_failed",
                 "completed_phases": phases,
@@ -327,11 +401,21 @@ fn build_inspect_terminal(request_id: &str, log: &InspectPhaseLog, terminal: Ins
             });
             if let Some(phase) = failed_phase {
                 data["failed_phase"] = serde_json::json!(phase.id);
-                if let Some(producer) = phase.producer { data["producer"] = Value::String(producer); }
-                if let Some(category) = phase.category { data["category"] = Value::String(category); }
+                if let Some(producer) = phase.producer {
+                    data["producer"] = Value::String(producer);
+                }
+                if let Some(category) = phase.category {
+                    data["category"] = Value::String(category);
+                }
             }
-            if let Some(detail) = failure_detail { data["failure_detail"] = Value::String(detail); }
-            Response { id: request_id.to_string(), success: false, data }
+            if let Some(detail) = failure_detail {
+                data["failure_detail"] = Value::String(detail);
+            }
+            Response {
+                id: request_id.to_string(),
+                success: false,
+                data,
+            }
         }
     }
 }
@@ -2255,7 +2339,6 @@ mod fresh_payload_tests {
     }
 }
 
-
 #[cfg(test)]
 mod deferred_terminal_tests {
     use super::*;
@@ -2279,7 +2362,10 @@ mod deferred_terminal_tests {
         assert!(!response.success);
         assert!(response.data.get("failed_phase").is_none());
         assert_eq!(response.data["failure_reason"], "root_resolution_failed");
-        assert!((deferred.poll)(&ctx).is_none(), "terminal response must be emitted once");
+        assert!(
+            (deferred.poll)(&ctx).is_none(),
+            "terminal response must be emitted once"
+        );
     }
 
     #[test]
@@ -2295,13 +2381,19 @@ mod deferred_terminal_tests {
             &log,
             InspectTerminal::Fresh(serde_json::json!({})),
         );
-        assert_eq!(fresh.data["wait_stamp"]["phases"][0]["id"], "stat_verification");
+        assert_eq!(
+            fresh.data["wait_stamp"]["phases"][0]["id"],
+            "stat_verification"
+        );
         let interrupted = build_inspect_terminal(
             "inspect-terminal-shapes",
             &log,
             InspectTerminal::Interrupted,
         );
-        assert_eq!(interrupted.data["completed_phases"][0]["category"], "dead_code");
+        assert_eq!(
+            interrupted.data["completed_phases"][0]["category"],
+            "dead_code"
+        );
         let failed = build_inspect_terminal(
             "inspect-terminal-shapes",
             &log,
@@ -2311,7 +2403,10 @@ mod deferred_terminal_tests {
                 failure_detail: None,
             },
         );
-        assert_eq!(failed.data["completed_phases"][0]["id"], "stat_verification");
+        assert_eq!(
+            failed.data["completed_phases"][0]["id"],
+            "stat_verification"
+        );
         assert!(failed.data.get("failed_phase").is_none());
     }
 }
