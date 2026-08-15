@@ -84,6 +84,47 @@ pub struct EnsureServerOutcomes {
     pub attempts: Vec<ServerAttempt>,
 }
 
+/// Side-effect-free result of resolving the server kinds applicable to an
+/// inspection root. The public record set is deliberately only `ServerKey`s;
+/// the definitions retained internally are used later by the explicit start
+/// step and never cause a process to be opened during resolution.
+#[derive(Clone, Debug)]
+pub struct ApplicableServerSnapshot {
+    pub server_keys: Vec<ServerKey>,
+    candidates: Vec<ApplicableServerCandidate>,
+}
+
+#[derive(Clone, Debug)]
+struct ApplicableServerCandidate {
+    key: ServerKey,
+    definition: ServerDef,
+}
+
+#[derive(Clone, Debug)]
+pub enum ApplicabilityResolutionError {
+    RootUnreadable {
+        root: PathBuf,
+        reason: String,
+    },
+    MissingExecutable {
+        server_key: ServerKey,
+        binary: String,
+    },
+    CachedSpawnFailure {
+        server_key: ServerKey,
+        result: ServerAttemptResult,
+    },
+    NoApplicableServer {
+        root: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplicableServerStartError {
+    pub server_key: ServerKey,
+    pub result: ServerAttemptResult,
+}
+
 impl EnsureServerOutcomes {
     /// True if no server in the registry matched this file's extension.
     pub fn no_server_registered(&self) -> bool {
@@ -276,6 +317,38 @@ impl PostEditDiagnosticsWait {
     }
 }
 
+/// Wait state for blocking inspect diagnostics. It owns only channel receivers
+/// while parked so another LSP request can acquire the manager mutex and drain
+/// or mutate state before the inspect wait is released.
+pub(crate) struct InspectDiagnosticsWait {
+    lookup_path: PathBuf,
+    expected: Vec<(ServerKey, PreEditSnapshot)>,
+    event_rx: Receiver<LspEvent>,
+    wake_rx: Receiver<()>,
+    waiter_id: u64,
+}
+
+pub(crate) enum InspectDiagnosticsWake {
+    Event(LspEvent),
+    StateChanged,
+    Disconnected,
+}
+
+impl InspectDiagnosticsWait {
+    pub(crate) fn next_event(&self) -> InspectDiagnosticsWake {
+        crossbeam_channel::select! {
+            recv(self.event_rx) -> event => match event {
+                Ok(event) => InspectDiagnosticsWake::Event(event),
+                Err(_) => InspectDiagnosticsWake::Disconnected,
+            },
+            recv(self.wake_rx) -> wake => match wake {
+                Ok(()) => InspectDiagnosticsWake::StateChanged,
+                Err(_) => InspectDiagnosticsWake::Disconnected,
+            },
+        }
+    }
+}
+
 impl IntoIterator for DrainedLspEvents {
     type Item = LspEvent;
     type IntoIter = std::vec::IntoIter<LspEvent>;
@@ -304,6 +377,11 @@ pub struct LspManager {
     /// sleep through a diagnostics update consumed by another drain path.
     post_edit_waiters: HashMap<u64, Sender<()>>,
     next_post_edit_waiter_id: u64,
+    /// One-slot wake channels for inspect waits. These mirror post-edit waits
+    /// so an event drained by another request still wakes a lock-released
+    /// blocking inspection to recheck the authoritative store.
+    inspect_waiters: HashMap<u64, Sender<()>>,
+    next_inspect_waiter_id: u64,
     /// Optional binary path overrides used by integration tests.
     binary_overrides: HashMap<ServerKind, PathBuf>,
     /// Extra env vars merged into every spawned LSP child. Used in tests to
@@ -350,6 +428,8 @@ impl LspManager {
             event_rx,
             post_edit_waiters: HashMap::new(),
             next_post_edit_waiter_id: 0,
+            inspect_waiters: HashMap::new(),
+            next_inspect_waiter_id: 0,
             binary_overrides: HashMap::new(),
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
@@ -420,6 +500,132 @@ impl LspManager {
     /// For testing: override the binary for a server kind.
     pub fn override_binary(&mut self, kind: ServerKind, binary_path: PathBuf) {
         self.binary_overrides.insert(kind, binary_path);
+    }
+
+    /// Resolve every configured server applicable to a root without starting it.
+    ///
+    /// This is intentionally separate from `ensure_server_for_file_detailed`:
+    /// an inspect call must bind its applicability snapshot before a process can
+    /// spawn, initialize, or receive a document. The scan ignores its caller's
+    /// result scope because scope does not reduce diagnostic obligations.
+    pub fn resolve_applicable_servers_for_root(
+        &self,
+        project_root: &Path,
+        config: &Config,
+    ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+        if !project_root.is_dir() {
+            return Err(ApplicabilityResolutionError::RootUnreadable {
+                root: project_root.to_path_buf(),
+                reason: "project root is not a directory".to_string(),
+            });
+        }
+
+        let mut candidates = HashMap::<ServerKey, ApplicableServerCandidate>::new();
+        let walker = ignore::WalkBuilder::new(project_root)
+            .standard_filters(true)
+            .add_custom_ignore_filename(".aftignore")
+            .filter_entry(|entry| {
+                !matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+                )
+            })
+            .build();
+
+        for entry in walker {
+            let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
+                root: project_root.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            let file = entry.path();
+            for definition in servers_for_file(file, config) {
+                let Some(key) = server_key_for_definition(&definition, file, config) else {
+                    continue;
+                };
+                if candidates.contains_key(&key) {
+                    continue;
+                }
+                if let Some(result) = self.failed_spawns.get(&key) {
+                    return Err(ApplicabilityResolutionError::CachedSpawnFailure {
+                        server_key: key,
+                        result: result.clone(),
+                    });
+                }
+                if self.resolve_binary(&definition, config).is_err() {
+                    return Err(ApplicabilityResolutionError::MissingExecutable {
+                        server_key: key,
+                        binary: definition.binary.clone(),
+                    });
+                }
+                candidates.insert(key.clone(), ApplicableServerCandidate { key, definition });
+            }
+        }
+
+        if candidates.is_empty() {
+            return Err(ApplicabilityResolutionError::NoApplicableServer {
+                root: project_root.to_path_buf(),
+            });
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.key
+                .kind
+                .id_str()
+                .cmp(right.key.kind.id_str())
+                .then_with(|| left.key.root.cmp(&right.key.root))
+        });
+        let server_keys = candidates
+            .iter()
+            .map(|candidate| candidate.key.clone())
+            .collect();
+        Ok(ApplicableServerSnapshot {
+            server_keys,
+            candidates,
+        })
+    }
+
+    /// Start exactly the servers selected by a prior applicability snapshot.
+    ///
+    /// No document is opened here. That boundary makes a late configuration or
+    /// filesystem change apply to the next inspection rather than starting an
+    /// unrecorded server in the current call.
+    pub fn start_applicable_servers(
+        &mut self,
+        snapshot: &ApplicableServerSnapshot,
+        config: &Config,
+    ) -> Result<Vec<ServerKey>, ApplicableServerStartError> {
+        let mut started = Vec::new();
+        for candidate in &snapshot.candidates {
+            if self.clients.contains_key(&candidate.key) {
+                continue;
+            }
+            match self.spawn_server(&candidate.definition, &candidate.key.root, config) {
+                Ok(client) => {
+                    self.clients.insert(candidate.key.clone(), client);
+                    self.server_binaries
+                        .insert(candidate.key.clone(), candidate.definition.binary.clone());
+                    self.documents.entry(candidate.key.clone()).or_default();
+                    started.push(candidate.key.clone());
+                }
+                Err(error) => {
+                    let result = classify_spawn_error(&candidate.definition.binary, &error);
+                    self.failed_spawns
+                        .insert(candidate.key.clone(), result.clone());
+                    return Err(ApplicableServerStartError {
+                        server_key: candidate.key.clone(),
+                        result,
+                    });
+                }
+            }
+        }
+        Ok(started)
     }
 
     /// Ensure a server is running for the given file. Spawns if needed.
@@ -1425,6 +1631,50 @@ impl LspManager {
             .collect()
     }
 
+    /// Subscribe an inspect wait before releasing the manager mutex. Unlike the
+    /// legacy deadline API, this state carries no time budget: it is completed
+    /// by a publish/state change or remains in phase until a real interruption
+    /// or shutdown policy supplies a terminal result.
+    pub(crate) fn start_inspect_diagnostics_wait(
+        &mut self,
+        file_path: &Path,
+        expected: &[(ServerKey, PreEditSnapshot)],
+    ) -> InspectDiagnosticsWait {
+        let lookup_path = normalize_lookup_path(file_path);
+        let _ = self.drain_events_for_file(&lookup_path);
+        let waiter_id = self.next_inspect_waiter_id;
+        self.next_inspect_waiter_id = self.next_inspect_waiter_id.wrapping_add(1);
+        let (wake_tx, wake_rx) = bounded(1);
+        self.inspect_waiters.insert(waiter_id, wake_tx);
+        InspectDiagnosticsWait {
+            lookup_path,
+            expected: expected.to_vec(),
+            event_rx: self.event_rx.clone(),
+            wake_rx,
+            waiter_id,
+        }
+    }
+
+    /// Apply an event after a lock-released wait and report whether every
+    /// expected server has a usable diagnostic report for this document.
+    pub(crate) fn poll_inspect_diagnostics_wait(
+        &mut self,
+        wait: &InspectDiagnosticsWait,
+        wake: Option<InspectDiagnosticsWake>,
+    ) -> bool {
+        if let Some(InspectDiagnosticsWake::Event(event)) = wake {
+            self.handle_event(&event);
+        }
+        wait.expected.iter().all(|(server, pre)| {
+            self.diagnostic_entry_is_fresh_for_document(&wait.lookup_path, server, *pre)
+                || self.has_diagnostic_report_for_server_file(server, &wait.lookup_path)
+        })
+    }
+
+    pub(crate) fn finish_inspect_diagnostics_wait(&mut self, wait: InspectDiagnosticsWait) {
+        self.inspect_waiters.remove(&wait.waiter_id);
+    }
+
     /// Default timeout for `textDocument/diagnostic` (per-file pull). Servers
     /// usually respond in under 1s for files they've already analyzed; we
     /// allow up to 10s before falling back to push semantics. Currently
@@ -2005,15 +2255,23 @@ impl LspManager {
             _ => None,
         };
         self.wake_post_edit_waiters();
+        self.wake_inspect_waiters();
         published_file
     }
 
     fn wake_post_edit_waiters(&mut self) {
-        self.post_edit_waiters
-            .retain(|_, sender| match sender.try_send(()) {
-                Ok(()) | Err(TrySendError::Full(())) => true,
-                Err(TrySendError::Disconnected(())) => false,
-            });
+        Self::wake_waiters(&mut self.post_edit_waiters);
+    }
+
+    fn wake_inspect_waiters(&mut self) {
+        Self::wake_waiters(&mut self.inspect_waiters);
+    }
+
+    fn wake_waiters(waiters: &mut HashMap<u64, Sender<()>>) {
+        waiters.retain(|_, sender| match sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => true,
+            Err(TrySendError::Disconnected(())) => false,
+        });
     }
 
     fn handle_publish_diagnostics(
@@ -2795,5 +3053,80 @@ mod clear_diagnostics_tests {
         assert!(drained.diagnostics_changed);
         assert_eq!(drained.events.len(), 1);
         assert_eq!(manager.warm_error_warning_counts(), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod inspect_path_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::LspManager;
+    use crate::config::{Config, UserServerDef};
+    use crate::lsp::client::LspEvent;
+    use crate::lsp::registry::ServerKind;
+
+    #[test]
+    fn applicability_resolution_does_not_start_or_open_a_server() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        std::fs::write(root.join("inspect-root.json"), "{}\n").expect("root marker");
+        std::fs::write(root.join("input.inspectlang"), "value\n").expect("source file");
+
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_servers: vec![UserServerDef {
+                id: "inspect-test".to_string(),
+                extensions: vec!["inspectlang".to_string()],
+                binary: "inspect-test-lsp".to_string(),
+                args: Vec::new(),
+                root_markers: vec!["inspect-root.json".to_string()],
+                env: Default::default(),
+                initialization_options: None,
+                disabled: false,
+            }],
+            ..Config::default()
+        };
+        let mut manager = LspManager::new();
+        manager.override_binary(
+            ServerKind::Custom("inspect-test".into()),
+            std::env::current_exe().expect("current executable"),
+        );
+
+        let snapshot = manager
+            .resolve_applicable_servers_for_root(&root, &config)
+            .expect("resolution succeeds without spawning");
+        assert_eq!(snapshot.server_keys.len(), 1);
+        assert_eq!(snapshot.server_keys[0].kind.id_str(), "inspect-test");
+        assert_eq!(manager.server_count(), 0);
+        assert!(!manager.document_is_open_for_test(&root.join("input.inspectlang")));
+    }
+
+    #[test]
+    fn inspect_wait_releases_manager_lock_before_receiving() {
+        let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+        let wait = {
+            let mut manager = manager.lock();
+            manager.start_inspect_diagnostics_wait(&PathBuf::from("/tmp/inspect.rs"), &[])
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            entered_tx.send(()).expect("announce wait");
+            let _ = wait.next_event();
+        });
+        entered_rx.recv().expect("waiter started");
+
+        assert!(
+            manager.try_lock().is_some(),
+            "the manager lock must remain available while inspect waits"
+        );
+        manager
+            .lock()
+            .enqueue_event_for_test(LspEvent::ServerExited {
+                server_kind: ServerKind::Rust,
+                root: PathBuf::from("/tmp"),
+            });
+        join.join().expect("waiter exits after event");
     }
 }

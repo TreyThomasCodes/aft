@@ -30,12 +30,17 @@ pub enum DispatchOutcome {
 }
 
 pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response>>;
+pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response>;
 
 pub struct PendingResponse {
     pub request_id: String,
     pub session_id: String,
     pub attach_command: String,
     pub poll: PendingResponsePoll,
+    /// Optional terminal response emitted before this entry is removed during
+    /// shutdown. Long-running inspect uses this to avoid silently dropping its
+    /// only agent-visible terminal frame.
+    pub on_shutdown: Option<PendingResponseShutdown>,
 }
 
 pub struct ResolvedPending {
@@ -82,6 +87,22 @@ impl PendingResponses {
 
     pub fn drain_on_shutdown(&mut self) {
         self.entries.clear();
+    }
+
+    /// Resolve shutdown-aware entries before removing them from the registry.
+    /// Entries without a shutdown terminal retain the legacy drop behavior.
+    pub fn drain_on_shutdown_with(&mut self, ctx: &AppContext) -> Vec<ResolvedPending> {
+        self.entries
+            .drain(..)
+            .filter_map(|mut pending| {
+                let response = (pending.on_shutdown.as_mut()?)(ctx);
+                Some(ResolvedPending {
+                    response,
+                    session_id: pending.session_id,
+                    attach_command: pending.attach_command,
+                })
+            })
+            .collect()
     }
 }
 
@@ -239,9 +260,12 @@ pub fn attach_status_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::{aft_status_segment, holder_owns_status_bar};
-    use crate::context::StatusBarCounts;
+    use super::{aft_status_segment, holder_owns_status_bar, PendingResponse, PendingResponses};
+    use crate::config::Config;
+    use crate::context::{AppContext, StatusBarCounts};
     use crate::harness::Harness;
+    use crate::parser::TreeSitterProvider;
+    use crate::protocol::Response;
 
     #[test]
     fn live_holder_retires_only_opencode_response_bars() {
@@ -271,6 +295,26 @@ mod tests {
             format!("[AFT {}]", aft_status_segment(&counts)),
             "[AFT E2 W5 | D331 U221 C1159 | T8]"
         );
+    }
+
+    #[test]
+    fn shutdown_delivery_emits_terminal_before_removing_entry() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let mut pending = PendingResponses::default();
+        pending.register(PendingResponse {
+            request_id: "inspect-shutdown".to_string(),
+            session_id: String::new(),
+            attach_command: String::new(),
+            poll: Box::new(|_| None),
+            on_shutdown: Some(Box::new(|_| {
+                Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
+            })),
+        });
+
+        let resolved = pending.drain_on_shutdown_with(&ctx);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].response.id, "inspect-shutdown");
+        assert!(pending.is_empty());
     }
 
     #[test]

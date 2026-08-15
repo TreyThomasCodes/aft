@@ -10,6 +10,7 @@ pub(crate) use generated::is_generated_file;
 pub mod job;
 mod manager;
 pub mod oxc_engine;
+pub mod phase_log;
 pub mod scanners;
 pub mod tier2_scheduler;
 
@@ -25,4 +26,8 @@ pub use job::{
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
 pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
+pub use phase_log::{
+    format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId, InspectPhaseLog,
+    InspectPhaseLogSnapshot,
+};
 pub use tier2_scheduler::{Tier2RefreshScheduler, Tier2TriggerReason};

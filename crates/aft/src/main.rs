@@ -124,7 +124,7 @@ fn main() {
     aft::slog_info!("started, pid {}", std::process::id());
 
     let app = App::default_shared();
-    let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
+    let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     let registry = RuntimeRegistry::standalone(app, ctx);
     // P3-02 slice 2: signal handling aggregates all per-actor
     // background registries; drain/dispatch multi-root routing remains later.
@@ -320,7 +320,17 @@ fn main() {
         "shutdown phase=begin graceful_stdin={}",
         graceful_stdin_shutdown
     );
-    pending.drain_on_shutdown();
+    for mut resolved in pending.drain_on_shutdown_with(registry.current()) {
+        aft::response_finalize::finalize_response(
+            &mut resolved.response,
+            registry.current(),
+            &resolved.session_id,
+            &resolved.attach_command,
+        );
+        if let Err(error) = write_response(registry.current(), &resolved.response) {
+            aft::slog_error!("stdout write error while emitting shutdown terminal: {error}");
+        }
+    }
     aft::slog_info!("shutdown phase=pending_responses_drained");
     if graceful_stdin_shutdown {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
@@ -818,8 +828,11 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
-fn dispatch_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome {
+fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     aft::commands::tool_call::register_dispatch(dispatch);
+    if req.command == "inspect" {
+        return aft::commands::inspect::handle_inspect_deferred(&req, Arc::clone(ctx));
+    }
     if req.command == "bash"
         && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
     {
@@ -982,13 +995,13 @@ mod pending_response_tests {
 
     fn make_runtime_registry(root: &Path) -> RuntimeRegistry {
         let app = App::default_shared();
-        let ctx = AppContext::from_app(
+        let ctx = Arc::new(AppContext::from_app(
             Arc::clone(&app),
             Config {
                 project_root: Some(root.to_path_buf()),
                 ..Config::default()
             },
-        );
+        ));
         RuntimeRegistry::standalone(app, ctx)
     }
 
@@ -1118,6 +1131,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
+            on_shutdown: None,
         });
 
         let mut writer = Vec::new();
@@ -1311,6 +1325,7 @@ mod pending_response_tests {
                 calls_for_poll.set(calls_for_poll.get() + 1);
                 None
             }),
+            on_shutdown: None,
         });
         let mut writer = Vec::new();
 
@@ -1361,6 +1376,7 @@ mod pending_response_tests {
                 events_for_pending.lock().unwrap().push("pending");
                 Some(Response::success("pending-order", serde_json::json!({})))
             }),
+            on_shutdown: None,
         });
         let mut writer = Vec::new();
 
@@ -1397,6 +1413,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
+            on_shutdown: None,
         });
         let mut writer = Vec::new();
 
@@ -1437,6 +1454,7 @@ mod pending_response_tests {
                     serde_json::json!({"which": "ready"}),
                 ))
             }),
+            on_shutdown: None,
         });
         pending.register(PendingResponse {
             request_id: "pending-later".to_string(),
@@ -1452,6 +1470,7 @@ mod pending_response_tests {
                     None
                 }
             }),
+            on_shutdown: None,
         });
         let mut writer = Vec::new();
 
@@ -1493,6 +1512,7 @@ mod pending_response_tests {
                     serde_json::json!({"should_not_write": true}),
                 ))
             }),
+            on_shutdown: None,
         });
         let mut writer = Vec::new();
 
@@ -1516,7 +1536,7 @@ mod signal_handler_tests {
     #[test]
     fn signal_bg_registry_collection_includes_standalone_actor() {
         let app = App::default_shared();
-        let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
+        let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         let registry = RuntimeRegistry::standalone(app, ctx);
 
         assert_eq!(signal_bg_registries(&registry).len(), 1);
@@ -1535,14 +1555,14 @@ mod graceful_shutdown_search_index_tests {
 
     fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
         let app = App::default_shared();
-        let ctx = AppContext::from_app(
+        let ctx = Arc::new(AppContext::from_app(
             Arc::clone(&app),
             Config {
                 project_root: Some(root.to_path_buf()),
                 storage_dir: Some(storage.to_path_buf()),
                 ..Config::default()
             },
-        );
+        ));
         ctx.set_canonical_cache_root(std::fs::canonicalize(root).expect("canonical root"));
         RuntimeRegistry::standalone(app, ctx)
     }

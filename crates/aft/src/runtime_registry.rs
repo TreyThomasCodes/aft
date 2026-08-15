@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::context::{App, AppContext};
 
-pub type ProjectRuntime = AppContext;
+/// Standalone and subc contexts share the same owned handle so deferred work
+/// can outlive the synchronous dispatch stack without borrowing the runtime.
+pub type ProjectRuntime = Arc<AppContext>;
 
 pub struct RuntimeRegistry {
     app: Arc<App>,
@@ -38,21 +40,20 @@ mod tests {
 
     #[test]
     fn standalone_current_and_iter_return_single_runtime() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
         let app = ctx.app();
         let mut registry = RuntimeRegistry::standalone(Arc::clone(&app), ctx);
         assert!(Arc::ptr_eq(&app, &registry.app()));
         assert!(Arc::ptr_eq(&app, &registry.current().app()));
 
-        let current_ptr = registry.current() as *const ProjectRuntime;
-        let iter_ptrs = registry
-            .iter()
-            .map(|runtime| runtime as *const ProjectRuntime)
-            .collect::<Vec<_>>();
-
+        let current_ptr = Arc::as_ptr(registry.current());
+        let iter_ptrs = registry.iter().map(Arc::as_ptr).collect::<Vec<_>>();
         assert_eq!(iter_ptrs, vec![current_ptr]);
 
-        let current_mut_ptr = registry.current_mut() as *mut ProjectRuntime;
-        assert_eq!(current_mut_ptr as *const ProjectRuntime, current_ptr);
+        let current_mut_ptr = Arc::as_ptr(registry.current_mut());
+        assert_eq!(current_mut_ptr, current_ptr);
     }
 }
