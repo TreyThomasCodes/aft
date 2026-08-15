@@ -1,0 +1,8 @@
+{
+  "session": "fixture-session",
+  "dispatch_root": "/fixture/dispatch-root",
+  "other_root": "/fixture/other-root",
+  "producer": "rust-analyzer",
+  "dispatch_alert": "dispatch",
+  "other_alert": "other"
+}
