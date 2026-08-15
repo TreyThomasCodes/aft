@@ -106,6 +106,22 @@ fn target(root: &Path, file: &str, symbol: &str) -> String {
     for component in file.split('/') {
         path.push(component);
     }
+
+    // Snapshot paths remove Windows verbatim prefixes during normalization.
+    // Normalize every absolute target expectation the same way, including roots
+    // returned by fs::canonicalize as `\\?\C:\...`.
+    #[cfg(windows)]
+    let path = {
+        let display = path.to_string_lossy();
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{stripped}"))
+        } else if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            PathBuf::from(stripped)
+        } else {
+            path
+        }
+    };
+
     format!("{}::{symbol}", path.display())
 }
 
