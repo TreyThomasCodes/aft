@@ -1,11 +1,17 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 2;
 #[cfg(test)]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 1024;
+
+// This is an internal harness record, not a user-facing limiter setting. The
+// test harness performs 32 release/admission cycles, so retain enough events to
+// cover that exercise while bounding memory use in a long-lived daemon.
+const ADMISSION_EVENT_RETENTION: usize = 64;
 
 static GLOBAL_COLD_BUILD_LIMITER: LazyLock<Arc<ColdBuildLimiter>> =
     LazyLock::new(|| Arc::new(ColdBuildLimiter::new(DEFAULT_COLD_BUILD_LIMIT)));
@@ -46,35 +52,151 @@ pub(crate) fn acquire_blocking_while_with_limiter(
     kind: &str,
     admitted: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
+    acquire_blocking_while_inner(limiter, kind, None, admitted, || false)
+}
+
+/// Identify the source of a cold-build request without exposing a limiter knob.
+///
+/// The classes deliberately have no priority ordering. When both classes are
+/// waiting, the limiter only avoids admitting the class that was admitted most
+/// recently, so a continuously eligible class cannot monopolize releases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColdBuildAdmissionClass {
+    InspectTriggered,
+    Maintenance,
+}
+
+impl ColdBuildAdmissionClass {
+    const fn index(self) -> usize {
+        match self {
+            Self::InspectTriggered => 0,
+            Self::Maintenance => 1,
+        }
+    }
+
+    const fn other_index(self) -> usize {
+        match self {
+            Self::InspectTriggered => Self::Maintenance.index(),
+            Self::Maintenance => Self::InspectTriggered.index(),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::InspectTriggered => "inspect-triggered",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// Internal request metadata attached to an admission attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdBuildAdmissionRequest {
+    request_id: String,
+    class: ColdBuildAdmissionClass,
+}
+
+impl ColdBuildAdmissionRequest {
+    pub(crate) fn new(request_id: impl Into<String>, class: ColdBuildAdmissionClass) -> Self {
+        Self {
+            request_id: request_id.into(),
+            class,
+        }
+    }
+}
+
+/// A structured record of a successful cold-build admission.
+///
+/// `admission_order` records the order in which permits were admitted, not the
+/// order in which waiters arrived. Arrival-order and overtake checks require a
+/// separate ticketed-ordering design.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdBuildAdmissionEvent {
+    pub(crate) request_id: String,
+    pub(crate) class: ColdBuildAdmissionClass,
+    pub(crate) admission_order: u64,
+}
+
+/// Acquire a limiter permit for a classified request while it remains admitted
+/// and uncancelled.
+///
+/// Cancellation is sampled before every acquisition attempt and again after a
+/// permit has been acquired. The second check closes the gap before a build can
+/// start: a newly cancelled request returns the permit without emitting an
+/// admission event.
+pub(crate) fn acquire_blocking_while_cancellable_with_limiter(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    request: ColdBuildAdmissionRequest,
+    admitted: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool,
+) -> Option<ColdBuildPermit> {
+    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled)
+}
+
+fn acquire_blocking_while_inner(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    request: Option<&ColdBuildAdmissionRequest>,
+    admitted: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool,
+) -> Option<ColdBuildPermit> {
+    let _waiter = request.map(|request| AdmissionWaiter::register(limiter, request.class));
     let started = Instant::now();
     let mut logged = false;
     loop {
-        if !admitted() {
+        if !admitted() || cancelled() {
             return None;
         }
-        if let Some(permit) = limiter.try_acquire() {
-            // The root can become unbound after the pre-attempt check but
-            // before the permit CAS succeeds. Recheck while owning the slot;
-            // dropping the permit here returns it before any build starts.
-            if !admitted() {
-                drop(permit);
-                return None;
+        let class_is_eligible = request
+            .map(|request| limiter.class_is_eligible(request.class))
+            .unwrap_or(true);
+        if class_is_eligible {
+            if let Some(permit) = limiter.try_acquire() {
+                // A request can become unbound or cancelled after the pre-attempt
+                // check but before the permit is acquired. Recheck while owning
+                // the slot; dropping the permit returns it before any build starts.
+                if !admitted() || cancelled() {
+                    drop(permit);
+                    return None;
+                }
+                if let Some(request) = request {
+                    limiter.record_admission(request);
+                }
+                if logged {
+                    match request {
+                        Some(request) => crate::slog_info!(
+                            "{} cold-build slot acquired after {}ms wait: request={} kind={}",
+                            request.class.label(),
+                            started.elapsed().as_millis(),
+                            request.request_id,
+                            kind
+                        ),
+                        None => crate::slog_info!(
+                            "maintenance build slot acquired after {}ms wait: {}",
+                            started.elapsed().as_millis(),
+                            kind
+                        ),
+                    }
+                }
+                return Some(permit);
             }
-            if logged {
-                crate::slog_info!(
-                    "maintenance build slot acquired after {}ms wait: {}",
-                    started.elapsed().as_millis(),
-                    kind
-                );
-            }
-            return Some(permit);
         }
         if !logged {
-            crate::slog_info!(
-                "maintenance build queued behind concurrency cap ({}): {}",
-                limiter.limit(),
-                kind
-            );
+            match request {
+                Some(request) => crate::slog_info!(
+                    "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
+                    request.class.label(),
+                    limiter.limit(),
+                    request.request_id,
+                    kind
+                ),
+                None => crate::slog_info!(
+                    "maintenance build queued behind concurrency cap ({}): {}",
+                    limiter.limit(),
+                    kind
+                ),
+            }
             logged = true;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -103,6 +225,15 @@ pub(crate) fn acquire_blocking_while_with_test_limiter(
 pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
     limit: usize,
+    admission_state: Mutex<AdmissionState>,
+}
+
+#[derive(Debug)]
+struct AdmissionState {
+    waiting_by_class: [usize; 2],
+    last_admitted_class: Option<ColdBuildAdmissionClass>,
+    next_admission_order: u64,
+    events: VecDeque<ColdBuildAdmissionEvent>,
 }
 
 impl ColdBuildLimiter {
@@ -111,6 +242,12 @@ impl ColdBuildLimiter {
         Self {
             available: AtomicUsize::new(limit),
             limit,
+            admission_state: Mutex::new(AdmissionState {
+                waiting_by_class: [0; 2],
+                last_admitted_class: None,
+                next_admission_order: 1,
+                events: VecDeque::with_capacity(ADMISSION_EVENT_RETENTION),
+            }),
         }
     }
 
@@ -140,6 +277,85 @@ impl ColdBuildLimiter {
             }
         }
     }
+
+    fn class_is_eligible(&self, class: ColdBuildAdmissionClass) -> bool {
+        let state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiting_by_class[class.other_index()] == 0 || state.last_admitted_class != Some(class)
+    }
+
+    fn record_admission(&self, request: &ColdBuildAdmissionRequest) {
+        let mut state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let event = ColdBuildAdmissionEvent {
+            request_id: request.request_id.clone(),
+            class: request.class,
+            admission_order: state.next_admission_order,
+        };
+        state.next_admission_order += 1;
+        state.last_admitted_class = Some(request.class);
+        if state.events.len() == ADMISSION_EVENT_RETENTION {
+            state.events.pop_front();
+        }
+        state.events.push_back(event);
+    }
+
+    /// Expose recorded admissions to internal tests and harness code so they
+    /// can verify limiter behavior without parsing log output.
+    pub(crate) fn admission_events(&self) -> Vec<ColdBuildAdmissionEvent> {
+        self.admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn waiting_by_class_for_test(&self) -> [usize; 2] {
+        self.admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting_by_class
+    }
+}
+
+struct AdmissionWaiter {
+    limiter: Arc<ColdBuildLimiter>,
+    class: ColdBuildAdmissionClass,
+}
+
+impl AdmissionWaiter {
+    fn register(limiter: &Arc<ColdBuildLimiter>, class: ColdBuildAdmissionClass) -> Self {
+        let mut state = limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.waiting_by_class[class.index()] += 1;
+        drop(state);
+        Self {
+            limiter: Arc::clone(limiter),
+            class,
+        }
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waiting = &mut state.waiting_by_class[self.class.index()];
+        debug_assert!(*waiting > 0);
+        *waiting = waiting.saturating_sub(1);
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +380,23 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_for_waiters(limiter: &ColdBuildLimiter) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let waiting = limiter.waiting_by_class_for_test();
+            if waiting[ColdBuildAdmissionClass::InspectTriggered.index()] > 0
+                && waiting[ColdBuildAdmissionClass::Maintenance.index()] > 0
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both admission classes must remain queued; waiting={waiting:?}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -242,5 +475,125 @@ mod tests {
             "revoked work must leave the cold-build queue without taking a permit"
         );
         drop(held);
+    }
+
+    #[test]
+    fn cancellation_after_acquisition_returns_the_permit_without_an_event() {
+        let limiter = test_limiter(1);
+        let cancellation_checks = AtomicUsize::new(0);
+
+        let permit = acquire_blocking_while_cancellable_with_limiter(
+            &limiter,
+            "cancel-after-acquire",
+            ColdBuildAdmissionRequest::new(
+                "inspect-cancelled",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+            || true,
+            || cancellation_checks.fetch_add(1, Ordering::SeqCst) > 0,
+        );
+
+        assert!(permit.is_none());
+        assert_eq!(cancellation_checks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            1,
+            "post-acquisition cancellation must return the permit"
+        );
+        assert!(
+            limiter.admission_events().is_empty(),
+            "cancelled work must not emit a successful admission"
+        );
+    }
+
+    #[test]
+    fn admission_events_cover_both_classes_across_the_fixed_32_release_schedule() {
+        const RELEASE_COUNT: usize = 32;
+
+        let limiter = test_limiter(1);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (permit_tx, permit_rx) = std::sync::mpsc::channel();
+        let initial_permit = limiter.try_acquire().expect("hold the only slot");
+        let mut waiters = Vec::new();
+
+        for (request_id, class) in [
+            ("inspect-request", ColdBuildAdmissionClass::InspectTriggered),
+            ("maintenance-request", ColdBuildAdmissionClass::Maintenance),
+        ] {
+            let limiter = Arc::clone(&limiter);
+            let cancelled = Arc::clone(&cancelled);
+            let permit_tx = permit_tx.clone();
+            waiters.push(std::thread::spawn(move || {
+                while !cancelled.load(Ordering::SeqCst) {
+                    let permit = acquire_blocking_while_cancellable_with_limiter(
+                        &limiter,
+                        "fixed-release-test",
+                        ColdBuildAdmissionRequest::new(request_id, class),
+                        || true,
+                        || cancelled.load(Ordering::SeqCst),
+                    );
+                    let Some(permit) = permit else {
+                        return;
+                    };
+                    if permit_tx.send(permit).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        drop(permit_tx);
+
+        wait_for_waiters(&limiter);
+        let mut released_permit = Some(initial_permit);
+        for release in 1..RELEASE_COUNT {
+            wait_for_waiters(&limiter);
+            drop(released_permit.take());
+            released_permit = Some(
+                permit_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap_or_else(|error| {
+                        panic!("release {release} must admit a waiter: {error}")
+                    }),
+            );
+        }
+        wait_for_waiters(&limiter);
+        drop(released_permit);
+        let consumed_by_build = permit_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|error| panic!("release {RELEASE_COUNT} must admit a waiter: {error}"));
+
+        cancelled.store(true, Ordering::SeqCst);
+        for waiter in waiters {
+            waiter.join().expect("cancelled waiter joins");
+        }
+
+        let events = limiter.admission_events();
+        assert_eq!(events.len(), RELEASE_COUNT);
+        assert!(events
+            .iter()
+            .any(|event| event.class == ColdBuildAdmissionClass::InspectTriggered));
+        assert!(events
+            .iter()
+            .any(|event| event.class == ColdBuildAdmissionClass::Maintenance));
+        assert!(events.iter().all(|event| matches!(
+            event.request_id.as_str(),
+            "inspect-request" | "maintenance-request"
+        )));
+        assert!(events
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.admission_order == index as u64 + 1));
+
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            0,
+            "the final acquired permit must remain accounted for by the consumed build"
+        );
+        drop(consumed_by_build);
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            1,
+            "releasing the consumed build permit must restore the limiter slot"
+        );
     }
 }
