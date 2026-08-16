@@ -46,13 +46,23 @@ run_phase() {
   echo "    ok ($((SECONDS - started))s)"
 }
 
+extract_nextest_archive_for_prewarm() {
+  cargo nextest list \
+    --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" \
+    --extract-to "$AFT_NEXTEST_EXTRACT_TO" \
+    --workspace-remap "$PWD" \
+    --list-type binaries-only \
+    --message-format json \
+    --no-pager >/dev/null
+}
+
 # `cargo test --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
 # `cargo test --workspace --doc` until doctests actually exist.
 #
 # CI can split the independent execution phases after one job creates a nextest
 # archive. The default remains `all`, preserving the single-machine gate used
-# locally and by workflows that do not opt into Windows sharding.
+# locally and by workflows that do not opt into sharding.
 requested_phases="${AFT_GATE_PHASES:-all}"
 if [[ "$requested_phases" == "all" ]]; then
   phase_enabled() { return 0; }
@@ -143,7 +153,7 @@ for p in sorted(seen): print(p)
     target/debug/aft --version >/dev/null 2>&1 || true
   fi
 }
-if phase_enabled nextest && [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
+if phase_enabled nextest && [[ "$(uname)" == "Darwin" && -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
   run_phase "warm macOS first-exec cost: sign + exec every debug test binary" \
     bash -c "$(declare -f warm_macos_test_binaries)
       warm_macos_test_binaries --workspace"
@@ -151,7 +161,23 @@ fi
 
 if phase_enabled nextest; then
   nextest_args=(cargo nextest run)
-  if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
+  if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && -n "${AFT_NEXTEST_EXTRACT_TO:-}" ]]; then
+    # macOS archive shards need a stable extraction path so fresh test-binary
+    # inodes can be signed and executed before nextest starts timed tests.
+    # `binaries-only` extracts metadata without executing the binaries first.
+    mkdir -p "$AFT_NEXTEST_EXTRACT_TO"
+    run_phase "extract nextest archive for prewarming" \
+      extract_nextest_archive_for_prewarm
+    run_phase "warm macOS extracted test binaries" \
+      ./scripts/warm-macos-nextest-archive.sh
+    nextest_label="cargo nextest run from extracted archive metadata -E kind(test) - binary(=watcher_integration)"
+    nextest_args+=(
+      --cargo-metadata "$AFT_NEXTEST_EXTRACT_TO/target/nextest/cargo-metadata.json"
+      --binaries-metadata "$AFT_NEXTEST_EXTRACT_TO/target/nextest/binaries-metadata.json"
+      --target-dir-remap "$AFT_NEXTEST_EXTRACT_TO/target"
+      --workspace-remap "$PWD"
+    )
+  elif [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
     nextest_label="cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(test) - binary(=watcher_integration)"
     nextest_args+=(--archive-file "$AFT_NEXTEST_ARCHIVE_FILE")
   else

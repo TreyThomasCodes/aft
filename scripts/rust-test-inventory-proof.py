@@ -60,10 +60,10 @@ def run_command(command: list[str]) -> str:
         command,
         cwd=ROOT,
         stdout=subprocess.PIPE,
-        # Keep stderr SEPARATE: cargo writes compile progress ("Compiling ...",
-        # "Blocking waiting for file lock ...") to stderr, and merging it into
-        # the parsed stdout breaks the list parsers whenever a rebuild happens.
-        stderr=subprocess.PIPE,
+        # Cargo writes each `Running ...` suite boundary to stderr but writes
+        # that suite's test names to stdout. Merge the streams to preserve their
+        # ordering, then let the parser ignore ordinary compile progress.
+        stderr=subprocess.STDOUT,
         text=True,
         check=False,
         # ANSI color wraps cargo's output and silently breaks the line parsers
@@ -73,7 +73,6 @@ def run_command(command: list[str]) -> str:
     filtered_output = completed.stdout or ""
     if completed.returncode != 0:
         sys.stderr.write(f"command failed ({completed.returncode}): {' '.join(command)}\n")
-        sys.stderr.write(completed.stderr or "")
         sys.stderr.write(filtered_output)
         sys.exit(completed.returncode)
     return filtered_output
@@ -92,7 +91,9 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
     for raw_line in output.splitlines():
         line = raw_line.rstrip("\n")
         stripped = line.strip()
-        if not stripped or stripped.startswith("Finished `"):
+        if not stripped or stripped.startswith(
+            ("Compiling ", "Checking ", "Finished `", "Blocking waiting for file lock")
+        ):
             continue
 
         if stripped.startswith("Doc-tests "):

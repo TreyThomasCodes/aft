@@ -26,6 +26,10 @@ on:
         description: "Cargo profile for the aft binaries under test: 'release' (fat LTO, tag releases) or 'stage' (optimized, no LTO — minutes less link time; PR/push)"
         type: string
         default: release
+      publish_release_artifacts:
+        description: "Upload the release-tested macOS ARM64 and Windows x64 binaries for release.yml"
+        type: boolean
+        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -36,11 +40,52 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Linux E2E binary — one build feeds both Linux consumers. Warm main runs
+  # previously spent 7.1 minutes rebuilding in Docker and 2.6-3.3 minutes
+  # rebuilding natively for Pi RPC; artifact transfer is measured in the two
+  # downstream jobs and preserves one identical profile-specific binary.
+  # ---------------------------------------------------------------------------
+  e2e-linux-binary:
+    name: E2E binary (Linux x64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-linux-${{ inputs.cargo_profile }}
+          cache-on-failure: true
+
+      - name: Build shared AFT binary (Linux x64)
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
+
+      - name: Report shared binary size
+        run: |
+          bytes=$(stat -c %s "target/$CARGO_PROFILE_DIR/aft")
+          printf 'Shared Linux E2E binary: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-linux-${{ inputs.cargo_profile }}-binary
+          path: target/${{ env.CARGO_PROFILE_DIR }}/aft
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Linux Docker e2e — exercises the full OpenCode + plugin + binary stack
   # against a deterministic aimock LLM.
   # ---------------------------------------------------------------------------
   e2e-linux:
     name: E2E (Linux Docker)
+    needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -59,18 +104,16 @@ jobs:
           bun run --cwd packages/aft-bridge build
           bun run --cwd packages/opencode-plugin build
 
-      - name: Build Linux x64 binary in Docker
-        run: |
-          docker build --platform linux/amd64 \
-            --build-arg CARGO_PROFILE="$CARGO_PROFILE" \
-            -t aft-build-linux \
-            -f tests/docker/Dockerfile.build-linux .
+      - name: Download shared Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-linux-${{ inputs.cargo_profile }}-binary
+          path: tests/docker/fixtures
 
-      - name: Extract built binary
+      - name: Install shared binary fixture
         run: |
-          CID=$(docker create --platform linux/amd64 aft-build-linux true)
-          docker cp "$CID:/build/target/$CARGO_PROFILE_DIR/aft" tests/docker/fixtures/aft-linux-x64
-          docker rm "$CID"
+          mv tests/docker/fixtures/aft tests/docker/fixtures/aft-linux-x64
+          chmod +x tests/docker/fixtures/aft-linux-x64
 
       # The E2E Dockerfile installs the local package artifacts (npm pack
       # tarballs) instead of the published @latest plugin, so the image
@@ -97,6 +140,7 @@ jobs:
   # ---------------------------------------------------------------------------
   pi-rpc-e2e:
     name: E2E (Pi RPC)
+    needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     # 25: the job builds cargo + bun deps + dists before testing; with cold or
     # degraded caches (e.g. after an Actions incident) 10 minutes cancels it
@@ -113,15 +157,17 @@ jobs:
         with:
           node-version: "24"
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
-      - name: Build AFT binary (Linux native)
-        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
+      - name: Download shared AFT binary
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-linux-${{ inputs.cargo_profile }}-binary
+          path: target/${{ env.CARGO_PROFILE_DIR }}
+
+      - name: Restore binary executable permission
+        run: chmod +x "target/$CARGO_PROFILE_DIR/aft"
 
       - name: Build aft-bridge dist
         run: bun run --cwd packages/aft-bridge build
@@ -147,6 +193,10 @@ jobs:
     name: E2E (Windows native)
     runs-on: windows-2022
     timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
 
@@ -154,11 +204,24 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-windows-${{ inputs.cargo_profile }}
+          cache-on-failure: true
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      # release.yml publishes this exact binary after it passes the native E2E
+      # harness, eliminating a duplicate release build and a second Windows
+      # runner queue. Branch validation keeps the checked-in version unchanged.
+      - name: Sync versions from tag
+        if: inputs.publish_release_artifacts == true && startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
 
       - name: Build AFT binary (Windows x64)
         run: cargo build --profile $env:CARGO_PROFILE --target x86_64-pc-windows-msvc -p agent-file-tools
@@ -181,6 +244,14 @@ jobs:
           AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
 
+      - name: Upload release-tested Windows x64 binary
+        if: inputs.publish_release_artifacts == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: win32-x64
+          path: target/x86_64-pc-windows-msvc/${{ env.CARGO_PROFILE_DIR }}/aft.exe
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
   # a real macOS-arm64 runner. No containers (GH Actions macOS runners can't
@@ -195,10 +266,16 @@ jobs:
     name: E2E (macOS native)
     runs-on: macos-26
     timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       # cache-bin: false makes rust-cache safe on macOS: the old failure was
       # the cached ~/.cargo/bin shim overwriting the fresh cargo shim (which
@@ -206,12 +283,19 @@ jobs:
       # artifacts without touching shims. See _unit-suite.yml unit-macos.
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: e2e-macos-${{ inputs.cargo_profile }}
           cache-bin: false
           cache-on-failure: true
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      # release.yml publishes this exact binary after native E2E, rather than
+      # scheduling a second macOS ARM64 build for the same target and profile.
+      - name: Sync versions from tag
+        if: inputs.publish_release_artifacts == true && startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/version-sync.mjs --from-tag
 
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
@@ -237,3 +321,15 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
+
+      - name: Strip release-tested macOS ARM64 binary
+        if: inputs.publish_release_artifacts == true
+        run: strip "target/$CARGO_PROFILE_DIR/aft"
+
+      - name: Upload release-tested macOS ARM64 binary
+        if: inputs.publish_release_artifacts == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64
+          path: target/${{ env.CARGO_PROFILE_DIR }}/aft
+          if-no-files-found: error
