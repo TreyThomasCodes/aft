@@ -113,6 +113,7 @@ pub mod subc_config;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_cache_disk;
+pub mod symbol_diff;
 pub mod symbols;
 pub mod tool_path;
 pub mod url_fetch;
