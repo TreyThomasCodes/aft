@@ -26,17 +26,20 @@ const SURFACE_MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SOURCE_INVENTORY_PATH = "docs/v0.49-unified-tool-surface-inventory.json";
 const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
 // The surface GENERATION label: manifests describe the v0.49.0 activation
-// surface, whose identity carries forward until the next surface-changing
-// release. v0.50 keeps the same agent-facing surface in default mode (the
-// hashline gate is opt-in and schema artifacts are byte-identical), so the
-// generation label stays 0.49.0 while released versions advance.
+// surface lineage. v0.50 kept that surface byte-identical in default mode;
+// v0.51 advances it (blocking-fresh aft_inspect, status-bar retirement) and
+// the manifests regenerate against each governed commit, so the lineage
+// label stays 0.49.0 while the manifests themselves track the live surface.
+// Renaming the generation (docs/v0.49-* -> a new label) is deliberate
+// follow-up work, not a per-release edit.
 const TARGET_VERSION = "0.49.0";
 const PREVIOUS_VERSION = "0.48.1";
-// The version actually being released (patch and surface-preserving minor
-// releases move this while the surface generation stays 0.49.0).
-// Version-consistency checks compare against this; surface-identity checks
-// keep TARGET_VERSION.
-const GOVERNED_VERSION_LINES = ["0.49.", "0.50."];
+// The version actually being released. Version-consistency checks compare
+// against this; surface-identity checks keep TARGET_VERSION. Every new
+// minor line must be added here BEFORE its first tag: the npm publish job
+// runs this gate from the TAGGED commit, so a missing line fails the
+// release only after crates.io has already published (v0.51.0 incident).
+const GOVERNED_VERSION_LINES = ["0.49.", "0.50.", "0.51."];
 const RELEASE_VERSION = (() => {
   const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
   const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
