@@ -278,6 +278,21 @@ function buildSchema(): Record<string, unknown> {
           "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect.",
       },
 
+      worktree: {
+        type: "object",
+        properties: {
+          ram_overlay: {
+            type: "boolean",
+            default: false,
+            description:
+              "When true, a linked worktree applies local file-watcher events to the in-RAM trigram delta (and symbol-cache invalidation) so search reflects edits in that worktree. Default false. Never writes the shared on-disk index. Semantic search and callgraph stay frozen. User and project tiers may both set this; it only spends that machine's RAM.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "Linked-worktree RAM overlay for the borrowed trigram index. Default off. A repo may opt its worktrees in at project tier.",
+      },
+
       backup: {
         type: "object",
         properties: {

@@ -252,6 +252,16 @@ const InspectConfigSchema = z.object({
     .optional(),
 });
 
+const WorktreeConfigSchema = z.object({
+  /**
+   * When true, a linked worktree applies local file-watcher events to the
+   * in-RAM trigram delta (and symbol-cache invalidation) so search reflects
+   * edits in that worktree. Default: false. Never writes the shared on-disk
+   * index. Semantic search and callgraph stay frozen.
+   */
+  ram_overlay: z.boolean().optional(),
+});
+
 const BackupConfigSchema = z.object({
   /** Master switch for agent-facing undo backups. Defaults to true. */
   enabled: z.boolean().optional(),
@@ -348,6 +358,11 @@ export const AftConfigSchema = z.preprocess(
       inspect: InspectConfigSchema.optional(),
       /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
       backup: BackupConfigSchema.optional(),
+      /**
+       * Linked-worktree RAM overlay. Default off. A repo may opt its worktrees
+       * in at project tier; it only spends that machine's RAM.
+       */
+      worktree: WorktreeConfigSchema.optional(),
       /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
       sandbox: SandboxConfigSchema.optional(),
       /**
@@ -520,6 +535,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.backup !== undefined) overrides.backup = config.backup;
+  if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
 
   return overrides;
@@ -1149,6 +1165,16 @@ function mergeLspConfig(
   ) as AftConfig["lsp"];
 }
 
+function mergeWorktreeConfig(
+  baseWorktree: AftConfig["worktree"],
+  overrideWorktree: AftConfig["worktree"],
+): AftConfig["worktree"] {
+  if (baseWorktree === undefined && overrideWorktree === undefined) return undefined;
+  if (overrideWorktree === undefined) return baseWorktree;
+  if (baseWorktree === undefined) return overrideWorktree;
+  return { ...baseWorktree, ...overrideWorktree };
+}
+
 function mergeInspectConfig(
   baseInspect: AftConfig["inspect"],
   overrideInspect: AftConfig["inspect"],
@@ -1291,8 +1317,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "semantic_search",
   "callgraph_store",
   "callgraph_chunk_size",
-  "inspect",
-  "experimental",
+        "inspect",
+        "worktree",
+        "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in
   // a repo with weird shell needs) or opt in. NOT a security boundary —
@@ -1301,8 +1328,8 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "bash",
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
-  // "semantic"/"lsp" handled separately — strict field-level merge.
-  // "inspect" handled separately — deep-merged.
+        // "semantic"/"lsp" handled separately — strict field-level merge.
+        // "inspect"/"worktree" handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
@@ -1354,6 +1381,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
+  const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const bridge = base.bridge;
 
@@ -1364,6 +1392,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const safeOverride = pickProjectSafeFields(override);
   delete safeOverride.bash;
   delete safeOverride.inspect;
+  delete safeOverride.worktree;
 
   return {
     ...base,
@@ -1374,6 +1403,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(lsp ? { lsp } : {}),
     ...(bash !== undefined ? { bash } : {}),
     ...(inspect !== undefined ? { inspect } : {}),
+    ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent

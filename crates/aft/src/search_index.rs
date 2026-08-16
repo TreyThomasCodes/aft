@@ -1022,6 +1022,11 @@ impl SearchIndex {
         self.snapshot().candidates(query)
     }
 
+    /// Persist the current base+delta to `cache.bin`.
+    ///
+    /// Borrow-only roots (linked worktrees, including those with
+    /// `worktree.ram_overlay`) never take this path: `artifact_write_allowed`
+    /// fail-closes before any bytes are written.
     pub fn write_to_disk(&mut self, cache_dir: &Path, git_head: Option<&str>) -> bool {
         if !artifact_write_allowed(&self.project_root, cache_dir, &cache_dir.join("cache.bin")) {
             return false;

@@ -2700,6 +2700,12 @@ fn start_artifact_loads(starts: Vec<crossbeam_channel::Sender<()>>) -> bool {
 /// Start a trigram reload after an idle eviction. The caller keeps serving the
 /// current request through the bounded fallback walk. Read-only roots reopen the
 /// shared snapshot without acquiring a writer lease.
+///
+/// The reloaded index starts with an empty RAM delta containing only the
+/// borrowed base. Subsequent watcher events repopulate the overlay when
+/// `worktree.ram_overlay` is enabled. Until the next watcher apply, eviction
+/// may temporarily hide in-flight local edits from search; that is the
+/// intended initial behavior.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
     if ctx.canonical_cache_root_opt().is_none() {
         return false;
@@ -3105,6 +3111,8 @@ fn schedule_artifact_loads(
                         == search_content_generation
                 };
                 let mut persistence_succeeded = !persist_to_disk;
+                // Borrow-only / worktree roots never persist, overlay or not.
+                // `write_to_disk` also fail-closes via artifact_write_allowed.
                 if generation_current() && !is_worktree_bridge_for_search && persist_to_disk {
                     let published =
                         search_persist_epoch_flag.run_if_current(search_persist_epoch, || {

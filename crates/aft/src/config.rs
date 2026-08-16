@@ -132,6 +132,24 @@ impl Default for BackupConfig {
     }
 }
 
+/// Linked-worktree behavior that never writes shared on-disk artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    /// When true, a borrow-only (linked worktree) root applies its own
+    /// file-watcher events to the in-RAM trigram delta and invalidates the
+    /// symbol cache so search reflects local edits. Default false. Semantic
+    /// search and the callgraph stay frozen. Never persists to the shared
+    /// `cache.bin`.
+    pub ram_overlay: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self { ram_overlay: false }
+    }
+}
+
 pub const DEFAULT_SEMANTIC_MODEL: &str = "all-MiniLM-L6-v2";
 
 impl Config {
@@ -223,6 +241,8 @@ pub struct Config {
     pub semantic: SemanticBackendConfig,
     pub inspect: InspectConfig,
     pub backup: BackupConfig,
+    /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
+    pub worktree: WorktreeConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -307,6 +327,7 @@ impl Default for Config {
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
+            worktree: WorktreeConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

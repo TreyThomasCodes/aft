@@ -253,6 +253,10 @@ const CASES: ParityCase[] = [
     project: { lsp: { python: "ty", diagnostics_on_edit: true } },
   },
   {
+    name: "worktree_ram_overlay_project_safe",
+    project: { worktree: { ram_overlay: true } },
+  },
+  {
     name: "inspect_expected_mirrors_project_safe",
     project: {
       inspect: {

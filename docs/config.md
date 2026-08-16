@@ -80,6 +80,16 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
   // Default: false
   "search_index": false,
 
+  // Linked-worktree RAM overlay for the trigram index. Default: false.
+  // When true, a borrow-only worktree applies its own file-watcher events to
+  // the in-RAM delta of the borrowed search index (and invalidates the symbol
+  // cache) so grep/search see local edits. RAM cost scales with the number of
+  // changed files. Never writes the shared on-disk cache. Semantic search and
+  // the callgraph stay frozen. User and project tiers may both set this.
+  "worktree": {
+    "ram_overlay": false
+  },
+
   // Semantic code search (graduated from experimental in v0.18; aft_search tool).
   // Default backend is fastembed (local ONNX, no network) and requires ONNX Runtime
   // installed (brew install onnxruntime on macOS). The model is downloaded on first

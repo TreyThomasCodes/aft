@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     BackupConfig, Config, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    UserServerDef, WorktreeConfig, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::jsonc::strip_jsonc;
 
@@ -112,6 +112,7 @@ pub struct RawAftConfig {
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
     pub backup: Option<RawBackup>,
+    pub worktree: Option<RawWorktree>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -437,6 +438,18 @@ pub struct RawBridge {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawWorktree {
+    pub ram_overlay: Option<bool>,
+}
+
+impl RawWorktree {
+    fn is_empty(&self) -> bool {
+        self.ram_overlay.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawBackup {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
@@ -653,6 +666,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
     }
+    if override_config.worktree.is_some() {
+        base.worktree = override_config.worktree;
+    }
     if override_config.sandbox.is_some() {
         base.sandbox = override_config.sandbox;
     }
@@ -723,6 +739,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
+    base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
 }
 
@@ -965,6 +982,19 @@ fn merge_inspect_config(
     (!inspect.is_empty()).then_some(inspect)
 }
 
+fn merge_worktree_config(
+    base: Option<RawWorktree>,
+    override_worktree: Option<RawWorktree>,
+) -> Option<RawWorktree> {
+    let Some(override_worktree) = override_worktree else {
+        return base;
+    };
+
+    let mut worktree = base.unwrap_or_default();
+    worktree.ram_overlay = override_worktree.ram_overlay.or(worktree.ram_overlay);
+    (!worktree.is_empty()).then_some(worktree)
+}
+
 fn merge_inspect_duplicates(
     base: Option<RawInspectDuplicates>,
     override_duplicates: Option<RawInspectDuplicates>,
@@ -1120,6 +1150,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
+    config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
@@ -1192,6 +1223,14 @@ fn resolve_backup_config(raw: Option<&RawBackup>) -> BackupConfig {
         }
     }
     backup
+}
+
+fn resolve_worktree_config(raw: Option<&RawWorktree>) -> WorktreeConfig {
+    let mut worktree = WorktreeConfig::default();
+    if let Some(value) = raw.and_then(|raw| raw.ram_overlay) {
+        worktree.ram_overlay = value;
+    }
+    worktree
 }
 
 fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
@@ -1844,6 +1883,22 @@ mod tests {
 
         assert!(result.config.search_index);
         assert!(result.dropped.is_empty());
+    }
+
+    #[test]
+    fn worktree_ram_overlay_resolves_at_user_and_project_tiers() {
+        assert!(!resolve_config(&[]).config.worktree.ram_overlay);
+
+        let user = resolve_config(&[tier("user", r#"{ "worktree": { "ram_overlay": true } }"#)]);
+        assert!(user.config.worktree.ram_overlay);
+        assert!(user.dropped.is_empty());
+
+        let project = resolve_config(&[
+            tier("user", r#"{ "worktree": { "ram_overlay": false } }"#),
+            tier("project", r#"{ "worktree": { "ram_overlay": true } }"#),
+        ]);
+        assert!(project.config.worktree.ram_overlay);
+        assert!(project.dropped.is_empty());
     }
 
     #[test]

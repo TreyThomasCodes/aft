@@ -3395,6 +3395,15 @@ impl AppContext {
         !self.callgraph_writer()
     }
 
+    /// True when this root is borrow-only and `worktree.ram_overlay` is on.
+    ///
+    /// Search and symbol-cache watcher arms may then apply local edits to the
+    /// in-RAM trigram delta. Persist stays fail-closed: a borrow-only root
+    /// never writes the shared `cache.bin`, overlay or not.
+    pub fn ram_overlay_active(&self) -> bool {
+        self.shared_artifacts_read_only() && self.config().worktree.ram_overlay
+    }
+
     pub fn artifact_owner_status(&self) -> Option<ArtifactOwnerStatus> {
         self.artifact_owner_status.lock().clone()
     }
@@ -4629,6 +4638,9 @@ impl AppContext {
     /// Flush the owner-side trigram delta during an orderly transport shutdown.
     /// EOF/Goodbye teardown uses this best-effort path; signal and panic exits
     /// intentionally skip it so abrupt shutdown never waits on slow recovery work.
+    ///
+    /// Borrow-only roots (including ram-overlay worktrees) return immediately
+    /// and never write the shared artifact.
     #[doc(hidden)]
     pub fn flush_search_index_on_graceful_shutdown(&self) -> bool {
         if self.shared_artifacts_read_only() {

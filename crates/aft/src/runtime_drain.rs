@@ -1664,6 +1664,8 @@ fn spawn_search_corpus_refresh_admitted(
                 &cache_dir,
             );
             wait_on_search_rebuild_publish_gate_for_test();
+            // cache_lock is None for borrow-only roots, so ignore-refresh
+            // never writes cache.bin even when ram_overlay is on.
             if cache_lock.is_some()
                 && content_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
                     == content_generation
@@ -2044,6 +2046,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     }
     let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
     let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
+    let apply_ram_search_updates = !shared_artifacts_read_only || ctx.ram_overlay_active();
     let mut semantic_refresh_paths = std::mem::take(&mut state.semantic_refresh_paths);
     let mut status_changed = state.status_changed;
 
@@ -2107,7 +2110,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    if !shared_artifacts_read_only {
+                    if apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                             if let Ok(mut symbol_cache) = ctx.symbol_cache().write() {
                                 symbol_cache.invalidate(path);
@@ -2138,7 +2141,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
                     if heavy_root_work_allowed
-                        && !shared_artifacts_read_only
+                        && apply_ram_search_updates
                         && !oversized_inline_batch
                     {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
@@ -2158,6 +2161,8 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 },
             ),
             WatcherDrainApplyPhase::SemanticIndex => {
+                // Semantic stays frozen under worktree.ram_overlay: embedding
+                // cost is out of scope. Only a writer root invalidates here.
                 let mut invalidated_paths = Vec::new();
                 let completed = apply_watcher_path_phase(
                     WatcherDrainApplyPhase::SemanticIndex,
@@ -4628,5 +4633,275 @@ mod watcher_slice_tests {
         assert!(!second.has_more);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
         assert_eq!(ctx.pending_tier2_paths().len(), 2);
+    }
+
+    fn install_search_index(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+        file: &Path,
+        contents: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let canonical = std::fs::canonicalize(root).expect("canonical root");
+        ctx.update_config(|config| {
+            config.storage_dir = Some(storage.to_path_buf());
+            config.search_index = true;
+        });
+        ctx.set_canonical_cache_root(canonical.clone());
+        let cache_dir = crate::search_index::resolve_cache_dir(&canonical, Some(storage));
+        let mut index = crate::search_index::SearchIndex::build(&canonical);
+        index.index_file(file, contents);
+        let git_head = index.stored_git_head().map(str::to_owned);
+        assert!(
+            index.write_to_disk(&cache_dir, git_head.as_deref()),
+            "owner write of cache.bin must succeed before borrow-only setup"
+        );
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        (canonical, cache_dir)
+    }
+
+    fn grep_count(ctx: &AppContext, pattern: &str, root: &Path) -> usize {
+        let index = ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        index
+            .as_ref()
+            .expect("resident search index")
+            .grep(pattern, true, &[], &[], root, 10)
+            .matches
+            .len()
+    }
+
+    fn cache_bin_hash(path: &Path) -> blake3::Hash {
+        blake3::hash(&std::fs::read(path).expect("read cache.bin"))
+    }
+
+    fn search_index_has_pending_disk_changes(ctx: &AppContext) -> bool {
+        ctx.search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|index| index.has_pending_disk_changes())
+    }
+
+    fn mark_borrow_only(ctx: &AppContext, canonical: &Path, cache_dir: &Path) {
+        let project_key = cache_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("cache key")
+            .to_string();
+        crate::root_cache::configure_artifact_access(canonical, &project_key, true);
+        ctx.set_cache_role(true, None);
+    }
+
+    #[test]
+    fn ram_overlay_is_off_by_default_and_transport_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, _) = context_with_watcher(temp.path());
+        ctx.set_cache_role(true, None);
+        assert!(
+            ctx.shared_artifacts_read_only(),
+            "worktree role is borrow-only"
+        );
+        assert!(
+            !ctx.ram_overlay_active(),
+            "worktree.ram_overlay defaults off"
+        );
+
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+        assert!(
+            ctx.ram_overlay_active(),
+            "overlay follows config + borrow-only, not bind/transport identity"
+        );
+
+        ctx.set_cache_role(false, None);
+        assert!(
+            !ctx.ram_overlay_active(),
+            "owner roots stay on the normal writer path even when the gate is on"
+        );
+    }
+
+    #[test]
+    fn borrow_only_watcher_arms_are_noops_until_overlay_flips_on() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let file = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("overlay.rs");
+        std::fs::write(&file, "old overlay token\n").expect("write source");
+        let (canonical, cache_dir) = install_search_index(
+            &ctx,
+            root.path(),
+            storage.path(),
+            &file,
+            b"old overlay token\n",
+        );
+        mark_borrow_only(&ctx, &canonical, &cache_dir);
+        assert!(ctx.shared_artifacts_read_only());
+        assert!(!ctx.ram_overlay_active());
+        assert!(
+            !search_index_has_pending_disk_changes(&ctx),
+            "precondition: compacted owner write leaves no RAM delta"
+        );
+
+        std::fs::write(&file, "new overlay token\n").expect("edit source");
+        tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
+            .unwrap();
+        drain_watcher_events(&ctx);
+        assert!(
+            !search_index_has_pending_disk_changes(&ctx),
+            "gate off: borrow-only watcher must not mutate the RAM delta"
+        );
+
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+        assert!(ctx.ram_overlay_active());
+        tx.send(WatcherDispatchEvent::Paths(vec![file])).unwrap();
+        drain_watcher_events(&ctx);
+        assert!(
+            search_index_has_pending_disk_changes(&ctx),
+            "flipping the predicate on must let the same watcher arm apply"
+        );
+        assert_eq!(
+            grep_count(&ctx, "new overlay token", &canonical),
+            1,
+            "overlay-on drain must make the disk edit searchable from RAM"
+        );
+    }
+
+    #[test]
+    fn ram_overlay_search_reflects_edits_without_writing_cache_bin() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let file = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("overlay.rs");
+        std::fs::write(&file, "old overlay token\n").expect("write source");
+        let (canonical, cache_dir) = install_search_index(
+            &ctx,
+            root.path(),
+            storage.path(),
+            &file,
+            b"old overlay token\n",
+        );
+        mark_borrow_only(&ctx, &canonical, &cache_dir);
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            crate::semantic_index::SemanticIndex::new(canonical.clone(), 8),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+
+        let cache_path = cache_dir.join("cache.bin");
+        let before = cache_bin_hash(&cache_path);
+
+        std::fs::write(&file, "new overlay token\n").expect("edit source");
+        tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
+            .unwrap();
+        drain_watcher_events(&ctx);
+
+        assert_eq!(
+            grep_count(&ctx, "new overlay token", &canonical),
+            1,
+            "overlay must serve the edit from the RAM delta"
+        );
+        assert_eq!(grep_count(&ctx, "old overlay token", &canonical), 0);
+        assert_eq!(
+            cache_bin_hash(&cache_path),
+            before,
+            "overlay must not change on-disk cache.bin bytes"
+        );
+
+        {
+            // Family key != this checkout's path identity, matching a linked
+            // worktree that borrows the owner's shared artifact key.
+            let family_key = "shared-family-overlay-key";
+            crate::root_cache::configure_artifact_access(&canonical, family_key, true);
+            let family_dir = storage.path().join(family_key);
+            let mut index = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !index
+                    .as_mut()
+                    .expect("resident search index")
+                    .write_to_disk(&family_dir, None),
+                "direct persist must fail-closed for a borrow-only shared key"
+            );
+        }
+        assert!(
+            !ctx.flush_search_index_on_graceful_shutdown(),
+            "shutdown must not flush a borrow-only overlay root"
+        );
+        assert_eq!(
+            cache_bin_hash(&cache_path),
+            before,
+            "shutdown and persist must leave cache.bin byte-identical"
+        );
+
+        let refreshing = match &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            SemanticIndexStatus::Ready { refreshing, .. } => refreshing.clone(),
+            other => panic!("expected Ready semantic status, got {other:?}"),
+        };
+        assert!(
+            refreshing.is_empty(),
+            "semantic arm must stay frozen under the overlay"
+        );
+    }
+
+    #[test]
+    fn owner_root_still_uses_normal_path_when_overlay_gate_is_on() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let file = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("owner.rs");
+        std::fs::write(&file, "old owner token\n").expect("write source");
+        let (canonical, cache_dir) = install_search_index(
+            &ctx,
+            root.path(),
+            storage.path(),
+            &file,
+            b"old owner token\n",
+        );
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+        assert!(!ctx.shared_artifacts_read_only(), "owner root is a writer");
+        assert!(!ctx.ram_overlay_active());
+
+        std::fs::write(&file, "new owner token\n").expect("edit source");
+        tx.send(WatcherDispatchEvent::Paths(vec![file])).unwrap();
+        drain_watcher_events(&ctx);
+        assert_eq!(grep_count(&ctx, "new owner token", &canonical), 1);
+        assert_eq!(grep_count(&ctx, "old owner token", &canonical), 0);
+
+        assert!(
+            ctx.flush_search_index_on_graceful_shutdown(),
+            "owner persist path must still flush when the overlay gate is on"
+        );
+        let mut restored = crate::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical)
+            .expect("reload owner cache.bin");
+        restored.set_ready(true);
+        assert_eq!(
+            restored
+                .grep("new owner token", true, &[], &[], &canonical, 10)
+                .matches
+                .len(),
+            1,
+            "owner shutdown flush must persist the RAM delta"
+        );
     }
 }
