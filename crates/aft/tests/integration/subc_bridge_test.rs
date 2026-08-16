@@ -5632,6 +5632,10 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         serde_json::from_slice(&publish.body).expect("status.publish request body");
     assert_eq!(publish_body["method"], "status.publish");
     assert_eq!(publish_body["params"]["module"], "aft");
+    assert_eq!(
+        publish_body["params"]["text"], "E0 W0 | D21 U12 C13 | T14",
+        "the discovered holder must receive the real Tier-2 segment seeded by the tool call"
+    );
     assert_eq!(publish_body["params"]["revision"], 1);
     assert_eq!(publish_body["params"]["ttl_ms"], 7_500);
     assert_eq!(

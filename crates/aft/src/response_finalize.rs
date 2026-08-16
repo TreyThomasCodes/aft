@@ -30,13 +30,15 @@ pub fn finalize_response_with_bg_completions(
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
-    let _ = publish_fleet_status(response, ctx, session_id);
+    let plane_live = publish_fleet_status(response, ctx, session_id);
 
     // The pre-tool-call protocol has no dispatch-root provenance or agent-visible text. Keep its
     // legacy envelope seam isolated from terminal agent responses while older direct fixtures
     // migrate to explicit-root finalization.
-    if response.data.get("text").is_none() {
-        attach_status_bar(response, ctx, session_id, attach_command);
+    if response.data.get("text").is_none()
+        && !alert_render::is_excluded_finalization_command(attach_command)
+    {
+        attach_status_bar_after_publish(response, ctx, plane_live);
     }
 }
 
@@ -287,7 +289,16 @@ pub fn attach_status_bar(
     if alert_render::is_excluded_finalization_command(command) {
         return;
     }
-    let Some(plane_live) = publish_fleet_status(response, ctx, session_id) else {
+    let plane_live = publish_fleet_status(response, ctx, session_id);
+    attach_status_bar_after_publish(response, ctx, plane_live);
+}
+
+fn attach_status_bar_after_publish(
+    response: &mut Response,
+    ctx: &AppContext,
+    plane_live: Option<bool>,
+) {
+    let Some(plane_live) = plane_live else {
         return;
     };
     let harness = ctx.harness_opt();
@@ -321,9 +332,15 @@ pub fn attach_status_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::{aft_status_segment, holder_owns_status_bar, PendingResponse, PendingResponses};
+    use std::path::PathBuf;
+
+    use super::{
+        aft_status_segment, finalize_response_with_bg_completions, holder_owns_status_bar,
+        PendingResponse, PendingResponses,
+    };
     use crate::config::Config;
     use crate::context::{AppContext, StatusBarCounts};
+    use crate::fleet_status::FleetStatusClient;
     use crate::harness::Harness;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::Response;
@@ -339,6 +356,33 @@ mod tests {
         );
         assert!(!holder_owns_status_bar(true, Some(&Harness::Pi)));
         assert!(!holder_owns_status_bar(false, Some(&Harness::Opencode)));
+    }
+
+    #[test]
+    fn pre_discovery_publish_does_not_trip_the_holder_ownership_gate() {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(PathBuf::from("/tmp/project")),
+                ..Config::default()
+            },
+        );
+        ctx.set_harness(Harness::Opencode);
+        ctx.update_status_bar_tier2(Some(21), Some(12), Some(13), Some(14), false);
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        ctx.install_fleet_status_client(Some(client));
+        let mut response = Response::success("status", serde_json::json!({}));
+
+        finalize_response_with_bg_completions(&mut response, &ctx, "session-1", "echo", false);
+
+        assert_eq!(response.data["status_bar"]["dead_code"], 21);
+        let publish = wire_rx.try_recv().expect("single discovery publish");
+        assert_eq!(publish.body()["text"], "E0 W0 | D21 U12 C13 | T14");
+        assert!(
+            wire_rx.try_recv().is_err(),
+            "response published more than once"
+        );
+        publish.complete_unavailable();
     }
 
     #[test]
