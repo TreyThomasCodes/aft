@@ -333,20 +333,65 @@ jobs:
   # and Windows process/path/signal differences. Same suite as Linux but on a
   # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
   #
-  # PR and release modes are blocking. Integration tests now serialize
-  # filesystem paths through serde_json before writing NDJSON requests, so
-  # Windows backslashes are escaped correctly instead of being parsed as JSON
-  # escape sequences.
+  # The integration phase is the Windows critical path: recent warm-cache runs
+  # spent 9–16 minutes executing it, versus roughly four minutes compiling.
+  # Build its nextest archive once, then partition the same test inventory across
+  # three runners. Libtest phases remain together because their thousands of
+  # short tests are faster in one process, and watcher tests keep their existing
+  # single-threaded libtest execution.
+  #
+  # PR and release modes are blocking. Integration tests serialize filesystem
+  # paths through serde_json before writing NDJSON requests, so Windows
+  # backslashes are escaped correctly instead of being parsed as JSON escapes.
   # ---------------------------------------------------------------------------
-  unit-windows-cargo:
-    name: Cargo test (Windows)
+  unit-windows-nextest-archive:
+    name: Cargo test archive (Windows)
     runs-on: windows-2022
-    # 45 minutes: a cold-cache run (no prior green run saved a cache, e.g.
-    # after a day of cancel-superseded pushes) needs the full workspace
-    # build inside the job; 30 minutes killed those runs right before the
-    # finish line and cache-on-failure could not save what a hard timeout
-    # cancels.
-    timeout-minutes: 45
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Both the archive builder and the libtest job use the established
+      # unit-windows-cargo cache key. Keeping that key stable preserves the
+      # existing hot MSVC dependency cache while the jobs run independently.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-windows-cargo
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Build nextest archive (Windows integration suite)
+        run: cargo nextest archive --workspace -E "kind(test) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
+        shell: pwsh
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+
+      - name: Report nextest archive size
+        run: |
+          $bytes = (Get-Item $env:WINDOWS_NEXTEST_ARCHIVE).Length
+          "Windows nextest archive: {0:N2} MiB ({1:N0} bytes)" -f ($bytes / 1MB), $bytes
+        shell: pwsh
+        env:
+          WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+
+      # The archive is already zstd-compressed. Disabling the artifact action's
+      # second compression avoids spending CPU to recompress incompressible data.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-nextest-archive
+          path: ${{ runner.temp }}/windows-nextest.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+
+  unit-windows-libtest:
+    name: Cargo libtest + watcher (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
@@ -356,26 +401,57 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: unit-windows-cargo
           cache-on-failure: true
 
       - uses: taiki-e/install-action@nextest
 
-      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
-        # bash shell: the gate helper is a bash script; GitHub Windows runners
-        # ship git-bash. Thread cap of 4 because Windows runners are 2-core and
-        # process-spawn is expensive there — a wide nextest fan-out thrashes.
-        # The release-storm phase is skipped here: the 2-core runner cannot
-        # afford the cold release-profile build inside the job timeout, and
-        # its absolute latency bounds are not meaningful on that hardware.
-        # Linux and macOS CI run the release-storm phase and stay the
-        # arbiters for it.
+      - name: Rust libtest + watcher gate (Windows)
+        # Keep the libtest and watcher invocations from the normal gate exactly:
+        # libtest avoids per-test process fan-out, while watcher tests share
+        # fixtures and must remain single-threaded.
+        run: ./scripts/rust-test-gate.sh
+        shell: bash
+        env:
+          AFT_TEST_DIAG: "1"
+          AFT_GATE_PHASES: lib,watcher
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+  unit-windows-cargo:
+    name: Cargo integration shard ${{ matrix.shard }}/3 (Windows)
+    needs: unit-windows-nextest-archive
+    runs-on: windows-2022
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-nextest-archive
+          path: ${{ runner.temp }}
+
+      - name: Rust integration shard (nextest archive)
+        # The archive exports runtime paths for helper binaries. Hash partitioning
+        # assigns every non-watcher integration test to one shard.
         run: ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
           NEXTEST_TEST_THREADS: "4"
+          AFT_GATE_PHASES: nextest
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
-
   # ---------------------------------------------------------------------------
   # Cross-target warning gate (Windows, compile-only, DENIES warnings).
   # Split from unit-windows-cargo: with unique RUSTFLAGS it shares no

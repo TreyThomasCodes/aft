@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +7,11 @@ use std::time::Duration;
 #[test]
 fn spawned_aft_writes_durable_log_under_aft_cache_dir() {
     let temp = tempfile::TempDir::new().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let binary = std::env::var_os("NEXTEST_BIN_EXE_aft")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+    let mut child = Command::new(binary)
         .env("AFT_CACHE_DIR", temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

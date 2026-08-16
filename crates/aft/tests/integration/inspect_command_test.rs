@@ -28,9 +28,14 @@ fn fixture_project() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn fake_server_path() -> PathBuf {
-    option_env!("CARGO_BIN_EXE_fake-lsp-server")
-        .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
+    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
+        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
         .map(PathBuf::from)
+        .or_else(|| {
+            option_env!("CARGO_BIN_EXE_fake-lsp-server")
+                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
+                .map(PathBuf::from)
+        })
         .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
         .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
         .or_else(|| {
