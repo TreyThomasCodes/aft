@@ -340,6 +340,14 @@ echo "→ Refreshing bun.lock..."
 bun install --silent 2>&1 || { echo "Error: bun install failed after version sync"; exit 1; }
 echo ""
 
+# Refresh Cargo.lock the same way: version-sync bumps workspace Cargo.toml
+# versions, and without a lock refresh every later cargo invocation re-dirties
+# the tree with two-line version drift (which also blocks mason dispatch on a
+# dirty parent). --offline: the bump only renames workspace members.
+echo "→ Refreshing Cargo.lock..."
+cargo update -w --offline --quiet || { echo "Error: cargo update failed after version sync"; exit 1; }
+echo ""
+
 # Step 2: Commit (skip if versions were already at target)
 echo "→ Committing version bump..."
 git add -A

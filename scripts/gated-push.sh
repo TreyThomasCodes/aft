@@ -86,6 +86,12 @@ echo "gated-push: gate green — running governed-surface preflight"
 bun scripts/audit-v049-agent-surface.ts
 node scripts/release-gate-v049.mjs
 
+# Workspace-settings formatting check: masons sometimes verify with bare
+# `rustfmt --check FILE`, whose import layout differs from `cargo fmt`'s
+# workspace configuration, so drift accumulates invisibly until release.sh's
+# preflight refuses. Catching it here keeps main fmt-clean per push.
+cargo fmt --all -- --check || { echo "gated-push: cargo fmt drift — run 'cargo fmt --all'"; exit 1; }
+
 # Biome runs in CI's unit suites; a style-only miss costs a full CI roundtrip
 # (a template-vs-concat nit killed a push after every Rust gate was green).
 for pkg in packages/aft-bridge packages/opencode-plugin packages/pi-plugin packages/aft-cli; do
