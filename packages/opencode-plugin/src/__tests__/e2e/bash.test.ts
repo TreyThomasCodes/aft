@@ -715,9 +715,18 @@ test("OpenCode executes project-enabled host fallback when the bridge binary is 
     expect(output).toContain("e2e-host-fallback");
     expect(output).toContain("[exit code: 0]");
     expect(ask).toHaveBeenCalledTimes(1);
-    expect(ask.mock.calls[0][0].patterns).toEqual([
-      `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${await realPath(project)}`,
-    ]);
+    // Compare the working-directory line through realpath on BOTH sides: on
+    // Windows CI the temp dir reaches the plugin in 8.3 short form (RUNNER~1)
+    // while the test's own variable holds the long form - same directory, two
+    // spellings. The command lines must remain byte-exact.
+    const [pattern] = ask.mock.calls[0][0].patterns;
+    const marker = "\n\nWorking directory:\n";
+    const markerAt = pattern.indexOf(marker);
+    expect(markerAt).toBeGreaterThan(0);
+    expect(pattern.slice(0, markerAt)).toBe(
+      `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}`,
+    );
+    expect(await realPath(pattern.slice(markerAt + marker.length))).toBe(await realPath(project));
   } finally {
     await pool.shutdown();
     await rm(project, { recursive: true, force: true });
