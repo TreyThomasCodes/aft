@@ -1,0 +1,14 @@
+#!/bin/sh
+# Append the Alfonso co-author trailer to commits authored at this desk.
+# The repo owner never commits without the agent, so every non-worker commit
+# is joint work by declaration. Worker (mason) commits keep their own
+# authorship: their subjects carry the mason: prefix. Cherry-picks and
+# amends (source=commit) keep the source message untouched - picked worker
+# commits stay clean, and already-trailered commits are not double-stamped.
+msg_file="$1"
+source="$2"
+[ "$source" = "commit" ] && exit 0
+[ "$source" = "merge" ] && exit 0
+head -1 "$msg_file" | grep -q "^mason:" && exit 0
+grep -qi "^Co-authored-by:.*alfonso-aft" "$msg_file" && exit 0
+printf "\nCo-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>\n" >> "$msg_file"
