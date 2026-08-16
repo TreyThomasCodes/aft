@@ -13,7 +13,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import {
+  BASH_HOST_FALLBACK_BANNER,
+  type BinaryBridge,
+  BridgeTransportUnavailableError,
+} from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notifications.js";
@@ -807,6 +811,107 @@ describe("bash tool adapter", () => {
     await expect(
       bashTool.execute("test-call", { command: "echo test" }, undefined, undefined, extCtx),
     ).rejects.toThrow("Hook failed: permission denied");
+  });
+
+  test("gate-off preserves a transport-dead error unchanged", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const original = new BridgeTransportUnavailableError("byte-identical transport error");
+    const bridge = {
+      send: async () => {
+        throw original;
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, { bash: { host_fallback: false } } as PluginContext["config"]),
+    );
+
+    let captured: unknown;
+    try {
+      await tools
+        .get("bash")!
+        .execute("call", { command: "printf should-not-run" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: false,
+        });
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBe(original);
+    expect((captured as Error).message).toBe("byte-identical transport error");
+  });
+
+  test("engine-alive errors never engage host fallback", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const confirmations: unknown[] = [];
+    const bridge = {
+      send: async () => ({
+        success: false,
+        code: "invalid_request",
+        message: "invalid request from engine",
+      }),
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+    );
+
+    await expect(
+      tools
+        .get("bash")!
+        .execute("call", { command: "printf should-not-run" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+          ui: {
+            confirm: async (...args) => {
+              confirmations.push(args);
+              return true;
+            },
+          },
+        }),
+    ).rejects.toThrow("invalid request from engine");
+    expect(confirmations).toHaveLength(0);
+  });
+
+  test("transport-dead fallback confirms once then captures real host output", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const command =
+      process.platform === "win32"
+        ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('pi-fallback')"`
+        : "printf pi-fallback";
+    const bridge = {
+      send: async () => {
+        throw new BridgeTransportUnavailableError("bridge spawn failed");
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+    );
+    const confirmations: Array<{ title: string; message: string }> = [];
+
+    const result = await tools.get("bash")!.execute("call", { command }, undefined, undefined, {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async (title, message) => {
+          confirmations.push({ title, message });
+          return true;
+        },
+      },
+    });
+    const output = toolText(result);
+
+    expect(output).toStartWith(`${BASH_HOST_FALLBACK_BANNER}\n`);
+    expect(output).toContain("pi-fallback");
+    expect(output).toEndWith("[exit code: 0]");
+    expect(confirmations).toEqual([
+      {
+        title: "AFT unavailable — run command on host?",
+        message: `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${projectRoot}`,
+      },
+    ]);
   });
 
   test("execute throws Rust-side bash error responses", async () => {

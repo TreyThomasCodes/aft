@@ -170,6 +170,8 @@ export interface BashConfig {
   rewrite?: boolean;
   compress?: boolean;
   background?: boolean;
+  /** Permit per-command host fallback after AFT transport failure. Default false. */
+  host_fallback?: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -248,6 +250,8 @@ export interface ResolvedBashConfig {
   rewrite: boolean;
   compress: boolean;
   background: boolean;
+  /** Emergency local execution gate. Default false, including for `bash: true`. */
+  host_fallback: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -307,6 +311,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     rewrite: false,
     compress: false,
     background: false,
+    host_fallback: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
@@ -323,6 +328,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       rewrite: top.rewrite ?? true,
       compress: top.compress ?? true,
       background: top.background ?? true,
+      host_fallback: top.host_fallback ?? false,
     };
   }
 
@@ -472,6 +478,7 @@ const BashFeaturesSchema = z.object({
   rewrite: z.boolean().optional(),
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
+  host_fallback: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   foreground_wait_window_ms: z.number().int().positive().optional(),
@@ -676,6 +683,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
+  if (typeof config.bash === "object" && config.bash.host_fallback !== undefined) {
+    overrides.bash = { host_fallback: config.bash.host_fallback };
+  }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;

@@ -288,6 +288,11 @@ const CASES: ParityCase[] = [
   },
   { name: "bash_subagent", user: { bash: { subagent_background: true } } },
   {
+    name: "bash_host_fallback_project",
+    user: { bash: { host_fallback: false } },
+    project: { bash: { host_fallback: true } },
+  },
+  {
     name: "jsonc_comments",
     user: `{
   // comment

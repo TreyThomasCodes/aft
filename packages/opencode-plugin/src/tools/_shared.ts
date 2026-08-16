@@ -29,6 +29,7 @@ import {
   adaptToolError,
   canonicalizeProjectRoot,
   decodeFileUrl,
+  isBashTransportDeadError,
   timeoutForCommand,
 } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
@@ -268,6 +269,9 @@ export async function callBridge(
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
   } catch (error) {
+    // The break-glass gate must receive the original transport failure. In
+    // particular, do not append recovery text before gate-off callers rethrow it.
+    if (command === "bash" && isBashTransportDeadError(error)) throw error;
     throw adaptToolError(command, error);
   } finally {
     markBridgeEnd();

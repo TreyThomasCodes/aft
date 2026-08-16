@@ -340,6 +340,7 @@ pub struct RawBashFeatures {
     pub rewrite: Option<bool>,
     pub compress: Option<bool>,
     pub background: Option<bool>,
+    pub host_fallback: Option<bool>,
     pub subagent_background: Option<bool>,
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
@@ -925,6 +926,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 rewrite: override_features.rewrite.or(base.rewrite),
                 compress: override_features.compress.or(base.compress),
                 background: override_features.background.or(base.background),
+                host_fallback: override_features.host_fallback.or(base.host_fallback),
                 subagent_background: override_features
                     .subagent_background
                     .or(base.subagent_background),
@@ -948,6 +950,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             rewrite: Some(*enabled),
             compress: Some(*enabled),
             background: Some(*enabled),
+            host_fallback: None,
             subagent_background: None,
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
@@ -1313,6 +1316,7 @@ struct ResolvedBashConfig {
     rewrite: bool,
     compress: bool,
     background: bool,
+    host_fallback: bool,
     subagent_background: bool,
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
@@ -1321,12 +1325,11 @@ struct ResolvedBashConfig {
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     let bash = resolve_bash_config(raw);
-    // Resolve enabled and subagent_background, then discard them, because Rust
-    // does not use those two bash settings at runtime yet. Doing the resolution
-    // here keeps user config overriding project config in the same way as the
-    // bash fields below, so a later response can expose the values without
-    // changing how config files are interpreted.
+    // The plugins use `enabled` and `subagent_background` when registering bash
+    // capabilities. Rust resolves them only to accept and merge the same config;
+    // they do not control engine behavior.
     let _registration_only = (bash.enabled, bash.subagent_background);
+    config.bash.host_fallback = bash.host_fallback;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
@@ -1358,6 +1361,9 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
     let reminder_interval = top_features
         .and_then(|features| features.long_running_reminder_interval_ms)
         .or_else(|| legacy.and_then(|legacy| legacy.long_running_reminder_interval_ms));
+    let top_host_fallback = top_features
+        .and_then(|features| features.host_fallback)
+        .unwrap_or(false);
     let top_subagent_background = top_features
         .and_then(|features| features.subagent_background)
         .unwrap_or(false);
@@ -1371,6 +1377,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         rewrite: false,
         compress: false,
         background: false,
+        host_fallback: false,
         subagent_background: false,
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
@@ -1391,6 +1398,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
             rewrite: features.rewrite.unwrap_or(true),
             compress: features.compress.unwrap_or(true),
             background: features.background.unwrap_or(true),
+            host_fallback: top_host_fallback,
             subagent_background: top_subagent_background,
             ..base
         },

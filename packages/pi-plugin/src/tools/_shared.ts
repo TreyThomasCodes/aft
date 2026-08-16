@@ -12,6 +12,7 @@ import type {
 import {
   adaptToolError,
   formatBridgeErrorMessage,
+  isBashTransportDeadError,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
   timeoutForCommand,
@@ -156,6 +157,9 @@ export async function callBridge(
       Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
     );
   } catch (error) {
+    // Host fallback and gate-off propagation both require the untouched bridge
+    // transport error; logical AFT responses are handled below as BridgeError.
+    if (command === "bash" && isBashTransportDeadError(error)) throw error;
     throw adaptToolError(command, error);
   }
   if (response.success === false) {

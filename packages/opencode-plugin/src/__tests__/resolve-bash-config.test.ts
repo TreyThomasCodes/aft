@@ -47,6 +47,16 @@ describe("resolveBashConfig", () => {
     });
   });
 
+  test("host fallback defaults off even when bash features default on", () => {
+    expect(resolveBashConfig(cfg({ bash: true })).host_fallback).toBe(false);
+    expect(resolveBashConfig(cfg({ bash: {} })).host_fallback).toBe(false);
+    expect(resolveBashConfig(cfg({})).host_fallback).toBe(false);
+  });
+
+  test("bash.host_fallback is an explicit opt-in", () => {
+    expect(resolveBashConfig(cfg({ bash: { host_fallback: true } })).host_fallback).toBe(true);
+  });
+
   test("bash: { rewrite: false } → enabled; rewrite off, others default on", () => {
     const r = resolveBashConfig(cfg({ bash: { rewrite: false } }));
     expect(r).toMatchObject({

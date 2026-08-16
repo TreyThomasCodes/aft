@@ -1,0 +1,5 @@
+{
+  "bash": {
+    "host_fallback": true
+  }
+}

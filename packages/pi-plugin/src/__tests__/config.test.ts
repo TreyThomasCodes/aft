@@ -1047,6 +1047,12 @@ describe("loadAftConfig", () => {
 });
 
 describe("resolveProjectOverridesForConfigure", () => {
+  test("forwards the project-settable host fallback gate", () => {
+    expect(resolveProjectOverridesForConfigure({ bash: { host_fallback: true } })).toMatchObject({
+      bash: { host_fallback: true },
+    });
+  });
+
   test("forwards callgraph store chunking knobs to Rust configure", () => {
     expect(
       resolveProjectOverridesForConfigure({

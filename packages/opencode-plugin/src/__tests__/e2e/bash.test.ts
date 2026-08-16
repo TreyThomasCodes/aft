@@ -1,11 +1,13 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { loadAftConfig } from "../../config.js";
 import { createBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
 import { mockAsk, noopAsk } from "../test-helpers";
@@ -669,6 +671,58 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(askInput?.patterns.length ?? 0).toBeGreaterThan(0);
   });
 });
+
+test("OpenCode executes project-enabled host fallback when the bridge binary is missing", async () => {
+  const project = await mkdtemp(join(tmpdir(), "aft-host-fallback-e2e-"));
+  const configDir = join(project, ".cortexkit");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    join(configDir, "aft.jsonc"),
+    JSON.stringify({ bash: { host_fallback: true } }),
+    "utf8",
+  );
+  const pool = new BridgePool(join(project, "missing-aft-binary"), { timeoutMs: 250 }, {});
+
+  try {
+    const config = loadAftConfig(project);
+    const bash = createBashTool({
+      pool,
+      client: {} as PluginContext["client"],
+      config,
+      storageDir: join(project, ".aft-storage"),
+    });
+    const ask = mockAsk();
+    const command =
+      process.platform === "win32"
+        ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('e2e-host-fallback')"`
+        : "printf e2e-host-fallback";
+    const result = await bash.execute({ command }, {
+      sessionID: "fallback-e2e",
+      messageID: "message",
+      agent: "agent",
+      directory: project,
+      worktree: project,
+      abort: new AbortController().signal,
+      metadata: () => {},
+      ask,
+      callID: "call",
+    } as ToolContext);
+    const output = typeof result === "string" ? result : (result?.output ?? "");
+
+    expect(output).toContain(
+      "[AFT host fallback - module transport down; no rewrites/compression/background]",
+    );
+    expect(output).toContain("e2e-host-fallback");
+    expect(output).toContain("[exit code: 0]");
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask.mock.calls[0][0].patterns).toEqual([
+      `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${await realPath(project)}`,
+    ]);
+  } finally {
+    await pool.shutdown();
+    await rm(project, { recursive: true, force: true });
+  }
+}, 10_000);
 
 async function realPath(path: string): Promise<string> {
   const { realpath } = await import("node:fs/promises");

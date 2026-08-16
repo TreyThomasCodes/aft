@@ -239,6 +239,16 @@ export class BridgeTransportTimeoutError extends Error {
   }
 }
 
+/** A standalone bridge cannot carry a request because its process transport died. */
+export class BridgeTransportUnavailableError extends Error {
+  readonly code = "bridge_transport_unavailable" as const;
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "BridgeTransportUnavailableError";
+  }
+}
+
 /** Type guard for a transport-timeout rejection (bridge busy, retryable). */
 export function isBridgeTransportTimeout(err: unknown): err is BridgeTransportTimeoutError {
   return err instanceof Error && (err as { code?: unknown }).code === "transport_timeout";
@@ -738,7 +748,9 @@ export class BinaryBridge implements AftProjectTransport {
         );
       }
       if (this._shuttingDown) {
-        throw new Error(`${this.errorPrefix} Bridge is shutting down, cannot send "${command}"`);
+        throw new BridgeTransportUnavailableError(
+          `${this.errorPrefix} Bridge is shutting down, cannot send "${command}"`,
+        );
       }
 
       if (Object.hasOwn(params, "id")) {
@@ -823,7 +835,7 @@ export class BinaryBridge implements AftProjectTransport {
                 // Re-check liveness after version check — checkVersion() swallows
                 // errors as best-effort, so the bridge may have died without throwing.
                 if (!this.isAlive()) {
-                  throw new Error(
+                  throw new BridgeTransportUnavailableError(
                     `${this.errorPrefix} Bridge died during version check. Check logs: ${this.getLogFilePathVia()}`,
                   );
                 }
@@ -930,7 +942,11 @@ export class BinaryBridge implements AftProjectTransport {
         if (!this.process?.stdin?.writable) {
           this.pending.delete(id);
           clearTimeout(timer);
-          reject(new Error(`${this.errorPrefix} stdin not writable for command "${command}"`));
+          reject(
+            new BridgeTransportUnavailableError(
+              `${this.errorPrefix} stdin not writable for command "${command}"`,
+            ),
+          );
           return;
         }
 
@@ -942,7 +958,10 @@ export class BinaryBridge implements AftProjectTransport {
               this.pending.delete(id);
               clearTimeout(entry.timer);
               entry.reject(
-                new Error(`${this.errorPrefix} Failed to write to stdin: ${err.message}`),
+                new BridgeTransportUnavailableError(
+                  `${this.errorPrefix} Failed to write to stdin: ${err.message}`,
+                  { cause: err },
+                ),
               );
             }
           }
@@ -1300,7 +1319,7 @@ export class BinaryBridge implements AftProjectTransport {
     child.on("error", (err) => {
       if (this.process !== currentChild) return;
       this.errorVia(`Process error: ${err.message}${this.formatStderrTail()}`);
-      this.handleCrash();
+      this.handleCrash(err);
     });
 
     child.on("exit", (code, signal) => {
@@ -1324,7 +1343,9 @@ export class BinaryBridge implements AftProjectTransport {
         this.process = null;
         this.configured = false;
         this.clearRestartResetTimer();
-        this.rejectAllPending(new Error(`${this.errorPrefix} Binary killed by ${signal}`));
+        this.rejectAllPending(
+          new BridgeTransportUnavailableError(`${this.errorPrefix} Binary killed by ${signal}`),
+        );
         return;
       }
       this.handleCrash();
@@ -1615,8 +1636,9 @@ export class BinaryBridge implements AftProjectTransport {
     }
 
     this.rejectAllPending(
-      new Error(
+      new BridgeTransportUnavailableError(
         `${this.errorPrefix} Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""} (see ${this.getLogFilePathVia()})`,
+        { cause },
       ),
     );
 

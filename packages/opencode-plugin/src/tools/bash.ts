@@ -1,8 +1,12 @@
 import {
+  BASH_HOST_FALLBACK_REFUSAL,
   type BridgeRequestOptions,
+  bashHostFallbackAskPattern,
   coerceBoolean,
+  isBashTransportDeadError,
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
+  runBashHostFallback,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -380,6 +384,7 @@ export function createBashTool(
         !effectiveBackground && !requestedPty,
       );
       let data: Awaited<ReturnType<typeof withPermissionLoop>>;
+      let usedHostFallback = false;
       try {
         data = await withPermissionLoop(
           ctx,
@@ -416,6 +421,33 @@ export function createBashTool(
             },
           },
         );
+      } catch (error) {
+        if (!bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
+        if (rawRequestedBackground) {
+          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
+        }
+        if (rawRequestedPty) {
+          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
+        }
+
+        const projectRoot = projectRootFor(context);
+        const pattern = bashHostFallbackAskPattern(command, projectRoot);
+        await runAsk(
+          context.ask({
+            permission: "bash",
+            patterns: [pattern],
+            always: [],
+            metadata: { command, cwd: projectRoot, host_fallback: true },
+          }),
+        );
+        data = await runBashHostFallback({
+          command,
+          projectRoot,
+          timeoutMs: rawTimeout,
+          signal: context.abort,
+          env: shellEnv?.env,
+        });
+        usedHostFallback = true;
       } finally {
         removeAbortListener();
       }
@@ -435,12 +467,10 @@ export function createBashTool(
         return { output: rendered, title: uiTitle, metadata: metadataPayload };
       }
 
-      const rendered = maybeAppendGrepSearchHint(
-        (data.output as string | undefined) ?? "",
-        command,
-        aftSearchRegistered,
-        projectRootFor(context),
-      );
+      const output = (data.output as string | undefined) ?? "";
+      const rendered = usedHostFallback
+        ? output
+        : maybeAppendGrepSearchHint(output, command, aftSearchRegistered, projectRootFor(context));
       const metadataPayload = foregroundMetadata(description, data, rendered);
       metadata?.(metadataPayload);
       return {

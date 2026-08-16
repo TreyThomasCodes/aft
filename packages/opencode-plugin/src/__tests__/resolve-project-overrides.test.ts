@@ -83,6 +83,14 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
   });
 
+  test("forwards the project-settable host fallback gate as inert bash config", () => {
+    const overrides = resolveProjectOverridesForConfigure({
+      bash: { host_fallback: true },
+    });
+
+    expect(overrides.bash).toEqual({ host_fallback: true });
+  });
+
   test("project-level bash.background:false flows through (v0.27.1 regression)", () => {
     // Exact user scenario: user has bash.background:true (globally enabled),
     // project A sets bash.background:false (opt out for this project). Before

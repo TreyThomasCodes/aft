@@ -3,7 +3,12 @@ import { describe, expect, mock, test } from "bun:test";
 import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { BridgePool, BridgeRequestOptions } from "@cortexkit/aft-bridge";
+import {
+  BASH_HOST_FALLBACK_BANNER,
+  type BridgePool,
+  type BridgeRequestOptions,
+  BridgeTransportUnavailableError,
+} from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
@@ -344,6 +349,98 @@ describe("OpenCode bash adapter", () => {
       sandbox: "host",
       permissions_granted: ["esc_server_minted"],
     });
+  });
+
+  test("gate-off preserves a transport-dead error unchanged", async () => {
+    const original = new BridgeTransportUnavailableError("byte-identical transport error");
+    const ask = mockAsk();
+    const { tool: bash } = createHarness(
+      () => {
+        throw original;
+      },
+      undefined,
+      false,
+      { bash: { host_fallback: false } } as PluginContext["config"],
+    );
+
+    let captured: unknown;
+    try {
+      await bash.execute({ command: "printf should-not-run" }, createMockSdkContext({ ask }));
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBe(original);
+    expect((captured as Error).message).toBe("byte-identical transport error");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("engine-alive errors never engage host fallback", async () => {
+    const ask = mockAsk();
+    const { tool: bash } = createHarness(
+      () => ({ success: false, code: "path_outside_root", message: "outside project root" }),
+      undefined,
+      false,
+      { bash: { host_fallback: true } } as PluginContext["config"],
+    );
+
+    await expect(
+      bash.execute({ command: "printf should-not-run" }, createMockSdkContext({ ask })),
+    ).rejects.toThrow("outside project root");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("transport-dead fallback asks exactly once then captures real host output", async () => {
+    const ask = mockAsk();
+    const command =
+      process.platform === "win32"
+        ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('opencode-fallback')"`
+        : "printf opencode-fallback";
+    const { tool: bash } = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("bridge spawn failed");
+      },
+      undefined,
+      false,
+      { bash: { host_fallback: true } } as PluginContext["config"],
+    );
+
+    const output = bashText(await bash.execute({ command }, createMockSdkContext({ ask })));
+
+    expect(output).toStartWith(`${BASH_HOST_FALLBACK_BANNER}\n`);
+    expect(output).toContain("opencode-fallback");
+    expect(output).toEndWith("[exit code: 0]");
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask.mock.calls[0][0]).toEqual({
+      permission: "bash",
+      patterns: [
+        `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${PROJECT_CWD}`,
+      ],
+      always: [],
+      metadata: { command, cwd: PROJECT_CWD, host_fallback: true },
+    });
+  });
+
+  test("host fallback refuses background mode instead of spawning locally", async () => {
+    const ask = mockAsk();
+    const { tool: bash } = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("transport down");
+      },
+      undefined,
+      false,
+      { bash: { host_fallback: true } } as PluginContext["config"],
+    );
+
+    await expect(
+      bash.execute(
+        { command: "printf should-not-run", background: true },
+        createMockSdkContext({ ask }),
+      ),
+    ).rejects.toThrow(
+      "AFT transport is down; only foreground execution is available in host fallback; background:true is unsupported",
+    );
+    expect(ask).not.toHaveBeenCalled();
   });
 
   test("shell.env trigger fires before bridge call and merged env is forwarded", async () => {

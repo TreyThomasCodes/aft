@@ -21,6 +21,16 @@ export {
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
 } from "./bash-hints.js";
+export {
+  BASH_HOST_FALLBACK_BANNER,
+  BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES,
+  BASH_HOST_FALLBACK_MAX_TIMEOUT_MS,
+  BASH_HOST_FALLBACK_REFUSAL,
+  type BashHostFallbackOptions,
+  type BashHostFallbackResult,
+  bashHostFallbackAskPattern,
+  runBashHostFallback,
+} from "./bash-host-fallback.js";
 export { resolveBashKillTimeout } from "./bash-timeout.js";
 export type {
   BashCompletedPayload,
@@ -36,6 +46,7 @@ export type {
 export {
   BinaryBridge,
   BridgeTransportTimeoutError,
+  BridgeTransportUnavailableError,
   compareSemver,
   isBridgeTransportTimeout,
   tagStderrLine,
@@ -92,6 +103,7 @@ export {
   type AftToolErrorCause,
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
+  isBashTransportDeadError,
   toolErrorFromResponse,
 } from "./error-contract.js";
 // --- compact UI formatting ---
@@ -187,6 +199,7 @@ export {
   resolveBridgeForNudge,
   SubcTransportPool,
   type SubcTransportPoolOptions,
+  SubcTransportShuttingDownError,
 } from "./subc-transport.js";
 // --- shared agent-facing tool formatting ---
 export type { ReadFooterOptions } from "./tool-format.js";

@@ -169,6 +169,14 @@ pub struct SandboxConfig {
     pub read_deny: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BashConfig {
+    /// Permit plugin-side break-glass execution when its AFT transport is unavailable.
+    /// Rust accepts this for cross-language config parity but never acts on it.
+    pub host_fallback: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -232,6 +240,8 @@ pub struct Config {
     /// Milliseconds to wait before a foreground bash task is promoted to background handling.
     #[serde(skip, default = "default_foreground_wait_window_ms")]
     pub foreground_wait_window_ms: u64,
+    /// Plugin-owned bash settings accepted by configure but inert in the engine.
+    pub bash: BashConfig,
     /// Enable OpenCode-style bash permission prompts (default: false).
     pub bash_permissions: bool,
     /// Native sandbox policy for first-party bash and PTY processes.
@@ -321,6 +331,7 @@ impl Default for Config {
             bash_long_running_reminder_enabled: true,
             bash_long_running_reminder_interval_ms: 600_000,
             foreground_wait_window_ms: default_foreground_wait_window_ms(),
+            bash: BashConfig::default(),
             bash_permissions: false,
             sandbox: SandboxConfig::default(),
             search_index_max_file_size: 1_048_576,

@@ -375,6 +375,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
               },
+              host_fallback: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Break-glass host execution when AFT's module transport is unavailable. Project-settable. Every fallback command requires a fresh host permission prompt and runs without AFT rewrites, compression, or background support.",
+              },
               subagent_background: {
                 type: "boolean",
                 default: false,

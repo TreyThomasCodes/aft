@@ -163,6 +163,12 @@ const BashFeaturesSchema = z.object({
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
   /**
+   * Permit an emergency, per-command host execution when the AFT transport is
+   * unavailable. Every fallback command still requires a fresh host permission
+   * prompt. Default: false.
+   */
+  host_fallback: z.boolean().optional(),
+  /**
    * Allow OpenCode subagents to use real background bash (`background: true`
    * and auto-promotion). Default: false — subagents fall back to synchronous
    * foreground polling because they can't survive turn-end to receive the
@@ -531,6 +537,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // Bash / LSP / semantic all flow through dedicated resolvers because they
   // have their own merge / project-safety rules.
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
+  if (typeof config.bash === "object" && config.bash.host_fallback !== undefined) {
+    overrides.bash = { host_fallback: config.bash.host_fallback };
+  }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
@@ -557,6 +566,8 @@ export interface ResolvedBashConfig {
   rewrite: boolean;
   compress: boolean;
   background: boolean;
+  /** Emergency local execution gate. Default false, including for `bash: true`. */
+  host_fallback: boolean;
   /** See BashFeaturesSchema.subagent_background. Default false. */
   subagent_background: boolean;
   long_running_reminder_enabled?: boolean;
@@ -628,6 +639,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     rewrite: false,
     compress: false,
     background: false,
+    host_fallback: false,
     subagent_background: false,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
@@ -648,6 +660,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       rewrite: top.rewrite ?? true,
       compress: top.compress ?? true,
       background: top.background ?? true,
+      host_fallback: top.host_fallback ?? false,
       subagent_background: topSubagentBg,
     };
   }

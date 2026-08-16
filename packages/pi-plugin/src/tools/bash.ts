@@ -1,12 +1,16 @@
 import {
   type AftProjectTransport,
+  BASH_HOST_FALLBACK_REFUSAL,
   type BridgeRequestOptions,
+  bashHostFallbackAskPattern,
   coerceBoolean,
+  isBashTransportDeadError,
   isBridgeTransportTimeout,
   isTerminalStatus,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
+  runBashHostFallback,
   sleep,
 } from "@cortexkit/aft-bridge";
 import type {
@@ -449,7 +453,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
     ],
     parameters: bashParamsForConfig(bashCfg.background),
-    async execute(_toolCallId, params: Static<typeof BashParams>, _signal, onUpdate, extCtx) {
+    async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
@@ -518,41 +522,83 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
       const bridgeCommand = spawnContext.command;
 
       let streamed = "";
-      const response = await callBashWithPermissionLoop(
-        bridge,
-        {
-          command: bridgeCommand,
-          timeout: effectiveTimeout,
-          workdir: spawnContext.cwd ?? params.workdir,
-          env: spawnContext.env,
-          description: params.description,
-          background: effectiveBackground,
-          notify_on_completion: effectiveBackground,
-          compressed,
-          pty: requestedPty,
-          pty_rows: ptyRows,
-          pty_cols: ptyCols,
-          foreground_orchestrate: true,
-          block_to_completion: blockToCompletion,
-          wait: requestedWait,
-          sandbox: params.sandbox,
-        },
-        extCtx,
-        {
-          transportTimeoutMs: orchestratedTransportTimeoutMs(
-            blockToCompletion,
-            requestedWait,
-            effectiveTimeout,
-            foregroundWaitMs,
-          ),
-          onProgress: ({ text }) => {
-            streamed += text;
-            // Stream truncated output to avoid overwhelming the UI
-            const displayText = truncateToVisualLines(streamed, 100);
-            onUpdate?.(bashResult(displayText, { streaming: true }));
+      let usedHostFallback = false;
+      let response: Record<string, unknown>;
+      try {
+        response = await callBashWithPermissionLoop(
+          bridge,
+          {
+            command: bridgeCommand,
+            timeout: effectiveTimeout,
+            workdir: spawnContext.cwd ?? params.workdir,
+            env: spawnContext.env,
+            description: params.description,
+            background: effectiveBackground,
+            notify_on_completion: effectiveBackground,
+            compressed,
+            pty: requestedPty,
+            pty_rows: ptyRows,
+            pty_cols: ptyCols,
+            foreground_orchestrate: true,
+            block_to_completion: blockToCompletion,
+            wait: requestedWait,
+            sandbox: params.sandbox,
           },
-        },
-      );
+          extCtx,
+          {
+            transportTimeoutMs: orchestratedTransportTimeoutMs(
+              blockToCompletion,
+              requestedWait,
+              effectiveTimeout,
+              foregroundWaitMs,
+            ),
+            onProgress: ({ text }) => {
+              streamed += text;
+              // Stream truncated output to avoid overwhelming the UI
+              const displayText = truncateToVisualLines(streamed, 100);
+              onUpdate?.(bashResult(displayText, { streaming: true }));
+            },
+          },
+        );
+      } catch (error) {
+        if (!bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
+        if (rawRequestedBackground) {
+          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
+        }
+        if (rawRequestedPty) {
+          throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
+        }
+        if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+          throw new BridgeError(
+            "Permission denied: host fallback execution requires an interactive UI.",
+            "permission_denied",
+          );
+        }
+
+        const projectRoot = extCtx.cwd;
+        const pattern = bashHostFallbackAskPattern(bridgeCommand, projectRoot);
+        const approved = await extCtx.ui.confirm(
+          "AFT unavailable — run command on host?",
+          pattern,
+          {
+            signal: signal ?? extCtx.signal,
+          },
+        );
+        if (!approved) {
+          throw new BridgeError(
+            "Permission denied: AFT host fallback execution was denied.",
+            "permission_denied",
+          );
+        }
+        response = await runBashHostFallback({
+          command: bridgeCommand,
+          projectRoot,
+          timeoutMs: timeout,
+          signal: signal ?? extCtx.signal,
+          env: spawnContext.env,
+        });
+        usedHostFallback = true;
+      }
 
       if (response.success === false) {
         throw new Error((response.message as string | undefined) ?? "bash failed");
@@ -574,7 +620,9 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
 
       const output = (response.output as string | undefined) ?? "";
       return bashResult(
-        withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
+        usedHostFallback
+          ? output
+          : withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
         details,
       );
     },

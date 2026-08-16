@@ -57,6 +57,14 @@ import type {
   ToolCallResult,
 } from "./transport.js";
 
+/** The subc pool is closing and cannot carry another request. */
+export class SubcTransportShuttingDownError extends SubcCallError {
+  constructor() {
+    super("terminal", "subc transport is shutting down", "transport_shutting_down");
+    this.name = "SubcTransportShuttingDownError";
+  }
+}
+
 /** A held-open event subscription — the slice of subc-client's Subscription we use. */
 export interface SubcSubscriptionLike {
   /** Cancel the subscription (sends Cancel; idempotent); the provider unwinds with StreamEnd. */
@@ -1213,7 +1221,7 @@ export class SubcTransportPool implements AftTransportPool {
   getBridge(projectRoot: string): SubcTransport {
     const root = this.canonicalRoot(projectRoot);
     if (this.shuttingDown && this.lifecycleEnabled()) {
-      throw new SubcCallError("terminal", "subc transport is shutting down");
+      throw new SubcTransportShuttingDownError();
     }
 
     if (!this.lifecycleEnabled()) return this.makeFacade(root);
@@ -1574,7 +1582,7 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private async ensureClient(): Promise<SubcClientLike> {
-    if (this.shuttingDown) throw new SubcCallError("terminal", "subc transport is shutting down");
+    if (this.shuttingDown) throw new SubcTransportShuttingDownError();
     if (this.client) return this.client;
     if (this.connecting) return this.connecting;
     this.connecting = this.connectFn({
@@ -1589,7 +1597,7 @@ export class SubcTransportPool implements AftTransportPool {
           } catch {
             // A late connection is owned by the failed connect and is closed here.
           }
-          throw new SubcCallError("terminal", "subc transport is shutting down");
+          throw new SubcTransportShuttingDownError();
         }
         this.client = client;
         this.transportFailures = 0;

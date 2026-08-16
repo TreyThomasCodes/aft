@@ -12,8 +12,12 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 
-import { isBridgeTransportTimeout } from "./bridge.js";
-import { SubcRootGenerationExpiredError, SubcRootReapedError } from "./subc-transport.js";
+import { BridgeTransportUnavailableError, isBridgeTransportTimeout } from "./bridge.js";
+import {
+  SubcRootGenerationExpiredError,
+  SubcRootReapedError,
+  SubcTransportShuttingDownError,
+} from "./subc-transport.js";
 
 export interface AftToolErrorCause {
   code: string;
@@ -93,14 +97,37 @@ function isRouteGoodbyeError(error: unknown): boolean {
   return error.code === "route_closed" && error.message.includes("route closed by subc");
 }
 
-function isTransportClassError(error: unknown): boolean {
+function hasEngineResponse(error: Error): boolean {
+  const response = (error as Error & { response?: unknown }).response;
+  if (response !== null && typeof response === "object") return true;
+
+  const cause = error.cause;
+  if (cause === null || typeof cause !== "object") return false;
+  const causeResponse = (cause as { response?: unknown }).response;
+  return causeResponse !== null && typeof causeResponse === "object";
+}
+
+/**
+ * True only when bash could not reach a live AFT engine. A structured engine
+ * response wins over every code below because it proves the request reached AFT.
+ */
+export function isBashTransportDeadError(error: unknown): error is Error {
+  if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
+    return false;
+  }
+
   return (
-    isBridgeTransportTimeout(error) ||
+    error instanceof BridgeTransportUnavailableError ||
+    error instanceof SubcTransportShuttingDownError ||
     isConsumerReconnectTransient(error) ||
     error instanceof StaleRouteHandleError ||
     error instanceof SubcRootGenerationExpiredError ||
     error instanceof SubcRootReapedError
   );
+}
+
+function isTransportClassError(error: unknown): boolean {
+  return isBridgeTransportTimeout(error) || isBashTransportDeadError(error);
 }
 
 /**
