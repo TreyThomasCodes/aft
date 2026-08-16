@@ -16,7 +16,7 @@ use aft::inspect::{
 use aft::parser::SymbolCache;
 use serde_json::json;
 
-use super::helpers::AftProcess;
+use super::helpers::{user_config, AftProcess};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -422,7 +422,18 @@ fn inspect_engine_drain_routes_idle_scan_to_cache() {
 fn inspect_engine_command_returns_lane_a_shape() {
     let (_temp_dir, root, _file) = fixture_project();
     let mut aft = AftProcess::spawn();
-    let configure = aft.configure(&root);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(json!({
+                "lsp": { "disabled": ["rust"] }
+            })),
+        })
+        .to_string(),
+    );
     assert_eq!(
         configure["success"], true,
         "configure should succeed: {configure:?}"
@@ -442,13 +453,17 @@ fn inspect_engine_command_returns_lane_a_shape() {
         response["success"], true,
         "inspect should succeed: {response:?}"
     );
+    assert_eq!(
+        response["inspect_terminal"], "fresh",
+        "successful lane-A inspect must reach the fresh terminal: {response:?}"
+    );
     let diagnostics = response["summary"]["diagnostics"]
         .as_object()
         .expect("diagnostics summary");
     assert_eq!(
-        diagnostics.get("status").and_then(|value| value.as_str()),
-        Some("pending"),
-        "diagnostics should be active but not reported as clean until an LSP server runs: {response:?}"
+        diagnostics.get("errors").and_then(|value| value.as_u64()),
+        Some(0),
+        "disabled diagnostics producers should yield verified zero errors: {response:?}"
     );
     assert!(response["details"]["diagnostics"].is_array());
     assert!(response["summary"]["metrics"].is_object());

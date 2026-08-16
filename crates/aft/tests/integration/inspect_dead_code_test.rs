@@ -256,7 +256,10 @@ fn inspect_dead_code_unavailable_callgraph_returns_empty_result() {
     let success = scan(job(&root, paths, None));
 
     assert!(success.contributions.is_empty());
-    assert_eq!(success.aggregate["count"], 0);
+    assert!(
+        success.aggregate.get("count").is_none(),
+        "unavailable callgraph must not be represented as zero dead code"
+    );
     assert_eq!(success.aggregate["by_language"], json!({}));
     assert_eq!(success.aggregate["callgraph_available"], false);
     assert_eq!(success.aggregate["drill_down_capped"], false);

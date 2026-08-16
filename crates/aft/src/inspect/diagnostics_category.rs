@@ -164,6 +164,7 @@ fn collect_scoped_diagnostics(
         files.insert(crate::inspect::job::canonicalize_normalized(root));
     }
     let mut collection = DiagnosticsCollection {
+        applicability_is_empty: files.is_empty() && scoped.explicit_files_without_server == 0,
         files_without_server: scoped.explicit_files_without_server,
         ..DiagnosticsCollection::default()
     };

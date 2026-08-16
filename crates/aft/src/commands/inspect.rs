@@ -1062,6 +1062,12 @@ fn render_symbol_category(
     let Some(section) = summary.get(key) else {
         return;
     };
+    if key == "dead_code"
+        && section.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+    {
+        lines.push("Dead code analysis unavailable (no callgraph)".to_string());
+        return;
+    }
     if let Some(status) = section.get("status").and_then(Value::as_str) {
         if let Some(reason) = section.get("reason").and_then(Value::as_str) {
             lines.push(format!("{label}: {status} ({reason})"));
@@ -1546,6 +1552,13 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
             "count": count_from_payload(Some(payload)),
             "by_kind": payload.get("by_kind").or_else(|| payload.get("by_marker")).cloned().unwrap_or_else(|| serde_json::json!({})),
         }),
+        InspectCategory::DeadCode
+            if payload.get("callgraph_available").and_then(Value::as_bool) == Some(false) =>
+        {
+            // This is a terminal capability result, not a partial scan: dead-code
+            // analysis cannot run without the callgraph, so it must not claim zero.
+            serde_json::json!({ "callgraph_available": false })
+        }
         InspectCategory::DeadCode => serde_json::json!({
             "count": count_from_payload(Some(payload)),
             "generated_count": generated_count_from_payload(Some(payload)),
@@ -1905,6 +1918,16 @@ mod render_text_tests {
 
     fn render_with_details(summary: Value, details: Value) -> String {
         render_inspect_text(&summary_map(summary), &summary_map(details))
+    }
+
+    #[test]
+    fn renders_unavailable_dead_code_without_a_zero_count() {
+        let text = render(serde_json::json!({
+            "dead_code": { "callgraph_available": false }
+        }));
+
+        assert_eq!(text, "Dead code analysis unavailable (no callgraph)");
+        assert!(!text.contains("Dead code: 0"));
     }
 
     #[test]
@@ -2319,6 +2342,8 @@ mod fresh_payload_tests {
     }
 
     fn assert_no_banned_field(value: &Value) {
+        // `callgraph_available` is capability disclosure, not partiality, so fresh
+        // payloads may report terminal callgraph unavailability.
         const BANNED_KEYS: &[&str] = &[
             "provisional",
             "provisional_counts",
