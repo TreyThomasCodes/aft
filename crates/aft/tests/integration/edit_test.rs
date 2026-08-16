@@ -61,6 +61,14 @@ fn inline_lsp_diagnostics_fixture(
     package_name: &str,
     configure_id: &str,
 ) -> (tempfile::TempDir, PathBuf, AftProcess) {
+    inline_lsp_diagnostics_fixture_with_status(package_name, configure_id, None)
+}
+
+fn inline_lsp_diagnostics_fixture_with_status(
+    package_name: &str,
+    configure_id: &str,
+    server_status: Option<&str>,
+) -> (tempfile::TempDir, PathBuf, AftProcess) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let file = root.join("main.rs");
@@ -76,7 +84,14 @@ fn inline_lsp_diagnostics_fixture(
     .unwrap();
 
     let fake_server = fake_server_path();
-    let mut aft = AftProcess::spawn_with_env(&[("AFT_LSP_RUST_BINARY", fake_server.as_os_str())]);
+    let mut env = vec![("AFT_LSP_RUST_BINARY", fake_server.as_os_str())];
+    if let Some(server_status) = server_status {
+        env.push((
+            "AFT_FAKE_LSP_SERVER_STATUS",
+            std::ffi::OsStr::new(server_status),
+        ));
+    }
+    let mut aft = AftProcess::spawn_with_env(&env);
     let configure = aft.send(&format!(
         r#"{{"id":"{configure_id}","command":"configure","harness":"opencode","project_root":{}}}"#,
         crate::helpers::json_string(&root.display())
@@ -666,6 +681,66 @@ fn edit_match_returns_inline_lsp_diagnostics_when_requested() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn edit_match_complete_empty_requires_settled_clean_publish() {
+    let (_dir, file, mut aft) = inline_lsp_diagnostics_fixture_with_status(
+        "inline-diag-settled",
+        "cfg-inline-settled",
+        Some("publish_then_quiescent"),
+    );
+    let diagnostic_req = serde_json::json!({
+        "id": "em-inline-settled",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "let value = 1",
+        "replacement": "let answer = 1",
+        "diagnostics": true,
+    });
+    let diagnostic_resp = aft.send(&serde_json::to_string(&diagnostic_req).unwrap());
+
+    assert_eq!(
+        diagnostic_resp["lsp_complete"], true,
+        "quiescent server result should be complete: {diagnostic_resp:?}"
+    );
+    assert_eq!(
+        diagnostic_resp["lsp_diagnostics"]
+            .as_array()
+            .expect("lsp_diagnostics array")
+            .len(),
+        2,
+        "settling must expose the version-matched diagnostics instead of masking them: {diagnostic_resp:?}"
+    );
+    assert!(aft.shutdown().success());
+
+    let (_dir, file, mut aft) = inline_lsp_diagnostics_fixture_with_status(
+        "inline-diag-clean",
+        "cfg-inline-clean",
+        Some("empty_then_quiescent"),
+    );
+    let clean_req = serde_json::json!({
+        "id": "em-inline-clean",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "let value = 1",
+        "replacement": "let answer = 1",
+        "diagnostics": true,
+    });
+    let clean_resp = aft.send(&serde_json::to_string(&clean_req).unwrap());
+
+    assert_eq!(
+        clean_resp["lsp_complete"], true,
+        "settled clean server result should be complete: {clean_resp:?}"
+    );
+    assert!(
+        clean_resp["lsp_diagnostics"]
+            .as_array()
+            .expect("lsp_diagnostics array")
+            .is_empty(),
+        "complete+empty is reserved for the server's version-matched clean publish: {clean_resp:?}"
+    );
+    assert!(aft.shutdown().success());
 }
 
 #[test]

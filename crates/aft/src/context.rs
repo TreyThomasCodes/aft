@@ -5913,9 +5913,8 @@ impl AppContext {
     /// Notify LSP and optionally wait for diagnostics.
     ///
     /// Call this after `write_format_validate` when the request has `"diagnostics": true`.
-    /// Sends didChange only to a server that was already live, waits briefly for
-    /// publishDiagnostics, and returns any diagnostics for the file. If no server
-    /// is running, returns empty immediately without starting one.
+    /// Ensures the matching server is running, sends didOpen/didChange, waits
+    /// briefly for publishDiagnostics, and returns diagnostics for the file.
     ///
     /// Pre-edit cached diagnostics are never returned: only entries whose version
     /// matches the post-edit document version are authoritative.
@@ -5939,18 +5938,17 @@ impl AppContext {
         // stale pre-edit publishes that arrived late.
         let pre_snapshot = lsp.snapshot_pre_edit_state(file_path);
 
-        // The post-edit wait is an observation source only for servers that
-        // were already live. It must not turn a cold root into an analyzer start.
-        // Capture each target version before waiting so accepted snapshots remain
-        // partitioned by producer instead of inferred from flattened diagnostics.
-        let expected_versions =
-            match lsp.notify_file_changed_if_running_versioned(file_path, content, &config) {
-                Ok(v) => v,
-                Err(e) => {
-                    crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-                    return crate::lsp::manager::PostEditWaitOutcome::default();
-                }
-            };
+        // An explicit diagnostics request still starts matching servers only when
+        // needed. Record the document version sent to each server so completed results
+        // stay tied to the server and version that produced them.
+        let expected_versions = match lsp.notify_file_changed_versioned(file_path, content, &config)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
+                return crate::lsp::manager::PostEditWaitOutcome::default();
+            }
+        };
 
         // No server matched this file — return an empty outcome that's
         // honestly `complete: true` (nothing to wait for).
