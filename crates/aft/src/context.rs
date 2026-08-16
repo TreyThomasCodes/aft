@@ -2267,11 +2267,6 @@ impl AppContext {
         self.alert_state.lock().accept_batch(batch)
     }
 
-    #[cfg(test)]
-    pub(crate) fn alert_state_for_test(&self) -> AlertDeltaState {
-        self.alert_state.lock().clone()
-    }
-
     /// Invalidate the status-bar tsconfig-membership cache. Called from the
     /// watcher seam when a tsconfig-like file changes and from `configure`
     /// when the project root changes, so the next bar count re-reads from disk.
