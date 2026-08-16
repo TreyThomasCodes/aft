@@ -42,6 +42,8 @@ const MIN_FILE_ENTRY_BYTES: usize = 57;
 const LOOKUP_ENTRY_BYTES: usize = 16;
 const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
+const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
 
@@ -4117,10 +4119,30 @@ fn lookup_artifact_cache_key_memo(
     let mut state = artifact_cache_key_memo_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state
-        .entries_for_storage_root(storage_root)
-        .get(memo_root_key)
-        .cloned()
+    let entries = state.entries_for_storage_root(storage_root);
+    let entry = entries.get(memo_root_key)?.clone();
+    let now = current_time_millis();
+    if Path::new(memo_root_key).exists()
+        && now.saturating_sub(entry.recorded_at_ms)
+            >= ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE.as_millis() as u64
+    {
+        // Read-only roots may reuse the same borrowed artifact key for months without
+        // deriving a new key. Refresh at most daily to keep the cached key available
+        // while avoiding a disk write on every failed lookup.
+        let mut refreshed = entry.clone();
+        refreshed.recorded_at_ms = now;
+        entries.insert(memo_root_key.to_string(), refreshed);
+        if let Err(error) = write_artifact_cache_key_memo_file(storage_root, entries) {
+            entries.insert(memo_root_key.to_string(), entry.clone());
+            crate::slog_warn!(
+                "artifact cache key: failed to refresh memo for {} in {}: {}",
+                memo_root_key,
+                storage_root.display(),
+                error
+            );
+        }
+    }
+    entries.get(memo_root_key).cloned()
 }
 
 fn record_artifact_cache_key_memo(
@@ -4139,15 +4161,28 @@ fn record_artifact_cache_key_memo(
     {
         return Ok(());
     }
+    let now = current_time_millis();
     entries.insert(
         memo_root_key.to_string(),
         ArtifactCacheKeyMemoEntry {
             key: key.to_string(),
             git_root_commit: git_root_commit.to_string(),
-            recorded_at_ms: current_time_millis(),
+            recorded_at_ms: now,
         },
     );
+    prune_expired_artifact_cache_key_memo_entries(entries, now);
     write_artifact_cache_key_memo_file(storage_root, entries)
+}
+
+fn prune_expired_artifact_cache_key_memo_entries(
+    entries: &mut BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+    now: u64,
+) {
+    entries.retain(|root, entry| {
+        Path::new(root).exists()
+            || now.saturating_sub(entry.recorded_at_ms)
+                <= ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE.as_millis() as u64
+    });
 }
 
 fn read_artifact_cache_key_memo_file(
@@ -6222,10 +6257,155 @@ mod tests {
         serde_json::from_slice(&bytes).expect("parse memo file")
     }
 
+    fn write_cache_key_memo(
+        storage_root: &Path,
+        entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+    ) {
+        fs::create_dir_all(storage_root).expect("create memo storage");
+        fs::write(
+            artifact_cache_key_memo_path(storage_root),
+            serde_json::to_vec_pretty(entries).expect("serialize memo"),
+        )
+        .expect("write memo");
+    }
+
     fn git_like_root(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let root = dir.path().join(name);
         fs::create_dir_all(root.join(".git")).expect("create git marker");
         root
+    }
+
+    #[test]
+    fn artifact_cache_key_memo_write_prunes_only_deleted_old_entries() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let live_old_root = dir.path().join("live-old");
+        let dead_old_root = dir.path().join("dead-old");
+        let dead_recent_root = dir.path().join("dead-recent");
+        let written_root = dir.path().join("written");
+        fs::create_dir_all(&live_old_root).expect("create live root");
+        fs::create_dir_all(&written_root).expect("create written root");
+        let now = current_time_millis();
+        let old = now.saturating_sub(ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE.as_millis() as u64 + 1);
+        let recent =
+            now.saturating_sub(ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE.as_millis() as u64 / 2);
+        let mut seeded = BTreeMap::new();
+        for (root, key, recorded_at_ms) in [
+            (&live_old_root, "1111111111111111", old),
+            (&dead_old_root, "2222222222222222", old),
+            (&dead_recent_root, "3333333333333333", recent),
+        ] {
+            seeded.insert(
+                root.to_string_lossy().into_owned(),
+                ArtifactCacheKeyMemoEntry {
+                    key: key.to_string(),
+                    git_root_commit: "fixture-commit".to_string(),
+                    recorded_at_ms,
+                },
+            );
+        }
+        write_cache_key_memo(&storage, &seeded);
+
+        record_artifact_cache_key_memo(
+            &storage,
+            written_root.to_string_lossy().as_ref(),
+            "4444444444444444",
+            "written-commit",
+        )
+        .expect("record memo entry");
+
+        let memo = read_cache_key_memo(&storage);
+        assert!(memo.contains_key(live_old_root.to_string_lossy().as_ref()));
+        assert!(!memo.contains_key(dead_old_root.to_string_lossy().as_ref()));
+        assert!(memo.contains_key(dead_recent_root.to_string_lossy().as_ref()));
+        assert!(memo.contains_key(written_root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn artifact_cache_key_memo_prunes_hundreds_of_deleted_entries_on_next_write() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let written_root = dir.path().join("written");
+        fs::create_dir_all(&written_root).expect("create written root");
+        let old = current_time_millis()
+            .saturating_sub(ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE.as_millis() as u64 + 1);
+        let mut seeded = BTreeMap::new();
+        for index in 0..400 {
+            seeded.insert(
+                dir.path()
+                    .join(format!("dead-{index}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                ArtifactCacheKeyMemoEntry {
+                    key: format!("{index:016x}"),
+                    git_root_commit: format!("fixture-commit-{index}"),
+                    recorded_at_ms: old,
+                },
+            );
+        }
+        write_cache_key_memo(&storage, &seeded);
+        let bytes_before = fs::metadata(artifact_cache_key_memo_path(&storage))
+            .expect("stat seeded memo")
+            .len();
+
+        record_artifact_cache_key_memo(
+            &storage,
+            written_root.to_string_lossy().as_ref(),
+            "aaaaaaaaaaaaaaaa",
+            "written-commit",
+        )
+        .expect("record memo entry");
+
+        let memo = read_cache_key_memo(&storage);
+        let bytes_after = fs::metadata(artifact_cache_key_memo_path(&storage))
+            .expect("stat pruned memo")
+            .len();
+        assert_eq!(
+            memo.len(),
+            1,
+            "next write must remove all stale fixture roots"
+        );
+        assert!(memo.contains_key(written_root.to_string_lossy().as_ref()));
+        assert!(
+            bytes_after < bytes_before,
+            "pruning hundreds of dead entries must shrink the memo file"
+        );
+    }
+
+    #[test]
+    fn artifact_cache_key_memo_read_hit_refreshes_existing_root_once_per_day() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let root = dir.path().join("borrowed-root");
+        fs::create_dir_all(&root).expect("create borrowed root");
+        let mut seeded = BTreeMap::new();
+        seeded.insert(
+            root.to_string_lossy().into_owned(),
+            ArtifactCacheKeyMemoEntry {
+                key: "aaaaaaaaaaaaaaaa".to_string(),
+                git_root_commit: "fixture-commit".to_string(),
+                recorded_at_ms: 0,
+            },
+        );
+        write_cache_key_memo(&storage, &seeded);
+
+        let first = lookup_artifact_cache_key_memo(&storage, root.to_string_lossy().as_ref())
+            .expect("memo hit");
+        let persisted_first = read_cache_key_memo(&storage)
+            .get(root.to_string_lossy().as_ref())
+            .expect("persisted refreshed entry")
+            .recorded_at_ms;
+        let second = lookup_artifact_cache_key_memo(&storage, root.to_string_lossy().as_ref())
+            .expect("second memo hit");
+        let persisted_second = read_cache_key_memo(&storage)
+            .get(root.to_string_lossy().as_ref())
+            .expect("persisted entry after second hit")
+            .recorded_at_ms;
+
+        assert!(first.recorded_at_ms > 0);
+        assert_eq!(first.recorded_at_ms, persisted_first);
+        assert_eq!(second.recorded_at_ms, persisted_second);
+        assert_eq!(persisted_first, persisted_second);
     }
 
     #[test]

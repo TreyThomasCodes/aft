@@ -4192,8 +4192,32 @@ mod tests {
     use crate::semantic_index::SemanticIndex;
     use std::process::Command;
 
-    fn test_context() -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+    struct TestContext {
+        context: AppContext,
+        _storage: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestContext {
+        type Target = AppContext;
+
+        fn deref(&self) -> &Self::Target {
+            &self.context
+        }
+    }
+
+    fn test_context() -> TestContext {
+        let storage = tempfile::tempdir().expect("create configure test storage");
+        let context = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        TestContext {
+            context,
+            _storage: storage,
+        }
     }
 
     fn git_command(root: &std::path::Path) -> Command {
@@ -4373,6 +4397,12 @@ mod tests {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -4560,7 +4590,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_git_fixture(temp.path());
 
-        let ctx = test_context();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
@@ -4582,6 +4612,36 @@ mod tests {
             resolved,
             Some(crate::bash_background::storage_dir(None)),
             "configure must default storage_dir to the shared storage root"
+        );
+    }
+
+    #[test]
+    fn configure_writes_cache_key_memo_to_explicit_storage_only() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _aft_cache_dir = EnvVarGuard::remove("AFT_CACHE_DIR");
+        let temp = tempfile::tempdir().expect("create fixture root");
+        let default_data_root = temp.path().join("default-data");
+        let _xdg_data_home = EnvVarGuard::set(
+            "XDG_DATA_HOME",
+            default_data_root.to_str().expect("temporary path is UTF-8"),
+        );
+        let default_storage = crate::bash_background::storage_dir(None);
+        let project = temp.path().join("project");
+        let storage = temp.path().join("configured-storage");
+        init_git_fixture(&project);
+
+        let ctx = test_context();
+        let response = handle_configure_for_test(&configure_with_storage(&project, &storage), &ctx);
+
+        assert!(response.success, "configure failed: {response:?}");
+        assert!(
+            storage.join("cache-keys.json").is_file(),
+            "explicit storage_dir must receive the cache-key memo"
+        );
+        assert!(
+            !default_storage.join("cache-keys.json").exists(),
+            "explicit storage_dir must not write the default storage memo"
         );
     }
 
@@ -4677,7 +4737,7 @@ mod tests {
         config: &SemanticBackendConfig,
         limiter: super::SemanticRefreshLimiter,
     ) -> (
-        AppContext,
+        TestContext,
         crossbeam_channel::Sender<SemanticRefreshRequest>,
         crossbeam_channel::Receiver<SemanticRefreshEvent>,
         std::thread::JoinHandle<()>,
@@ -5396,7 +5456,13 @@ mod tests {
                 Arc::clone(&probe_started),
             );
 
-        let ctx = Arc::new(test_context());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
         let executor = crate::executor::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&canonical_root)
             .expect("canonical project root id");
