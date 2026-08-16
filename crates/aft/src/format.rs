@@ -73,6 +73,12 @@ enum ToolDetection {
     },
 }
 
+/// How a package declares the Rust edition in its Cargo manifest.
+enum CargoPackageEdition {
+    Explicit(String),
+    WorkspaceInherited,
+}
+
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -682,6 +688,59 @@ fn has_checker_support(lang: LangId) -> bool {
     )
 }
 
+fn cargo_package_edition(manifest: &Path) -> Option<CargoPackageEdition> {
+    let source = std::fs::read_to_string(manifest).ok()?;
+    let value: toml::Value = toml::from_str(&source).ok()?;
+    let edition = value.get("package")?.get("edition")?;
+
+    if let Some(edition) = edition.as_str() {
+        return Some(CargoPackageEdition::Explicit(edition.to_string()));
+    }
+
+    edition
+        .get("workspace")
+        .and_then(toml::Value::as_bool)
+        .filter(|workspace| *workspace)
+        .map(|_| CargoPackageEdition::WorkspaceInherited)
+}
+
+fn workspace_package_edition(manifest: &Path) -> Option<String> {
+    let mut directory = manifest.parent();
+    while let Some(current) = directory {
+        let workspace_manifest = current.join("Cargo.toml");
+        if let Ok(source) = std::fs::read_to_string(&workspace_manifest) {
+            if let Ok(value) = toml::from_str::<toml::Value>(&source) {
+                if let Some(workspace) = value.get("workspace") {
+                    return workspace
+                        .get("package")
+                        .and_then(|package| package.get("edition"))
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+        }
+        directory = current.parent();
+    }
+    None
+}
+
+/// Build rustfmt arguments from the manifest that enabled the Rust candidate.
+///
+/// Manifests are read for each format request rather than cached: rustfmt's
+/// process startup dominates one or two small local reads, and this makes
+/// Cargo.toml edits take effect immediately.
+fn rustfmt_args(manifest: &Path, file_str: &str) -> Vec<String> {
+    let mut args = match cargo_package_edition(manifest) {
+        Some(CargoPackageEdition::Explicit(edition)) => vec!["--edition".to_string(), edition],
+        Some(CargoPackageEdition::WorkspaceInherited) => workspace_package_edition(manifest)
+            .map(|edition| vec!["--edition".to_string(), edition])
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    args.push(file_str.to_string());
+    args
+}
+
 fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<ToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
@@ -767,10 +826,13 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         }
         LangId::Rust => {
             if has_project_config(project_root, &["Cargo.toml"]) {
+                let manifest = project_root
+                    .expect("Cargo.toml requires a project root")
+                    .join("Cargo.toml");
                 vec![ToolCandidate {
                     tool: "rustfmt".to_string(),
                     source: "Cargo.toml".to_string(),
-                    args: vec![file_str.to_string()],
+                    args: rustfmt_args(&manifest, file_str),
                     required: true,
                 }]
             } else {

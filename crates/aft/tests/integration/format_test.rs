@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde_json::json;
 
@@ -80,6 +81,54 @@ fn prepend_path(existing_path: &std::ffi::OsStr, dir: &std::path::Path) -> std::
     std::env::join_paths(paths).unwrap()
 }
 
+/// Serialize tests that install and invoke the rustfmt wrapper so concurrent
+/// runs do not interfere with their response-timeout windows.
+fn rustfmt_edition_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Install a rustfmt wrapper that rejects a missing or unexpected edition flag.
+fn install_rustfmt_edition_guard(dir: &std::path::Path, expected_edition: Option<&str>) {
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let guard = match expected_edition {
+            Some(edition) => format!(
+                "if [ \"$1\" != \"--edition\" ] || [ \"$2\" != \"{edition}\" ]; then\n  printf '%s\\n' 'rustfmt expected --edition {edition}' >&2\n  exit 1\nfi\n"
+            ),
+            None => "if [ \"$1\" = \"--edition\" ]; then\n  printf '%s\\n' 'rustfmt expected no edition flag' >&2\n  exit 1\nfi\n".to_string(),
+        };
+        let stub = bin_dir.join("rustfmt");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\nfi\n{guard}exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        warm_executable(&stub, &["--version"]);
+    }
+
+    #[cfg(windows)]
+    {
+        let script = match expected_edition {
+            Some(edition) => format!(
+                "@echo off\r\nif \"%~1\"==\"--version\" goto version\r\nif not \"%~1\"==\"--edition\" goto missing\r\nif not \"%~2\"==\"{edition}\" goto missing\r\n\"%AFT_TEST_REAL_RUSTFMT%\" %*\r\nexit /b %errorlevel%\r\n:version\r\n\"%AFT_TEST_REAL_RUSTFMT%\" --version\r\nexit /b %errorlevel%\r\n:missing\r\necho rustfmt expected --edition {edition} 1>&2\r\nexit /b 1\r\n"
+            ),
+            None => "@echo off\r\nif \"%~1\"==\"--version\" goto version\r\nif \"%~1\"==\"--edition\" goto unexpected_edition\r\n\"%AFT_TEST_REAL_RUSTFMT%\" %*\r\nexit /b %errorlevel%\r\n:version\r\n\"%AFT_TEST_REAL_RUSTFMT%\" --version\r\nexit /b %errorlevel%\r\n:unexpected_edition\r\necho rustfmt expected no edition flag 1>&2\r\nexit /b 1\r\n".to_string(),
+        };
+        fs::write(bin_dir.join("rustfmt.cmd"), script).unwrap();
+    }
+}
+
 /// Create a temp directory scoped to format tests.
 /// Create a unique temp directory for each test invocation.
 fn format_test_dir(test_name: &str) -> std::path::PathBuf {
@@ -151,6 +200,149 @@ fn format_integration_applied_rustfmt() {
     );
 
     let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn format_integration_rustfmt_uses_package_edition() {
+    // Each test starts an AFT process and invokes the real rustfmt through its
+    // guard; serializing them avoids starving their response-timeout windows.
+    let _lock = rustfmt_edition_test_lock();
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    };
+
+    let dir = format_test_dir("rustfmt_package_edition");
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    install_rustfmt_edition_guard(&dir, Some("2021"));
+    let target = dir.join("src").join("format_edition.rs");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
+    ]);
+    aft.configure_format_on_edit(&dir);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-rust-edition","command":"write","file":{},"content":"async   fn   format_me( ) {{ }}\n"}}"#,
+        crate::helpers::json_string(&target.display()),
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "edition-aware rustfmt should format async Rust: {resp:?}"
+    );
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("async fn format_me() {}"),
+        "rustfmt should format the async function"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn format_integration_rustfmt_uses_workspace_package_edition() {
+    let _lock = rustfmt_edition_test_lock();
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    };
+
+    let workspace = format_test_dir("rustfmt_workspace_edition");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n\n[workspace.package]\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let member = workspace.join("member");
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+    )
+    .unwrap();
+    install_rustfmt_edition_guard(&member, Some("2021"));
+    let target = member.join("src").join("lib.rs");
+
+    let path = prepend_path(&std::ffi::OsString::new(), &member);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
+    ]);
+    aft.configure_format_on_edit(&member);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
+        crate::helpers::json_string(&target.display()),
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "workspace edition should be passed to rustfmt: {resp:?}"
+    );
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("async fn format_member() {}"),
+        "rustfmt should format the async workspace member"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn format_integration_rustfmt_preserves_bare_2015_invocation() {
+    let _lock = rustfmt_edition_test_lock();
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    };
+
+    let dir = format_test_dir("rustfmt_no_edition");
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    install_rustfmt_edition_guard(&dir, None);
+    let target = dir.join("src").join("format_2015.rs");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
+    ]);
+    aft.configure_format_on_edit(&dir);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-no-edition","command":"write","file":{},"content":"fn  main( ) {{ }}\n"}}"#,
+        crate::helpers::json_string(&target.display()),
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "a manifest without edition must run bare rustfmt: {resp:?}"
+    );
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("fn main() {}"),
+        "rustfmt should format the Rust 2015-compatible function"
+    );
+
     let status = aft.shutdown();
     assert!(status.success());
 }
