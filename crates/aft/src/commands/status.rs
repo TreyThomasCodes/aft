@@ -291,6 +291,8 @@ impl AppContext {
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
+            // Machine field. Human renderers must treat worktree/read_only as a
+            // shared-index borrow, never as a degraded_reasons entry.
             "cache_role": self.cache_role(),
             "artifact_owner": artifact_owner,
             "degraded": degraded,

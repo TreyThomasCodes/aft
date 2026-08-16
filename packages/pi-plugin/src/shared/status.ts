@@ -165,6 +165,17 @@ function formatCount(value: number | null): string {
   return value == null ? "—" : value.toLocaleString("en-US");
 }
 
+/** Neutral label for cache_role. Worktree/read_only borrow the shared repo index; they are not a failure. */
+export function formatCacheRoleLabel(role: string): string {
+  if (role === "worktree") {
+    return "worktree — shared repo index (built by the main checkout)";
+  }
+  if (role === "read_only") {
+    return "read_only — sharing the repo index family (read-only borrow)";
+  }
+  return role;
+}
+
 export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
   if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
     return "Rebuilding (model changed)";
@@ -271,7 +282,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `AFT version: ${status.version}`,
     `Project root: ${status.project_root ?? "(not configured)"}`,
     `Canonical root: ${status.canonical_root ?? "(not configured)"}`,
-    `Cache role: ${status.cache_role}`,
+    `Cache role: ${formatCacheRoleLabel(status.cache_role)}`,
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
@@ -356,7 +367,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Version:** \`${status.version}\``,
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
     `- **Canonical root:** \`${status.canonical_root ?? "(not configured)"}\``,
-    `- **Cache role:** \`${status.cache_role}\``,
+    `- **Cache role:** \`${formatCacheRoleLabel(status.cache_role)}\``,
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,

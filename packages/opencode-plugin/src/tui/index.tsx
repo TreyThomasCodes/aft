@@ -10,6 +10,7 @@ import {
   type AftStatusSnapshot,
   coerceAftStatus,
   formatBytes,
+  formatCacheRoleLabel,
   formatSemanticIndexStatus,
   formatSemanticRefreshing,
 } from "../shared/status";
@@ -218,10 +219,10 @@ const StatusDialog = (props: StatusDialogProps) => {
     }
   });
 
-  // Visual cache-role badge: main is accent, worktree is warning,
-  // not_initialized is muted. Matches the sidebar convention.
+  // Visual cache-role badge: main is accent. Worktree/read_only borrow the
+  // shared repo index — muted, not warning, so it is not read as a failure.
   const cacheRoleTone = (role: string): "accent" | "warn" | "muted" =>
-    role === "main" ? "accent" : role === "worktree" ? "warn" : "muted";
+    role === "main" ? "accent" : "muted";
   // Reuse the sidebar's label/value formatter so the dialog and sidebar
   // render identical text (e.g. "Session" / "-174,489 tokens, 59% reduction").
   // The earlier `formatCompressionDialogRows` returned padded strings that
@@ -286,7 +287,7 @@ const StatusDialog = (props: StatusDialogProps) => {
           <R
             theme={t()}
             label="Cache role"
-            value={status()!.cache_role}
+            value={formatCacheRoleLabel(status()!.cache_role)}
             tone={cacheRoleTone(status()!.cache_role)}
           />
         </box>

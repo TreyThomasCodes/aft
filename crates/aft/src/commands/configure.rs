@@ -5520,7 +5520,7 @@ mod tests {
         assert!(sibling_response.data["artifact_owner"]["note"]
             .as_str()
             .unwrap()
-            .contains("shared artifacts opened read-only"));
+            .contains("sharing the repo index family"));
         assert!(
             sibling_ctx.search_index_rx().read().unwrap().is_some(),
             "read-only sibling search artifact must remain gated until configure maintenance"

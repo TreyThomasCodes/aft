@@ -39,6 +39,7 @@ const {
   scopedSidebarSnapshot,
   shouldSuppressUninitializedDowngrade,
 } = await import("../tui/sidebar.tsx");
+const { worktreeCacheRoleNote } = await import("../shared/status.js");
 
 const compression = (overrides: Partial<StatusCompression> = {}): StatusCompression => ({
   project: {
@@ -108,6 +109,17 @@ describe("sidebar compression rows", () => {
     expect(rows).toHaveLength(3);
     expect(rows[0]).toEqual({ kind: "scope", label: "Project" });
     expect(rows.some((row) => row.kind === "scope" && row.label === "Session")).toBe(false);
+  });
+});
+
+describe("worktreeCacheRoleNote", () => {
+  test("worktree is a muted shared-index note, not a degraded reason", () => {
+    expect(worktreeCacheRoleNote("worktree")).toBe(
+      "shared repo index (built by the main checkout)",
+    );
+    expect(worktreeCacheRoleNote("main")).toBeNull();
+    expect(worktreeCacheRoleNote("read_only")).toBeNull();
+    expect(worktreeCacheRoleNote(undefined)).toBeNull();
   });
 });
 

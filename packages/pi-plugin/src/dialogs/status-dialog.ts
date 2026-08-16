@@ -29,6 +29,7 @@ import {
   type AftStatusSnapshot,
   coerceAftStatus,
   formatBytes,
+  formatCacheRoleLabel,
   formatSemanticIndexStatus,
   formatSemanticRefreshing,
   type StatusCompression,
@@ -190,9 +191,16 @@ function renderInner(
   // padded label so paths visually align across rows.
   lines.push(rowFull("Project root", s.project_root ?? "(not configured)", theme, innerWidth));
   lines.push(rowFull("Canonical root", s.canonical_root ?? "(not configured)", theme, innerWidth));
-  const cacheTone: ToneColor =
-    s.cache_role === "main" ? "accent" : s.cache_role === "worktree" ? "warning" : "muted";
-  lines.push(rowFull("Cache role", theme.fg(cacheTone, s.cache_role), theme, innerWidth));
+  // Worktree/read_only borrow the shared repo index — muted, not warning.
+  const cacheTone: ToneColor = s.cache_role === "main" ? "accent" : "muted";
+  lines.push(
+    rowFull(
+      "Cache role",
+      theme.fg(cacheTone, formatCacheRoleLabel(s.cache_role)),
+      theme,
+      innerWidth,
+    ),
+  );
   lines.push("");
 
   // Two-column body — Pi's TUI is monospace, so padEnd-based columns

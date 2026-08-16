@@ -17,6 +17,7 @@ import {
   formatSemanticRefreshing,
   type StatusBar,
   type StatusCompression,
+  worktreeCacheRoleNote,
 } from "../shared/status";
 import { resolveCortexKitStorageRoot } from "../shared/storage-paths";
 import { badgeTextColor } from "./badge-contrast";
@@ -561,6 +562,10 @@ const SidebarContent = (props: {
     return reasons.map(degradedReasonLabel).join("; ");
   };
 
+  // Worktree borrow is a shared-index arrangement, not a degraded_reasons
+  // entry. Keep this muted and separate from the DEGRADED badge above.
+  const worktreeNote = () => worktreeCacheRoleNote(s()?.cache_role);
+
   return (
     <box
       width="100%"
@@ -624,6 +629,12 @@ const SidebarContent = (props: {
       {s()?.degraded && degradedSummary() && (
         <box marginTop={1} width="100%">
           <text fg={props.theme.warning}>⚠ {degradedSummary()}</text>
+        </box>
+      )}
+
+      {!notInitialized() && worktreeNote() && (
+        <box marginTop={1} width="100%">
+          <text fg={props.theme.textMuted}>{worktreeNote()}</text>
         </box>
       )}
 

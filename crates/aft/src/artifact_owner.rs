@@ -125,10 +125,7 @@ pub fn claim_or_open_read_only(
                 }
 
                 if manifest_owner_alive(&existing) {
-                    let note = format!(
-                        "shared artifacts opened read-only: cache key {project_key} is owned by checkout {} (scope {}, pid {})",
-                        existing.checkout_path, existing.project_scope_key, existing.pid
-                    );
+                    let note = read_only_borrow_note(&existing.checkout_path);
                     return Ok(ArtifactOwnerClaim {
                         status: ArtifactOwnerStatus {
                             mode: ArtifactOwnerMode::ReadOnly,
@@ -180,31 +177,26 @@ pub fn open_read_only_borrow(
 
     let (owner_project_scope_key, owner_checkout_path, note) = match read_manifest(&path) {
         Ok(existing) => {
-            let note = format!(
-                "shared artifacts opened read-only: cache key {project_key} is owned by checkout {} (scope {}, pid {})",
-                existing.checkout_path, existing.project_scope_key, existing.pid
-            );
+            let note = read_only_borrow_note(&existing.checkout_path);
             (existing.project_scope_key, existing.checkout_path, note)
         }
         Err(ReadManifestError::NotFound) => (
             project_scope_key.to_string(),
             fallback_checkout.clone(),
-            format!(
-                "shared artifacts opened read-only: linked worktree will not claim cache key {project_key}; waiting for the main checkout to publish shared artifacts"
-            ),
+            "sharing the repo index family; waiting for the main checkout to publish shared artifacts"
+                .to_string(),
         ),
         Err(ReadManifestError::Malformed) => (
             project_scope_key.to_string(),
             fallback_checkout.clone(),
-            format!(
-                "shared artifacts opened read-only: owner manifest for cache key {project_key} is malformed; not repairing it from a linked worktree"
-            ),
+            "sharing the repo index family; owner manifest is malformed; not repairing it from a linked worktree"
+                .to_string(),
         ),
         Err(ReadManifestError::Io(error)) => (
             project_scope_key.to_string(),
             fallback_checkout.clone(),
             format!(
-                "shared artifacts opened read-only: failed to inspect owner manifest for cache key {project_key}: {error}"
+                "sharing the repo index family; failed to inspect owner manifest: {error}"
             ),
         ),
     };
@@ -395,6 +387,12 @@ impl ArtifactOwnerLease {
         self.last_heartbeat_ms = now;
         Ok(true)
     }
+}
+
+/// Human-facing note for a read-only borrow of another checkout's index family.
+/// This is a shared-index arrangement, not a degraded mode.
+fn read_only_borrow_note(owner_checkout: &str) -> String {
+    format!("sharing the repo index family owned by {owner_checkout} (read-only borrow)")
 }
 
 fn create_owner_manifest(
@@ -844,7 +842,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second.status.mode, ArtifactOwnerMode::ReadOnly);
-        assert!(second.status.note.unwrap().contains("read-only"));
+        let note = second.status.note.unwrap();
+        assert!(
+            note.contains("sharing the repo index family owned by"),
+            "{note}"
+        );
+        assert!(note.contains("read-only borrow"), "{note}");
         assert!(second.lease.is_none());
     }
 

@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import {
   coerceAftStatus,
   formatBytes,
+  formatCacheRoleLabel,
   formatStatusDialogMessage,
   formatStatusMarkdown,
 } from "../shared/status.js";
@@ -110,5 +111,25 @@ describe("shared status helpers", () => {
     expect(dialog).toContain("Semantic error\nrate limited");
     expect(markdown).toContain("**Progress:** 10 / 50");
     expect(markdown).toContain("**Storage dir:** `/tmp/aft`");
+  });
+
+  test("worktree cache role uses shared-index phrasing, not degraded", () => {
+    expect(formatCacheRoleLabel("worktree")).toBe(
+      "worktree — shared repo index (built by the main checkout)",
+    );
+    expect(formatCacheRoleLabel("read_only")).toBe(
+      "read_only — sharing the repo index family (read-only borrow)",
+    );
+    expect(formatCacheRoleLabel("main")).toBe("main");
+
+    const status = coerceAftStatus({ cache_role: "worktree" });
+    const dialog = formatStatusDialogMessage(status);
+    const markdown = formatStatusMarkdown(status);
+    expect(dialog).toContain(
+      "Cache role: worktree — shared repo index (built by the main checkout)",
+    );
+    expect(markdown).toContain("shared repo index (built by the main checkout)");
+    expect(dialog.toLowerCase()).not.toContain("degraded");
+    expect(markdown.toLowerCase()).not.toContain("degraded");
   });
 });

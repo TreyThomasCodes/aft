@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   coerceAftStatus,
+  formatCacheRoleLabel,
   formatStatusDialogMessage,
   formatStatusMarkdown,
+  worktreeCacheRoleNote,
 } from "../shared/status.js";
 
 const baseResponse = Object.freeze({
@@ -99,5 +101,33 @@ describe("formatStatus* output", () => {
     expect(markdown).toContain("**Model:** text-embedding-3-small");
     expect(dialog).not.toContain("AFT_SEMANTIC_KEY");
     expect(markdown).not.toContain("AFT_SEMANTIC_KEY");
+  });
+
+  test("worktree cache role uses shared-index phrasing, not degraded", () => {
+    expect(formatCacheRoleLabel("worktree")).toBe(
+      "worktree — shared repo index (built by the main checkout)",
+    );
+    expect(formatCacheRoleLabel("read_only")).toBe(
+      "read_only — sharing the repo index family (read-only borrow)",
+    );
+    expect(formatCacheRoleLabel("main")).toBe("main");
+    expect(worktreeCacheRoleNote("worktree")).toBe(
+      "shared repo index (built by the main checkout)",
+    );
+    expect(worktreeCacheRoleNote("main")).toBeNull();
+    expect(worktreeCacheRoleNote("read_only")).toBeNull();
+
+    const status = coerceAftStatus({
+      ...baseResponse,
+      cache_role: "worktree",
+    } as unknown as Record<string, unknown>);
+    const dialog = formatStatusDialogMessage(status);
+    const markdown = formatStatusMarkdown(status);
+    expect(dialog).toContain(
+      "Cache role: worktree — shared repo index (built by the main checkout)",
+    );
+    expect(markdown).toContain("shared repo index (built by the main checkout)");
+    expect(dialog.toLowerCase()).not.toContain("degraded");
+    expect(markdown.toLowerCase()).not.toContain("degraded");
   });
 });

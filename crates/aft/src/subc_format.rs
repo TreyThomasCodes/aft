@@ -2773,6 +2773,15 @@ fn format_status(data: &Value) -> String {
         .unwrap_or("?");
     lines.push(format!("AFT {version} — {root}"));
 
+    // Worktree / read-only borrow is a shared-index arrangement, not a
+    // degraded mode. Render it with the same vocabulary the TUI uses so
+    // agents do not read cache_role=worktree as "AFT is broken here".
+    if let Some(role) = data.get("cache_role").and_then(Value::as_str) {
+        if let Some(line) = format_cache_role_line(role) {
+            lines.push(line);
+        }
+    }
+
     if data.get("degraded").and_then(Value::as_bool) == Some(true) {
         let reasons = data
             .get("degraded_reasons")
@@ -2860,6 +2869,14 @@ fn format_status(data: &Value) -> String {
     }
 
     lines.join("\n")
+}
+
+fn format_cache_role_line(role: &str) -> Option<String> {
+    match role {
+        "worktree" => Some("cache: shared repo index (built by the main checkout)".to_string()),
+        "read_only" => Some("cache: sharing the repo index family (read-only borrow)".to_string()),
+        _ => None,
+    }
 }
 
 fn status_field(data: &Value, section: &str, key: &str) -> String {
@@ -3037,6 +3054,50 @@ mod status_memory_tests {
         );
         assert!(rendered.contains("/repo: 3.0 MiB (semantic 2.0 MiB, trigram 1.0 MiB"));
         assert!(!rendered.contains("\"memory\""));
+    }
+
+    #[test]
+    fn status_text_renders_worktree_as_shared_index_not_degraded() {
+        let data = json!({
+            "version": "test",
+            "project_root": "/repo",
+            "cache_role": "worktree",
+            "degraded": false,
+            "degraded_reasons": []
+        });
+        let rendered = format_status(&data);
+        assert!(rendered.contains("cache: shared repo index (built by the main checkout)"));
+        assert!(
+            !rendered.to_lowercase().contains("degraded"),
+            "worktree borrow must not be labeled degraded: {rendered}"
+        );
+    }
+
+    #[test]
+    fn status_text_renders_read_only_as_shared_index_borrow() {
+        let data = json!({
+            "version": "test",
+            "project_root": "/repo",
+            "cache_role": "read_only",
+            "degraded": false
+        });
+        let rendered = format_status(&data);
+        assert!(rendered.contains("cache: sharing the repo index family (read-only borrow)"));
+        assert!(!rendered.to_lowercase().contains("degraded"));
+    }
+
+    #[test]
+    fn status_text_keeps_real_degraded_reasons_alongside_worktree_borrow() {
+        let data = json!({
+            "version": "test",
+            "project_root": "/repo",
+            "cache_role": "worktree",
+            "degraded": true,
+            "degraded_reasons": ["home_root"]
+        });
+        let rendered = format_status(&data);
+        assert!(rendered.contains("cache: shared repo index (built by the main checkout)"));
+        assert!(rendered.contains("DEGRADED: home_root"));
     }
 }
 
