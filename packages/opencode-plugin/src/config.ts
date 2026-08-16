@@ -1317,9 +1317,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "semantic_search",
   "callgraph_store",
   "callgraph_chunk_size",
-        "inspect",
-        "worktree",
-        "experimental",
+  "inspect",
+  "worktree",
+  "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in
   // a repo with weird shell needs) or opt in. NOT a security boundary —
@@ -1328,8 +1328,8 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "bash",
   // "disabled_tools" handled separately — unioned via array merge.
   // "formatter"/"checker" handled separately — deep-merged.
-        // "semantic"/"lsp" handled separately — strict field-level merge.
-        // "inspect"/"worktree" handled separately — deep-merged.
+  // "semantic"/"lsp" handled separately — strict field-level merge.
+  // "inspect"/"worktree" handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
