@@ -55,12 +55,13 @@ fn cycle_details(response: &Value) -> &[Value] {
 }
 
 fn assert_cycle_scan_complete(response: &Value) {
-    let incomplete = response["scanner_state"]["incomplete_categories"]
-        .as_array()
-        .unwrap_or_else(|| panic!("missing scanner state: {response:#}"));
-    assert!(
-        !incomplete.iter().any(|category| category == "cycles"),
-        "cycle scan was incomplete: {response:#}"
+    assert_eq!(
+        response["success"], true,
+        "a successful inspect response must be complete: {response:#}"
+    );
+    assert_eq!(
+        response["inspect_terminal"], "fresh",
+        "successful cycle inspection must reach the fresh terminal: {response:#}"
     );
 }
 

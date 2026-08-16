@@ -978,6 +978,7 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
     let project = setup_project(&[
         ("fake.toml", "[project]\n"),
         ("src/main.fake", "hello\n"),
+        ("src/support.ts", "export const support = 1;\n"),
         ("ignored/skip.fake", "hello\n"),
         (".aftignore", "ignored/\n"),
     ]);
@@ -1004,6 +1005,7 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
             "lsp_paths_extra": [fake_bin_dir],
             "config": user_config(serde_json::json!({
                 "lsp": {
+                    "disabled": ["typescript", "oxlint", "biome"],
                     "servers": {
                         "fake": {
                             "extensions": ["fake"],
@@ -1021,20 +1023,72 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
         "configure should succeed: {configure:?}"
     );
 
-    let response = send(
+    let diagnostics = send(
         &mut aft,
         json!({
-            "id": "inspect-diagnostics-aftignore",
-            "command": "inspect",
-            "sections": ["diagnostics"],
-            "scope": ".",
-            "topK": 10,
+            "id": "warm-inspect-aftignore-diagnostics",
+            "command": "lsp_diagnostics",
+            "file": project.path().join("src/main.fake"),
+            "wait_ms": 2_000,
         }),
     );
+    assert_eq!(
+        diagnostics["success"], true,
+        "fake LSP diagnostics warm-up should succeed: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics["complete"], true,
+        "fake LSP diagnostics warm-up should complete: {diagnostics:?}"
+    );
+    assert_eq!(
+        diagnostics["total"], 1,
+        "fake LSP diagnostics warm-up should report the main fixture: {diagnostics:?}"
+    );
+    let support_lsp = send(
+        &mut aft,
+        json!({
+            "id": "inspect-support-lsp",
+            "command": "lsp_inspect",
+            "file": project.path().join("src/support.ts"),
+        }),
+    );
+    assert_eq!(
+        support_lsp["matching_servers"],
+        json!([]),
+        "the Tier-2 support file must not add an unchecked diagnostics producer: {support_lsp:?}"
+    );
+
+    let request = json!({
+        "id": "inspect-diagnostics-aftignore",
+        "command": "inspect",
+        "sections": ["diagnostics"],
+        "scope": ".",
+        "topK": 10,
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let response = loop {
+        let response = send(&mut aft, request.clone());
+        if response["success"] == true {
+            break response;
+        }
+        assert_eq!(
+            response["failure_reason"], "inspect_not_fresh",
+            "inspect failed for an unexpected reason: {response:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "inspect should become fresh after fake LSP collection: {response:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
 
     assert_eq!(
         response["success"], true,
         "inspect should succeed: {response:?}"
+    );
+    assert_eq!(
+        response["inspect_terminal"], "fresh",
+        "successful scoped diagnostics inspect must be fresh: {response:?}"
     );
     assert_eq!(response["summary"]["diagnostics"]["errors"], 1);
     let details = response["details"]["diagnostics"]

@@ -50,6 +50,8 @@ fn request(payload: Value) -> RawRequest {
 
 fn configured_context(root: &Path) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
+    fs::write(root.join(".aftignore"), "**/tsconfig*.json\npackage.json\n")
+        .expect("ignore config-only diagnostics files");
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -93,6 +95,15 @@ fn diagnostics_details(response: &Value) -> &[Value] {
 }
 
 fn inspect_diagnostics_scope(ctx: &AppContext, scope: &str) -> Value {
+    let root = ctx
+        .config()
+        .project_root
+        .clone()
+        .expect("configured project root");
+    let file = root.join(scope);
+    let content = fs::read_to_string(&file).expect("read scoped diagnostic fixture");
+    warm_scope_lsp(ctx, &file, &content);
+
     inspect(
         ctx,
         json!({
@@ -103,6 +114,22 @@ fn inspect_diagnostics_scope(ctx: &AppContext, scope: &str) -> Value {
             "topK": 20,
         }),
     )
+}
+
+fn warm_scope_lsp(ctx: &AppContext, file: &Path, content: &str) {
+    open_with_lsp(ctx, file, content);
+    let config = ctx.config().clone();
+    let results = ctx
+        .lsp()
+        .pull_file_diagnostics(file, &config)
+        .expect("pull scoped diagnostics");
+    assert!(
+        results.iter().any(|result| matches!(
+            &result.outcome,
+            aft::lsp::manager::PullFileOutcome::Full { .. }
+        )),
+        "fake LSP should complete a pull for {file:?}: {results:?}"
+    );
 }
 
 fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
@@ -149,10 +176,6 @@ fn inspect_diagnostics_scoped_skips_tsconfig_excluded_test_file() {
     assert!(
         diagnostics_details(&response).is_empty(),
         "excluded test diagnostics must not surface: {response:#}"
-    );
-    assert_eq!(
-        response["summary"]["diagnostics"]["files_without_server"], 0,
-        "tsconfig-filtered files are skipped, not counted as no-server: {response:#}"
     );
 }
 
@@ -206,6 +229,8 @@ fn inspect_diagnostics_detail_surfaces_without_sections_param() {
 
     // Scope provided, but NO `sections` — the exact call shape that previously
     // returned a count with no message.
+    let file = root.join("packages/pkg/src/foo.ts");
+    warm_scope_lsp(&ctx, &file, "export const foo = 1;\n");
     let response = inspect(
         &ctx,
         json!({
@@ -254,6 +279,12 @@ fn inspect_diagnostics_zero_items_has_no_details_without_sections() {
 
     // Excluded file, NO `sections` — zero diagnostics, so the always-on path
     // must not inject an empty diagnostics detail array.
+    let file = root.join("packages/pkg/src/foo.test.ts");
+    warm_scope_lsp(
+        &ctx,
+        &file,
+        "import { test } from 'bun:test';\ntest('works', () => import.meta.dir);\n",
+    );
     let response = inspect(
         &ctx,
         json!({

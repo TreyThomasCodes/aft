@@ -12,6 +12,7 @@ use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
 use aft::inspect::{InspectCache, InspectCategory, InspectSnapshot, Tier2TriggerReason};
+use aft::lsp::registry::ServerKind;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
 use serde_json::{json, Value};
@@ -68,6 +69,16 @@ fn configured_context_with_storage(
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    // These fixtures exercise scheduler behavior rather than LSP startup. Seed a
+    // checked-clean report so blocking inspect can require a complete diagnostics
+    // prerequisite without changing the scheduler subject under test.
+    ctx.lsp()
+        .diagnostics_store_mut_for_test()
+        .publish_with_kind(
+            ServerKind::Rust,
+            root.join(".aft-test-authoritative-diagnostics"),
+            Vec::new(),
+        );
     if callgraph_store {
         ensure_callgraph_store_ready(&ctx);
     }
@@ -239,61 +250,13 @@ fn automatic_tier2_category_names(ctx: &AppContext) -> Vec<&'static str> {
         .collect()
 }
 
-fn scanner_state_categories(response: &Value, key: &str) -> Vec<String> {
-    response["scanner_state"][key]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    item.as_str().map(str::to_string).or_else(|| {
-                        item.get("category")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn scanner_state_contains(response: &Value, key: &str, category: &str) -> bool {
-    scanner_state_categories(response, key)
-        .iter()
-        .any(|value| value == category)
-}
-
 fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let response = inspect(ctx);
-        assert_eq!(
-            response["success"], true,
-            "inspect failed while waiting: {response:#}"
-        );
-
-        let failed = scanner_state_categories(&response, "failed_categories");
-        assert!(
-            failed.is_empty(),
-            "tier2 failed while waiting: {response:#}"
-        );
-
-        let pending = scanner_state_categories(&response, "pending_categories");
-        let stale = scanner_state_categories(&response, "stale_categories");
-        let still_warming = categories.iter().any(|category| {
-            pending.iter().any(|pending| pending == category)
-                || stale.iter().any(|stale| stale == category)
-        });
-        if !still_warming {
-            return response;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for tier2 categories {categories:?}: {response:#}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
+    let response = inspect(ctx);
+    assert_eq!(
+        response["success"], true,
+        "inspect should wait for fresh Tier-2 categories {categories:?}: {response:#}"
+    );
+    response
 }
 
 #[test]
@@ -377,9 +340,19 @@ fn manual_dead_code_query_without_callgraph_store_reports_unavailable() {
     assert_eq!(queued["queued_categories"], json!(["dead_code"]));
 
     let response = wait_for_tier2(&ctx, &["dead_code"]);
+    let dead_code = response["summary"]["dead_code"]
+        .as_object()
+        .expect("dead_code summary");
     assert_eq!(
-        response["summary"]["dead_code"]["callgraph_available"], false,
-        "manual dead_code must report the unavailable callgraph honestly: {response:#}"
+        dead_code
+            .get("callgraph_available")
+            .and_then(Value::as_bool),
+        Some(false),
+        "manual dead_code must disclose the unavailable callgraph: {response:#}"
+    );
+    assert!(
+        !dead_code.contains_key("count"),
+        "unavailable dead_code must not be represented as zero: {response:#}"
     );
 }
 
@@ -453,9 +426,9 @@ fn direct_inspect_mid_watcher_quiet_window_computes_immediately() {
 
     let response = inspect(&ctx);
 
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "dead_code"),
-        "direct inspect should compute Tier-2 during the watcher quiet window: {response:#}"
+    assert_eq!(
+        response["success"], true,
+        "direct inspect should compute fresh Tier-2 data during the watcher quiet window: {response:#}"
     );
     assert_eq!(
         ctx.inspect_manager()
@@ -479,9 +452,9 @@ fn direct_inspect_cold_tier2_computes_without_scheduler_pull() {
 
     let response = inspect(&ctx);
 
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "dead_code"),
-        "direct inspect should wait for the cold Tier-2 result when it finishes before the deadline: {response:#}"
+    assert_eq!(
+        response["success"], true,
+        "direct inspect should return fresh Tier-2 data without a scheduler pull: {response:#}"
     );
     assert!(
         !ctx.tier2_pull_demand_pending(),
@@ -578,13 +551,6 @@ fn linked_worktree_explicit_inspect_keeps_parent_aggregates_byte_identical() {
     assert_eq!(
         worktree_response["success"], true,
         "worktree inspect failed: {worktree_response:#}"
-    );
-    let pending = scanner_state_categories(&worktree_response, "pending_categories");
-    assert!(
-        ["dead_code", "unused_exports", "duplicates", "cycles"]
-            .iter()
-            .all(|category| !pending.iter().any(|pending| pending == category)),
-        "explicit worktree inspect should complete its Tier-2 demand scan: {worktree_response:#}"
     );
     assert!(
         worktree_response["summary"]["unused_exports"]["count"].is_number(),

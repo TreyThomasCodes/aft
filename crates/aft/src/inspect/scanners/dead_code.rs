@@ -539,7 +539,6 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
     json!({
-        "count": 0,
         "items": [],
         "by_language": {},
         "languages_skipped": [],

@@ -294,72 +294,18 @@ fn tier2_run(ctx: &AppContext, categories: &[&str]) {
 }
 
 fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
-    // Hang-catch deadline only (real assertions are the response checks below);
-    // 10s flaked on loaded Windows CI release runners where the Tier-2 scan
-    // sits behind the callgraph cold build. 90s matches the cold-build guard.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        ctx.inspect_manager().drain_completions();
-        let response = inspect(
-            ctx,
-            json!({
-                "id": "inspect-tier2-wait",
-                "command": "inspect",
-            }),
-        );
-        assert_eq!(
-            response["success"], true,
-            "inspect failed while waiting: {response:#}"
-        );
-
-        let failed = scanner_state_categories(&response, "failed_categories");
-        assert!(
-            failed.is_empty(),
-            "tier2 failed while waiting: {response:#}"
-        );
-
-        let pending = scanner_state_categories(&response, "pending_categories");
-        let stale = scanner_state_categories(&response, "stale_categories");
-        let still_warming = categories.iter().any(|category| {
-            pending.iter().any(|pending| pending == category)
-                || stale.iter().any(|stale| stale == category)
-        });
-        if !still_warming {
-            return;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for tier2 categories {categories:?}: {response:#}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn scanner_state_categories(response: &Value, key: &str) -> Vec<String> {
-    response["scanner_state"][key]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    if let Some(category) = item.as_str() {
-                        Some(category.to_string())
-                    } else {
-                        item.get("category")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn scanner_state_contains(response: &Value, key: &str, category: &str) -> bool {
-    scanner_state_categories(response, key)
-        .iter()
-        .any(|value| value == category)
+    ctx.inspect_manager().drain_completions();
+    let response = inspect(
+        ctx,
+        json!({
+            "id": "inspect-tier2-wait",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(
+        response["success"], true,
+        "inspect should wait for fresh Tier-2 categories {categories:?}: {response:#}"
+    );
 }
 
 fn assert_summary_count(response: &Value, category: &str, count: u64) {
@@ -616,16 +562,6 @@ fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    for category in ["dead_code", "unused_exports", "duplicates", "cycles"] {
-        assert!(
-            !scanner_state_contains(&response, "pending_categories", category),
-            "{category} should finish during direct inspect: {response:#}"
-        );
-        assert!(
-            !scanner_state_contains(&response, "stale_categories", category),
-            "{category} should not be served from a stale aggregate: {response:#}"
-        );
-    }
     assert_summary_count(&response, "unused_exports", 2);
     assert_summary_count(&response, "duplicates", 0);
     assert_summary_count(&response, "cycles", 0);
@@ -754,7 +690,10 @@ fn inspect_dead_code_reuse_reports_unavailable_when_store_not_ready() {
     );
     assert_eq!(success.aggregate["callgraph_available"], false);
     assert_eq!(success.aggregate["notes"], json!(["callgraph_unavailable"]));
-    assert_eq!(success.aggregate["count"], 0);
+    assert!(
+        success.aggregate.get("count").is_none(),
+        "unavailable callgraph must not be represented as zero dead code"
+    );
 }
 
 #[test]
@@ -909,14 +848,6 @@ fn inspect_command_computed_tier2_zero_count_stays_count_zero() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "duplicates"),
-        "computed duplicate cache hit must not be pending: {response:#}"
-    );
-    assert!(
-        !scanner_state_contains(&response, "stale_categories", "duplicates"),
-        "computed duplicate cache hit must not be stale: {response:#}"
-    );
     assert_summary_count(&response, "duplicates", 0);
     assert_eq!(
         response["summary"]["duplicates"]["total_groups"].as_u64(),
@@ -942,14 +873,6 @@ fn inspect_command_tier2_warm_cache_hit_is_not_stale() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert!(
-        !scanner_state_contains(&response, "stale_categories", "duplicates"),
-        "warm duplicate cache hit must not be marked stale: {response:#}"
-    );
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "duplicates"),
-        "warm duplicate cache hit must not be marked pending: {response:#}"
-    );
     assert!(
         response["summary"]["duplicates"]["total_groups"]
             .as_u64()
@@ -997,14 +920,6 @@ fn inspect_command_tier2_changed_file_returns_fresh_without_scheduler_wait() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert!(
-        !scanner_state_contains(&response, "stale_categories", "duplicates"),
-        "direct inspect should not serve the pre-edit aggregate as stale: {response:#}"
-    );
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "duplicates"),
-        "warm one-file edit should finish before the direct inspect deadline: {response:#}"
-    );
     assert_summary_count(&response, "duplicates", 0);
     let top = response["summary"]["unused_exports"]["top"]
         .as_array()
@@ -1195,10 +1110,6 @@ fn inspect_command_direct_forced_path_catches_mtime_preserved_same_size_edit() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert!(
-        !scanner_state_contains(&response, "pending_categories", "unused_exports"),
-        "forced direct inspect should complete the invalidated file: {response:#}"
-    );
     let top = response["summary"]["unused_exports"]["top"]
         .as_array()
         .expect("unused exports top");
@@ -1238,14 +1149,6 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
         }),
     );
     assert_eq!(before["success"], true, "inspect failed: {before:#}");
-    assert!(
-        !scanner_state_contains(&before, "stale_categories", "dead_code"),
-        "freshly computed dead_code aggregate should not be stale: {before:#}"
-    );
-    assert!(
-        !scanner_state_contains(&before, "pending_categories", "dead_code"),
-        "freshly computed dead_code aggregate should not be pending: {before:#}"
-    );
     let before_count = before["summary"]["dead_code"]["count"]
         .as_u64()
         .expect("dead_code count");
@@ -1298,14 +1201,6 @@ fn inspect_command_tier2_hash_miss_after_restart_serves_stale_dead_code_results(
     );
 
     assert_eq!(after["success"], true, "inspect failed: {after:#}");
-    assert!(
-        !scanner_state_contains(&after, "stale_categories", "dead_code"),
-        "direct inspect should refresh a hash-miss aggregate instead of serving stale data: {after:#}"
-    );
-    assert!(
-        !scanner_state_contains(&after, "pending_categories", "dead_code"),
-        "direct hash-miss refresh should complete before the deadline for this fixture: {after:#}"
-    );
     assert_summary_count(&after, "dead_code", before_count);
     assert!(
         dead_code_items(&after).contains(&("src/lib.ts".to_string(), "unused".to_string())),
