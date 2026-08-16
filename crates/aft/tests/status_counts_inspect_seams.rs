@@ -69,8 +69,22 @@ fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
 
     assert!(inspect.contains("refresh_status_bar_counts(ctx, &outcomes);"));
     assert!(inspect.contains("ctx.update_status_bar_tier2("));
-    assert!(!inspect.contains("fresh_payloads"));
-    assert!(!inspect.contains("inspect_not_fresh"));
+    // The counts refresh must run on the OUTCOMES side of the freshness gate:
+    // truthful fleet values update from whatever the collection proved even when
+    // `fresh_payloads` refuses the payload. (During parallel campaign assembly
+    // this test asserted the freshness machinery was absent entirely; the two
+    // campaigns now share this module, so the seam contract is ordering, not
+    // absence.)
+    let refresh_at = inspect
+        .find("refresh_status_bar_counts(ctx, &outcomes);")
+        .expect("counts refresh call site");
+    let gate_at = inspect
+        .find("let payloads = match fresh_payloads(&outcomes)")
+        .expect("freshness gate call site");
+    assert!(
+        refresh_at < gate_at,
+        "counts must refresh before the freshness gate can refuse the payload"
+    );
     assert!(
         response_finalize.contains("let local_counts = ctx.status_bar_counts();")
             && response_finalize.contains(".map(aft_status_segment)"),
