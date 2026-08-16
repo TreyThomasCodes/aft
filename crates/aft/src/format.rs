@@ -688,6 +688,22 @@ fn has_checker_support(lang: LangId) -> bool {
     )
 }
 
+fn nearest_package_manifest(file: &Path) -> Option<PathBuf> {
+    let mut directory = file.parent();
+    while let Some(current) = directory {
+        let manifest = current.join("Cargo.toml");
+        if let Ok(source) = std::fs::read_to_string(&manifest) {
+            if let Ok(value) = toml::from_str::<toml::Value>(&source) {
+                if value.get("package").is_some() {
+                    return Some(manifest);
+                }
+            }
+        }
+        directory = current.parent();
+    }
+    None
+}
+
 fn cargo_package_edition(manifest: &Path) -> Option<CargoPackageEdition> {
     let source = std::fs::read_to_string(manifest).ok()?;
     let value: toml::Value = toml::from_str(&source).ok()?;
@@ -724,27 +740,31 @@ fn workspace_package_edition(manifest: &Path) -> Option<String> {
     None
 }
 
-/// Build rustfmt arguments from the manifest that enabled the Rust candidate.
+/// Build rustfmt arguments from the nearest package manifest for the file.
 ///
 /// Manifests are read for each format request rather than cached: rustfmt's
 /// process startup dominates one or two small local reads, and this makes
 /// Cargo.toml edits take effect immediately.
-fn rustfmt_args(manifest: &Path, file_str: &str) -> Vec<String> {
-    let mut args = match cargo_package_edition(manifest) {
+fn rustfmt_args(file: &Path) -> Vec<String> {
+    let manifest = nearest_package_manifest(file);
+    let mut args = match manifest.as_deref().and_then(cargo_package_edition) {
         Some(CargoPackageEdition::Explicit(edition)) => vec!["--edition".to_string(), edition],
-        Some(CargoPackageEdition::WorkspaceInherited) => workspace_package_edition(manifest)
+        Some(CargoPackageEdition::WorkspaceInherited) => manifest
+            .as_deref()
+            .and_then(workspace_package_edition)
             .map(|edition| vec!["--edition".to_string(), edition])
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    args.push(file_str.to_string());
+    args.push(file.to_string_lossy().into_owned());
     args
 }
 
-fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<ToolCandidate> {
+fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolCandidate> {
     let project_root = config.project_root.as_deref();
+    let file_str = path.to_string_lossy();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
-        return explicit_formatter_candidate(preferred, file_str);
+        return explicit_formatter_candidate(preferred, &file_str);
     }
 
     match lang {
@@ -826,13 +846,10 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         }
         LangId::Rust => {
             if has_project_config(project_root, &["Cargo.toml"]) {
-                let manifest = project_root
-                    .expect("Cargo.toml requires a project root")
-                    .join("Cargo.toml");
                 vec![ToolCandidate {
                     tool: "rustfmt".to_string(),
                     source: "Cargo.toml".to_string(),
-                    args: rustfmt_args(&manifest, file_str),
+                    args: rustfmt_args(path),
                     required: true,
                 }]
             } else {
@@ -1165,9 +1182,8 @@ fn checker_args(candidate: &ToolCandidate) -> Vec<String> {
 }
 
 fn detect_formatter_for_path(path: &Path, lang: LangId, config: &Config) -> ToolDetection {
-    let file_str = path.to_string_lossy().to_string();
     resolve_tool_candidates(
-        formatter_candidates(lang, config, &file_str),
+        formatter_candidates(lang, config, path),
         config.project_root.as_deref(),
     )
 }
@@ -1335,8 +1351,7 @@ pub fn detect_missing_tools(project_root: &Path, config: &Config) -> Vec<Missing
         let language = lang_key(lang);
         let placeholder = placeholder_file_for_language(project_root, lang);
         let file_str = placeholder.to_string_lossy().to_string();
-
-        for candidate in formatter_candidates(lang, config, &file_str) {
+        for candidate in formatter_candidates(lang, config, &placeholder) {
             if let Some(warning) = missing_tool_warning(
                 "formatter_not_installed",
                 language,

@@ -303,6 +303,102 @@ fn format_integration_rustfmt_uses_workspace_package_edition() {
 }
 
 #[test]
+fn format_integration_rustfmt_uses_member_edition_from_virtual_workspace() {
+    let _lock = rustfmt_edition_test_lock();
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    };
+
+    let workspace = format_test_dir("rustfmt_virtual_workspace_edition");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    )
+    .unwrap();
+    let member = workspace.join("member");
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    install_rustfmt_edition_guard(&workspace, Some("2021"));
+    let target = member.join("src").join("lib.rs");
+
+    let path = prepend_path(&std::ffi::OsString::new(), &workspace);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
+    ]);
+    aft.configure_format_on_edit(&workspace);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-virtual-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
+        crate::helpers::json_string(&target.display()),
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "member edition should be passed through a virtual workspace: {resp:?}"
+    );
+    assert!(
+        fs::read_to_string(&target)
+            .unwrap()
+            .contains("async fn format_member() {}"),
+        "rustfmt should format the async virtual-workspace member"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn format_integration_rustfmt_prefers_member_edition_over_workspace_default() {
+    let _lock = rustfmt_edition_test_lock();
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
+        eprintln!("SKIP: rustfmt not on PATH");
+        return;
+    };
+
+    let workspace = format_test_dir("rustfmt_member_edition_precedence");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n\n[workspace.package]\nedition = \"2018\"\n",
+    )
+    .unwrap();
+    let member = workspace.join("member");
+    fs::create_dir_all(member.join("src")).unwrap();
+    fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    install_rustfmt_edition_guard(&workspace, Some("2021"));
+    let target = member.join("src").join("lib.rs");
+
+    let path = prepend_path(&std::ffi::OsString::new(), &workspace);
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
+    ]);
+    aft.configure_format_on_edit(&workspace);
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-member-edition-precedence","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
+        crate::helpers::json_string(&target.display()),
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
+    assert_eq!(
+        resp["formatted"], true,
+        "member edition should override workspace.package.edition: {resp:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn format_integration_rustfmt_preserves_bare_2015_invocation() {
     let _lock = rustfmt_edition_test_lock();
     let Some(real_rustfmt) = which::which("rustfmt").ok() else {
