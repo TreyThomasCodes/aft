@@ -49,16 +49,47 @@ run_phase() {
 # `cargo test --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
 # `cargo test --workspace --doc` until doctests actually exist.
-# The platform-verifier TLS test spawns a subprocess whose keychain trust
-# evaluation is unbounded on Macs with third-party root CAs (NordVPN: ~10s
-# quiet, minutes under full-suite load — blew a 600s budget twice on
-# 2026-08-09). Isolation is the fix, not a bigger budget: run it alone
-# first (seconds when serial), then exclude it from the parallel phase.
-run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-  cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+#
+# CI can split the independent execution phases after one job creates a nextest
+# archive. The default remains `all`, preserving the single-machine gate used
+# locally and by workflows that do not opt into Windows sharding.
+requested_phases="${AFT_GATE_PHASES:-all}"
+if [[ "$requested_phases" == "all" ]]; then
+  phase_enabled() { return 0; }
+else
+  IFS=',' read -r -a selected_phases <<< "$requested_phases"
+  for selected_phase in "${selected_phases[@]}"; do
+    case "$selected_phase" in
+      lib|nextest|watcher|storm) ;;
+      *)
+        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, nextest, watcher, storm, or all)" >&2
+        exit 2
+        ;;
+    esac
+  done
 
-run_phase "cargo test --workspace --lib --bins --quiet" \
-  cargo test --workspace --lib --bins --quiet -- --skip platform_verifier_tls_client_subprocess
+  phase_enabled() {
+    local wanted="$1"
+    local selected_phase
+    for selected_phase in "${selected_phases[@]}"; do
+      [[ "$selected_phase" == "$wanted" ]] && return 0
+    done
+    return 1
+  }
+fi
+
+if phase_enabled lib; then
+  # The platform-verifier TLS test spawns a subprocess whose keychain trust
+  # evaluation is unbounded on Macs with third-party root CAs (NordVPN: ~10s
+  # quiet, minutes under full-suite load — blew a 600s budget twice on
+  # 2026-08-09). Isolation is the fix, not a bigger budget: run it alone
+  # first (seconds when serial), then exclude it from the parallel phase.
+  run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+    cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+
+  run_phase "cargo test --workspace --lib --bins --quiet" \
+    cargo test --workspace --lib --bins --quiet -- --skip platform_verifier_tls_client_subprocess
+fi
 
 # macOS: the first exec of a freshly-linked binary is expensive, and it is NOT
 # Gatekeeper assessment — setting com.apple.quarantine changes nothing, and a
@@ -112,17 +143,33 @@ for p in sorted(seen): print(p)
     target/debug/aft --version >/dev/null 2>&1 || true
   fi
 }
-if [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
+if phase_enabled nextest && [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
   run_phase "warm macOS first-exec cost: sign + exec every debug test binary" \
     bash -c "$(declare -f warm_macos_test_binaries)
       warm_macos_test_binaries --workspace"
 fi
 
-run_phase "cargo nextest run --workspace -E kind(test) - binary(=watcher_integration)" \
-  cargo nextest run --workspace -E 'kind(test) - binary(=watcher_integration)'
+if phase_enabled nextest; then
+  nextest_args=(cargo nextest run)
+  if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
+    nextest_label="cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(test) - binary(=watcher_integration)"
+    nextest_args+=(--archive-file "$AFT_NEXTEST_ARCHIVE_FILE")
+  else
+    nextest_label="cargo nextest run --workspace -E kind(test) - binary(=watcher_integration)"
+    nextest_args+=(--workspace)
+  fi
+  nextest_args+=(-E 'kind(test) - binary(=watcher_integration)')
+  if [[ -n "${AFT_NEXTEST_PARTITION:-}" ]]; then
+    nextest_label+=" --partition $AFT_NEXTEST_PARTITION"
+    nextest_args+=(--partition "$AFT_NEXTEST_PARTITION")
+  fi
+  run_phase "$nextest_label" "${nextest_args[@]}"
+fi
 
-run_phase "cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1" \
-  cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1
+if phase_enabled watcher; then
+  run_phase "cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1" \
+    cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1
+fi
 
 # The main subc storm test asserts production-calibrated absolute latencies
 # (2s bind headroom, the module's real 12s bind deadline). It is
@@ -132,9 +179,11 @@ run_phase "cargo test -p agent-file-tools --test watcher_integration --quiet -- 
 # Skippable because the 2-core Windows CI runner can neither afford the
 # cold release-profile build inside the job timeout nor honor absolute
 # latency bounds — Linux and macOS CI remain the release-storm arbiters.
-if [[ "${AFT_GATE_SKIP_RELEASE_STORM:-}" == "1" ]]; then
-  echo "==> release-storm phase skipped (AFT_GATE_SKIP_RELEASE_STORM=1)"
-else
-  run_phase "cargo nextest run --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-    cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+if phase_enabled storm; then
+  if [[ "${AFT_GATE_SKIP_RELEASE_STORM:-}" == "1" ]]; then
+    echo "==> release-storm phase skipped (AFT_GATE_SKIP_RELEASE_STORM=1)"
+  else
+    run_phase "cargo nextest run --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
+      cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+  fi
 fi

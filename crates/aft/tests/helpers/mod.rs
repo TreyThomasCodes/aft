@@ -192,7 +192,11 @@ impl AftProcess {
     }
 
     fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
+        // Nextest remaps archive binaries into its extraction directory, so its
+        // runtime variable must win over Cargo's compile-time binary path.
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
+            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
+            .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")));
         let diag_enabled =
