@@ -108,6 +108,8 @@ async function createToolHarness(
   const configuredParams = configureParamsFromLegacyOverrides({
     storage_dir: join(h.tempDir, ".storage"),
     harness: "opencode",
+    ...(preset.explicitFormatter ? { formatter: preset.explicitFormatter } : {}),
+    ...(preset.explicitChecker ? { checker: preset.explicitChecker } : {}),
     ...configOverrides,
   });
   await writeSubcHarnessConfig(h, configuredParams);
@@ -267,6 +269,10 @@ export function runFormatOnEditApplyPatchSuite(
       const rustShim: FakeFormatterShim = {
         name: "rustfmt",
         script: `#!/bin/sh
+if [ "$#" -ne 1 ]; then
+  echo "rustfmt shim expected one explicit file argument, got $#" >&2
+  exit 64
+fi
 file="$1"
 cat > "$file" <<'EOF'
 fn main() {
