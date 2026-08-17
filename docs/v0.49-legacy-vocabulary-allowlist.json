@@ -134,8 +134,8 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "location": "line 55, column 21",
-      "line": 55,
+      "location": "line 60, column 21",
+      "line": 60,
       "column": 21,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -143,8 +143,8 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "location": "line 64, column 37",
-      "line": 64,
+      "location": "line 69, column 37",
+      "line": 69,
       "column": 37,
       "token": "filePath",
       "class": "rust-compatibility",
