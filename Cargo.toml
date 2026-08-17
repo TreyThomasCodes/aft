@@ -2,6 +2,15 @@
 resolver = "2"
 members = ["crates/aft", "crates/aft-tokenizer"]
 
+# MSRV contract: the locked oxc 0.126 dependency family requires rustc 1.92,
+# so `cargo check --locked` on an older toolchain dies with a transitive
+# dependency error instead of an AFT-owned diagnostic. Declaring it here makes
+# cargo surface a clear "requires rustc 1.92" error and lets CI pin the floor.
+# We deliberately do NOT add a rust-toolchain.toml pin: contributors on newer
+# stable must not be forced down to the floor.
+[workspace.package]
+rust-version = "1.92"
+
 [profile.release]
 lto = true
 codegen-units = 1

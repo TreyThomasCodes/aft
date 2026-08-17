@@ -8,6 +8,7 @@ repository = "https://github.com/cortexkit/aft"
 keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
+rust-version.workspace = true
 
 [lib]
 name = "aft"

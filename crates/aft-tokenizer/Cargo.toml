@@ -4,6 +4,7 @@ version = "0.51.0"
 edition = "2021"
 description = "Claude lookup-encoding tokenizer for Agent File Tools"
 license = "MIT"
+rust-version.workspace = true
 
 [dependencies]
 fancy-regex = "0.18"

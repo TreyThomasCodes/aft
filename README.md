@@ -226,7 +226,7 @@ See the [configuration reference](docs/config.md) for the full schema, and the [
 
 AFT is a monorepo: Bun workspaces for TypeScript, a cargo workspace for Rust.
 
-**Requirements:** Bun ≥ 1.0, Rust stable toolchain (1.82+).
+**Requirements:** Bun ≥ 1.0, Rust stable toolchain (1.92+ — the locked oxc 0.126 dependency family requires rustc 1.92).
 
 ```sh
 bun install            # JS dependencies

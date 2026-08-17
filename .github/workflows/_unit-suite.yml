@@ -324,6 +324,40 @@ jobs:
         run: cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
 
   # ---------------------------------------------------------------------------
+  # MSRV floor check (Linux, pinned to the declared rust-version).
+  #
+  # The locked oxc 0.126 dependency family requires rustc 1.92, so the real
+  # floor is set by a transitive dependency, not by AFT's own code. This job
+  # pins the toolchain to the declared rust-version and runs `cargo check
+  # --locked` so a floor bump in the lockfile fails here with a clear
+  # AFT-owned signal instead of a confusing transitive-dependency error on
+  # contributor machines. It runs in parallel with the other unit jobs and
+  # gates nothing, so it never extends the critical path.
+  # ---------------------------------------------------------------------------
+  unit-linux-msrv:
+    name: MSRV check (rustc 1.92)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.92
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-linux-msrv
+          cache-on-failure: true
+
+      - name: Cargo check (locked, MSRV floor)
+        run: cargo check --locked -p agent-file-tools --lib
+
+  # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
   #
   # Warm-cache runs spent 7.5-9.2 minutes in the Rust gate and only 0.7-1.3
