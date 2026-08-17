@@ -355,7 +355,7 @@ jobs:
           cache-on-failure: true
 
       - name: Cargo check (locked, MSRV floor)
-        run: cargo check --locked -p agent-file-tools --lib
+        run: cargo check --workspace --all-targets --locked
 
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
