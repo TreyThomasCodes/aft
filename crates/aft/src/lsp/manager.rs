@@ -108,6 +108,7 @@ pub struct ApplicableServerSnapshot {
 struct ApplicableServerCandidate {
     key: ServerKey,
     definition: ServerDef,
+    source_file: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -624,7 +625,14 @@ impl LspManager {
                     );
                     continue;
                 }
-                candidates.insert(key.clone(), ApplicableServerCandidate { key, definition });
+                candidates.insert(
+                    key.clone(),
+                    ApplicableServerCandidate {
+                        key,
+                        definition,
+                        source_file: file.to_path_buf(),
+                    },
+                );
             }
         }
 
@@ -669,7 +677,12 @@ impl LspManager {
                 outcomes.successful.push(candidate.key.clone());
                 continue;
             }
-            match self.spawn_server(&candidate.definition, &candidate.key.root, config) {
+            match self.spawn_server(
+                &candidate.definition,
+                &candidate.key.root,
+                &candidate.source_file,
+                config,
+            ) {
                 Ok(client) => {
                     self.clients.insert(candidate.key.clone(), client);
                     self.server_binaries
@@ -756,7 +769,7 @@ impl LspManager {
                     continue;
                 }
 
-                match self.spawn_server(&def, &key.root, config) {
+                match self.spawn_server(&def, &key.root, file_path, config) {
                     Ok(client) => {
                         self.clients.insert(key.clone(), client);
                         self.server_binaries.insert(key.clone(), def.binary.clone());
@@ -2467,8 +2480,11 @@ impl LspManager {
         &self,
         def: &ServerDef,
         root: &Path,
+        source_file: &Path,
         config: &Config,
     ) -> Result<LspClient, LspError> {
+        let initialization_options =
+            initialization_options_for_spawn(def, source_file, root, config)?;
         let binary = self.resolve_binary(def, config)?;
 
         // Merge the server-defined env with our test-injected env.
@@ -2500,7 +2516,7 @@ impl LspManager {
             self.child_registry.clone(),
             Some(&reclaim_root),
         )?;
-        if let Err(err) = client.initialize(root, def.initialization_options.clone()) {
+        if let Err(err) = client.initialize(root, initialization_options) {
             wait_for_stderr_tail(&mut client);
             let stderr_tail = client.stderr_tail();
             let reason = if client.child_exited() || !stderr_tail.is_empty() {
@@ -2567,6 +2583,86 @@ impl LspManager {
 impl Default for LspManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+const ASTRO_TSDK_UNAVAILABLE: &str = "astro-ls requires a project TypeScript install; none found";
+
+fn initialization_options_for_spawn(
+    def: &ServerDef,
+    source_file: &Path,
+    server_root: &Path,
+    config: &Config,
+) -> Result<Option<serde_json::Value>, LspError> {
+    if def.kind != ServerKind::Astro {
+        return Ok(def.initialization_options.clone());
+    }
+
+    if def
+        .initialization_options
+        .as_ref()
+        .and_then(|options| options.pointer("/typescript/tsdk"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tsdk| !tsdk.is_empty())
+    {
+        return Ok(def.initialization_options.clone());
+    }
+
+    // astro-ls does not discover TypeScript itself. Resolve the nearest project
+    // installation for the triggering .astro file without walking above the
+    // configured project, so monorepo members use their own TypeScript SDK.
+    let project_root = config.project_root.as_deref().unwrap_or(server_root);
+    let boundary = if source_file.starts_with(project_root) {
+        project_root
+    } else {
+        server_root
+    };
+    let tsdk = find_project_typescript_sdk(source_file, boundary)
+        .ok_or_else(|| LspError::ServerNotReady(ASTRO_TSDK_UNAVAILABLE.to_string()))?;
+    let mut options = serde_json::json!({
+        "typescript": {
+            "tsdk": tsdk.to_string_lossy(),
+        }
+    });
+    if let Some(configured) = def.initialization_options.clone() {
+        merge_json_override(&mut options, configured);
+    }
+    Ok(Some(options))
+}
+
+fn find_project_typescript_sdk(source_file: &Path, project_root: &Path) -> Option<PathBuf> {
+    let mut directory = source_file.parent()?;
+    loop {
+        let lib = directory
+            .join("node_modules")
+            .join("typescript")
+            .join("lib");
+        if lib.join("tsserverlibrary.js").is_file() || lib.join("typescript.js").is_file() {
+            return Some(lib);
+        }
+        if directory == project_root {
+            return None;
+        }
+        let parent = directory.parent()?;
+        if !parent.starts_with(project_root) {
+            return None;
+        }
+        directory = parent;
+    }
+}
+
+fn merge_json_override(base: &mut serde_json::Value, override_value: serde_json::Value) {
+    match (base, override_value) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(override_fields)) => {
+            for (key, value) in override_fields {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_json_override(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, value) => *base = value,
     }
 }
 

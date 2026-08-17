@@ -234,6 +234,9 @@ fn delay_changed_diagnostics_if_requested() {
 }
 
 fn main() -> io::Result<()> {
+    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_STARTED_SIGNAL") {
+        std::fs::write(signal_path, b"started")?;
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());

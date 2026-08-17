@@ -444,6 +444,122 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
 }
 
 #[test]
+fn astro_uses_the_nearest_project_typescript_sdk() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let member = root.join("apps/site");
+    let page = member.join("src/page.astro");
+    let root_tsdk = root.join("node_modules/typescript/lib");
+    let member_tsdk = member.join("node_modules/typescript/lib");
+    fs::create_dir_all(page.parent().unwrap()).unwrap();
+    fs::create_dir_all(&root_tsdk).unwrap();
+    fs::create_dir_all(&member_tsdk).unwrap();
+    fs::write(root.join("bun.lock"), "").unwrap();
+    fs::write(&page, "---\n---\n<h1>Astro</h1>\n").unwrap();
+    fs::write(root_tsdk.join("typescript.js"), "").unwrap();
+    fs::write(member_tsdk.join("tsserverlibrary.js"), "").unwrap();
+    let config = Config {
+        project_root: Some(root),
+        ..Config::default()
+    };
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Astro, fake_server_path());
+
+    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    assert_eq!(outcomes.successful.len(), 1, "outcomes: {outcomes:?}");
+    let initialized = collect_notification(&mut manager, "custom/initialized");
+    assert_eq!(
+        initialized["initializationOptions"]["typescript"]["tsdk"],
+        member_tsdk.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn astro_user_initialization_options_override_the_computed_tsdk() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let page = root.join("src/page.astro");
+    let computed_tsdk = root.join("node_modules/typescript/lib");
+    fs::create_dir_all(page.parent().unwrap()).unwrap();
+    fs::create_dir_all(&computed_tsdk).unwrap();
+    fs::write(root.join("bun.lock"), "").unwrap();
+    fs::write(&page, "<h1>Astro</h1>\n").unwrap();
+    fs::write(computed_tsdk.join("typescript.js"), "").unwrap();
+    let config = Config {
+        project_root: Some(root),
+        lsp_servers: vec![UserServerDef {
+            id: "astro".to_string(),
+            extensions: Vec::new(),
+            binary: String::new(),
+            args: Vec::new(),
+            root_markers: Vec::new(),
+            env: HashMap::new(),
+            initialization_options: Some(json!({
+                "typescript": { "tsdk": "/configured/typescript/lib" },
+                "astro": { "feature": true }
+            })),
+            disabled: false,
+        }],
+        ..Config::default()
+    };
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Astro, fake_server_path());
+
+    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    assert_eq!(outcomes.successful.len(), 1, "outcomes: {outcomes:?}");
+    let initialized = collect_notification(&mut manager, "custom/initialized");
+    assert_eq!(
+        initialized["initializationOptions"]["typescript"]["tsdk"],
+        "/configured/typescript/lib"
+    );
+    assert_eq!(
+        initialized["initializationOptions"]["astro"]["feature"],
+        true
+    );
+}
+
+#[test]
+fn astro_without_project_typescript_is_unavailable_without_spawning() {
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("workspace");
+    let page = root.join("src/page.astro");
+    let started_signal = temp_dir.path().join("astro-started");
+    fs::create_dir_all(page.parent().unwrap()).unwrap();
+    fs::write(root.join("bun.lock"), "").unwrap();
+    fs::write(&page, "<h1>Astro</h1>\n").unwrap();
+    let config = Config {
+        project_root: Some(root),
+        ..Config::default()
+    };
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Astro, fake_server_path());
+    manager.set_extra_env(
+        "AFT_FAKE_LSP_STARTED_SIGNAL",
+        &started_signal.to_string_lossy(),
+    );
+
+    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    assert!(outcomes.successful.is_empty());
+    let astro_attempt = outcomes
+        .attempts
+        .iter()
+        .find(|attempt| attempt.server_id == "astro")
+        .expect("Astro attempt");
+    match &astro_attempt.result {
+        ServerAttemptResult::SpawnFailed { reason, .. } => assert!(
+            reason.contains("astro-ls requires a project TypeScript install; none found"),
+            "unexpected reason: {reason}"
+        ),
+        result => panic!("unexpected Astro result: {result:?}"),
+    }
+    assert_eq!(manager.active_client_count(), 0);
+    assert!(
+        !started_signal.exists(),
+        "astro-ls process started without a project TypeScript SDK"
+    );
+}
+
+#[test]
 fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
     let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();
     let config = Config::default();

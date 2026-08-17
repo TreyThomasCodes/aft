@@ -561,6 +561,11 @@ pub fn builtin_servers() -> Vec<ServerDef> {
             "astro-ls",
             &["--stdio"],
             &[
+                "astro.config.js",
+                "astro.config.mjs",
+                "astro.config.ts",
+                "astro.config.cjs",
+                "package.json",
                 "package-lock.json",
                 "bun.lockb",
                 "bun.lock",
