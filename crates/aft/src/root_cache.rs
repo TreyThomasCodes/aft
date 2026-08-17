@@ -43,7 +43,6 @@ pub const READ_MARKER_CROSS_HOST_STALE_MS: u64 = fs_lock::STALE_HEARTBEAT_MS * 5
 // A one-second grace keeps a marker created immediately after process launch
 // attached to that process while still identifying clear PID reuse.
 const PROCESS_START_TIME_GRACE_MS: u64 = 1_000;
-const SHARED_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {
@@ -475,19 +474,18 @@ impl std::fmt::Debug for WriterLease {
 }
 
 impl WriterLease {
+    /// Acquire a shared writer lease.
+    ///
+    /// Same-process callers wait without a timeout because the current lease
+    /// attempt may need filesystem work that takes several seconds. The
+    /// filesystem lock acquisition itself is nonblocking.
     pub fn acquire_shared(
         domain: RootCacheDomain,
         cache_dir: &Path,
         key: &str,
         project_root: &Path,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
-        Self::acquire_shared_with_timeout(
-            domain,
-            cache_dir,
-            key,
-            project_root,
-            SHARED_WRITER_LEASE_TIMEOUT,
-        )
+        Self::acquire_shared_inner(domain, cache_dir, key, project_root, None)
     }
 
     /// Acquire a process-shared writer lease without waiting past `timeout`.
@@ -502,7 +500,17 @@ impl WriterLease {
         project_root: &Path,
         timeout: Duration,
     ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
-        let deadline = Instant::now() + timeout;
+        Self::acquire_shared_inner(domain, cache_dir, key, project_root, Some(timeout))
+    }
+
+    fn acquire_shared_inner(
+        domain: RootCacheDomain,
+        cache_dir: &Path,
+        key: &str,
+        project_root: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<Option<Arc<Self>>, fs_lock::AcquireError> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let access = ArtifactAccess::for_root(project_root);
         if !access.allows_writer_lease(domain, key, &writer_lease_path(cache_dir)) {
             return Ok(None);
@@ -517,24 +525,30 @@ impl WriterLease {
         }
 
         let acquisition_lock = process_lease_acquisition_lock(&registry_key)?;
-        let _acquisition_guard = loop {
-            match acquisition_lock.try_lock() {
-                Ok(guard) => break guard,
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(fs_lock::AcquireError::Io(io::Error::other(
-                        "process lease acquisition poisoned",
-                    )));
-                }
-                Err(TryLockError::WouldBlock) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(fs_lock::AcquireError::Timeout);
+        let _acquisition_guard = if let Some(deadline) = deadline {
+            loop {
+                match acquisition_lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(fs_lock::AcquireError::Io(io::Error::other(
+                            "process lease acquisition poisoned",
+                        )));
                     }
-                    std::thread::sleep(
-                        Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
-                    );
+                    Err(TryLockError::WouldBlock) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(fs_lock::AcquireError::Timeout);
+                        }
+                        std::thread::sleep(
+                            Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
+                        );
+                    }
                 }
             }
+        } else {
+            acquisition_lock.lock().map_err(|_| {
+                fs_lock::AcquireError::Io(io::Error::other("process lease acquisition poisoned"))
+            })?
         };
 
         if let Some(existing) = shared_process_lease(&registry_key)? {
@@ -544,8 +558,10 @@ impl WriterLease {
 
         run_acquire_shared_hook_for_test(domain, cache_dir, key);
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let lease = Arc::new(Self::acquire(domain, cache_dir, key, remaining)?);
+        let filesystem_timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO);
+        let lease = Arc::new(Self::acquire(domain, cache_dir, key, filesystem_timeout)?);
         process_leases()
             .lock()
             .map_err(|_| {
