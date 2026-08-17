@@ -224,8 +224,11 @@ pub fn attach_bg_completions(
 
 fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
     let stale_mark = if counts.tier2_stale { "~" } else { "" };
+    // Self-labeled per the fleet status-line format ruling (2026-08-17): the
+    // holder composes segments label-free and joins module boundaries with a
+    // bullet, so each publisher's text must carry its own leading label.
     format!(
-        "E{} W{} | {}D{} U{} C{} | T{}",
+        "AFT E{} W{} | {}D{} U{} C{} | T{}",
         counts.errors,
         counts.warnings,
         stale_mark,
@@ -377,7 +380,7 @@ mod tests {
 
         assert_eq!(response.data["status_bar"]["dead_code"], 21);
         let publish = wire_rx.try_recv().expect("single discovery publish");
-        assert_eq!(publish.body()["text"], "E0 W0 | D21 U12 C13 | T14");
+        assert_eq!(publish.body()["text"], "AFT E0 W0 | D21 U12 C13 | T14");
         assert!(
             wire_rx.try_recv().is_err(),
             "response published more than once"
@@ -386,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn solo_bar_bytes_remain_the_existing_golden() {
+    fn published_segment_bytes_are_self_labeled() {
         let counts = StatusBarCounts {
             errors: 2,
             warnings: 5,
@@ -397,7 +400,7 @@ mod tests {
             tier2_stale: false,
         };
         assert_eq!(
-            format!("[AFT {}]", aft_status_segment(&counts)),
+            format!("[{}]", aft_status_segment(&counts)),
             "[AFT E2 W5 | D331 U221 C1159 | T8]"
         );
     }
@@ -423,14 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn solo_bar_stale_marker_bytes_remain_the_existing_golden() {
+    fn published_segment_stale_marker_bytes_are_self_labeled() {
         let counts = StatusBarCounts {
             dead_code: 10,
             tier2_stale: true,
             ..StatusBarCounts::default()
         };
         assert_eq!(
-            format!("[AFT {}]", aft_status_segment(&counts)),
+            format!("[{}]", aft_status_segment(&counts)),
             "[AFT E0 W0 | ~D10 U0 C0 | T0]"
         );
     }
