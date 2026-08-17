@@ -27,6 +27,7 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
 const MANIFEST_TTL: Duration = Duration::from_secs(15 * 60);
 const MANIFEST_STALE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const ROUTING_OPERATION: &str = "gh.route";
+const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 
@@ -239,7 +240,7 @@ fn run(args: &[OsString]) -> i32 {
                         )
                     }
                 };
-            match route_governed(&determination, request) {
+            match route_governed(&paths, &determination, request) {
                 RouteOutcome::Result(output) => {
                     print!("{output}");
                     0
@@ -282,6 +283,7 @@ struct StatePaths {
     manifest: PathBuf,
     rung: PathBuf,
     bypass_audit: PathBuf,
+    unexpected_gh_route_advertisers: PathBuf,
 }
 
 impl StatePaths {
@@ -306,6 +308,7 @@ impl StatePaths {
             manifest: root.join("gh-routing-manifest.json"),
             rung: root.join("rung-cache.json"),
             bypass_audit: root.join("operator-bypass.jsonl"),
+            unexpected_gh_route_advertisers: root.join("unexpected-gh-route-advertisers.json"),
             root,
         }
     }
@@ -387,7 +390,7 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
         }
     }
 
-    let discovery = probe_governance(&connection_file, cwd, deadline);
+    let discovery = probe_governance(paths, &connection_file, cwd, deadline);
     let record = match discovery {
         ProbeResult::Ready { module_id } => {
             // The manifest is checked before the detector because it defines the
@@ -489,6 +492,7 @@ enum ProbeResult {
 }
 
 fn probe_governance(
+    paths: &StatePaths,
     connection_file: &Path,
     cwd: &Path,
     deadline: std::time::Instant,
@@ -499,6 +503,7 @@ fn probe_governance(
     }
     let connection_file = connection_file.to_path_buf();
     let project_root = project_root_for(cwd);
+    let record_paths = paths.clone();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -519,7 +524,9 @@ fn probe_governance(
             .catalog_list()
             .await
             .map_err(|_| ProbeResult::Unreachable)?;
-        let Some(module_id) = route_holder(&catalog.modules) else {
+        let holder = route_holder(&catalog.modules);
+        record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
+        let Some(module_id) = holder.module_id else {
             return Err(ProbeResult::NoRoute);
         };
         let identity = BindIdentity {
@@ -548,8 +555,14 @@ fn probe_governance(
     }
 }
 
-fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<String> {
-    entries.iter().find_map(|entry| {
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RouteHolder {
+    module_id: Option<String>,
+    unexpected_advertisers: Vec<String>,
+}
+
+fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> RouteHolder {
+    select_route_holder(entries.iter().filter_map(|entry| {
         entry
             .roles
             .iter()
@@ -561,7 +574,25 @@ fn route_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<String> {
                 )
             })
             .then(|| entry.module_id.clone())
-    })
+    }))
+}
+
+fn select_route_holder(advertisers: impl IntoIterator<Item = String>) -> RouteHolder {
+    let mut holder = None;
+    let mut unexpected_advertisers = BTreeSet::new();
+    for advertiser in advertisers {
+        // Governed routes carry identity-bearing writes, so only prefrontal-core may
+        // hold `gh.route`; another module advertising it must not capture the route.
+        if advertiser == ROUTING_HOLDER_MODULE_ID {
+            holder.get_or_insert(advertiser);
+        } else {
+            unexpected_advertisers.insert(advertiser);
+        }
+    }
+    RouteHolder {
+        module_id: holder,
+        unexpected_advertisers: unexpected_advertisers.into_iter().collect(),
+    }
 }
 
 fn project_root_for(cwd: &Path) -> PathBuf {
@@ -1250,7 +1281,11 @@ enum RouteOutcome {
     Unavailable(String),
 }
 
-fn route_governed(determination: &RungRecord, request: GovernedRequest) -> RouteOutcome {
+fn route_governed(
+    paths: &StatePaths,
+    determination: &RungRecord,
+    request: GovernedRequest,
+) -> RouteOutcome {
     let Some(connection_file) = configured_connection_file() else {
         return RouteOutcome::Unavailable(
             "the governance connection file is no longer available".to_string(),
@@ -1258,6 +1293,7 @@ fn route_governed(determination: &RungRecord, request: GovernedRequest) -> Route
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = project_root_for(&cwd);
+    let record_paths = paths.clone();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1279,7 +1315,9 @@ fn route_governed(determination: &RungRecord, request: GovernedRequest) -> Route
                 .catalog_list()
                 .await
                 .map_err(|error| RouteOutcome::Unavailable(error.to_string()))?;
-            let module_id = route_holder(&catalog.modules).ok_or_else(|| {
+            let holder = route_holder(&catalog.modules);
+            record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
+            let module_id = holder.module_id.ok_or_else(|| {
                 RouteOutcome::Unavailable("no holder advertises gh.route".to_string())
             })?;
             let route = consumer
@@ -1461,6 +1499,7 @@ fn append_bypass_audit(
 struct SelfReport {
     shim_version: &'static str,
     gh_routing_schema_floor: u64,
+    unexpected_gh_route_advertiser: Option<Vec<String>>,
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
     bypass_audit: Option<Vec<Value>>,
@@ -1537,6 +1576,7 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
+        unexpected_gh_route_advertiser: unexpected_gh_route_advertisers(paths),
         cached_manifest: cached_manifest_report(paths),
         last_rung: last_rung_report(paths),
         bypass_audit,
@@ -1626,6 +1666,31 @@ fn read_bypass_audit(paths: &StatePaths) -> (Option<Vec<Value>>, Option<String>)
         }
     }
     (Some(records), None)
+}
+
+fn unexpected_gh_route_advertisers(paths: &StatePaths) -> Option<Vec<String>> {
+    serde_json::from_slice(&fs::read(&paths.unexpected_gh_route_advertisers).ok()?)
+        .ok()
+        .filter(|advertisers: &Vec<String>| !advertisers.is_empty())
+}
+
+fn record_unexpected_gh_route_advertisers(paths: &StatePaths, advertisers: &[String]) {
+    if advertisers.is_empty() {
+        return;
+    }
+    let mut recorded = unexpected_gh_route_advertisers(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    recorded.extend(advertisers.iter().cloned());
+    let Ok(bytes) = serde_json::to_vec(&recorded.into_iter().collect::<Vec<_>>()) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&paths.root);
+    let temporary = paths.unexpected_gh_route_advertisers.with_extension("tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(temporary, &paths.unexpected_gh_route_advertisers);
+    }
 }
 
 fn self_report_executing_image() -> Result<PathBuf, String> {
@@ -1830,6 +1895,7 @@ mod tests {
             vec![
                 "shim_version",
                 "gh_routing_schema_floor",
+                "unexpected_gh_route_advertiser",
                 "cached_manifest",
                 "last_rung",
                 "bypass_audit",
@@ -1839,6 +1905,47 @@ mod tests {
                 "real_gh_resolution",
                 "real_gh_resolution_error",
             ]
+        );
+    }
+
+    #[test]
+    fn route_holder_is_pinned_and_records_other_advertisers() {
+        let holder = select_route_holder([
+            "other-module".to_string(),
+            ROUTING_HOLDER_MODULE_ID.to_string(),
+            "another-module".to_string(),
+        ]);
+        assert_eq!(holder.module_id.as_deref(), Some(ROUTING_HOLDER_MODULE_ID));
+        assert_eq!(
+            holder.unexpected_advertisers,
+            vec!["another-module", "other-module"]
+        );
+
+        let holder = select_route_holder(["other-module".to_string()]);
+        assert_eq!(holder.module_id, None);
+        assert_eq!(holder.unexpected_advertisers, vec!["other-module"]);
+    }
+
+    #[test]
+    fn unexpected_route_advertisers_are_persisted_for_self_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        record_unexpected_gh_route_advertisers(&paths, &["other-module".to_string()]);
+        record_unexpected_gh_route_advertisers(&paths, &["another-module".to_string()]);
+
+        assert_eq!(
+            unexpected_gh_route_advertisers(&paths),
+            Some(vec![
+                "another-module".to_string(),
+                "other-module".to_string(),
+            ])
+        );
+        assert_eq!(
+            build_self_report(&paths).unexpected_gh_route_advertiser,
+            Some(vec![
+                "another-module".to_string(),
+                "other-module".to_string(),
+            ])
         );
     }
 
