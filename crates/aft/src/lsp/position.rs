@@ -53,7 +53,8 @@ pub fn build_text_document_position(
 /// - `\\?\C:\dir\file.rs` -> `file:///C:/dir/file.rs`
 /// - `\\?\UNC\server\share\file.rs` -> `file://server/share/file.rs`
 ///
-/// Non-Windows paths use `Url::from_file_path` unchanged.
+/// Non-Windows absolute paths use the same RFC 3986 path-segment encoder so
+/// reserved delimiters cannot make an otherwise valid LSP URI unparsable.
 pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
     let raw = path.to_string_lossy();
     let normalized = normalize_windows_path_for_uri(&raw);
@@ -62,7 +63,7 @@ pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
         let uri = format!(
             "file://{}/{}",
             encode_uri_component(server),
-            encode_uri_path(path)
+            encode_windows_uri_path(path)
         );
         return Url::parse(&uri).map_err(|_| {
             LspError::NotFound(format!(
@@ -73,10 +74,7 @@ pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
     }
 
     if is_windows_drive_path(&normalized) {
-        let uri = format!(
-            "file:///{}",
-            encode_uri_path(&normalized.replace('\\', "/"))
-        );
+        let uri = format!("file:///{}", encode_windows_uri_path(&normalized));
         return Url::parse(&uri).map_err(|_| {
             LspError::NotFound(format!(
                 "failed to convert '{}' to file URI",
@@ -85,12 +83,23 @@ pub fn path_to_uri(path: &Path) -> Result<Url, LspError> {
         });
     }
 
-    Url::from_file_path(path).map_err(|_| {
-        LspError::NotFound(format!(
-            "failed to convert '{}' to file URI",
-            path.display()
-        ))
-    })
+    if normalized.starts_with('/') {
+        // RFC 3986 brackets are authority delimiters, not path characters.
+        // Building the URI ourselves keeps every LSP payload parseable while
+        // preserving legal path punctuation such as parentheses.
+        let uri = format!("file://{}", encode_uri_path(&normalized));
+        return Url::parse(&uri).map_err(|_| {
+            LspError::NotFound(format!(
+                "failed to convert '{}' to file URI",
+                path.display()
+            ))
+        });
+    }
+
+    Err(LspError::NotFound(format!(
+        "failed to convert '{}' to file URI",
+        path.display()
+    )))
 }
 
 /// Convert a `file://` URL back into a filesystem path.
@@ -195,7 +204,27 @@ fn is_ascii_drive_prefix(path: &str) -> bool {
 
 fn encode_uri_component(value: &str) -> String {
     value.bytes().fold(String::new(), |mut encoded, byte| {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':') {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            )
+        {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
@@ -205,11 +234,14 @@ fn encode_uri_component(value: &str) -> String {
 }
 
 fn encode_uri_path(path: &str) -> String {
-    path.replace('\\', "/")
-        .split('/')
+    path.split('/')
         .map(encode_uri_component)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn encode_windows_uri_path(path: &str) -> String {
+    encode_uri_path(&path.replace('\\', "/"))
 }
 
 /// Percent-decode a single URI path segment into one filesystem path component.
@@ -383,5 +415,44 @@ mod tests {
 
         let unc = Url::parse("file://server/share/a%2Fb/file.rs").expect("url");
         assert!(url_to_path(&unc).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_framework_route_paths_round_trip_through_lsp_uris() {
+        for path in [
+            "/tmp/aft/(app)/page.tsx",
+            "/tmp/aft/[locationId]/route.ts",
+            "/tmp/aft/[[...sign-in]]/page.tsx",
+        ] {
+            let path = Path::new(path);
+            let uri = uri_for_path(path).expect("LSP URI");
+            assert!(!uri.as_str().contains(['[', ']']), "URI: {}", uri.as_str());
+            assert_eq!(
+                uri_to_path(&uri).as_deref(),
+                Some(path),
+                "URI: {}",
+                uri.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_framework_route_paths_round_trip_through_lsp_uris() {
+        for path in [
+            r"C:\repo\(app)\page.tsx",
+            r"C:\repo\[locationId]\route.ts",
+            r"C:\repo\[[...sign-in]]\page.tsx",
+        ] {
+            let path = Path::new(path);
+            let uri = uri_for_path(path).expect("LSP URI");
+            assert!(!uri.as_str().contains(['[', ']']), "URI: {}", uri.as_str());
+            assert_eq!(
+                uri_to_path(&uri).as_deref(),
+                Some(path),
+                "URI: {}",
+                uri.as_str()
+            );
+        }
     }
 }

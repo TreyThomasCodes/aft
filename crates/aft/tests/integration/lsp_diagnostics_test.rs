@@ -1405,6 +1405,63 @@ fn test_pull_diagnostics_returns_full_report() {
     );
 }
 
+#[test]
+fn test_pull_diagnostics_accepts_a_bracketed_route_directory() {
+    use aft::lsp::manager::PullFileOutcome;
+
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("workspace");
+    let file = root.join("src/[locationId]/route.rs");
+    fs::create_dir_all(file.parent().unwrap()).expect("create bracketed route directory");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"route\"\n").expect("Cargo.toml");
+    fs::write(&file, "fn route() {}\n").expect("route source");
+    let config = Config {
+        project_root: Some(root),
+        ..Config::default()
+    };
+    let mut manager = manager_with_fake_server();
+    manager.set_extra_env("AFT_FAKE_LSP_PULL", "1");
+
+    let results = manager
+        .pull_file_diagnostics(&file, &config)
+        .expect("pull diagnostics succeeds for bracketed route");
+    assert!(matches!(
+        results.as_slice(),
+        [result] if matches!(&result.outcome, PullFileOutcome::Full { diagnostic_count: 1 })
+    ));
+    let cached = manager.get_diagnostics_for_file(&file);
+    assert!(
+        cached
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("E0PULL")),
+        "pulled route diagnostic should use the decoded path key: {cached:?}"
+    );
+}
+
+#[test]
+fn test_publish_diagnostics_echo_joins_a_bracketed_store_path() {
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("workspace");
+    let file = root.join("src/[[...sign-in]]/page.rs");
+    fs::create_dir_all(file.parent().unwrap()).expect("create bracketed route directory");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"page\"\n").expect("Cargo.toml");
+    fs::write(&file, "fn page() {}\n").expect("page source");
+    let mut manager = manager_with_fake_server();
+
+    manager
+        .notify_file_changed_default(&file, "fn page() {}\n")
+        .expect("open bracketed route");
+    wait_for_publish(&mut manager);
+
+    let cached = manager.get_diagnostics_for_file(&file);
+    assert!(
+        cached
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("E0001")),
+        "echoed publish URI should join the decoded filesystem path: {cached:?}"
+    );
+}
+
 /// When the server doesn't declare diagnosticProvider, pull falls back
 /// to "PullNotSupported" without crashing. The convention says the agent
 /// must see this honestly.
