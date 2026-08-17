@@ -300,12 +300,24 @@ jobs:
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
 
-      # Ad-hoc sign + exec once: an unsigned fresh binary gets SIGKILLed on
-      # newer macOS, and the first exec pays a syspolicyd assessment that can
-      # take 30-90s under load — pay it here, not inside a harness timeout.
-      - name: Sign and warm the binary
+      # Strip BEFORE signing and testing, never after: v0.51.1 shipped a
+      # SIGKILL-on-load arm64 binary (#238) because strip ran after the e2e
+      # suite — the post-verification mutation invalidated the signature and
+      # strip's auto-re-sign produced a corrupt one. The e2e suite below must
+      # exercise the exact bytes that get published.
+      - name: Strip release binary
+        if: inputs.publish_release_artifacts == true
+        run: strip "target/$CARGO_PROFILE_DIR/aft"
+
+      # Ad-hoc sign + verify + exec once: an unsigned fresh binary gets
+      # SIGKILLed on newer macOS, and the first exec pays a syspolicyd
+      # assessment that can take 30-90s under load — pay it here, not inside a
+      # harness timeout. --verify --strict is the hard gate: it fails on the
+      # corrupt-signature shape #238 shipped, with no exec needed.
+      - name: Sign, verify, and warm the binary
         run: |
-          codesign -f -s - "target/$CARGO_PROFILE_DIR/aft" 2>/dev/null || true
+          codesign -f -s - "target/$CARGO_PROFILE_DIR/aft"
+          codesign --verify --strict "target/$CARGO_PROFILE_DIR/aft"
           "target/$CARGO_PROFILE_DIR/aft" --version
 
       - name: Install workspace deps + build aft-bridge
@@ -321,10 +333,6 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
-
-      - name: Strip release-tested macOS ARM64 binary
-        if: inputs.publish_release_artifacts == true
-        run: strip "target/$CARGO_PROFILE_DIR/aft"
 
       # Package the split debug info (dSYM) as a sibling release asset. The
       # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed

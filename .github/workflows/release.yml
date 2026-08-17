@@ -156,6 +156,15 @@ jobs:
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
 
+      # Sign after the LAST binary mutation and hard-verify: v0.51.1 published
+      # this asset with no signature at all (#238 class - cross-compiled x64
+      # gets no linker signature and nothing signed it). --verify --strict
+      # fails the job on unsigned or corrupt-signature binaries.
+      - name: Sign and verify binary
+        run: |
+          codesign -f -s - target/x86_64-apple-darwin/release/aft
+          codesign --verify --strict target/x86_64-apple-darwin/release/aft
+
       # Package the split debug info (dSYM) as a sibling release asset. The
       # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
       # binary would otherwise return nameless offsets. `ditto` dereferences the
