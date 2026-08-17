@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 /// convention (`~/.config/cortexkit/<module>.jsonc`) alongside `subc.jsonc` and
 /// `mcp.jsonc`. Pure over its env inputs so it is testable without mutating
 /// process-global env vars (which race under the parallel test runner).
-fn user_config_path_from(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+pub(crate) fn user_config_path_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
     let base = xdg_config_home
         .map(PathBuf::from)
         // An unset-but-empty `$XDG_CONFIG_HOME` ("") is not absolute → fall back

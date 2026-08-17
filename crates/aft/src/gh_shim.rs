@@ -438,11 +438,21 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
 }
 
 fn configured_connection_file() -> Option<PathBuf> {
-    // This intentionally does not call `subc_config::cortexkit_user_config_path`:
-    // shim discovery is pinned to the user-tier standard path and accepts neither
-    // an environment redirect nor a project walk-up.
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let config_path = PathBuf::from(home).join(".config/cortexkit/aft.jsonc");
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    configured_connection_file_from(xdg_config_home.as_deref(), home.as_deref())
+}
+
+fn configured_connection_file_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    // The shim uses the same user-tier resolver as subc: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`,
+    // then `~/.config/cortexkit/aft.jsonc`. XDG selects only the trusted user's
+    // config location; it cannot select a project file or alter the configured
+    // connection. If that path is invalid, resolution falls back to the lower-priority
+    // R1 route instead of allowing a routing bypass.
+    let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
 }
@@ -1447,56 +1457,180 @@ fn append_bypass_audit(
     file.sync_data()
 }
 
+#[derive(Serialize)]
+struct SelfReport {
+    shim_version: &'static str,
+    gh_routing_schema_floor: u64,
+    cached_manifest: CachedManifestReport,
+    last_rung: LastRungReport,
+    bypass_audit: Option<Vec<Value>>,
+    bypass_audit_error: Option<String>,
+    executing_image: Option<String>,
+    executing_image_error: Option<String>,
+    real_gh_resolution: Option<RealGhResolution>,
+    real_gh_resolution_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CachedManifestReport {
+    version: Option<u64>,
+    version_error: Option<String>,
+    state: Option<&'static str>,
+    state_error: Option<String>,
+    diagnostics: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct LastRungReport {
+    rung: Option<&'static str>,
+    rung_error: Option<String>,
+    as_of_unix_secs: Option<u64>,
+    as_of_unix_secs_error: Option<String>,
+    determination_inputs: Option<BTreeMap<String, String>>,
+    determination_inputs_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RealGhResolution {
+    path: String,
+    shim_path_positions: Vec<usize>,
+}
+
 fn print_self_report(paths: &StatePaths) {
-    let manifest = cached_manifest_summary(paths);
-    let rung = load_rung_record(paths);
-    let image = executing_image();
-    println!("gh-shim-version: {}", env!("CARGO_PKG_VERSION"));
-    println!("gh_routing_schema_floor: {SCHEMA_FLOOR}");
-    println!("cached-manifest: {}", manifest.0);
-    if let Some(diagnostic) = manifest.1 {
-        println!("self-report-diagnostic: {}", diagnostic.as_str());
+    // This is deliberately one JSON document, rather than status lines, so a
+    // later forensic process can consume it with jq while every dependency is down.
+    if let Ok(document) = render_self_report(paths) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(document.as_bytes());
     }
-    match rung {
-        Some(record) => {
-            println!(
-                "last-rung: {} as-of {}",
-                record.rung.label(),
-                record.as_of_unix_secs
-            );
-            for (input, result) in record.inputs {
-                println!("rung-input: {input}={result}");
+}
+
+fn render_self_report(paths: &StatePaths) -> Result<String, serde_json::Error> {
+    let report = build_self_report(paths);
+    let mut document = serde_json::to_string(&report)?;
+    document.push('\n');
+    Ok(document)
+}
+
+fn build_self_report(paths: &StatePaths) -> SelfReport {
+    let image = self_report_executing_image();
+    let (real_gh_resolution, real_gh_resolution_error) = match image.as_ref() {
+        Ok(image) => match resolve_real_gh(image) {
+            Some(path) => (
+                Some(RealGhResolution {
+                    path: path.to_string_lossy().into_owned(),
+                    shim_path_positions: executing_image_path_positions(image),
+                }),
+                None,
+            ),
+            None => (
+                None,
+                Some(
+                    "PATH contains no upstream gh after skipping the executing shim image"
+                        .to_string(),
+                ),
+            ),
+        },
+        Err(error) => (None, Some(format!("executing image unavailable: {error}"))),
+    };
+    let (bypass_audit, bypass_audit_error) = read_bypass_audit(paths);
+    SelfReport {
+        shim_version: env!("CARGO_PKG_VERSION"),
+        gh_routing_schema_floor: SCHEMA_FLOOR,
+        cached_manifest: cached_manifest_report(paths),
+        last_rung: last_rung_report(paths),
+        bypass_audit,
+        bypass_audit_error,
+        executing_image: image
+            .as_ref()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        executing_image_error: image.err(),
+        real_gh_resolution,
+        real_gh_resolution_error,
+    }
+}
+
+fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
+    match load_manifest(paths, unix_seconds()) {
+        Ok(manifest) => CachedManifestReport {
+            version: Some(manifest.manifest_version),
+            version_error: None,
+            state: Some("valid"),
+            state_error: None,
+            diagnostics: Vec::new(),
+        },
+        Err(problem) => {
+            let error = problem.status_label();
+            CachedManifestReport {
+                version: None,
+                version_error: Some(error.clone()),
+                state: None,
+                state_error: Some(error),
+                diagnostics: vec![problem.diagnostic().as_str()],
             }
         }
-        None => {
-            println!("last-rung: unavailable");
-            println!(
-                "self-report-diagnostic: {}",
-                SelfReportDiagnostic::RungUnavailable.as_str()
-            );
+    }
+}
+
+fn last_rung_report(paths: &StatePaths) -> LastRungReport {
+    match fs::read(&paths.rung) {
+        Ok(bytes) => match serde_json::from_slice::<RungRecord>(&bytes) {
+            Ok(record) => LastRungReport {
+                rung: Some(record.rung.label()),
+                rung_error: None,
+                as_of_unix_secs: Some(record.as_of_unix_secs),
+                as_of_unix_secs_error: None,
+                determination_inputs: Some(record.inputs),
+                determination_inputs_error: None,
+            },
+            Err(error) => unavailable_last_rung(format!("corrupt rung cache: {error}")),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            unavailable_last_rung("rung cache is unavailable".to_string())
+        }
+        Err(error) => unavailable_last_rung(format!("rung cache is unavailable: {error}")),
+    }
+}
+
+fn unavailable_last_rung(error: String) -> LastRungReport {
+    LastRungReport {
+        rung: None,
+        rung_error: Some(error.clone()),
+        as_of_unix_secs: None,
+        as_of_unix_secs_error: Some(error.clone()),
+        determination_inputs: None,
+        determination_inputs_error: Some(error),
+    }
+}
+
+fn read_bypass_audit(paths: &StatePaths) -> (Option<Vec<Value>>, Option<String>) {
+    let contents = match fs::read_to_string(&paths.bypass_audit) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Some(Vec::new()), None),
+        Err(error) => return (None, Some(format!("bypass audit is unavailable: {error}"))),
+    };
+    let mut records = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                return (
+                    None,
+                    Some(format!(
+                        "bypass audit is corrupt at line {}: {error}",
+                        line_number + 1
+                    )),
+                )
+            }
         }
     }
-    println!("executing-image: {}", image.display());
-    println!("path-position: {}", executing_image_path_position(&image));
-    for record in read_bypass_audit(paths) {
-        println!("operator-bypass: {record}");
-    }
+    (Some(records), None)
 }
 
-fn cached_manifest_summary(paths: &StatePaths) -> (String, Option<SelfReportDiagnostic>) {
-    let now = unix_seconds();
-    match load_manifest(paths, now) {
-        Ok(manifest) => (format!("version {}", manifest.manifest_version), None),
-        Err(problem) => (problem.status_label(), Some(problem.diagnostic())),
-    }
-}
-
-fn read_bypass_audit(paths: &StatePaths) -> Vec<String> {
-    fs::read_to_string(&paths.bypass_audit)
-        .ok()
-        .into_iter()
-        .flat_map(|contents| contents.lines().map(str::to_string).collect::<Vec<_>>())
-        .collect()
+fn self_report_executing_image() -> Result<PathBuf, String> {
+    let path = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(path.canonicalize().unwrap_or(path))
 }
 
 fn executing_image() -> PathBuf {
@@ -1506,19 +1640,12 @@ fn executing_image() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("unavailable"))
 }
 
-fn executing_image_path_position(image: &Path) -> String {
+fn executing_image_path_positions(image: &Path) -> Vec<usize> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let positions = std::env::split_paths(&path)
+    std::env::split_paths(&path)
         .enumerate()
-        .filter_map(|(index, directory)| {
-            same_image(&directory.join("gh"), image).then_some(index.to_string())
-        })
-        .collect::<Vec<_>>();
-    if positions.is_empty() {
-        "not-on-PATH".to_string()
-    } else {
-        positions.join(",")
-    }
+        .filter_map(|(index, directory)| same_image(&directory.join("gh"), image).then_some(index))
+        .collect()
 }
 
 fn delegate(args: &[OsString]) -> i32 {
@@ -1686,6 +1813,72 @@ mod tests {
     }
 
     #[test]
+    fn status_serializes_one_json_document_with_the_exact_top_level_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let document = render_self_report(&paths).expect("self report serialization");
+        assert!(document.ends_with('\n'));
+        let value: Value = serde_json::from_str(&document).expect("self report JSON");
+        let keys = value
+            .as_object()
+            .expect("self report object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "shim_version",
+                "gh_routing_schema_floor",
+                "cached_manifest",
+                "last_rung",
+                "bypass_audit",
+                "bypass_audit_error",
+                "executing_image",
+                "executing_image_error",
+                "real_gh_resolution",
+                "real_gh_resolution_error",
+            ]
+        );
+    }
+
+    #[test]
+    fn xdg_connection_config_precedes_home_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let xdg = directory.path().join("xdg");
+        let home = directory.path().join("home");
+        let xdg_connection = directory.path().join("xdg-connection.json");
+        let home_connection = directory.path().join("home-connection.json");
+        fs::write(&xdg_connection, "{}").unwrap();
+        fs::write(&home_connection, "{}").unwrap();
+        let xdg_config = xdg.join("cortexkit/aft.jsonc");
+        let home_config = home.join(".config/cortexkit/aft.jsonc");
+        fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
+        fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        fs::write(
+            &xdg_config,
+            format!(
+                r#"{{"subc":{{"connection_file":"{}"}}}}"#,
+                xdg_connection.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &home_config,
+            format!(
+                r#"{{"subc":{{"connection_file":"{}"}}}}"#,
+                home_connection.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_connection_file_from(Some(xdg.as_os_str()), Some(home.as_os_str())),
+            Some(xdg_connection)
+        );
+    }
+
+    #[test]
     fn initial_manifest_is_complete_and_valid() {
         fixture_manifest()
             .validate()
@@ -1776,8 +1969,8 @@ mod tests {
             Err(ManifestProblem::Invalid(_))
         ));
         assert_eq!(
-            cached_manifest_summary(&paths).1,
-            Some(SelfReportDiagnostic::ManifestInvalid)
+            cached_manifest_report(&paths).diagnostics,
+            vec![SelfReportDiagnostic::ManifestInvalid.as_str()]
         );
 
         let mut below_floor = fixture_manifest();
@@ -1934,9 +2127,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
         append_bypass_audit(&paths, "issue close", Some("owner/repo"), 99).unwrap();
-        let records = read_bypass_audit(&paths);
+        let (records, error) = read_bypass_audit(&paths);
+        assert!(error.is_none());
+        let records = records.unwrap();
         assert_eq!(records.len(), 1);
-        assert!(records[0].contains("issue close"));
+        assert_eq!(records[0]["tuple"], "issue close");
     }
 
     #[test]
