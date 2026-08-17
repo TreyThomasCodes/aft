@@ -78,6 +78,12 @@ bun run --cwd packages/pi-plugin build
 echo
 
 # 5. Stage + sign the binary
+#
+# The staged binary is stripped (release profile), so a thread-stack sample of
+# the running dev binary would come back as nameless offsets. Copy its split
+# debug info (dSYM) next to the preswap evidence, keyed by the binary's content
+# sha, so a staged dev binary is symbolicatable too (same mechanism as the
+# release dSYM assets).
 echo "==> staging binary into versioned cache"
 mkdir -p "$CACHE_DIR"
 cp target/release/aft "$BINARY_PATH"
@@ -89,6 +95,20 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   # content-derived (name + hash), so every rebuild mints a new one and any
   # macOS grant keyed to the identifier (TCC etc.) silently dies per stage.
   codesign --force --sign - --identifier "$(basename "$BINARY_PATH")" "$BINARY_PATH"
+
+  # Preserve the dSYM for the staged binary. `ditto` dereferences the `aft.dSYM`
+  # symlink cargo emits (it points at a hash-named bundle under deps/) and
+  # copies it to a canonical name keyed by the binary's content sha, so the
+  # dSYM for a given staged binary is findable next to the preswap evidence.
+  if [[ -d "target/release/aft.dSYM" ]]; then
+    PRESWAP_DIR="${HOME}/.local/share/cortexkit/aft/preswap-evidence"
+    BIN_SHA="$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}' | cut -c1-8)"
+    mkdir -p "$PRESWAP_DIR"
+    ditto "target/release/aft.dSYM" "$PRESWAP_DIR/aft-${BIN_SHA}.dSYM"
+    echo "    dSYM -> $PRESWAP_DIR/aft-${BIN_SHA}.dSYM"
+  else
+    echo "    (no dSYM found at target/release/aft.dSYM; skipping)"
+  fi
 fi
 echo
 

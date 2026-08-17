@@ -373,6 +373,19 @@ if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/
     # --identifier pins the signing identity to the file name; the default is
     # content-derived, so identifier-keyed macOS grants die on every release.
     codesign --force --sign - --identifier aft "$CACHE_DIR/$TAG/aft" 2>/dev/null || true
+
+    # Preserve the split debug info (dSYM) for the staged release binary, keyed
+    # by the binary's content sha, next to the preswap evidence. The staged
+    # binary is stripped, so without this a thread-stack sample of it would come
+    # back as nameless offsets. `ditto` dereferences the `aft.dSYM` symlink
+    # cargo emits and copies it to a canonical name.
+    if [[ -d "target/release/aft.dSYM" ]]; then
+      PRESWAP_DIR="${HOME}/.local/share/cortexkit/aft/preswap-evidence"
+      BIN_SHA="$(shasum -a 256 "$CACHE_DIR/$TAG/aft" | awk '{print $1}' | cut -c1-8)"
+      mkdir -p "$PRESWAP_DIR"
+      ditto "target/release/aft.dSYM" "$PRESWAP_DIR/aft-${BIN_SHA}.dSYM"
+      echo "  dSYM -> $PRESWAP_DIR/aft-${BIN_SHA}.dSYM"
+    fi
   fi
   echo "  Updated $CACHE_DIR/$TAG/aft"
 fi

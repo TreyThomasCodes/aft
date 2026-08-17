@@ -326,6 +326,26 @@ jobs:
         if: inputs.publish_release_artifacts == true
         run: strip "target/$CARGO_PROFILE_DIR/aft"
 
+      # Package the split debug info (dSYM) as a sibling release asset. The
+      # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
+      # binary would otherwise return nameless offsets. `ditto` dereferences the
+      # `aft.dSYM` symlink cargo emits (it points at a hash-named bundle under
+      # deps/) and copies it to a canonical `aft.dSYM` before zipping, so the
+      # release asset is self-contained and keyed by the binary's UUID.
+      - name: Package dSYM
+        if: inputs.publish_release_artifacts == true
+        run: |
+          ditto "target/$CARGO_PROFILE_DIR/aft.dSYM" release-dsym/aft.dSYM
+          ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
+
+      - name: Upload release-tested macOS ARM64 dSYM
+        if: inputs.publish_release_artifacts == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64-dsym
+          path: release-dsym/aft-darwin-arm64-dsym.zip
+          if-no-files-found: error
+
       - name: Upload release-tested macOS ARM64 binary
         if: inputs.publish_release_artifacts == true
         uses: actions/upload-artifact@v4

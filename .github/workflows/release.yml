@@ -156,10 +156,27 @@ jobs:
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
 
+      # Package the split debug info (dSYM) as a sibling release asset. The
+      # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
+      # binary would otherwise return nameless offsets. `ditto` dereferences the
+      # `aft.dSYM` symlink cargo emits (it points at a hash-named bundle under
+      # deps/) and copies it to a canonical `aft.dSYM` before zipping, so the
+      # release asset is self-contained and keyed by the binary's UUID.
+      - name: Package dSYM
+        run: |
+          ditto target/x86_64-apple-darwin/release/aft.dSYM release-dsym/aft.dSYM
+          ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-x64-dsym.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: darwin-x64
           path: target/x86_64-apple-darwin/release/aft
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-x64-dsym
+          path: release-dsym/aft-darwin-x64-dsym.zip
           if-no-files-found: error
 
   build-linux-arm64:
@@ -502,6 +519,11 @@ jobs:
           cp artifacts/win32-arm64/aft.exe release-assets/aft-win32-arm64.exe
           cp artifacts/win32-x64/aft.exe release-assets/aft-win32-x64.exe
           chmod +x release-assets/aft-*
+          # Split debug info (dSYM) for the darwin release binaries, so a
+          # deployed binary's thread-stack samples symbolicate by name instead
+          # of returning nameless offsets. Named aft-<target>-dsym.zip.
+          cp artifacts/darwin-arm64-dsym/aft-darwin-arm64-dsym.zip release-assets/
+          cp artifacts/darwin-x64-dsym/aft-darwin-x64-dsym.zip release-assets/
 
       - name: Generate checksums
         run: |

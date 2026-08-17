@@ -15,6 +15,16 @@ rust-version = "1.92"
 lto = true
 codegen-units = 1
 strip = true
+# Emit line tables + symbol names into a SEPARATE artifact (the dSYM bundle on
+# macOS, a .dwp on Linux) instead of the shipped binary. `strip = true` above
+# still strips the shipped binary, so its size does not regress; the debug info
+# lands in the sibling dSYM/dwp that release.yml packages and uploads. This is
+# what lets `sample`/`atos` symbolicate a deployed release binary by name
+# instead of returning nameless offsets (v0.50.x, v0.51.0 wedge on 2026-08-17).
+# line-tables-only is cheap (no full debug=2); it only adds the line table +
+# symbol names needed for stack symbolication.
+debug = "line-tables-only"
+split-debuginfo = "packed"
 
 # Local staging builds (dev binaries for the daemon/NDJSON caches). No LTO +
 # default parallel codegen: a dev-bounce binary is rebuilt many times a day,
