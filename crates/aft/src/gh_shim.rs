@@ -205,6 +205,9 @@ fn run(args: &[OsString]) -> i32 {
         Ok(manifest) => manifest,
         Err(_) => return delegate(args),
     };
+    let Some(agent_id) = resolved_agent_binding(&manifest, &cwd) else {
+        return delegate(args);
+    };
 
     match classify(args, &manifest, current_platform()) {
         Classification::Mechanical => delegate(args),
@@ -240,7 +243,7 @@ fn run(args: &[OsString]) -> i32 {
                         )
                     }
                 };
-            match route_governed(&paths, &determination, request) {
+            match route_governed(&paths, &determination, &agent_id, request) {
                 RouteOutcome::Result(output) => {
                     print!("{output}");
                     0
@@ -385,45 +388,55 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
             .unwrap_or_else(|| RungRecord::r1(now, "discovery_budget_exhausted"));
     }
     if let Some(record) = cached.as_ref().filter(|record| record.fresh_at(now)) {
-        if record.rung != Rung::R3 || load_manifest(paths, now).is_ok() {
+        if record.rung != Rung::R3
+            || load_manifest(paths, now)
+                .ok()
+                .and_then(|manifest| resolved_agent_binding(&manifest, cwd))
+                .is_some()
+        {
             return record.clone();
         }
     }
 
-    let discovery = probe_governance(paths, &connection_file, cwd, deadline);
+    // The signed manifest supplies the binding before the probe opens a route, so
+    // rate accounting and audit records use the same agent session on every run.
+    let manifest = match load_manifest(paths, now) {
+        Ok(manifest) => manifest,
+        Err(_) => {
+            let record = RungRecord::r2(now, "manifest_unavailable", None);
+            write_rung_record_silently(paths, &record);
+            return record;
+        }
+    };
+    let Some(agent_id) = resolved_agent_binding(&manifest, cwd) else {
+        let record = RungRecord::r2(
+            now,
+            "agent_binding_unavailable",
+            Some(manifest.manifest_version),
+        );
+        write_rung_record_silently(paths, &record);
+        return record;
+    };
+
+    let discovery = probe_governance(paths, &connection_file, cwd, deadline, &agent_id);
     let record = match discovery {
         ProbeResult::Ready { module_id } => {
-            // The manifest is checked before the detector because it defines the
-            // complete detector inventory. An invalid cache therefore cannot be
-            // used to select a detector or activate R3.
-            match load_manifest(paths, now) {
-                Ok(manifest) => match find_ambient_agent_credential(&manifest.detectors) {
-                    Some(source) => {
-                        let mut record = RungRecord::r2(
-                            now,
-                            "agent_credentials_present",
-                            Some(manifest.manifest_version),
-                        );
-                        record
-                            .inputs
-                            .insert("agent_credentials_present".to_string(), source);
-                        record
-                            .inputs
-                            .insert("catalog_holder".to_string(), module_id);
-                        record
-                    }
-                    None => RungRecord::r3(now, manifest.manifest_version),
-                },
-                Err(_) => {
-                    let mut record = RungRecord::r2(now, "manifest_unavailable", None);
+            match find_ambient_agent_credential(&manifest.detectors) {
+                Some(source) => {
+                    let mut record = RungRecord::r2(
+                        now,
+                        "agent_credentials_present",
+                        Some(manifest.manifest_version),
+                    );
                     record
                         .inputs
-                        .insert("catalog_gh_route".to_string(), "ready".to_string());
+                        .insert("agent_credentials_present".to_string(), source);
                     record
                         .inputs
-                        .insert("agent_binding".to_string(), "ready".to_string());
+                        .insert("catalog_holder".to_string(), module_id);
                     record
                 }
+                None => RungRecord::r3(now, manifest.manifest_version),
             }
         }
         ProbeResult::Unreachable => RungRecord::r2(now, "daemon_unreachable", None),
@@ -496,6 +509,7 @@ fn probe_governance(
     connection_file: &Path,
     cwd: &Path,
     deadline: std::time::Instant,
+    agent_id: &str,
 ) -> ProbeResult {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
@@ -504,6 +518,7 @@ fn probe_governance(
     let connection_file = connection_file.to_path_buf();
     let project_root = project_root_for(cwd);
     let record_paths = paths.clone();
+    let agent_id = agent_id.to_string();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -532,7 +547,7 @@ fn probe_governance(
         let identity = BindIdentity {
             project_root: project_root.to_string_lossy().into_owned().into(),
             harness: "aft-gh-shim".to_string(),
-            session: format!("gh-shim-{}", std::process::id()),
+            session: gh_session_id(&agent_id),
         };
         let route = consumer
             .open_route(
@@ -583,6 +598,8 @@ fn select_route_holder(advertisers: impl IntoIterator<Item = String>) -> RouteHo
     for advertiser in advertisers {
         // Governed routes carry identity-bearing writes, so only prefrontal-core may
         // hold `gh.route`; another module advertising it must not capture the route.
+        // The holder module identifies the routing server, not the bound agent. Using
+        // its module ID would merge all agents into one audit and rate-accounting session.
         if advertiser == ROUTING_HOLDER_MODULE_ID {
             holder.get_or_insert(advertiser);
         } else {
@@ -602,6 +619,65 @@ fn project_root_for(cwd: &Path) -> PathBuf {
         .find(|path| path.join(".git").exists())
         .map(Path::to_path_buf)
         .unwrap_or(canonical)
+}
+
+fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<String> {
+    let project_root = project_root_for(cwd);
+    let repository = repository_key_from_origin(&project_root)?;
+    manifest.bindings.get(&repository).cloned()
+}
+
+fn repository_key_from_origin(project_root: &Path) -> Option<String> {
+    // The binding key comes from parsing the local origin remote, not a network
+    // lookup, so a signed manifest selects the same agent when offline.
+    let remote = origin_remote(project_root)?;
+    canonical_repository_key(&remote)
+}
+
+fn origin_remote(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(|remote| remote.trim().to_string())
+        .filter(|remote| !remote.is_empty())
+}
+
+fn canonical_repository_key(value: &str) -> Option<String> {
+    let remote = value.trim().trim_end_matches('/');
+    let path = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git://github.com/",
+        "git@github.com:",
+        "github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| remote.strip_prefix(prefix))
+    .unwrap_or(remote)
+    .trim_end_matches(".git")
+    .trim_matches('/');
+    let mut parts = path.split('/');
+    let owner = parts.next()?.trim();
+    let repository = parts.next()?.trim();
+    (!owner.is_empty() && !repository.is_empty() && parts.next().is_none()).then(|| {
+        format!(
+            "{}/{}",
+            owner.to_ascii_lowercase(),
+            repository.to_ascii_lowercase()
+        )
+    })
+}
+
+fn gh_session_id(agent_id: &str) -> String {
+    format!("gh-shim:{agent_id}")
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -747,6 +823,8 @@ struct Manifest {
     canonicalization: BTreeMap<String, Canonicalization>,
     #[serde(default)]
     repository_sections: BTreeMap<String, RepositorySection>,
+    #[serde(default)]
+    bindings: BTreeMap<String, String>,
 }
 
 impl Manifest {
@@ -819,6 +897,19 @@ impl Manifest {
             if declared.get(tuple) != Some(&Tier::Governed) {
                 return Err(format!(
                     "canonicalization {tuple} does not name a governed tuple"
+                ));
+            }
+        }
+
+        for (repository, agent_id) in &self.bindings {
+            if canonical_repository_key(repository).as_deref() != Some(repository.as_str()) {
+                return Err(format!(
+                    "binding repository {repository} is not canonical owner/name"
+                ));
+            }
+            if agent_id.trim().is_empty() || agent_id.trim() != agent_id {
+                return Err(format!(
+                    "binding repository {repository} has an invalid agent id"
                 ));
             }
         }
@@ -1259,17 +1350,8 @@ fn explicit_repo(args: &[OsString]) -> Option<String> {
 }
 
 fn infer_repository_from_git() -> Option<String> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|remote| remote.trim().to_string())
-        .filter(|remote| !remote.is_empty())
+    let cwd = std::env::current_dir().ok()?;
+    origin_remote(&cwd)
 }
 
 #[derive(Debug)]
@@ -1284,6 +1366,7 @@ enum RouteOutcome {
 fn route_governed(
     paths: &StatePaths,
     determination: &RungRecord,
+    agent_id: &str,
     request: GovernedRequest,
 ) -> RouteOutcome {
     let Some(connection_file) = configured_connection_file() else {
@@ -1294,6 +1377,7 @@ fn route_governed(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = project_root_for(&cwd);
     let record_paths = paths.clone();
+    let agent_id = agent_id.to_string();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1326,22 +1410,13 @@ fn route_governed(
                     BindIdentity {
                         project_root: project_root.to_string_lossy().into_owned().into(),
                         harness: "aft-gh-shim".to_string(),
-                        session: format!("gh-shim-{}", std::process::id()),
+                        session: gh_session_id(&agent_id),
                     },
                     CallOptions::default(),
                 )
                 .await
                 .map_err(|_| RouteOutcome::UnboundIdentity)?;
-            let wire_request = json!({
-                "operation": ROUTING_OPERATION,
-                "gh_route_schema": 1,
-                "action": request.action,
-                "target": request.target,
-                "body": request.body,
-                "repository": request.repository,
-                "manifest_version": request.manifest_version,
-                "rung_as_of_unix_secs": determination.as_of_unix_secs,
-            });
+            let wire_request = governed_wire_request(determination, &agent_id, request);
             let body = serde_json::to_vec(&wire_request)
                 .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
             let response = consumer
@@ -1355,6 +1430,27 @@ fn route_governed(
             parse_governed_response(&response)
         })
         .unwrap_or_else(|outcome| outcome)
+}
+
+fn governed_wire_request(
+    determination: &RungRecord,
+    agent_id: &str,
+    request: GovernedRequest,
+) -> Value {
+    json!({
+        "operation": ROUTING_OPERATION,
+        "gh_route_schema": 1,
+        "action": request.action,
+        "target": request.target,
+        "body": request.body,
+        "repository": request.repository,
+        "manifest_version": request.manifest_version,
+        "rung_as_of_unix_secs": determination.as_of_unix_secs,
+        "metadata": {
+            "agent_id": agent_id,
+            "pid": std::process::id(),
+        },
+    })
 }
 
 fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
@@ -2019,6 +2115,40 @@ mod tests {
                 rationale: None,
             });
         assert!(empty_api.validate().unwrap_err().contains("rationale"));
+
+        let mut malformed_binding = fixture_manifest();
+        malformed_binding.bindings.insert(
+            "https://github.com/cortexkit/aft.git".to_string(),
+            "alfonso-aft".to_string(),
+        );
+        assert!(malformed_binding
+            .validate()
+            .unwrap_err()
+            .contains("canonical owner/name"));
+    }
+
+    #[test]
+    fn binding_keys_and_governed_session_identity_are_stable() {
+        assert_eq!(
+            canonical_repository_key("https://github.com/CortexKit/aft.git"),
+            Some("cortexkit/aft".to_string())
+        );
+        assert_eq!(
+            canonical_repository_key("git@github.com:cortexkit/aft.git"),
+            Some("cortexkit/aft".to_string())
+        );
+        assert_eq!(gh_session_id("alfonso-aft"), "gh-shim:alfonso-aft");
+
+        let request = GovernedRequest {
+            action: "issue comment".to_string(),
+            target: Map::new(),
+            body: Map::new(),
+            repository: Some("cortexkit/aft".to_string()),
+            manifest_version: 1,
+        };
+        let wire = governed_wire_request(&RungRecord::r3(7, 1), "alfonso-aft", request);
+        assert_eq!(wire["metadata"]["agent_id"], "alfonso-aft");
+        assert_eq!(wire["metadata"]["pid"], std::process::id());
     }
 
     #[test]

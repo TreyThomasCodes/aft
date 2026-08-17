@@ -41,5 +41,8 @@
     "pr review": {"argv_forms": ["target-and-body"], "target_fields": ["number"], "body_fields": ["body"]},
     "issue reaction": {"argv_forms": ["target-and-reaction"], "target_fields": ["number"], "body_fields": ["reaction"]}
   },
-  "repository_sections": {}
+  "repository_sections": {},
+  "bindings": {
+    "cortexkit/aft": "alfonso-aft"
+  }
 }
