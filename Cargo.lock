@@ -66,6 +66,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustc-hash",
  "rustls",

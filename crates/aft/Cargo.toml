@@ -107,6 +107,9 @@ rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-platform-verifier = "0.6"
+# Verify fleet-served gh routing manifests with a public-key signature before
+# they can authorise governed routing.
+ring = "0.17"
 tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
 # Local embedding backend (all-MiniLM-L6-v2) driven directly through ort, so we
 # control intra-op thread count (fastembed hardcoded all-cores). hf-hub fetches

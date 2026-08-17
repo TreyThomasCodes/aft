@@ -76,6 +76,7 @@ pub mod fleet_status;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
+pub mod gh_shim;
 pub mod grep_executor;
 pub mod harness;
 pub mod hashline;

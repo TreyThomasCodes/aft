@@ -35,6 +35,13 @@ fn parse_subc_arg(
 }
 
 fn main() {
+    // `gh` is a compatibility entry point for the upstream GitHub CLI. Handle
+    // it before scanning AFT's global arguments; otherwise `gh --version` would
+    // be mistaken for AFT's own `--version` flag.
+    if aft::gh_shim::is_shim_invocation_from_env() {
+        std::process::exit(aft::gh_shim::run_from_env());
+    }
+
     // Confinement must be installed before global argument scanning, logging,
     // PATH discovery, or application threads. Target arguments such as
     // `--version` belong to the command after `--`, not to AFT itself.
