@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use aft::cache_freshness;
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
-use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
+use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call};
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
@@ -2595,7 +2595,7 @@ fn inspect_command_diagnostics_scope_actively_pulls_cold_file_and_narrows() {
 }
 
 #[test]
-fn scoped_diagnostics_drains_events_after_each_file_before_nonfresh_return() {
+fn scoped_diagnostics_drains_events_after_each_file_before_partial_return() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-drain\"\n");
     for name in ["a.rs", "b.rs", "c.rs"] {
@@ -2628,8 +2628,9 @@ fn scoped_diagnostics_drains_events_after_each_file_before_nonfresh_return() {
         }),
     );
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["code"], "inspect_not_fresh");
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["gaps"][0]["kind"], "failed_producer");
     assert_eq!(
         ctx.lsp().pending_event_count_for_test(),
         0,
@@ -2779,7 +2780,7 @@ fn blocking_scoped_diagnostics_closes_every_document_it_opens() {
 }
 
 #[test]
-fn inspect_command_diagnostics_missing_server_is_not_returned_as_a_zero_result() {
+fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-missing\"\n");
     write_file(&root, "src/main.rs", "fn main() {}\n");
@@ -2799,9 +2800,16 @@ fn inspect_command_diagnostics_missing_server_is_not_returned_as_a_zero_result()
         }),
     );
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["code"], "inspect_not_fresh");
-    assert!(response.get("summary").is_none());
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["summary"]["diagnostics"]["complete"], false);
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert_eq!(response["gaps"][0]["kind"], "failed_producer");
+    assert_eq!(response["gaps"][0]["producer"], "rust");
+    assert_eq!(response["gaps"][0]["categories"], json!(["diagnostics"]));
+    assert!(response["gaps"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("rust-analyzer")));
 }
 
 #[test]
@@ -2925,5 +2933,71 @@ fn inspect_command_diagnostics_details_honor_top_k() {
             .len(),
         3,
         "diagnostics details should honor topK: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"inspect-gap\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn rust_value() -> u8 { 1 }\n");
+    write_file(
+        &root,
+        "web/package.json",
+        "{\"name\":\"inspect-gap-web\"}\n",
+    );
+    write_file(&root, ".aftignore", "package.json\n");
+    write_file(
+        &root,
+        "web/src/app.ts",
+        "export function tsValue(): number { return 1; }\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+
+    let rust_root_uri = file_uri(&root);
+    let mut lsp = ctx.lsp();
+    lsp.override_binary(ServerKind::Rust, fake_server_path());
+    lsp.override_binary(ServerKind::TypeScript, fake_server_path());
+    lsp.set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    lsp.set_extra_env("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI", &rust_root_uri);
+    drop(lsp);
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-producer-gap",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh");
+    assert_eq!(response["complete"], false);
+    assert!(
+        response["summary"]["diagnostics"]["errors"]
+            .as_u64()
+            .is_some_and(|errors| errors > 0),
+        "the working TypeScript producer's diagnostics should survive: {response:#}"
+    );
+    let rust_gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
+        .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
+    assert_eq!(rust_gap["kind"], "failed_producer");
+    assert_eq!(rust_gap["categories"], json!(["diagnostics"]));
+    assert!(
+        rust_gap["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "failed producer reason missing: {response:#}"
     );
 }

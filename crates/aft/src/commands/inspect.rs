@@ -13,7 +13,8 @@ use crate::inspect::{
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
 };
 use crate::lsp::manager::{
-    ApplicabilityResolutionError, ApplicableServerSnapshot, ApplicableServerStartError,
+    ApplicabilityResolutionError, ApplicableServerFailure, ApplicableServerSnapshot,
+    ApplicableServerStartOutcomes,
 };
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
@@ -23,7 +24,7 @@ const MAX_TOP_K: usize = 100;
 const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false)
+    handle_inspect_payload(req, ctx, false, false, &[])
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -72,6 +73,7 @@ fn handle_inspect_payload(
     ctx: &AppContext,
     force_root_diagnostics: bool,
     applicability_is_empty: bool,
+    producer_failures: &[ApplicableServerFailure],
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -139,6 +141,7 @@ fn handle_inspect_payload(
                 &scope,
                 scope_was_provided || force_root_diagnostics,
                 applicability_is_empty,
+                producer_failures,
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline)) = tier2_receivers.remove(category) {
@@ -374,7 +377,7 @@ fn run_blocking_inspect_body(
             )
         })
         .collect::<Vec<_>>();
-    let start_result = {
+    let start_outcomes = {
         let mut lsp = ctx.lsp();
         lsp.start_applicable_servers(&applicability, &ctx.config())
     };
@@ -384,30 +387,13 @@ fn run_blocking_inspect_body(
         }
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
-    if let Err(error) = start_result {
-        finish_start_failure(starts, &error);
-        return build_inspect_terminal(
-            &req.id,
-            &phase_log,
-            InspectTerminal::PhaseFailed {
-                failed_phase: Some(InspectPhaseEntry::lsp(
-                    InspectPhaseId::LspStart,
-                    &error.server_key,
-                )),
-                failure_reason: "server_start_failed",
-                failure_detail: Some(start_failure_detail(&error)),
-            },
-        );
-    }
-    for (_, phase) in starts {
-        phase.complete();
-    }
+    finish_start_phases(starts, &start_outcomes);
 
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
-    let quiescence = applicability
-        .server_keys
+    let quiescence = start_outcomes
+        .successful
         .iter()
         .map(|server| {
             phase_log.start(InspectPhaseEntry::lsp(
@@ -421,7 +407,13 @@ fn run_blocking_inspect_body(
     // flattened category payloads cannot recover producer ownership.
     let accepted_snapshots = ctx.lsp().drain_events().accepted_snapshots;
     let inspect_snapshot = build_snapshot(ctx).ok();
-    let response = handle_inspect_payload(req, ctx, true, applicability.server_keys.is_empty());
+    let response = handle_inspect_payload(
+        req,
+        ctx,
+        true,
+        applicability.server_keys.is_empty(),
+        &start_outcomes.failures,
+    );
     if inspect_cancellation_requested() {
         for phase in quiescence {
             phase.fail("inspect request cancelled");
@@ -475,43 +467,30 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
     }
 }
 
-fn finish_start_failure(
+fn finish_start_phases(
     starts: Vec<(
         crate::lsp::roots::ServerKey,
         crate::inspect::phase_log::InspectPhaseHandle,
     )>,
-    error: &ApplicableServerStartError,
+    outcomes: &ApplicableServerStartOutcomes,
 ) {
     for (server, phase) in starts {
-        if server == error.server_key {
-            phase.fail(start_failure_detail(error));
+        if let Some(failure) = outcomes
+            .failures
+            .iter()
+            .find(|failure| failure.server_key == server)
+        {
+            // A producer failure is complete evidence about that producer, not a
+            // request-wide phase failure. Other producers must still be reported.
+            phase.fail(failure.reason());
         } else {
             phase.complete();
         }
     }
 }
 
-fn start_failure_detail(error: &ApplicableServerStartError) -> String {
-    match &error.result {
-        crate::lsp::manager::ServerAttemptResult::BinaryNotInstalled { binary } => {
-            format!("{binary} is unavailable")
-        }
-        crate::lsp::manager::ServerAttemptResult::SpawnFailed { reason, .. } => reason.clone(),
-        crate::lsp::manager::ServerAttemptResult::NoRootMarker { .. }
-        | crate::lsp::manager::ServerAttemptResult::Ok { .. } => {
-            "server could not be started".to_string()
-        }
-    }
-}
-
-fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'static str {
-    match error {
-        ApplicabilityResolutionError::MissingExecutable { .. } => "missing_executable",
-        ApplicabilityResolutionError::RootUnreadable { .. }
-        | ApplicabilityResolutionError::CachedSpawnFailure { .. } => {
-            "applicability_resolution_failed"
-        }
-    }
+fn applicability_failure_reason(_error: &ApplicabilityResolutionError) -> &'static str {
+    "applicability_resolution_failed"
 }
 
 fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
@@ -519,13 +498,6 @@ fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
         ApplicabilityResolutionError::RootUnreadable { root, reason } => {
             format!("cannot resolve {}: {reason}", root.display())
         }
-        ApplicabilityResolutionError::MissingExecutable { server_key, binary } => {
-            format!("{binary} is required for {}", server_key.kind.id_str())
-        }
-        ApplicabilityResolutionError::CachedSpawnFailure { server_key, result } => format!(
-            "cached failure for {}: {result:?}",
-            server_key.kind.id_str()
-        ),
     }
 }
 
@@ -958,6 +930,7 @@ fn build_inspect_payload(
 ) -> Value {
     let mut summary = Map::new();
     let mut details = Map::new();
+    let mut gaps = Vec::new();
 
     for category in InspectCategory::active() {
         // `fresh_payloads` established this invariant before this emitter runs.
@@ -966,10 +939,18 @@ fn build_inspect_payload(
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
-        summary.insert(
-            category.as_str().to_string(),
-            summary_for(*category, payload),
-        );
+        let mut category_summary = summary_for(*category, payload);
+        if payload.get("complete").and_then(Value::as_bool) == Some(false) {
+            category_summary["complete"] = Value::Bool(false);
+            if let Some(category_gaps) = payload.get("gaps").and_then(Value::as_array) {
+                category_summary["gaps"] = Value::Array(category_gaps.clone());
+                gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
+                    gap["categories"] = serde_json::json!([category.as_str()]);
+                    gap
+                }));
+            }
+        }
+        summary.insert(category.as_str().to_string(), category_summary);
         if sections.includes(*category) {
             details.insert(
                 category.as_str().to_string(),
@@ -1027,6 +1008,10 @@ fn build_inspect_payload(
     if !details.is_empty() {
         payload["details"] = Value::Object(details);
     }
+    if !gaps.is_empty() {
+        payload["complete"] = Value::Bool(false);
+        payload["gaps"] = Value::Array(gaps);
+    }
     payload
 }
 
@@ -1034,8 +1019,9 @@ fn build_inspect_payload(
 fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value>) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    // This renderer receives only the verified payload map produced above. It
-    // therefore contains findings, never cache-state guidance or partial counts.
+    // Counts are emitted only from verified producer results. A failed producer
+    // is rendered separately so the remaining findings cannot read as all-clear.
+    render_incomplete_categories(&mut lines, summary);
     render_group_category(&mut lines, "Duplicates", summary, details, "duplicates");
     render_cycles_category(&mut lines, summary, details);
     render_symbol_category(&mut lines, "Dead code", summary, details, "dead_code");
@@ -1049,6 +1035,32 @@ fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value
     render_todos(&mut lines, summary, details);
 
     lines.join("\n")
+}
+
+fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    for (category, value) in summary {
+        if value.get("complete").and_then(Value::as_bool) != Some(false) {
+            continue;
+        }
+        for gap in value
+            .get("gaps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let producer = gap
+                .get("producer")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown producer");
+            let reason = gap
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            lines.push(format!(
+                "Incomplete {category}: producer {producer} failed ({reason})"
+            ));
+        }
+    }
 }
 
 fn render_cycles_category(
@@ -2452,7 +2464,6 @@ mod fresh_payload_tests {
             "servers_not_installed",
             "files_without_server",
             "failed_categories",
-            "complete",
         ];
 
         match value {
@@ -2479,6 +2490,13 @@ mod fresh_payload_tests {
                         assert!(
                             !matches!(value.as_str(), Some("pending" | "stale" | "failed")),
                             "partial category status leaked into payload: {value}"
+                        );
+                    }
+                    if key == "complete" {
+                        assert_eq!(
+                            value.as_bool(),
+                            Some(false),
+                            "inspect completion disclosure must name a real gap"
                         );
                     }
                     assert_no_banned_field(value);

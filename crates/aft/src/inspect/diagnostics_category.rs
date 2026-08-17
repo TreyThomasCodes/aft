@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,8 +8,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
-    EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot, PullFileOutcome, PullFileResult,
-    ServerAttemptResult,
+    ApplicableServerFailure, EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot,
+    PullFileOutcome, PullFileResult, ServerAttemptResult,
 };
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
@@ -29,7 +29,7 @@ struct DiagnosticsCollection {
     server_ran: bool,
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
-    servers_not_installed: BTreeSet<String>,
+    producer_failures: BTreeMap<String, String>,
     /// An explicit unsupported file prevents the inspected set from being
     /// mechanically verified, even though it does not have a server to wait on.
     files_without_server: usize,
@@ -71,16 +71,17 @@ impl Drop for ScopedInspectDocuments<'_> {
 
 /// Collect diagnostics for the explicit inspect path.
 ///
-/// A collection becomes Fresh only after all pending, unavailable, or otherwise
-/// unverified diagnostic sources have been resolved. If any such condition
-/// remains, the command emits a terminal non-fresh response instead of
-/// serializing zero counts or cache-state fields.
+/// A collection becomes Fresh after every producer has either returned verified
+/// results or reached a terminal failure. Terminal producer failures remain named
+/// gaps in the payload; pending or otherwise unverified sources still prevent a
+/// fresh response.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     scope_was_provided: bool,
     applicability_is_empty: bool,
+    producer_failures: &[ApplicableServerFailure],
 ) -> JobOutcome {
     let collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
@@ -100,7 +101,9 @@ pub(crate) fn run_diagnostics_category(
         collect_warm_working_set(ctx, snapshot)
     };
 
-    if collection.is_complete() {
+    let mut collection = collection;
+    collection.record_producer_failures(producer_failures);
+    if collection.is_reportable() {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
         }
@@ -349,15 +352,11 @@ fn record_attempt_gaps(outcomes: &EnsureServerOutcomes, collection: &mut Diagnos
     for attempt in &outcomes.attempts {
         match &attempt.result {
             ServerAttemptResult::Ok { .. } => {}
-            ServerAttemptResult::BinaryNotInstalled { .. } => {
+            ServerAttemptResult::BinaryNotInstalled { .. }
+            | ServerAttemptResult::SpawnFailed { .. } => {
                 collection
-                    .servers_not_installed
-                    .insert(attempt.server_id.clone());
-            }
-            ServerAttemptResult::SpawnFailed { .. } => {
-                collection
-                    .servers_not_installed
-                    .insert(attempt.server_id.clone());
+                    .producer_failures
+                    .insert(attempt.server_id.clone(), attempt.result.failure_reason());
             }
             ServerAttemptResult::NoRootMarker { .. } => {
                 // The server is registered for this file's extension but none of
@@ -523,10 +522,22 @@ fn scoped_lsp_files(
 }
 
 impl DiagnosticsCollection {
+    fn record_producer_failures(&mut self, failures: &[ApplicableServerFailure]) {
+        for failure in failures {
+            self.producer_failures
+                .entry(server_id(&failure.server_key))
+                .or_insert_with(|| failure.reason());
+        }
+    }
+
+    #[cfg(test)]
     fn is_complete(&self) -> bool {
-        (self.server_ran || self.applicability_is_empty)
+        self.is_reportable() && self.producer_failures.is_empty()
+    }
+
+    fn is_reportable(&self) -> bool {
+        (self.server_ran || self.applicability_is_empty || !self.producer_failures.is_empty())
             && self.servers_pending.is_empty()
-            && self.servers_not_installed.is_empty()
             && self.files_without_server == 0
             && self
                 .diagnostics
@@ -535,7 +546,7 @@ impl DiagnosticsCollection {
     }
 
     fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
-        debug_assert!(self.is_complete());
+        debug_assert!(self.is_reportable());
         self.sort_and_dedup();
         let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self
@@ -544,13 +555,29 @@ impl DiagnosticsCollection {
             .map(|diagnostic| diagnostic_item(snapshot, diagnostic))
             .collect::<Vec<_>>();
 
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "errors": errors,
             "warnings": warnings,
             "info": info,
             "hints": hints,
             "items": items,
-        })
+        });
+        if !self.producer_failures.is_empty() {
+            payload["complete"] = Value::Bool(false);
+            payload["gaps"] = Value::Array(
+                self.producer_failures
+                    .into_iter()
+                    .map(|(producer, reason)| {
+                        serde_json::json!({
+                            "kind": "failed_producer",
+                            "producer": producer,
+                            "reason": reason,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        payload
     }
 
     fn sort_and_dedup(&mut self) {
@@ -722,6 +749,22 @@ mod payload_count_tests {
         assert!(payload.get("complete").is_none());
         assert!(payload.get("status").is_none());
         assert!(payload.get("provisional_counts").is_none());
+    }
+
+    #[test]
+    fn terminal_producer_failure_is_a_reportable_named_gap() {
+        let mut collection = collection();
+        collection
+            .producer_failures
+            .insert("astro".into(), "initialize failed".into());
+
+        assert!(collection.is_reportable());
+        assert!(!collection.is_complete());
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["complete"], false);
+        assert_eq!(payload["gaps"][0]["kind"], "failed_producer");
+        assert_eq!(payload["gaps"][0]["producer"], "astro");
+        assert_eq!(payload["gaps"][0]["reason"], "initialize failed");
     }
 }
 

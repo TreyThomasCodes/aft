@@ -244,6 +244,18 @@ fn main() -> io::Result<()> {
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
+                    if let Some(target_root_uri) =
+                        std::env::var("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI").ok()
+                    {
+                        let request_root_uri = params
+                            .as_ref()
+                            .and_then(|value| value.get("rootUri"))
+                            .and_then(Value::as_str);
+                        if request_root_uri == Some(target_root_uri.as_str()) {
+                            eprintln!("intentional initialize failure for {target_root_uri}");
+                            std::process::exit(1);
+                        }
+                    }
                     if std::env::var("AFT_FAKE_LSP_INIT_CRASH_MODULE_NOT_FOUND")
                         .ok()
                         .as_deref()

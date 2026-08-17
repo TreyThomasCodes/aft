@@ -101,6 +101,7 @@ pub struct EnsureServerOutcomes {
 pub struct ApplicableServerSnapshot {
     pub server_keys: Vec<ServerKey>,
     candidates: Vec<ApplicableServerCandidate>,
+    producer_failures: Vec<ApplicableServerFailure>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,24 +112,41 @@ struct ApplicableServerCandidate {
 
 #[derive(Clone, Debug)]
 pub enum ApplicabilityResolutionError {
-    RootUnreadable {
-        root: PathBuf,
-        reason: String,
-    },
-    MissingExecutable {
-        server_key: ServerKey,
-        binary: String,
-    },
-    CachedSpawnFailure {
-        server_key: ServerKey,
-        result: ServerAttemptResult,
-    },
+    RootUnreadable { root: PathBuf, reason: String },
 }
 
 #[derive(Clone, Debug)]
-pub struct ApplicableServerStartError {
+pub struct ApplicableServerFailure {
     pub server_key: ServerKey,
     pub result: ServerAttemptResult,
+}
+
+impl ApplicableServerFailure {
+    pub fn reason(&self) -> String {
+        self.result.failure_reason()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApplicableServerStartOutcomes {
+    pub successful: Vec<ServerKey>,
+    pub failures: Vec<ApplicableServerFailure>,
+}
+
+impl ServerAttemptResult {
+    pub fn failure_reason(&self) -> String {
+        match self {
+            Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
+            Self::SpawnFailed { reason, .. } => reason.clone(),
+            Self::NoRootMarker { looked_for } => {
+                format!(
+                    "no workspace root marker found (looked for {})",
+                    looked_for.join(", ")
+                )
+            }
+            Self::Ok { .. } => "server started successfully".to_string(),
+        }
+    }
 }
 
 impl EnsureServerOutcomes {
@@ -553,6 +571,7 @@ impl LspManager {
         }
 
         let mut candidates = HashMap::<ServerKey, ApplicableServerCandidate>::new();
+        let mut producer_failures = HashMap::<ServerKey, ApplicableServerFailure>::new();
         let walker = ignore::WalkBuilder::new(project_root)
             .standard_filters(true)
             .add_custom_ignore_filename(".aftignore")
@@ -580,50 +599,54 @@ impl LspManager {
                 let Some(key) = server_key_for_definition(&definition, file, config) else {
                     continue;
                 };
-                if candidates.contains_key(&key) {
+                if candidates.contains_key(&key) || producer_failures.contains_key(&key) {
                     continue;
                 }
                 if let Some(result) = self.failed_spawns.get(&key) {
-                    return Err(ApplicabilityResolutionError::CachedSpawnFailure {
-                        server_key: key,
-                        result: result.clone(),
-                    });
+                    producer_failures.insert(
+                        key.clone(),
+                        ApplicableServerFailure {
+                            server_key: key,
+                            result: result.clone(),
+                        },
+                    );
+                    continue;
                 }
                 if self.resolve_binary(&definition, config).is_err() {
-                    return Err(ApplicabilityResolutionError::MissingExecutable {
-                        server_key: key,
-                        binary: definition.binary.clone(),
-                    });
+                    producer_failures.insert(
+                        key.clone(),
+                        ApplicableServerFailure {
+                            server_key: key,
+                            result: ServerAttemptResult::BinaryNotInstalled {
+                                binary: definition.binary.clone(),
+                            },
+                        },
+                    );
+                    continue;
                 }
                 candidates.insert(key.clone(), ApplicableServerCandidate { key, definition });
             }
         }
 
-        if candidates.is_empty() {
-            // An empty applicability set has no diagnostics producer to start or
-            // wait for. Preserve that fact as a valid snapshot so inspect can
-            // satisfy the diagnostics phase vacuously.
-            return Ok(ApplicableServerSnapshot {
-                server_keys: Vec::new(),
-                candidates: Vec::new(),
-            });
-        }
-
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            left.key
-                .kind
-                .id_str()
-                .cmp(right.key.kind.id_str())
-                .then_with(|| left.key.root.cmp(&right.key.root))
-        });
-        let server_keys = candidates
+        candidates.sort_by(|left, right| server_key_sort(&left.key, &right.key));
+        let mut producer_failures = producer_failures.into_values().collect::<Vec<_>>();
+        producer_failures
+            .sort_by(|left, right| server_key_sort(&left.server_key, &right.server_key));
+        let mut server_keys = candidates
             .iter()
             .map(|candidate| candidate.key.clone())
-            .collect();
+            .chain(
+                producer_failures
+                    .iter()
+                    .map(|failure| failure.server_key.clone()),
+            )
+            .collect::<Vec<_>>();
+        server_keys.sort_by(server_key_sort);
         Ok(ApplicableServerSnapshot {
             server_keys,
             candidates,
+            producer_failures,
         })
     }
 
@@ -636,10 +659,14 @@ impl LspManager {
         &mut self,
         snapshot: &ApplicableServerSnapshot,
         config: &Config,
-    ) -> Result<Vec<ServerKey>, ApplicableServerStartError> {
-        let mut started = Vec::new();
+    ) -> ApplicableServerStartOutcomes {
+        let mut outcomes = ApplicableServerStartOutcomes {
+            failures: snapshot.producer_failures.clone(),
+            ..ApplicableServerStartOutcomes::default()
+        };
         for candidate in &snapshot.candidates {
             if self.clients.contains_key(&candidate.key) {
+                outcomes.successful.push(candidate.key.clone());
                 continue;
             }
             match self.spawn_server(&candidate.definition, &candidate.key.root, config) {
@@ -648,20 +675,20 @@ impl LspManager {
                     self.server_binaries
                         .insert(candidate.key.clone(), candidate.definition.binary.clone());
                     self.documents.entry(candidate.key.clone()).or_default();
-                    started.push(candidate.key.clone());
+                    outcomes.successful.push(candidate.key.clone());
                 }
                 Err(error) => {
                     let result = classify_spawn_error(&candidate.definition.binary, &error);
                     self.failed_spawns
                         .insert(candidate.key.clone(), result.clone());
-                    return Err(ApplicableServerStartError {
+                    outcomes.failures.push(ApplicableServerFailure {
                         server_key: candidate.key.clone(),
                         result,
                     });
                 }
             }
         }
-        Ok(started)
+        outcomes
     }
 
     /// Ensure a server is running for the given file. Spawns if needed.
