@@ -6274,6 +6274,30 @@ impl AppContext {
         }))
     }
 
+    /// Resolve a possibly-relative path against the configured project root.
+    ///
+    /// Safety arms that key backup/checkpoint state by path (`undo`,
+    /// `undo_preview`, `edit_history`, `checkpoint`) must resolve relative paths
+    /// against the request's bound project root BEFORE validation and keying.
+    /// Otherwise a relative path is joined against the daemon's current working
+    /// directory by `canonicalize_key`, which differs from the root the mutating
+    /// tool resolved against — the per-(session, path) stack lookup then misses
+    /// and the user gets a false `no_undo_history`.
+    ///
+    /// When no `project_root` is configured (direct CLI usage), relative paths
+    /// fall back to the current working directory, matching `canonicalize_key`.
+    pub fn resolve_relative_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        if let Some(root) = &self.config().project_root {
+            return root.join(path);
+        }
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+
     /// Validate that a file path falls within the configured project root.
     ///
     /// When `project_root` is configured (normal plugin usage), this resolves the

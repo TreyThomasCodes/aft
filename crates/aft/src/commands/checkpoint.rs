@@ -91,10 +91,15 @@ fn validate_checkpoint_files(
 ) -> Result<Vec<PathBuf>, Response> {
     let mut validated = Vec::with_capacity(files.len());
     for path in files {
+        // Resolve relative paths against the bound project root so the
+        // checkpoint key matches the path the mutating tool recorded. A relative
+        // path passed straight to `canonicalize_key` would be joined against the
+        // daemon's cwd and miss the snapshot.
+        let input = ctx.resolve_relative_path(&path);
         // Creation and restore must authorize and key the same final object.
         // Resolving only ancestors preserves a final symlink for the snapshot
         // reader while still rejecting symlinked parents that escape the root.
-        validated.push(ctx.validate_write_location(req_id, &path)?);
+        validated.push(ctx.validate_write_location(req_id, &input)?);
     }
     Ok(validated)
 }

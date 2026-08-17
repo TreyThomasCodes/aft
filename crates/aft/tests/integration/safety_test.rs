@@ -1613,3 +1613,175 @@ fn restricted_undo_preview_and_undo_preserve_symlinked_backup_key() {
     assert!(status.success());
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Configure a project root WITHOUT path restriction. This is the default
+/// plugin posture and the exact configuration under which the relative-path
+/// undo hole reproduced: a relative path passed to `canonicalize_key` is joined
+/// against the daemon's cwd (not the bound project root), so the per-session
+/// stack lookup misses and reports a false `no_undo_history`.
+fn configure_unrestricted(aft: &mut AftProcess, root: &std::path::Path, request_id: &str) {
+    let response = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": request_id,
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(response["success"], true, "configure: {response:?}");
+}
+
+#[test]
+fn relative_path_undo_restores_after_edit() {
+    // Regression: a relative `file` passed to `undo` must resolve against the
+    // bound project root so the backup key matches the path the mutating tool
+    // recorded. Before the fix it was joined against the daemon's cwd, the
+    // stack lookup missed, and the user got a false `no_undo_history`.
+    let dir = temp_dir("relative_undo_after_edit");
+    let file = dir.join("target.txt");
+    fs::write(&file, "hello world\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-relative-undo");
+
+    let edit = serde_json::json!({
+        "id": "edit-relative-undo",
+        "command": "edit_match",
+        "file": file.display().to_string(),
+        "match": "world",
+        "replacement": "rust",
+    });
+    let edit_resp = aft.send(&serde_json::to_string(&edit).unwrap());
+    assert_eq!(edit_resp["success"], true, "edit: {edit_resp:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello rust\n");
+
+    // Send `undo` with a relative `file` value, matching the input that exposed
+    // the path-resolution bug (a relative path was joined against the daemon's
+    // cwd instead of the bound project root).
+    let undo = aft.send(r#"{"id":"undo-relative","command":"undo","file":"target.txt"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello world\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn relative_path_undo_preview_and_history_see_same_stack_as_absolute() {
+    let dir = temp_dir("relative_preview_history");
+    let file = dir.join("tracked.txt");
+    fs::write(&file, "v1").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-relative-preview-history");
+
+    // Snapshot v1, then modify and snapshot v2, then modify to v3. The stack is
+    // [v1, v2]; the top backup holds v2's content, so undo restores v2.
+    aft.send(&format!(
+        r#"{{"id":"s1","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    fs::write(&file, "v2").unwrap();
+    aft.send(&format!(
+        r#"{{"id":"s2","command":"snapshot","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    fs::write(&file, "v3").unwrap();
+
+    // Relative-path history must see the same stack as the absolute path.
+    let abs_history = aft.send(&format!(
+        r#"{{"id":"hist-abs","command":"edit_history","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(abs_history["success"], true, "abs history: {abs_history:?}");
+    let rel_history =
+        aft.send(r#"{"id":"hist-rel","command":"edit_history","file":"tracked.txt"}"#);
+    assert_eq!(rel_history["success"], true, "rel history: {rel_history:?}");
+    assert_eq!(
+        rel_history["entries"], abs_history["entries"],
+        "relative and absolute history must agree"
+    );
+
+    // Relative-path preview must see the same stack as the absolute path.
+    let abs_preview = aft.send(&format!(
+        r#"{{"id":"preview-abs","command":"undo_preview","file":{}}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(abs_preview["success"], true, "abs preview: {abs_preview:?}");
+    let rel_preview =
+        aft.send(r#"{"id":"preview-rel","command":"undo_preview","file":"tracked.txt"}"#);
+    assert_eq!(rel_preview["success"], true, "rel preview: {rel_preview:?}");
+    assert_eq!(
+        rel_preview["paths"], abs_preview["paths"],
+        "relative and absolute preview must agree"
+    );
+
+    // Relative-path undo restores the top of the same stack (v2's content).
+    let undo = aft.send(r#"{"id":"undo-rel","command":"undo","file":"tracked.txt"}"#);
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "v2");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn relative_path_escaping_root_still_fails_validation() {
+    let container = tempfile::tempdir().unwrap();
+    let root = container.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    let outside = container.path().join("outside.txt");
+    fs::write(&outside, "outside-control").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &root, "cfg-relative-escape");
+
+    // A relative path that lexically escapes the root must still be rejected.
+    let undo = aft.send(r#"{"id":"undo-escape","command":"undo","file":"../outside.txt"}"#);
+    assert_eq!(undo["success"], false, "undo escape: {undo:?}");
+    assert_eq!(undo["code"], "path_outside_root");
+
+    let preview =
+        aft.send(r#"{"id":"preview-escape","command":"undo_preview","file":"../outside.txt"}"#);
+    assert_eq!(preview["success"], false, "preview escape: {preview:?}");
+    assert_eq!(preview["code"], "path_outside_root");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn undo_miss_message_echoes_resolved_absolute_path() {
+    // The miss message is a defect surface of its own: "no undo history for:
+    // <input path>" is indistinguishable from a genuine no-backups state, and
+    // the two want opposite agent responses. Echoing the RESOLVED absolute path
+    // turns a silent wrong answer into a visibly wrong input.
+    let dir = temp_dir("undo_miss_absolute");
+    let file = dir.join("never_snapshotted.txt");
+    fs::write(&file, "content").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, &dir, "cfg-undo-miss-absolute");
+
+    let undo = aft.send(r#"{"id":"undo-miss","command":"undo","file":"never_snapshotted.txt"}"#);
+    assert_eq!(undo["success"], false, "undo: {undo:?}");
+    assert_eq!(undo["code"], "no_undo_history");
+    let message = undo["message"].as_str().unwrap();
+    // The message must contain the resolved absolute path (root-joined), not the
+    // raw relative input, so a mis-resolution is visible in the error itself.
+    // Compare against the non-canonicalized absolute path: the message echoes the
+    // root-joined spelling, while `fs::canonicalize` would resolve macOS
+    // `/var` → `/private/var` and diverge.
+    let resolved = dir.join("never_snapshotted.txt");
+    assert!(
+        message.contains(&resolved.display().to_string()),
+        "miss message should echo the resolved absolute path, got: {message}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&dir);
+}

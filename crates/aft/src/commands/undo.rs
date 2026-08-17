@@ -30,7 +30,12 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         };
     };
 
-    let resolved = match ctx.validate_write_location(&req.id, Path::new(file)) {
+    // Resolve relative paths against the bound project root BEFORE validation so
+    // the backup key matches the path the mutating tool recorded. A relative path
+    // passed straight to `canonicalize_key` would be joined against the daemon's
+    // cwd, missing the stack and reporting a false `no_undo_history`.
+    let input = ctx.resolve_relative_path(Path::new(file));
+    let resolved = match ctx.validate_write_location(&req.id, &input) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
@@ -64,7 +69,8 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
         .or_else(|| req.params.get("filePath"))
         .and_then(|v| v.as_str())
         .map(|file| {
-            ctx.validate_write_location(&req.id, Path::new(file))
+            let input = ctx.resolve_relative_path(Path::new(file));
+            ctx.validate_write_location(&req.id, &input)
                 .and_then(|path| {
                     backup
                         .preview_latest_path(req.session(), &path)

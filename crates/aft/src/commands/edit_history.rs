@@ -19,18 +19,11 @@ pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Resolve relative paths against project_root so backup keys match
-    let config = ctx.config();
-    let resolved = if Path::new(file).is_relative() {
-        if let Some(ref root) = config.project_root {
-            root.join(file)
-        } else {
-            Path::new(file).to_path_buf()
-        }
-    } else {
-        Path::new(file).to_path_buf()
-    };
-    drop(config);
+    // Resolve relative paths against the bound project root so the backup key
+    // matches the path the mutating tool recorded. A relative path passed
+    // straight to `canonicalize_key` would be joined against the daemon's cwd
+    // and miss the stack.
+    let resolved = ctx.resolve_relative_path(Path::new(file));
 
     let backup = ctx.backup().lock();
     let history = backup.history(req.session(), &resolved);
