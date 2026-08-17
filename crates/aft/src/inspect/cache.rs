@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+const INSPECT_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 // Field data (2026-08-06): ~/.local/share/cortexkit/aft/inspect held 1,945
 // scope-key directories for about 30 repositories; 1,849 directories (21.5 GB)
 // had no file newer than seven days. Scope keys hash canonical checkout paths,
@@ -51,6 +52,7 @@ pub(crate) struct InspectDbTimings {
 #[derive(Debug)]
 pub enum InspectCacheError {
     Io(std::io::Error),
+    WriterLeaseTimeout,
     Sql(rusqlite::Error),
     Json(serde_json::Error),
     LockPoisoned(&'static str),
@@ -61,6 +63,12 @@ impl fmt::Display for InspectCacheError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InspectCacheError::Io(error) => write!(formatter, "inspect cache io error: {error}"),
+            InspectCacheError::WriterLeaseTimeout => {
+                write!(
+                    formatter,
+                    "writer_lease_timeout: inspect writer lease deadline elapsed"
+                )
+            }
             InspectCacheError::Sql(error) => {
                 write!(formatter, "inspect cache sqlite error: {error}")
             }
@@ -1863,13 +1871,17 @@ fn acquire_writer_lease(
     project_key: &str,
     project_root: &Path,
 ) -> Result<Option<Arc<crate::root_cache::WriterLease>>, InspectCacheError> {
-    crate::root_cache::WriterLease::acquire_shared(
+    crate::root_cache::WriterLease::acquire_shared_with_timeout(
         crate::root_cache::RootCacheDomain::Inspect,
         inspect_dir,
         project_key,
         project_root,
+        INSPECT_WRITER_LEASE_TIMEOUT,
     )
-    .map_err(|error| InspectCacheError::Io(std::io::Error::other(error.to_string())))
+    .map_err(|error| match error {
+        crate::fs_lock::AcquireError::Timeout => InspectCacheError::WriterLeaseTimeout,
+        crate::fs_lock::AcquireError::Io(error) => InspectCacheError::Io(error),
+    })
 }
 
 fn open_readonly_connection(path: &Path) -> Result<Connection, InspectCacheError> {
@@ -2405,6 +2417,40 @@ mod tests {
             sqlite_readonly_uri(Path::new(r"C:\Users\name with spaces\db#1.sqlite")),
             "file:///C:/Users/name%20with%20spaces/db%231.sqlite?mode=ro"
         );
+    }
+
+    #[test]
+    fn held_writer_lease_fails_within_the_inspect_deadline() {
+        let temp = tempfile::tempdir().expect("create temporary cache root");
+        let project_root = temp.path().join("project");
+        let inspect_dir = temp.path().join("inspect");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_key = crate::path_identity::project_scope_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, "shared", false);
+        let project_dir = project_inspect_dir(inspect_dir.clone(), &project_key);
+        fs::create_dir_all(&project_dir).expect("create project inspect directory");
+
+        // Hold the actual lease file through an independent handle so the test
+        // exercises the contended wait rather than an uncontended fast path.
+        let held = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&project_dir),
+            Duration::ZERO,
+        )
+        .expect("hold inspect writer lease");
+        let started = Instant::now();
+        let error = match InspectCache::open(inspect_dir.clone(), project_root.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("contended inspect cache must fail honestly"),
+        };
+        assert!(matches!(error, InspectCacheError::WriterLeaseTimeout));
+        assert!(
+            started.elapsed() <= INSPECT_WRITER_LEASE_TIMEOUT + Duration::from_secs(1),
+            "writer lease acquisition exceeded its deadline"
+        );
+
+        drop(held);
+        InspectCache::open(inspect_dir, project_root)
+            .expect("cache opens after the competing writer releases");
     }
 
     #[cfg(windows)]

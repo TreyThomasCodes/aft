@@ -17,6 +17,7 @@ use crate::{
         CallGraphStore,
     },
     config::Config,
+    inspect::{InspectCache, InspectCacheError},
     parser::TreeSitterProvider,
     path_identity::ProjectRootId,
     protocol::Response,
@@ -837,6 +838,136 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .blockers
         .iter()
         .any(|blocker| blocker.starts_with("idle_workers==0(")));
+}
+
+#[test]
+fn bind_blocker_snapshot_names_a_stuck_reader_occupant() {
+    let executor = test_executor(1, 1, 1, 1);
+    let (_dir, root) = test_root("stuck-reader-blocker");
+    executor.register_actor(root.clone(), test_ctx());
+    let (reader_started_tx, reader_started_rx) = crossbeam_channel::bounded(1);
+    let (release_reader_tx, release_reader_rx) = crossbeam_channel::bounded(1);
+    let reader = executor.submit(
+        root.clone(),
+        Lane::SerialLspStatus,
+        "abandoned-inspect".to_string(),
+        Box::new(move |_| {
+            reader_started_tx.send(()).expect("inspect starts");
+            release_reader_rx.recv().expect("release inspect");
+            ok("inspect")
+        }),
+    );
+    reader_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("inspect enters the LSP lane");
+    {
+        let mut state = executor.inner.state.lock();
+        let running = state
+            .running_jobs
+            .get_mut(&(root.clone(), "abandoned-inspect".to_string()))
+            .expect("running inspect census entry");
+        running.started_at = Instant::now() - READER_STUCK_CENSUS_AGE - Duration::from_secs(1);
+    }
+    let bind = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-after-inspect".to_string(),
+        Box::new(|_| ok("bind")),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let snapshot = loop {
+        if let Some(snapshot) = executor.try_bind_blocker_snapshot(&root, "subc-bind-after-inspect")
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "blocker snapshot timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let blocker = snapshot
+        .blockers
+        .iter()
+        .find(|blocker| blocker.starts_with("waiting_on_readers_stuck("))
+        .expect("stuck-reader blocker");
+    assert!(blocker.contains("job=abandoned-inspect"));
+    assert!(blocker.contains("lane=SerialLspStatus"));
+    assert!(blocker.contains("age_ms="));
+
+    release_reader_tx.send(()).expect("release inspect");
+    reader
+        .recv_timeout(Duration::from_secs(1))
+        .expect("inspect completes");
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("bind proceeds after the reader releases");
+}
+
+#[test]
+fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("held-inspect-writer-lease");
+    executor.register_actor(root.clone(), test_ctx());
+    let project_root = root.as_path().to_path_buf();
+    let inspect_dir = project_root.join("inspect-cache");
+    let project_key = crate::path_identity::project_scope_key(&project_root);
+    crate::root_cache::configure_artifact_access(&project_root, "shared", false);
+    let project_dir = inspect_dir.join(&project_key);
+    std::fs::create_dir_all(&project_dir).expect("create project inspect directory");
+    let held = crate::fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(&project_dir),
+        Duration::ZERO,
+    )
+    .expect("hold inspect writer lease");
+
+    let (inspect_started_tx, inspect_started_rx) = crossbeam_channel::bounded(1);
+    let inspect = executor.submit(
+        root.clone(),
+        Lane::SerialLspStatus,
+        "inspect-held-writer-lease".to_string(),
+        Box::new(move |_| {
+            inspect_started_tx.send(()).expect("inspect starts");
+            match InspectCache::open(inspect_dir, project_root) {
+                Err(InspectCacheError::WriterLeaseTimeout) => Response::error(
+                    "inspect-held-writer-lease",
+                    "writer_lease_timeout",
+                    "inspect writer lease deadline elapsed",
+                ),
+                Err(error) => panic!("unexpected inspect cache error: {error}"),
+                Ok(_) => panic!("contended inspect cache unexpectedly opened"),
+            }
+        }),
+    );
+    inspect_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("inspect starts while lease is held");
+
+    let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded(1);
+    let bind = executor.submit(
+        root,
+        Lane::Mutating,
+        "subc-bind-after-writer-timeout".to_string(),
+        Box::new(move |_| {
+            bind_started_tx.send(()).expect("bind starts");
+            ok("bind")
+        }),
+    );
+    assert!(
+        bind_started_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "bind must wait while inspect still occupies the LSP lane"
+    );
+
+    let inspect_response = inspect
+        .recv_timeout(Duration::from_secs(3))
+        .expect("inspect reaches its writer lease deadline");
+    assert!(!inspect_response.success);
+    assert_eq!(inspect_response.data["code"], "writer_lease_timeout");
+    bind_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("bind starts after inspect reports the timeout");
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("bind completes while competing lease remains held");
+    drop(held);
 }
 
 #[test]

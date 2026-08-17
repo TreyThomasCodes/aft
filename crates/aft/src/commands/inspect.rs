@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 
@@ -19,6 +20,7 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
+const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_inspect_payload(req, ctx, false, false)
@@ -90,6 +92,10 @@ fn handle_inspect_payload(
         Err(response) => return response,
     };
 
+    if inspect_cancellation_requested() {
+        return inspect_interrupted_response(&req.id);
+    }
+
     let manager = ctx.inspect_manager();
     let mut tier2_receivers = BTreeMap::new();
     for category in InspectCategory::active()
@@ -112,11 +118,17 @@ fn handle_inspect_payload(
             };
             let _ = tx.send(outcome);
         });
-        tier2_receivers.insert(category, rx);
+        tier2_receivers.insert(
+            category,
+            (rx, std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT),
+        );
     }
 
     let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
+        if inspect_cancellation_requested() {
+            return inspect_interrupted_response(&req.id);
+        }
         let outcome = if *category == InspectCategory::Diagnostics {
             // Diagnostics use the serial LSP lane rather than the inspect worker
             // pool. A non-authoritative collection remains a non-fresh outcome;
@@ -129,8 +141,11 @@ fn handle_inspect_payload(
                 applicability_is_empty,
             )
         } else if category.is_tier2() {
-            if let Some(rx) = tier2_receivers.remove(category) {
-                receive_tier2_completion(rx)
+            if let Some((rx, deadline)) = tier2_receivers.remove(category) {
+                match receive_tier2_completion_until(rx, *category, deadline) {
+                    Some(outcome) => outcome,
+                    None => return inspect_interrupted_response(&req.id),
+                }
             } else {
                 // A read-only daemon may serve a cached aggregate only when the
                 // stat-verification path proves that artifact is still current.
@@ -345,6 +360,10 @@ fn run_blocking_inspect_body(
     applicability: ApplicableServerSnapshot,
     phase_log: InspectPhaseLog,
 ) -> Response {
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+
     let starts = applicability
         .server_keys
         .iter()
@@ -355,10 +374,17 @@ fn run_blocking_inspect_body(
             )
         })
         .collect::<Vec<_>>();
-    if let Err(error) = {
+    let start_result = {
         let mut lsp = ctx.lsp();
         lsp.start_applicable_servers(&applicability, &ctx.config())
-    } {
+    };
+    if inspect_cancellation_requested() {
+        for (_, phase) in starts {
+            phase.fail("inspect request cancelled");
+        }
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    if let Err(error) = start_result {
         finish_start_failure(starts, &error);
         return build_inspect_terminal(
             &req.id,
@@ -377,6 +403,9 @@ fn run_blocking_inspect_body(
         phase.complete();
     }
 
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
     let quiescence = applicability
         .server_keys
         .iter()
@@ -393,11 +422,20 @@ fn run_blocking_inspect_body(
     let accepted_snapshots = ctx.lsp().drain_events().accepted_snapshots;
     let inspect_snapshot = build_snapshot(ctx).ok();
     let response = handle_inspect_payload(req, ctx, true, applicability.server_keys.is_empty());
+    if inspect_cancellation_requested() {
+        for phase in quiescence {
+            phase.fail("inspect request cancelled");
+        }
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
     if let Some(inspect_snapshot) = &inspect_snapshot {
         record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
     }
     for phase in quiescence {
         phase.complete();
+    }
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
     if response.success {
         build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Fresh(response.data))
@@ -407,7 +445,7 @@ fn run_blocking_inspect_body(
             &phase_log,
             InspectTerminal::PhaseFailed {
                 failed_phase: phase_log.in_flight_entry(),
-                failure_reason: "inspect_not_fresh",
+                failure_reason: inspect_failure_reason(&response),
                 failure_detail: response
                     .data
                     .get("message")
@@ -415,6 +453,25 @@ fn run_blocking_inspect_body(
                     .map(str::to_owned),
             },
         )
+    }
+}
+
+fn inspect_failure_reason(response: &Response) -> &'static str {
+    let message = response
+        .data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message.contains("writer_lease_timeout") {
+        "writer_lease_timeout"
+    } else if message.contains("cold_build_limiter_timeout") {
+        "cold_build_limiter_timeout"
+    } else if message.contains("inspect_phase_timeout") {
+        "inspect_phase_timeout"
+    } else if message.contains("lsp_quiescence_timeout") {
+        "lsp_quiescence_timeout"
+    } else {
+        "inspect_not_fresh"
     }
 }
 
@@ -672,10 +729,50 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     ))
 }
 
-fn receive_tier2_completion(rx: std::sync::mpsc::Receiver<JobOutcome>) -> JobOutcome {
-    rx.recv().unwrap_or_else(|_| JobOutcome::Failed {
-        message: "inspect Tier-2 worker disconnected before completion".to_string(),
-    })
+fn receive_tier2_completion_until(
+    rx: std::sync::mpsc::Receiver<JobOutcome>,
+    category: InspectCategory,
+    deadline: std::time::Instant,
+) -> Option<JobOutcome> {
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Some(JobOutcome::Failed {
+                message: format!(
+                    "inspect_phase_timeout: {} did not complete within {}s",
+                    category.as_str(),
+                    BLOCKING_TIER2_PHASE_TIMEOUT.as_secs()
+                ),
+            });
+        }
+        let wait = Duration::from_millis(50).min(deadline.saturating_duration_since(now));
+        match rx.recv_timeout(wait) {
+            Ok(outcome) => return Some(outcome),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if inspect_cancellation_requested() {
+                    return None;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(JobOutcome::Failed {
+                    message: "inspect Tier-2 worker disconnected before completion".to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn inspect_cancellation_requested() -> bool {
+    crate::executor::current_job_cancellation()
+        .is_some_and(|token| token.cancel_requested_before_commit())
+}
+
+fn inspect_interrupted_response(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "inspect_interrupted",
+        "inspect request was abandoned before completion",
+    )
 }
 
 fn fresh_payloads(
@@ -2513,5 +2610,30 @@ mod deferred_terminal_tests {
             "stat_verification"
         );
         assert!(failed.data.get("failed_phase").is_none());
+    }
+
+    #[test]
+    fn writer_lease_deadline_has_a_named_terminal_reason() {
+        let response = Response::error(
+            "inspect-writer-timeout",
+            "inspect_not_fresh",
+            "dead_code failed: writer_lease_timeout: inspect writer lease deadline elapsed",
+        );
+        assert_eq!(inspect_failure_reason(&response), "writer_lease_timeout");
+    }
+
+    #[test]
+    fn blocking_tier2_wait_has_a_hard_phase_deadline() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let outcome = receive_tier2_completion_until(
+            rx,
+            InspectCategory::DeadCode,
+            std::time::Instant::now() + Duration::from_millis(20),
+        )
+        .expect("deadline produces an honest failure");
+        assert!(matches!(
+            outcome,
+            JobOutcome::Failed { message } if message.contains("inspect_phase_timeout")
+        ));
     }
 }

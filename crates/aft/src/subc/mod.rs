@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::config_resolve::ConfigTier;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
-use crate::executor::{Executor, Lane};
+use crate::executor::{Executor, JobCancellation, Lane};
 use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
 use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
@@ -185,6 +185,14 @@ struct ToolCallCompletion {
 }
 
 #[derive(Clone)]
+struct ActiveToolCall {
+    root_id: ProjectRootId,
+    cancellation: JobCancellation,
+}
+
+type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
+
+#[derive(Clone)]
 struct PushSenders {
     lossy_tx: mpsc::Sender<LossyPushEnvelope>,
     reliable_tx: mpsc::UnboundedSender<PushEnvelope>,
@@ -241,6 +249,82 @@ impl PersistentCancelSignal {
             notified.await;
         }
     }
+}
+
+fn finish_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: u64) {
+    active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(route, corr));
+}
+
+fn cancel_active_tool_call(
+    active: &ActiveToolCalls,
+    executor: &Executor,
+    route: RouteChannel,
+    corr: u64,
+    reason: &str,
+) -> bool {
+    let call = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(route, corr));
+    let Some(call) = call else {
+        return false;
+    };
+    let outcome = executor.cancel_job(&call.root_id, &call.cancellation);
+    log::debug!(
+        "subc attach: cancelled active tool call route={route} corr={corr} reason={reason} outcome={outcome:?}"
+    );
+    true
+}
+
+fn cancel_active_tool_calls_for_route(
+    active: &ActiveToolCalls,
+    executor: &Executor,
+    route: RouteChannel,
+    reason: &str,
+) -> usize {
+    let cancelled = {
+        let mut calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cancelled = Vec::new();
+        calls.retain(|(call_route, _), call| {
+            if *call_route == route {
+                cancelled.push(call.clone());
+                false
+            } else {
+                true
+            }
+        });
+        cancelled
+    };
+    for call in &cancelled {
+        let outcome = executor.cancel_job(&call.root_id, &call.cancellation);
+        log::debug!(
+            "subc attach: cancelled active tool call route={route} reason={reason} outcome={outcome:?}"
+        );
+    }
+    cancelled.len()
+}
+
+fn cancel_all_active_tool_calls(
+    active: &ActiveToolCalls,
+    executor: &Executor,
+    reason: &str,
+) -> usize {
+    let cancelled = {
+        let mut calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        calls.drain().map(|(_, call)| call).collect::<Vec<_>>()
+    };
+    for call in &cancelled {
+        let outcome = executor.cancel_job(&call.root_id, &call.cancellation);
+        log::debug!("subc attach: cancelled active tool call reason={reason} outcome={outcome:?}");
+    }
+    cancelled.len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,8 +837,10 @@ fn quiesce_connection_roots(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    active_tool_calls: &ActiveToolCalls,
     executor: &Arc<Executor>,
 ) {
+    cancel_all_active_tool_calls(active_tool_calls, executor, "connection teardown");
     for cancel in route_bash_cancels.values() {
         cancel.token.cancel();
     }
@@ -1011,6 +1097,8 @@ fn purge_deleted_root_residents(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    active_tool_calls: &ActiveToolCalls,
+    executor: &Executor,
     retry_buffer: &mut RetryBuffer,
     reclaimed_routes: &mut ReclaimedRoutes,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -1047,6 +1135,7 @@ fn purge_deleted_root_residents(
         if let Some(cancel) = route_bash_cancels.remove(&route) {
             cancel.token.cancel();
         }
+        cancel_active_tool_calls_for_route(active_tool_calls, executor, route, "root reclaim");
         retry_buffer.remove(&route);
         if let Some(sub) = bg_subs.remove(&route) {
             metrics.record_bg_subscription_ended(&sub.root, &sub.session, route, "root-reclaim");
@@ -1709,6 +1798,7 @@ async fn teardown_installed_route(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    active_tool_calls: &ActiveToolCalls,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
@@ -1745,6 +1835,7 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
+    cancel_active_tool_calls_for_route(active_tool_calls, executor, channel, cancellation_reason);
     if let Some(pending) = pending_binds.get_mut(&channel) {
         pending.cancelled = true;
         let outcome = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
@@ -2406,6 +2497,7 @@ where
     let mut pending_bash_asks: HashMap<ReverseCorrKey, PendingBashAsk> = HashMap::new();
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
+    let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     let health_rollup_cache = HealthRollupCache::new();
     health_rollup_cache.refresh(&executor, &shared_app);
     let mut next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
@@ -2631,6 +2723,7 @@ where
                             &mut pending_bash_asks,
                             &mut live_roots,
                             &mut route_bash_cancels,
+                            &active_tool_calls,
                             &mut pending_binds,
                             &mut retry_buffer,
                             &mut push_buffer,
@@ -2677,6 +2770,7 @@ where
                             &mut bg_wake_pending,
                             &mut pending_bash_asks,
                             &mut route_bash_cancels,
+                            &active_tool_calls,
                             &mut retry_buffer,
                             &mut push_buffer,
                             &shutdown,
@@ -2701,6 +2795,7 @@ where
                             &pending_binds,
                             &mut live_roots,
                             &executor,
+                            &active_tool_calls,
                             &shutdown,
                             &connection_cancel,
                             &bash_deferred_tx,
@@ -2724,6 +2819,13 @@ where
                     }
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
+                        cancel_active_tool_call(
+                            &active_tool_calls,
+                            executor.as_ref(),
+                            channel,
+                            frame.header.corr,
+                            "Cancel frame",
+                        );
                         if bg_subs.contains_key(&channel) {
                             if let Err(error) = end_bg_subscription(
                                 &writer_tx,
@@ -2756,10 +2858,9 @@ where
                             break Err(error);
                         }
                     }
-                    // Incoming push messages are ignored here. Cancel frames only
-                    // stop pending bash elicitation requests; executor-level
-                    // cancellation for tool calls that are already running is not
-                    // implemented.
+                    // Incoming push messages are ignored here. Cancel frames are
+                    // handled above for both active inspect jobs and pending bash
+                    // elicitation requests.
                     _ => {}
                 }
             }
@@ -2923,6 +3024,8 @@ where
                         &mut root_channels,
                         &mut installed_route_epochs,
                         &mut route_bash_cancels,
+                        &active_tool_calls,
+                        executor.as_ref(),
                         &mut retry_buffer,
                         &mut reclaimed_routes,
                         &mut session_identity,
@@ -2981,6 +3084,7 @@ where
         &mut root_channels,
         &mut installed_route_epochs,
         &mut route_bash_cancels,
+        &active_tool_calls,
         &executor,
     );
 
@@ -3572,6 +3676,7 @@ async fn handle_control_request(
     bg_wake_pending: &mut HashSet<RouteChannel>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    active_tool_calls: &ActiveToolCalls,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     shutdown: &Arc<Notify>,
@@ -3647,6 +3752,7 @@ async fn handle_control_request(
                     pending_bash_asks,
                     live_roots,
                     route_bash_cancels,
+                    active_tool_calls,
                     pending_binds,
                     retry_buffer,
                     push_buffer,
@@ -4018,6 +4124,7 @@ async fn handle_tool_call(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
+    active_tool_calls: &ActiveToolCalls,
     shutdown: &Arc<Notify>,
     connection_cancel: &PersistentCancelSignal,
     bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
@@ -4402,52 +4509,70 @@ async fn handle_tool_call(
     let request_id_for_force = request_id.clone();
     let format_context_for_frame = format_context.clone();
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
+    let cancellable_inspect = bare_name == "inspect";
     phase_trace.mark_executor_submitted();
-    let rx = executor.submit_async(
-        identity.root.clone(),
-        lane,
-        request_id.clone(),
-        Box::new(move |ctx| {
-            phase_trace.mark_job_admitted();
-            log_ctx::with_session(Some(identity_for_run.session.clone()), || {
-                let run = || {
-                    let finalizer = |response: &mut Response| {
-                        crate::response_finalize::finalize_response_with_bg_completions(
-                            response,
-                            ctx,
-                            &identity_for_run.session,
-                            &bare_name,
-                            bind_trust.allows_bash_observation(),
-                        );
-                    };
-                    match run_tool_call(
-                        &bare_name,
-                        arguments,
-                        &format_context,
-                        &tool_call_context,
+    let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+        phase_trace.mark_job_admitted();
+        log_ctx::with_session(Some(identity_for_run.session.clone()), || {
+            let run = || {
+                let finalizer = |response: &mut Response| {
+                    crate::response_finalize::finalize_response_with_bg_completions(
+                        response,
                         ctx,
-                        &dispatch,
-                        Some(&finalizer),
-                        Some(&mut phase_trace),
-                    ) {
-                        ToolCallOutcome::Unary(result) => {
-                            let response = result.response;
-                            let _ = tool_call_tx.send(ToolCallCompletion {
-                                text: result.text,
-                                phase_trace,
-                            });
-                            response
-                        }
-                    }
+                        &identity_for_run.session,
+                        &bare_name,
+                        bind_trust.allows_bash_observation(),
+                    );
                 };
-                if matches!(bind_trust, BindTrust::Untrusted) {
-                    ctx.with_force_restrict(&request_id_for_force, run)
-                } else {
-                    run()
+                match run_tool_call(
+                    &bare_name,
+                    arguments,
+                    &format_context,
+                    &tool_call_context,
+                    ctx,
+                    &dispatch,
+                    Some(&finalizer),
+                    Some(&mut phase_trace),
+                ) {
+                    ToolCallOutcome::Unary(result) => {
+                        let response = result.response;
+                        let _ = tool_call_tx.send(ToolCallCompletion {
+                            text: result.text,
+                            phase_trace,
+                        });
+                        response
+                    }
                 }
-            })
-        }),
-    );
+            };
+            if matches!(bind_trust, BindTrust::Untrusted) {
+                ctx.with_force_restrict(&request_id_for_force, run)
+            } else {
+                run()
+            }
+        })
+    });
+    let (rx, cancellation) = if cancellable_inspect {
+        let (rx, cancellation) =
+            executor.submit_cancellable_async(identity.root.clone(), lane, request_id.clone(), job);
+        (rx, Some(cancellation))
+    } else {
+        (
+            executor.submit_async(identity.root.clone(), lane, request_id.clone(), job),
+            None,
+        )
+    };
+    if let Some(cancellation) = cancellation {
+        active_tool_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (route_id, frame.header.corr),
+                ActiveToolCall {
+                    root_id: identity.root.clone(),
+                    cancellation,
+                },
+            );
+    }
     let completion_tx = tx.clone();
     let completion_shutdown = Arc::clone(shutdown);
     let route = route_id;
@@ -4455,9 +4580,13 @@ async fn handle_tool_call(
     let flags = frame.header.flags;
     let ver = frame.header.ver;
     let completion_metrics = Arc::clone(metrics);
+    let active_tool_calls = Arc::clone(active_tool_calls);
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id.clone()).await;
+        if cancellable_inspect {
+            finish_active_tool_call(&active_tool_calls, route, corr);
+        }
         let (text, phase_trace) = match tool_call_rx.await {
             Ok(completion) => (completion.text, Some(completion.phase_trace)),
             Err(_) => (
@@ -4738,6 +4867,78 @@ pub(crate) mod test_support {
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ))
+    }
+
+    #[test]
+    fn cancelled_inspect_releases_lsp_lane_for_queued_bind() {
+        let executor = Arc::new(Executor::new());
+        let (_dir, root) = test_root("cancelled-inspect-lane");
+        executor.register_actor(root.clone(), test_ctx());
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        let route = RouteChannel {
+            channel: 7,
+            epoch: 1,
+        };
+        let (inspect_started_tx, inspect_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (_inspect_rx, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            "abandoned-inspect".to_string(),
+            Box::new(move |_| {
+                inspect_started_tx.send(()).expect("inspect starts");
+                while !crate::executor::current_job_cancellation()
+                    .is_some_and(|token| token.cancel_requested_before_commit())
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Response::error(
+                    "abandoned-inspect",
+                    "inspect_interrupted",
+                    "inspect request abandoned",
+                )
+            }),
+        );
+        active.lock().expect("active tool call map").insert(
+            (route, 41),
+            ActiveToolCall {
+                root_id: root.clone(),
+                cancellation,
+            },
+        );
+        inspect_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("inspect occupies the LSP lane");
+
+        let (bind_started_tx, bind_started_rx) = std::sync::mpsc::sync_channel(1);
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-after-abandonment".to_string(),
+            Box::new(move |_| {
+                bind_started_tx.send(()).expect("bind starts");
+                Response::success("bind", json!({}))
+            }),
+        );
+        assert!(
+            bind_started_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "bind must remain behind the live LSP reader"
+        );
+
+        assert!(cancel_active_tool_call(
+            &active,
+            executor.as_ref(),
+            route,
+            41,
+            "test abandonment"
+        ));
+        bind_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bind starts after inspect cancellation boundary");
+        bind.recv_timeout(Duration::from_secs(1))
+            .expect("bind completes after inspect cancellation");
+        assert!(active.lock().expect("active tool call map").is_empty());
     }
 
     pub(super) fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
@@ -5591,6 +5792,7 @@ mod tests {
         let mut bg_wake_pending = HashSet::from([route]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
+        let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
         health::take_bg_observability_logs_for_test();
         purge_deleted_root_residents(
             &root,
@@ -5598,6 +5800,8 @@ mod tests {
             &mut root_channels,
             &mut installed_route_epochs,
             &mut route_bash_cancels,
+            &active_tool_calls,
+            executor.as_ref(),
             &mut retry_buffer,
             &mut reclaimed_routes,
             &mut session_identity,
@@ -6066,6 +6270,7 @@ mod tests {
         let mut root_channels = HashMap::from([(root.clone(), HashSet::from([route]))]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
         let mut route_bash_cancels = HashMap::new();
+        let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
 
         quiesce_connection_roots(
             &mut live_roots,
@@ -6074,6 +6279,7 @@ mod tests {
             &mut root_channels,
             &mut installed_route_epochs,
             &mut route_bash_cancels,
+            &active_tool_calls,
             &executor,
         );
         assert!(live_roots[&root].unbound_quiesced);
@@ -6108,6 +6314,8 @@ mod tests {
                 &mut root_channels,
                 &mut installed_route_epochs,
                 &mut route_bash_cancels,
+                &active_tool_calls,
+                executor.as_ref(),
                 &mut retry_buffer,
                 &mut reclaimed_routes,
                 &mut session_identity,

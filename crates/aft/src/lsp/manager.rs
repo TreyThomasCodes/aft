@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
@@ -351,6 +352,7 @@ pub(crate) enum InspectDiagnosticsWake {
 }
 
 impl InspectDiagnosticsWait {
+    #[cfg(test)]
     pub(crate) fn next_event(&self) -> InspectDiagnosticsWake {
         crossbeam_channel::select! {
             recv(self.event_rx) -> event => match event {
@@ -361,6 +363,20 @@ impl InspectDiagnosticsWait {
                 Ok(()) => InspectDiagnosticsWake::StateChanged,
                 Err(_) => InspectDiagnosticsWake::Disconnected,
             },
+        }
+    }
+
+    pub(crate) fn next_event_timeout(&self, timeout: Duration) -> Option<InspectDiagnosticsWake> {
+        crossbeam_channel::select! {
+            recv(self.event_rx) -> event => Some(match event {
+                Ok(event) => InspectDiagnosticsWake::Event(event),
+                Err(_) => InspectDiagnosticsWake::Disconnected,
+            }),
+            recv(self.wake_rx) -> wake => Some(match wake {
+                Ok(()) => InspectDiagnosticsWake::StateChanged,
+                Err(_) => InspectDiagnosticsWake::Disconnected,
+            }),
+            default(timeout) => None,
         }
     }
 }
@@ -3150,6 +3166,7 @@ mod clear_diagnostics_tests {
 mod inspect_path_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::LspManager;
     use crate::config::{Config, UserServerDef};
@@ -3233,5 +3250,15 @@ mod inspect_path_tests {
                 root: PathBuf::from("/tmp"),
             });
         join.join().expect("waiter exits after event");
+    }
+
+    #[test]
+    fn inspect_wait_can_stop_at_a_phase_deadline() {
+        let mut manager = LspManager::new();
+        let wait = manager.start_inspect_diagnostics_wait(&PathBuf::from("/tmp/inspect.rs"), &[]);
+        let started = std::time::Instant::now();
+        assert!(wait.next_event_timeout(Duration::from_millis(20)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        manager.finish_inspect_diagnostics_wait(wait);
     }
 }

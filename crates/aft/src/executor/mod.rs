@@ -78,6 +78,9 @@ pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>
 /// daemon rejects binds at 12s, so promotion at 6s leaves half the budget for
 /// draining readers and running the configure itself.
 const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
+/// Readers older than this still block queued writer jobs; report their job
+/// metadata instead of only the generic `waiting_on_readers` diagnosis.
+const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -1207,7 +1210,25 @@ impl SchedulerState {
                     blockers.push(format!("queued_behind_configure({configure_count})"));
                 }
                 if actor.read_inflight > 0 || actor.lsp_inflight {
-                    blockers.push("waiting_on_readers".to_string());
+                    let now = Instant::now();
+                    let stuck_readers = self
+                        .running_jobs
+                        .values()
+                        .filter(|job| {
+                            job.root_id == *root_id
+                                && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+                                && now.saturating_duration_since(job.started_at)
+                                    >= READER_STUCK_CENSUS_AGE
+                        })
+                        .collect::<Vec<_>>();
+                    if stuck_readers.is_empty() {
+                        blockers.push("waiting_on_readers".to_string());
+                    } else {
+                        blockers.push(format!(
+                            "waiting_on_readers_stuck({})",
+                            format_running_jobs(&stuck_readers)
+                        ));
+                    }
                 }
             }
         }

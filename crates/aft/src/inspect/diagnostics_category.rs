@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
 use crate::config::Config;
@@ -13,6 +14,8 @@ use crate::lsp::manager::{
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
+
+const BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 struct CollectedDiagnostic {
@@ -89,7 +92,10 @@ pub(crate) fn run_diagnostics_category(
     } else if scope_was_provided {
         // A deferred inspection can collect diagnostics for the entire root
         // without an explicit scope. Scope filters rendered results, not work.
-        collect_scoped_diagnostics(ctx, snapshot, scope)
+        match collect_scoped_diagnostics(ctx, snapshot, scope) {
+            Ok(collection) => collection,
+            Err(message) => return JobOutcome::Failed { message },
+        }
     } else {
         collect_warm_working_set(ctx, snapshot)
     };
@@ -151,7 +157,8 @@ fn collect_scoped_diagnostics(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
     scope: &JobScope,
-) -> DiagnosticsCollection {
+) -> Result<DiagnosticsCollection, String> {
+    let deadline = Instant::now() + BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT;
     let config = ctx.config().clone();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     let whole_root = JobScope::from_roots(
@@ -171,12 +178,21 @@ fn collect_scoped_diagnostics(
     let mut opened_documents = ScopedInspectDocuments::new(ctx);
 
     for file in files {
-        collect_scoped_file(ctx, &config, &file, &mut collection, &mut opened_documents);
+        check_diagnostics_phase_boundary(deadline)?;
+        collect_scoped_file(
+            ctx,
+            &config,
+            &file,
+            &mut collection,
+            &mut opened_documents,
+            deadline,
+        )?;
         // Pull-only servers may leave didOpen diagnostics, telemetry, and log
         // notifications queued because they do not enter the push waiter.
         ctx.lsp().drain_events();
     }
 
+    check_diagnostics_phase_boundary(deadline)?;
     collection.diagnostics =
         scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
     collection.servers_pending.extend(
@@ -187,39 +203,60 @@ fn collect_scoped_diagnostics(
     );
     collection.sort_and_dedup();
     drop(opened_documents);
-    collection
+    Ok(collection)
 }
 
-/// Park on diagnostics without retaining the manager lock. Every state check
-/// is a short lock acquisition, so another LSP event drain can make progress.
 fn wait_for_inspect_diagnostics_without_manager_lock(
     ctx: &AppContext,
     file: &Path,
     expected: &[(ServerKey, PreEditSnapshot)],
-) {
+    deadline: Instant,
+) -> Result<(), String> {
     let wait = {
         let mut lsp = ctx.lsp();
         lsp.start_inspect_diagnostics_wait(file, expected)
     };
-    loop {
+    let result = loop {
         if {
             let mut lsp = ctx.lsp();
             lsp.poll_inspect_diagnostics_wait(&wait, None)
         } {
-            break;
+            break Ok(());
         }
-        let wake = wait.next_event();
+        if let Err(message) = check_diagnostics_phase_boundary(deadline) {
+            break Err(message);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(wake) = wait.next_event_timeout(Duration::from_millis(50).min(remaining)) else {
+            continue;
+        };
         if matches!(&wake, InspectDiagnosticsWake::Disconnected) {
-            break;
+            break Ok(());
         }
         if {
             let mut lsp = ctx.lsp();
             lsp.poll_inspect_diagnostics_wait(&wait, Some(wake))
         } {
-            break;
+            break Ok(());
         }
-    }
+    };
     ctx.lsp().finish_inspect_diagnostics_wait(wait);
+    result
+}
+
+fn check_diagnostics_phase_boundary(deadline: Instant) -> Result<(), String> {
+    if crate::executor::current_job_cancellation()
+        .is_some_and(|token| token.cancel_requested_before_commit())
+    {
+        return Err("inspect request cancelled during LSP quiescence".to_string());
+    }
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "lsp_quiescence_timeout: diagnostics did not complete within {}s",
+            BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 fn collect_scoped_file(
@@ -228,7 +265,9 @@ fn collect_scoped_file(
     file: &Path,
     collection: &mut DiagnosticsCollection,
     opened_documents: &mut ScopedInspectDocuments<'_>,
-) {
+    deadline: Instant,
+) -> Result<(), String> {
+    check_diagnostics_phase_boundary(deadline)?;
     // One canonical form across the LSP boundary: bare fs::canonicalize yields
     // verbatim paths on Windows, which no longer match normalized server keys.
     let canonical = crate::inspect::job::canonicalize_normalized(file);
@@ -240,14 +279,14 @@ fn collect_scoped_file(
     record_attempt_gaps(&outcomes, collection);
     if outcomes.only_inapplicable_root_markers() {
         collection.files_without_server += 1;
-        return;
+        return Ok(());
     }
     if outcomes.no_server_registered() {
         collection.files_without_server += 1;
-        return;
+        return Ok(());
     }
     if outcomes.successful.is_empty() {
-        return;
+        return Ok(());
     }
 
     let pre_push_snapshot = {
@@ -273,11 +312,12 @@ fn collect_scoped_file(
             }
         }
     };
+    check_diagnostics_phase_boundary(deadline)?;
 
     let push_fallback_servers =
         record_pull_results(&outcomes.successful, &pull_results, collection);
     if push_fallback_servers.is_empty() {
-        return;
+        return Ok(());
     }
 
     let expected = push_fallback_servers
@@ -289,7 +329,7 @@ fn collect_scoped_file(
             )
         })
         .collect::<Vec<(ServerKey, PreEditSnapshot)>>();
-    wait_for_inspect_diagnostics_without_manager_lock(ctx, &canonical, &expected);
+    wait_for_inspect_diagnostics_without_manager_lock(ctx, &canonical, &expected, deadline)?;
 
     let lsp = ctx.lsp();
     for key in push_fallback_servers {
@@ -302,6 +342,7 @@ fn collect_scoped_file(
             collection.servers_pending.insert(server_id(&key));
         }
     }
+    Ok(())
 }
 
 fn record_attempt_gaps(outcomes: &EnsureServerOutcomes, collection: &mut DiagnosticsCollection) {
