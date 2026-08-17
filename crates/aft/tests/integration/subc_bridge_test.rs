@@ -1881,8 +1881,13 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
         elapsed >= Duration::from_millis(150),
         "attach did not observe the first retry backoff: {elapsed:?}"
     );
+    // Upper bound guards against waiting out the full 60s attach budget on a
+    // stale endpoint (the bug this test exists for). It is a liveness ceiling,
+    // not a latency target: loaded CI runners have pushed a successful attach
+    // past 4s (5.7s observed on a Windows shard), so keep generous headroom
+    // below the budget rather than a tight bound that reddens under load.
     assert!(
-        elapsed < Duration::from_secs(4),
+        elapsed < Duration::from_secs(30),
         "rewritten endpoint attach took too long: {elapsed:?}"
     );
 }
