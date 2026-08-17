@@ -69,6 +69,15 @@ fn configured_context_with_storage(
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    // Every test in this file asserts scheduler decisions (queued vs deferred
+    // categories), and the deferral branch fires whenever the process-wide
+    // ColdBuildLimiter's slots happen to be held by PARALLEL NEIGHBOR tests -
+    // manual_dead_code_query_without_callgraph_store_reports_unavailable failed
+    // 3/3 under the full parallel suite and passed isolated on the same tree
+    // (2026-08-17). Give each context its own capacity so assertions observe
+    // this file's scheduling decisions, not the suite's load (issue #1190's
+    // isolation seam).
+    ctx.isolate_cold_build_limiter_for_test(2);
     // These fixtures exercise scheduler behavior rather than LSP startup. Seed a
     // checked-clean report so blocking inspect can require a complete diagnostics
     // prerequisite without changing the scheduler subject under test.
