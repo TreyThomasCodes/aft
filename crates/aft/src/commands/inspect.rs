@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
 use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::context::AppContext;
-use crate::inspect::diagnostics_category::run_diagnostics_category;
+use crate::inspect::diagnostics_category::{
+    check_diagnostics_phase_boundary, diagnostics_phase_timeout, run_diagnostics_category,
+};
 use crate::inspect::{
     format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
@@ -16,6 +18,7 @@ use crate::lsp::manager::{
     ApplicabilityResolutionError, ApplicableServerFailure, ApplicableServerSnapshot,
     ApplicableServerStartOutcomes,
 };
+use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
@@ -404,10 +407,48 @@ fn run_blocking_inspect_body(
             ))
         })
         .collect::<Vec<_>>();
+    // A blocking inspection waits for the producers it started so the warm
+    // store holds their settled view before the payload reads it. The wait is
+    // root-level — producers fill the warm store by publishing while events
+    // are drained — and never per-file: a request scope cannot change it.
+    let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful);
+    if inspect_cancellation_requested() {
+        for phase in quiescence {
+            phase.fail("inspect request cancelled");
+        }
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
     // A blocking inspection is an explicit diagnostics observation source. Keep
     // accepted producer snapshots intact until the inspect response is built;
     // flattened category payloads cannot recover producer ownership.
-    let accepted_snapshots = ctx.lsp().drain_events().accepted_snapshots;
+    let accepted_snapshots = match wait_outcome {
+        Ok((snapshots, blocked)) => {
+            if blocked {
+                phase_log.note_blocking_wait();
+            }
+            snapshots
+        }
+        Err(message) => {
+            // Name the phase that was still in flight before the handles are
+            // failed, so the terminal keeps its quiescence attribution.
+            let failed_phase = phase_log.in_flight_entry();
+            for phase in quiescence {
+                phase.fail(&message);
+            }
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                InspectTerminal::PhaseFailed {
+                    failed_phase,
+                    failure_reason: quiescence_failure_reason(&message),
+                    failure_detail: Some(message),
+                },
+            );
+        }
+    };
+    for phase in quiescence {
+        phase.complete();
+    }
     let inspect_snapshot = build_snapshot(ctx).ok();
     let response = handle_inspect_payload(
         req,
@@ -417,16 +458,10 @@ fn run_blocking_inspect_body(
         &start_outcomes.failures,
     );
     if inspect_cancellation_requested() {
-        for phase in quiescence {
-            phase.fail("inspect request cancelled");
-        }
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
     if let Some(inspect_snapshot) = &inspect_snapshot {
         record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
-    }
-    for phase in quiescence {
-        phase.complete();
     }
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -447,6 +482,49 @@ fn run_blocking_inspect_body(
                     .map(str::to_owned),
             },
         )
+    }
+}
+
+/// Wait for every successfully started producer to settle before the payload
+/// reads the warm store: a producer settles once it holds a current
+/// authoritative (non-stale, non-provisional) report or stops warming
+/// (declares quiescence). Events are drained with the manager lock held only
+/// for the drain itself, so producers keep publishing while the wait ticks.
+/// Bounded by the configured diagnostics deadline; cancellation and the
+/// deadline are checked at every tick. Returns the accepted producer
+/// snapshots drained during the wait plus whether the wait ever blocked.
+fn wait_for_root_quiescence(
+    ctx: &AppContext,
+    expected: &[ServerKey],
+) -> Result<(Vec<AcceptedDiagnosticSnapshot>, bool), String> {
+    let timeout = diagnostics_phase_timeout(&ctx.config());
+    let deadline = Instant::now() + timeout;
+    let mut accepted_snapshots = Vec::new();
+    let mut blocked = false;
+    loop {
+        check_diagnostics_phase_boundary(deadline, timeout)?;
+        accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
+        if root_producers_settled(ctx, expected) {
+            return Ok((accepted_snapshots, blocked));
+        }
+        blocked = true;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(Duration::from_millis(50).min(remaining));
+    }
+}
+
+fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
+    let lsp = ctx.lsp();
+    expected.iter().all(|server| {
+        lsp.has_authoritative_report_for_server(server) || !lsp.server_is_warming(server)
+    })
+}
+
+fn quiescence_failure_reason(message: &str) -> &'static str {
+    if message.contains("lsp_quiescence_timeout") {
+        "lsp_quiescence_timeout"
+    } else {
+        "inspect_not_fresh"
     }
 }
 

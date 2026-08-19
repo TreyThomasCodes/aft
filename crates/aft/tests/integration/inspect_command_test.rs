@@ -166,6 +166,39 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     ctx
 }
 
+/// `configured_context` with an explicit inspect diagnostics deadline. The
+/// blocking quiescence wait is bounded by this value, and its timeout error
+/// text must carry the configured budget.
+fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    crate::helpers::disable_in_process_file_watcher();
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage_dir.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configure = request(json!({
+        "id": "configure",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "config": crate::helpers::user_config(serde_json::json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false,
+            "inspect": { "diagnostics_timeout_ms": timeout_ms }
+        })),
+    }));
+    let response = serde_json::to_value(handle_configure(&configure, &ctx))
+        .expect("configure response serializes");
+    assert_eq!(response["success"], true, "configure failed: {response:#}");
+    ctx
+}
+
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
     let (latest, disconnected) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
@@ -2827,6 +2860,154 @@ fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
             .and_then(Value::as_array)
             .is_none_or(|items| items.is_empty()),
         "clean scope must not render findings: {response:#}"
+    );
+}
+
+/// A blocking inspect facing a warming producer must wait for the producer to
+/// settle instead of rendering the warming store: the payload asserted below
+/// can only be built from a publish that arrives after the call started.
+#[test]
+fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-blocking-wait\"\n",
+    );
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    // Blocking tool calls run every active category, so the Tier-2
+    // prerequisites (callgraph store, aggregates) must be ready first.
+    let ctx = Arc::new(configured_context_with_callgraph_store(&root, true));
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    configure_fake_rust_lsp(&ctx);
+    // Warming mode: didOpen publishes provisional diagnostics, and only a
+    // later didChange declares quiescence and publishes the settled set.
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+    let config = ctx.config().clone();
+    ctx.lsp()
+        .notify_file_changed(&file, "fn main() {}\n", &config)
+        .expect("open document");
+    wait_for_lsp_report_state(&ctx, &file, true);
+
+    // While the blocking inspect waits, an edit settles the producer: the
+    // quiescence declaration and the authoritative publish arrive together.
+    let edit_ctx = Arc::clone(&ctx);
+    let edit_file = file.clone();
+    let edit_config = config.clone();
+    let editor = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        edit_ctx
+            .lsp()
+            .notify_file_changed(
+                &edit_file,
+                "fn main() { let _settled = 1; }\n",
+                &edit_config,
+            )
+            .expect("settle the producer via an edit");
+    });
+
+    let started = Instant::now();
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-blocking-wait",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+    editor.join().expect("editor thread completes");
+
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh");
+    // Event-ordering proof that the wait blocked: this message exists only
+    // after the post-start publish was drained.
+    let details = response["details"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics details");
+    assert!(
+        details
+            .iter()
+            .any(|item| item["message"] == "test diagnostic after change"),
+        "the settled publish must be part of the payload: {response:#}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the wait must block until the producer settles, not return the warming store"
+    );
+}
+
+/// A producer that never settles bounds the blocking wait at the configured
+/// deadline: the terminal is PHASE-FAILED attributed to the quiescence phase.
+#[test]
+fn blocking_inspect_expires_at_the_configured_quiescence_deadline() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-blocking-deadline\"\n",
+    );
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    // Warming mode without any later edit: the server declares warming at
+    // startup and nothing ever declares quiescence.
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+
+    let started = Instant::now();
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-blocking-deadline",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], false, "response: {response:#}");
+    assert_eq!(response["inspect_terminal"], "phase_failed");
+    assert_eq!(response["failure_reason"], "lsp_quiescence_timeout");
+    assert_eq!(response["failed_phase"], "lsp_quiescence");
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "the wait must run until the configured deadline instead of failing early"
+    );
+}
+
+/// The deadline error text carries the configured millisecond budget end to
+/// end: user config, clamped deadline, blocking wait, terminal failure detail.
+#[test]
+fn blocking_inspect_deadline_error_names_the_configured_budget() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-blocking-budget\"\n",
+    );
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 12_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-blocking-budget",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], false, "response: {response:#}");
+    assert_eq!(response["failure_reason"], "lsp_quiescence_timeout");
+    let detail = response["failure_detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("failure_detail missing: {response:#}"));
+    assert!(
+        detail.contains("12000ms"),
+        "the configured budget must reach the error text: {detail}"
     );
 }
 

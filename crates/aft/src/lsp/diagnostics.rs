@@ -447,6 +447,15 @@ impl DiagnosticsStore {
         })
     }
 
+    /// True if this server holds any authoritative report: an entry that is
+    /// neither watcher-stale nor warming-provisional. Empty checked-clean
+    /// reports count — they still prove the producer analyzed a document.
+    pub fn has_authoritative_report_for_server(&self, server: &ServerKey) -> bool {
+        self.entries
+            .iter()
+            .any(|((key, _), entry)| key == server && !entry.stale && !entry.provisional)
+    }
+
     /// True if this exact server instance has an entry (fresh or stale) for
     /// this exact file. Pull diagnostics use stale entries as the previous
     /// resultId cache when asking the server whether diagnostics are unchanged.

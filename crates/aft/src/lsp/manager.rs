@@ -2202,6 +2202,24 @@ impl LspManager {
             .has_authoritative_report_for_file(&normalized)
     }
 
+    /// True if this server instance holds any authoritative report: an entry
+    /// that is neither watcher-stale nor warming-provisional, including an
+    /// empty checked-clean report. Needed by the blocking quiescence wait, which
+    /// settles per producer rather than per file.
+    pub fn has_authoritative_report_for_server(&self, server: &ServerKey) -> bool {
+        self.diagnostics.has_authoritative_report_for_server(server)
+    }
+
+    /// True if this server instance is still warming: its reports stay
+    /// provisional until it declares quiescence. A server the manager does not
+    /// know (never started, or exited since) is not warming and cannot block a
+    /// quiescence wait.
+    pub fn server_is_warming(&self, server: &ServerKey) -> bool {
+        self.clients
+            .get(server)
+            .is_some_and(|client| client.diagnostics_are_provisional())
+    }
+
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
         let mut saw_file_diagnostics = false;
         while let Ok(event) = self.event_rx.try_recv() {

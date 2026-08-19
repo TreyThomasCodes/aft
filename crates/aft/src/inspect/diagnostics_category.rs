@@ -15,13 +15,11 @@ use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
-/// Configured deadline for blocking diagnostics waits. The warm-collection
-/// path has no blocking LSP phase, so nothing consumes this boundary today;
-/// it stays the reference deadline for any blocking diagnostics wait and is
-/// pinned by the unit test below. The same config value also drives the
-/// plugin-side transport headroom for inspect calls.
-#[cfg_attr(not(test), allow(dead_code))]
-fn diagnostics_phase_timeout(config: &Config) -> Duration {
+/// Configured deadline for the blocking root-level quiescence wait. The same
+/// config value also drives the plugin-side transport headroom for inspect
+/// calls, so a caller that waits the full deadline still returns before the
+/// transport gives up.
+pub(crate) fn diagnostics_phase_timeout(config: &Config) -> Duration {
     Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
         MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
         MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -267,8 +265,13 @@ fn scoped_coverage_candidates(
     candidates.into_iter().collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn check_diagnostics_phase_boundary(deadline: Instant, timeout: Duration) -> Result<(), String> {
+/// Boundary check for the blocking quiescence wait: observes cancellation and
+/// the configured deadline at every tick. The deadline error text carries the
+/// configured millisecond budget so the agent can see which value fired.
+pub(crate) fn check_diagnostics_phase_boundary(
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<(), String> {
     if crate::executor::current_job_cancellation()
         .is_some_and(|token| token.cancel_requested_before_commit())
     {
