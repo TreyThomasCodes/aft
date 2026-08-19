@@ -1,0 +1,64 @@
+{
+  "fixture_version": 1,
+  "post_audit_release_gate": {
+    "satisfied": false,
+    "required_before_enumerated_post_forms": [
+      "an external caller audit names each exact REST and GraphQL POST form",
+      "a reviewed parser recognizes each admitted field and input shape",
+      "a signed manifest release declares every admitted form"
+    ]
+  },
+  "mechanical": [
+    {
+      "name": "api-default-get",
+      "argv": ["api", "/repos/cortexkit/aft"],
+      "classification": "mechanical",
+      "passthrough": true
+    },
+    {
+      "name": "api-explicit-get",
+      "argv": ["api", "--method", "GET", "/repos/cortexkit/aft/issues"],
+      "classification": "mechanical",
+      "passthrough": true
+    }
+  ],
+  "unclassified_at_r3": [
+    {
+      "name": "rest-post-with-field",
+      "argv": ["api", "--method", "POST", "/repos/cortexkit/aft/issues/42/comments", "--field", "body=not admitted"],
+      "variation": "method, endpoint, and field-bearing request",
+      "passthrough": false
+    },
+    {
+      "name": "rest-post-with-raw-field",
+      "argv": ["api", "-X", "POST", "/repos/cortexkit/aft/issues/42/comments", "--raw-field", "body=not admitted"],
+      "variation": "method and raw-field request shape",
+      "passthrough": false
+    },
+    {
+      "name": "rest-post-with-input",
+      "argv": ["api", "--method=POST", "/repos/cortexkit/aft/issues/42/comments", "--input=payload.json"],
+      "variation": "method and input request shape",
+      "passthrough": false
+    },
+    {
+      "name": "graphql-with-short-field",
+      "argv": ["api", "graphql", "-f", "query=mutation { addComment(input: {body: \"not admitted\"}) { clientMutationId } }"],
+      "variation": "GraphQL operation and short field request shape",
+      "passthrough": false
+    },
+    {
+      "name": "graphql-with-capital-short-field",
+      "argv": ["api", "graphql", "-F", "query=mutation { addComment(input: {body: \"not admitted\"}) { clientMutationId } }"],
+      "variation": "GraphQL operation and typed short field request shape",
+      "passthrough": false
+    },
+    {
+      "name": "undeclared-patch",
+      "argv": ["api", "--method", "PATCH", "/repos/cortexkit/aft/issues/42"],
+      "variation": "undeclared write method",
+      "passthrough": false
+    }
+  ],
+  "r3_refusal": "gh_shim_unclassified"
+}

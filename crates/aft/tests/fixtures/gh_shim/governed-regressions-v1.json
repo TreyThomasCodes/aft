@@ -1,0 +1,65 @@
+{
+  "fixture_version": 1,
+  "governed_argv": ["issue", "comment", "42", "--body", "A concise comment."],
+  "token_environment_names": ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"],
+  "tripwire_contract": {
+    "real_gh_child_count": 0,
+    "shim_token_environment": "absent",
+    "owned_descendant_token_environment": "absent"
+  },
+  "cases": [
+    {
+      "name": "governed-success",
+      "seam_outcome": "result",
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "accepted-holder-refusal",
+      "seam_outcome": "refusal",
+      "holder_codes": ["identity_mismatch", "unmapped_operation", "custody_unavailable", "schema_unsupported", "rate_limited"],
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "unknown-holder-refusal",
+      "seam_outcome": "refusal",
+      "holder_code": "quota_exhausted_v2",
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "incompatible-holder-refusal",
+      "seam_outcome": "schema_mismatch",
+      "variants": ["missing refusal_code", "non-string refusal_code"],
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "missing-holder",
+      "seam_outcome": "unavailable",
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "route-open-failure",
+      "seam_outcome": "unbound_identity",
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "request-failure",
+      "seam_outcome": "unavailable",
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    },
+    {
+      "name": "newer-result-schema",
+      "seam_outcome": "schema_mismatch",
+      "response": {"outcome": "result", "gh_route_schema": 2, "result": {}, "field_order": []},
+      "real_gh_child_count": 0,
+      "delegate_called": false
+    }
+  ],
+  "never_passthrough_after_governed_path_failure": true
+}

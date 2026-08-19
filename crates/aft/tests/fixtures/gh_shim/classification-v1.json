@@ -1,0 +1,118 @@
+{
+  "fixture_version": 1,
+  "platform": "macos",
+  "governed": [
+    {
+      "name": "issue-comment",
+      "argv": ["issue", "comment", "42", "--body", "A concise comment."],
+      "tuple": "issue comment",
+      "classification": "governed"
+    },
+    {
+      "name": "pr-comment",
+      "argv": ["pr", "comment", "7", "--body", "A concise pull-request comment."],
+      "tuple": "pr comment",
+      "classification": "governed"
+    },
+    {
+      "name": "pr-review",
+      "argv": ["pr", "review", "7", "--body", "Looks good."],
+      "tuple": "pr review",
+      "classification": "governed"
+    },
+    {
+      "name": "issue-reaction",
+      "argv": ["issue", "reaction", "42", "--reaction", "+1"],
+      "tuple": "issue reaction",
+      "classification": "governed"
+    }
+  ],
+  "admin": [
+    {
+      "name": "issue-close",
+      "argv": ["issue", "close", "42"],
+      "tuple": "issue close",
+      "classification": "admin",
+      "r3_refusal": "gh_shim_admin_tier"
+    },
+    {
+      "name": "pr-close",
+      "argv": ["pr", "close", "7"],
+      "tuple": "pr close",
+      "classification": "admin",
+      "r3_refusal": "gh_shim_admin_tier"
+    },
+    {
+      "name": "pr-merge",
+      "argv": ["pr", "merge", "7"],
+      "tuple": "pr merge",
+      "classification": "admin",
+      "r3_refusal": "gh_shim_admin_tier"
+    },
+    {
+      "name": "release-create",
+      "argv": ["release", "create", "v1.0.0"],
+      "tuple": "release create",
+      "classification": "admin",
+      "r3_refusal": "gh_shim_admin_tier"
+    }
+  ],
+  "unclassified": [
+    {
+      "name": "adjacent-issue-create",
+      "argv": ["issue", "create", "--title", "Adjacent write"],
+      "reason": "adjacent tuple is not declared"
+    },
+    {
+      "name": "adjacent-pr-reopen",
+      "argv": ["pr", "reopen", "7"],
+      "reason": "adjacent tuple is not declared"
+    },
+    {
+      "name": "adjacent-release-publish",
+      "argv": ["release", "publish", "v1.0.0"],
+      "reason": "adjacent tuple is not declared"
+    },
+    {
+      "name": "issue-comment-undeclared-flag",
+      "argv": ["issue", "comment", "42", "--body", "A concise comment.", "--editor"],
+      "reason": "governed canonicalization rejects an undeclared flag"
+    },
+    {
+      "name": "pr-comment-undeclared-flag",
+      "argv": ["pr", "comment", "7", "--body", "A concise pull-request comment.", "--web"],
+      "reason": "governed canonicalization rejects an undeclared flag"
+    },
+    {
+      "name": "pr-review-undeclared-flag",
+      "argv": ["pr", "review", "7", "--body", "Looks good.", "--approve"],
+      "reason": "governed canonicalization rejects an undeclared flag"
+    },
+    {
+      "name": "issue-reaction-undeclared-flag",
+      "argv": ["issue", "reaction", "42", "--reaction", "+1", "--web"],
+      "reason": "governed canonicalization rejects an undeclared flag"
+    },
+    {
+      "name": "issue-comment-positional-body",
+      "argv": ["issue", "comment", "42", "A concise comment."],
+      "reason": "the target-and-body positional variant is not declared"
+    },
+    {
+      "name": "pr-comment-positional-body",
+      "argv": ["pr", "comment", "7", "A concise pull-request comment."],
+      "reason": "the target-and-body positional variant is not declared"
+    },
+    {
+      "name": "pr-review-positional-body",
+      "argv": ["pr", "review", "7", "Looks good."],
+      "reason": "the target-and-body positional variant is not declared"
+    },
+    {
+      "name": "issue-reaction-positional-reaction",
+      "argv": ["issue", "reaction", "42", "+1"],
+      "reason": "the target-and-reaction positional variant is not declared"
+    }
+  ],
+  "r3_unclassified_refusal": "gh_shim_unclassified"
+}

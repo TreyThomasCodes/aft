@@ -1,0 +1,66 @@
+{
+  "fixture_version": 1,
+  "schema_id": "gh_route_result_v1",
+  "cases": [
+    {
+      "name": "issue-comment-result",
+      "response": {
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {
+          "url": "https://github.com/cortexkit/aft/issues/42#issuecomment-1",
+          "id": 1,
+          "labels": ["governed", "mock"]
+        },
+        "field_order": ["url", "id", "labels"]
+      },
+      "serialized_json": "{\"field_order\":[\"url\",\"id\",\"labels\"],\"gh_route_schema\":1,\"outcome\":\"result\",\"result\":{\"id\":1,\"labels\":[\"governed\",\"mock\"],\"url\":\"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"}}",
+      "rendered_stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\nlabels:\n  \"governed\"\n  \"mock\"\n"
+    },
+    {
+      "name": "pr-comment-result",
+      "response": {
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {
+          "url": "https://github.com/cortexkit/aft/pull/7#issuecomment-2",
+          "id": 2,
+          "status": "created"
+        },
+        "field_order": ["status", "url", "id"]
+      },
+      "serialized_json": "{\"field_order\":[\"status\",\"url\",\"id\"],\"gh_route_schema\":1,\"outcome\":\"result\",\"result\":{\"id\":2,\"status\":\"created\",\"url\":\"https://github.com/cortexkit/aft/pull/7#issuecomment-2\"}}",
+      "rendered_stdout": "status: \"created\"\nurl: \"https://github.com/cortexkit/aft/pull/7#issuecomment-2\"\nid: 2\n"
+    },
+    {
+      "name": "pr-review-result",
+      "response": {
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {
+          "id": 3,
+          "state": "COMMENTED",
+          "url": "https://github.com/cortexkit/aft/pull/7#pullrequestreview-3"
+        },
+        "field_order": ["state", "id", "url"]
+      },
+      "serialized_json": "{\"field_order\":[\"state\",\"id\",\"url\"],\"gh_route_schema\":1,\"outcome\":\"result\",\"result\":{\"id\":3,\"state\":\"COMMENTED\",\"url\":\"https://github.com/cortexkit/aft/pull/7#pullrequestreview-3\"}}",
+      "rendered_stdout": "state: \"COMMENTED\"\nid: 3\nurl: \"https://github.com/cortexkit/aft/pull/7#pullrequestreview-3\"\n"
+    },
+    {
+      "name": "issue-reaction-result",
+      "response": {
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {
+          "content": "+1",
+          "id": 4,
+          "url": "https://github.com/cortexkit/aft/issues/42#reaction-4"
+        },
+        "field_order": ["content", "url", "id"]
+      },
+      "serialized_json": "{\"field_order\":[\"content\",\"url\",\"id\"],\"gh_route_schema\":1,\"outcome\":\"result\",\"result\":{\"content\":\"+1\",\"id\":4,\"url\":\"https://github.com/cortexkit/aft/issues/42#reaction-4\"}}",
+      "rendered_stdout": "content: \"+1\"\nurl: \"https://github.com/cortexkit/aft/issues/42#reaction-4\"\nid: 4\n"
+    }
+  ]
+}

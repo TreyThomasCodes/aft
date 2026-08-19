@@ -1,0 +1,98 @@
+{
+  "fixture_version": 1,
+  "top_level_keys": [
+    "shim_version",
+    "gh_routing_schema_floor",
+    "unexpected_gh_route_advertiser",
+    "bound_holder",
+    "agent_binding",
+    "last_seam_refusal",
+    "cached_manifest",
+    "last_rung",
+    "bypass_audit",
+    "bypass_audit_error",
+    "executing_image",
+    "executing_image_error",
+    "real_gh_resolution",
+    "real_gh_resolution_error"
+  ],
+  "binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"},
+  "holder": "prefrontal-core",
+  "previous_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001},
+  "transitions": [
+    {
+      "name": "governed-success",
+      "event": "holder returns a valid gh_route_result_v1",
+      "before": {"bound_holder": null, "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": null},
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": null}
+    },
+    {
+      "name": "accepted-holder-refusals",
+      "event": "holder returns each accepted refusal code",
+      "cases": [
+        {"code": "identity_mismatch", "at_unix_secs": 1700000010, "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "identity_mismatch", "at_unix_secs": 1700000010}}},
+        {"code": "unmapped_operation", "at_unix_secs": 1700000011, "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "unmapped_operation", "at_unix_secs": 1700000011}}},
+        {"code": "custody_unavailable", "at_unix_secs": 1700000012, "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "custody_unavailable", "at_unix_secs": 1700000012}}},
+        {"code": "schema_unsupported", "at_unix_secs": 1700000013, "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "schema_unsupported", "at_unix_secs": 1700000013}}},
+        {"code": "rate_limited", "at_unix_secs": 1700000014, "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000014}}}
+      ]
+    },
+    {
+      "name": "incompatible-refusal-data",
+      "event": "holder omits refusal_code or returns a non-string refusal_code",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "shim_refusal": "gh_shim_seam_schema_mismatch"
+    },
+    {
+      "name": "missing-holder",
+      "event": "catalog.list has no prefrontal-core gh.route holder",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": null, "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "shim_refusal": "gh_shim_seam_unavailable"
+    },
+    {
+      "name": "route-open-failure",
+      "event": "prefrontal-core is advertised but route opening is rejected",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": null, "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "shim_refusal": "gh_shim_unbound_identity"
+    },
+    {
+      "name": "unbound-identity",
+      "event": "the manifest has no canonical binding for the resolved repository",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "rung": "R2",
+      "governed_route_opened": false,
+      "consequence": "lower-rung passthrough preserves seam state"
+    },
+    {
+      "name": "subsequent-mechanical-invocation",
+      "event": "issue view follows the preceding governed invocation",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}}
+    },
+    {
+      "name": "concurrent-governed-invocations",
+      "event": "one valid result completes before a rate_limited holder refusal",
+      "invocations": [
+        {"name": "first", "outcome": "result", "completes_before": "second"},
+        {"name": "second", "outcome": "refusal", "code": "rate_limited", "at_unix_secs": 1700000020}
+      ],
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000020}},
+      "persistence_invariant": "the persisted document is one complete JSON object"
+    },
+    {
+      "name": "restart-persistence",
+      "event": "a new shim process reads the state after a rate_limited refusal",
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}}
+    },
+    {
+      "name": "success-preserves-last-refusal",
+      "event": "a valid result follows a rate_limited holder refusal",
+      "before": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}},
+      "after": {"bound_holder": "prefrontal-core", "agent_binding": {"repo": "cortexkit/aft", "agent_id": "alfonso-aft"}, "last_seam_refusal": {"code": "rate_limited", "at_unix_secs": 1700000001}}
+    }
+  ]
+}

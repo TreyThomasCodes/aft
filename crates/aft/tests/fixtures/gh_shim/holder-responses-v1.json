@@ -1,0 +1,70 @@
+{
+  "fixture_version": 1,
+  "operation": "gh.route",
+  "accepted_refusal_codes": [
+    "identity_mismatch",
+    "unmapped_operation",
+    "custody_unavailable",
+    "schema_unsupported",
+    "rate_limited"
+  ],
+  "refusal_exit_status": 86,
+  "responses": [
+    {
+      "name": "identity-mismatch",
+      "response": {"outcome": "refusal", "refusal_code": "identity_mismatch"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: identity_mismatch\n",
+      "self_report_refusal_code": "identity_mismatch"
+    },
+    {
+      "name": "unmapped-operation",
+      "response": {"outcome": "refusal", "refusal_code": "unmapped_operation"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: unmapped_operation\n",
+      "self_report_refusal_code": "unmapped_operation"
+    },
+    {
+      "name": "custody-unavailable",
+      "response": {"outcome": "refusal", "refusal_code": "custody_unavailable"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: custody_unavailable\n",
+      "self_report_refusal_code": "custody_unavailable"
+    },
+    {
+      "name": "schema-unsupported",
+      "response": {"outcome": "refusal", "refusal_code": "schema_unsupported"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: schema_unsupported\n",
+      "self_report_refusal_code": "schema_unsupported"
+    },
+    {
+      "name": "rate-limited",
+      "response": {"outcome": "refusal", "refusal_code": "rate_limited"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: rate_limited\n",
+      "self_report_refusal_code": "rate_limited"
+    },
+    {
+      "name": "unknown-non-empty-code",
+      "response": {"outcome": "refusal", "refusal_code": "quota_exhausted_v2"},
+      "shim_refusal": "gh_shim_seam_refusal",
+      "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: quota_exhausted_v2\n",
+      "self_report_refusal_code": "quota_exhausted_v2"
+    },
+    {
+      "name": "missing-code",
+      "response": {"outcome": "refusal"},
+      "shim_refusal": "gh_shim_seam_schema_mismatch",
+      "stderr_prefix": "gh-shim: gh_shim_seam_schema_mismatch: governance refusal omitted a string refusal_code",
+      "self_report_transition": "preserve_previous"
+    },
+    {
+      "name": "non-string-code",
+      "response": {"outcome": "refusal", "refusal_code": 7},
+      "shim_refusal": "gh_shim_seam_schema_mismatch",
+      "stderr_prefix": "gh-shim: gh_shim_seam_schema_mismatch: governance refusal omitted a string refusal_code",
+      "self_report_transition": "preserve_previous"
+    }
+  ]
+}
