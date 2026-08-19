@@ -10,7 +10,7 @@
 - Use `packages/aft-bridge/src/transport-factory.ts` to instantiate either `BridgePool` (standalone NDJSON bridge, isolating one `aft` process per project root) or `SubcTransportPool` (daemon-backed transport) satisfying the shared `AftTransportPool` interface.
 - Use `packages/aft-cli/src/index.ts` as the unified setup/doctor CLI across all harnesses.
 - Use `crates/aft/src/commands/` handlers to keep protocol dispatch thin and command logic modular, with `crates/aft/src/commands/tool_call.rs` acting as the single endpoint for tool invocation routing.
-- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/hashline/` (including byte scanning, line-tag snapshots, syntax verifier, apply repair, two-phase transactions, remap recovery, release gates, and seed-zero xxHash32 tag normalization oracle), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/memory.rs`, `crates/aft/src/logging.rs`, `crates/aft/src/fleet_status.rs`, `crates/aft/src/compress/`, `crates/aft/src/bash_rewrite/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/lsp/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/legacy_partitions.rs`, `crates/aft/src/cold_build_limiter.rs`, `crates/aft/src/symbol_diff.rs`, `crates/aft/src/alert_render.rs`, `crates/aft/src/alert_records.rs`, and `crates/aft/src/alert_state.rs` as shared engines behind multiple commands.
+- Use `crates/aft/src/edit.rs`, `crates/aft/src/format.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/inspect/` (including codebase-health scanners and the `oxc_engine/` liveness solver), `crates/aft/src/hashline/` (including byte scanning, line-tag snapshots, syntax verifier, apply repair, two-phase transactions, remap recovery, release gates, and seed-zero xxHash32 tag normalization oracle), `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/grep_executor.rs`, `crates/aft/src/memory.rs`, `crates/aft/src/logging.rs`, `crates/aft/src/fleet_status.rs`, `crates/aft/src/compress/`, `crates/aft/src/bash_rewrite/`, `crates/aft/src/patch/`, `crates/aft/src/pty_render.rs`, `crates/aft/src/response_finalize.rs`, `crates/aft/src/lsp/`, `crates/aft/src/artifact_owner.rs`, `crates/aft/src/readonly_artifacts.rs`, `crates/aft/src/root_cache.rs`, `crates/aft/src/legacy_partitions.rs`, `crates/aft/src/cold_build_limiter.rs`, `crates/aft/src/symbol_diff.rs`, `crates/aft/src/alert_render.rs`, `crates/aft/src/alert_records.rs`, and `crates/aft/src/alert_state.rs`, and `crates/aft/src/gh_shim.rs` as shared engines behind multiple commands.
 
 ## Layers
 
@@ -31,7 +31,7 @@
 **Shared bridge layer:**
 - Purpose: Resolve or download the binary, start worker processes, manage ONNX runtime, format output, select and manage the transport pool, and forward requests. All harness adapters share this layer.
 - Location: `packages/aft-bridge/src/bridge.ts`, `packages/aft-bridge/src/pool.ts`, `packages/aft-bridge/src/subc-transport.ts`, `packages/aft-bridge/src/revivable-transport.ts`, `packages/aft-bridge/src/transport.ts`, `packages/aft-bridge/src/transport-factory.ts`, `packages/aft-bridge/src/resolver.ts`, `packages/aft-bridge/src/downloader.ts`, `packages/aft-bridge/src/onnx-runtime.ts`, `packages/aft-bridge/src/migration.ts`, `packages/aft-bridge/src/zoom-format.ts`, `packages/aft-bridge/src/path-aliases.ts`, `packages/aft-bridge/src/error-contract.ts`, `packages/aft-bridge/src/cache-paths.ts`, `packages/aft-bridge/src/lifecycle-registry.ts`, `packages/aft-bridge/src/durable-log.ts`, `packages/aft-bridge/src/bash-host-fallback.ts`
-- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions with independent reconnects, revivable transport pool wrapper (`packages/aft-bridge/src/revivable-transport.ts`) instantiating replacement pools on demand when new traffic arrives post-shutdown, break-glass bash host fallback execution (`packages/aft-bridge/src/bash-host-fallback.ts`) executing approved commands directly in the foreground without AFT processing when transport is down, session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger, durable log sinks (`packages/aft-bridge/src/durable-log.ts`), wait-aware transport budgets propagation (mapping `transportTimeoutMs` to route requests to avoid premature client-side timeouts during long command execution), canonical path alias resolution (`packages/aft-bridge/src/path-aliases.ts`), host-neutral error adaptation (`packages/aft-bridge/src/error-contract.ts`, mapping route GOODBYE errors to unknown-outcome disposition to prevent duplicate mutations), per-realm subc lifecycle management (`packages/aft-bridge/src/lifecycle-registry.ts`), and consolidated cache root resolution (`packages/aft-bridge/src/cache-paths.ts`)
+- Contains: Transport factory routing selection (via user-tier `subc.connection_file`), subc client connection pooling, route caching per session-identity, background event subscriptions with independent reconnects, revivable transport pool wrapper (`packages/aft-bridge/src/revivable-transport.ts`) instantiating replacement pools on demand when new traffic arrives post-shutdown, break-glass bash host fallback execution (`packages/aft-bridge/src/bash-host-fallback.ts`) executing approved commands directly in the foreground without AFT processing when transport is down, session bridge lifecycle, restart handling, version checks, binary discovery, binary download, ONNX runtime detection, storage migration, compact UI formatting, active logger, durable log sinks (`packages/aft-bridge/src/durable-log.ts`), wait-aware transport budgets propagation (mapping `transportTimeoutMs` to route requests to avoid premature client-side timeouts during long command execution), canonical path alias resolution (`packages/aft-bridge/src/path-aliases.ts`), host-neutral error adaptation (`packages/aft-bridge/src/error-contract.ts`, mapping route GOODBYE and standalone post-write / sibling-timeout crashes to unknown-outcome disposition to prevent duplicate mutations), per-realm subc lifecycle management (`packages/aft-bridge/src/lifecycle-registry.ts`), and consolidated cache root resolution (`packages/aft-bridge/src/cache-paths.ts`)
 - Depends on: Node child-process APIs, GitHub releases, `onnxruntime-node`, `@cortexkit/subc-client`
 - Used by: `packages/opencode-plugin/src/index.ts`, `packages/pi-plugin/src/index.ts`
 
@@ -58,8 +58,8 @@
 
 **Protocol and command layer:**
 - Purpose: Accept NDJSON requests, route tool calls via the unified `tool_call` command, and dispatch them to focused command handlers.
-- Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/commands/health_digest.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/runtime_drain.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`
-- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, server-rendered agent-facing text formatting (with directory outlines formatted as text unwrapping JSON envelopes), non-blocking control channel 0 health check responder reading derivation maps without spawning git subprocesses, and standalone command handlers for read/write/edit/hashline/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/bash_wait_detach/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state/health_digest
+- Location: `crates/aft/src/main.rs`, `crates/aft/src/protocol.rs`, `crates/aft/src/commands/`, `crates/aft/src/commands/health_digest.rs`, `crates/aft/src/run_tool_call.rs`, `crates/aft/src/runtime_drain.rs`, `crates/aft/src/subc_translate.rs`, `crates/aft/src/subc_format.rs`, `crates/aft/src/gh_shim.rs`
+- Contains: Request dispatch, response encoding, a unified `tool_call` routing engine, tool-to-command translation mapping, credential-free `gh` routing shim dispatch, server-rendered agent-facing text formatting (with directory outlines formatted as text unwrapping JSON envelopes), non-blocking control channel 0 health check responder reading derivation maps without spawning git subprocesses, and standalone command handlers for read/write/edit/hashline/apply_patch/delete_file/move_file/outline/zoom/bash/bash_orchestrate/bash_status/bash_wait_detach/batch/grep/glob/search/imports/refactor/LSP/inspect/conflicts/checkpoints/state/health_digest
 - Depends on: `crates/aft/src/context.rs`, `crates/aft/src/parser.rs`, `crates/aft/src/callgraph.rs`, `crates/aft/src/callgraph_store/mod.rs`, `crates/aft/src/edit.rs`, `crates/aft/src/semantic_index.rs`, `crates/aft/src/search_index.rs`, `crates/aft/src/compress/`
 - Used by: `packages/aft-bridge/src/bridge.ts`
 
@@ -89,7 +89,7 @@
 
 **Edit pipeline:**
 
-1. Validate path and verify symlink safety (recursively follow components up to 40 hops to reject escaping paths) -- `crates/aft/src/context.rs`
+1. Validate path and verify symlink safety (recursively follow components up to 40 hops to reject escaping paths), resolving relative paths against the bound project root via `AppContext::resolve_relative_path` before validation and safety keying -- `crates/aft/src/context.rs`
 2. Translate tool arguments to command parameters -- `crates/aft/src/subc_translate.rs`. This includes resolving and normalizing path arguments. RFC 8089 `file:` URLs (e.g., `file:///path`, `file:/path`, or `file://localhost/path`) are percent-decoded using a byte-wise tolerant algorithm to ensure both the plugin-side permission check and the server-side resolution agree on the target filesystem path. When `edit_mode: "hashline"` is configured in `aft.jsonc`, `subc_translate.rs` routes edit requests to `handle_hashline_edit` (`crates/aft/src/commands/hashline.rs`) ahead of legacy shape checks, executing mutations through the hashline two-phase transaction engine (`crates/aft/src/hashline/transaction/mod.rs`). Tagged read rendering (`crates/aft/src/commands/read.rs`) mints line tags and snapshot baselines when hashline mode is active.
 3. Check edit permissions -- `packages/opencode-plugin/src/tools/permissions.ts` (or Pi equivalents). Under Pi, project-internal mutations apply without confirmation prompts, while external paths are validated by Rust path restrictions to avoid unanswered-prompt hangs.
 4. Snapshot, mutate, diff, and validate content -- `crates/aft/src/edit.rs`
@@ -160,15 +160,16 @@
 **Codebase inspection flow:**
 
 1. Receive `aft_inspect` tool request -- `packages/opencode-plugin/src/tools/inspect.ts`, `packages/pi-plugin/src/tools/inspect.ts`, `crates/aft/src/commands/inspect.rs`.
-2. Blocking inspections execute full-root analysis across all active categories (LSP diagnostics, Tier 2 rescans, callgraph store readiness, and stat verification), recording completed phases into an `InspectPhaseLog` (`crates/aft/src/inspect/phase_log.rs`).
+2. Blocking inspections execute full-root analysis across all active categories (LSP diagnostics, Tier 2 rescans, callgraph store readiness, and stat verification), bounded by phase deadlines and responsive to cooperative cancellation tokens (`JobCancellation`), recording completed phases into an `InspectPhaseLog` (`crates/aft/src/inspect/phase_log.rs`).
 3. If an explicit `scope` is provided, it narrows the returned drill-down findings but does not reduce full-root verification work. `sections` controls which categories are rendered in detail versus summarized.
-4. Return a terminal inspection result (`FRESH` carrying completed phases and a wait-stamp; `INTERRUPTED`; or `PHASE-FAILED` carrying failure reason, failure detail, and completed phases).
+4. Producer-scoped LSP start or spawn failures isolate into reportable named gaps (`ApplicableServerFailure`) in the diagnostics category payload without aborting the overall inspection request, preserving verified results from surviving producers.
+5. Return a terminal inspection result (`FRESH` carrying completed phases and a wait-stamp; `INTERRUPTED`; or `PHASE-FAILED` carrying failure reason, failure detail, and completed phases).
 
 **Alert observation and response finalization flow:**
 
 1. Ingest authoritative LSP diagnostic snapshots per producer partition (`ProducerKey`) -- `crates/aft/src/alert_state.rs`.
 2. The session-owned alert engine (`AlertEngine` in `crates/aft/src/alert_render.rs`) tracks active and newly surfaced error diagnostics per dispatch root across agent turns.
-3. During response finalization (`crates/aft/src/response_finalize.rs::finalize_response_for_dispatch_root`), attach server-rendered `<system-reminder>` alert blocks containing error findings and counts to agent-visible tool responses.
+3. During response finalization (`crates/aft/src/response_finalize.rs::finalize_response_for_dispatch_root`), attach server-rendered `<system-reminder>` alert blocks containing error findings and counts to agent-visible tool responses, self-labeling AFT's status bar segment (`AFT E... W... | ...`) for fleet status composition.
 4. For OpenCode sessions, write durable observation rows (`alert_rendered_records`) and disappearance rows (`alert_disappearance_records`) into SQLite (`crates/aft/src/alert_records.rs`) to track 5-turn resolution lifecycles.
 
 ## Key Abstractions
@@ -373,6 +374,11 @@
 - Location: `crates/aft/src/inspect/phase_log.rs`
 - Pattern: Per-request phase journal recording completed phases (`InspectPhaseId`: `LspStart`, `LspQuiescence`, `Tier2Rescan`, `CallgraphReady`, `StatVerification`) and attributing them to producers or categories to form terminal inspection payloads (`FRESH`, `INTERRUPTED`, `PHASE-FAILED`).
 
+**GhShim:**
+- Purpose: Route `gh` CLI invocations without ambient credentials.
+- Location: `crates/aft/src/gh_shim.rs`
+- Pattern: Process boundary intercepting `gh` command invocations, validating signed routing manifests (`gh-routing-manifest`), routing governed commands to `prefrontal-core` via subc `gh.route` seam or execing upstream `gh` for un-governed/mechanical operations (yielding refusal exit status 86 on security/manifest violations), and providing offline self-report (`--status`, `--shim-version`).
+
 ## Entry Points
 
 **OpenCode plugin entry point:**
@@ -404,6 +410,11 @@
 - Location: `crates/aft/src/main.rs`, `crates/aft/src/subc/mod.rs`
 - Triggers: Spawned with the `--subc <connection-file>` argument
 - Responsibilities: Connect to the subc daemon over loopback TCP, authenticate using HMAC handshake, and process frames via tokio client loop routed through the per-actor executor
+
+**GitHub CLI routing shim entry point:**
+- Location: `crates/aft/src/gh_shim.rs`, `crates/aft/src/main.rs`
+- Triggers: Invocation as `gh` (argv[0]), `AFT_GH_SHIM`, or `AFT_DISPATCH_AS=gh`
+- Responsibilities: Validate signed routing manifest, route governed commands via `prefrontal-core` subc `gh.route` seam or exec upstream `gh`, handle `--status` and `--shim-version` self-reports
 
 **Rust binary CLI subcommands:**
 - Location: `crates/aft/src/cli/`
