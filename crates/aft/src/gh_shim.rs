@@ -29,6 +29,15 @@ const MANIFEST_STALE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const ROUTING_OPERATION: &str = "gh.route";
 const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
+const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
+const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge"];
+const ACCEPTED_SEAM_REFUSAL_CODES: &[&str] = &[
+    "identity_mismatch",
+    "unmapped_operation",
+    "custody_unavailable",
+    "schema_unsupported",
+    "rate_limited",
+];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
@@ -205,7 +214,7 @@ fn run(args: &[OsString]) -> i32 {
         Ok(manifest) => manifest,
         Err(_) => return delegate(args),
     };
-    let Some(agent_id) = resolved_agent_binding(&manifest, &cwd) else {
+    let Some(agent_binding) = resolved_agent_binding(&manifest, &cwd) else {
         return delegate(args);
     };
 
@@ -243,26 +252,13 @@ fn run(args: &[OsString]) -> i32 {
                         )
                     }
                 };
-            match route_governed(&paths, &determination, &agent_id, request) {
-                RouteOutcome::Result(output) => {
-                    print!("{output}");
-                    0
-                }
-                RouteOutcome::Refusal(code) => refuse(
-                    RefusalCode::SeamRefusal,
-                    &format!("governance seam refused the action: {code}"),
-                ),
-                RouteOutcome::UnboundIdentity => refuse(
-                    RefusalCode::UnboundIdentity,
-                    "the project binding was unavailable at route time",
-                ),
-                RouteOutcome::SchemaMismatch(message) => {
-                    refuse(RefusalCode::SeamSchemaMismatch, &message)
-                }
-                RouteOutcome::Unavailable(message) => {
-                    refuse(RefusalCode::SeamUnavailable, &message)
-                }
-            }
+            governed_outcome_status(route_governed(
+                &paths,
+                &determination,
+                &agent_binding,
+                request,
+                now,
+            ))
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
@@ -272,6 +268,26 @@ fn run(args: &[OsString]) -> i32 {
             ),
         ),
     }
+}
+
+fn governed_outcome_status(outcome: RouteOutcome) -> i32 {
+    match outcome {
+        RouteOutcome::Result(output) => {
+            print!("{output}");
+            0
+        }
+        RouteOutcome::Refusal(code) => refuse(RefusalCode::SeamRefusal, &seam_refusal_text(&code)),
+        RouteOutcome::UnboundIdentity => refuse(
+            RefusalCode::UnboundIdentity,
+            "the project binding was unavailable at route time",
+        ),
+        RouteOutcome::SchemaMismatch(message) => refuse(RefusalCode::SeamSchemaMismatch, &message),
+        RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
+    }
+}
+
+fn seam_refusal_text(code: &str) -> String {
+    format!("governance seam refused the action: {code}")
 }
 
 fn is_reserved_self_report(args: &[OsString]) -> bool {
@@ -287,6 +303,7 @@ struct StatePaths {
     rung: PathBuf,
     bypass_audit: PathBuf,
     unexpected_gh_route_advertisers: PathBuf,
+    seam_state: PathBuf,
 }
 
 impl StatePaths {
@@ -312,6 +329,7 @@ impl StatePaths {
             rung: root.join("rung-cache.json"),
             bypass_audit: root.join("operator-bypass.jsonl"),
             unexpected_gh_route_advertisers: root.join("unexpected-gh-route-advertisers.json"),
+            seam_state: root.join("seam-state.json"),
             root,
         }
     }
@@ -408,7 +426,7 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
             return record;
         }
     };
-    let Some(agent_id) = resolved_agent_binding(&manifest, cwd) else {
+    let Some(agent_binding) = resolved_agent_binding(&manifest, cwd) else {
         let record = RungRecord::r2(
             now,
             "agent_binding_unavailable",
@@ -418,7 +436,13 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
         return record;
     };
 
-    let discovery = probe_governance(paths, &connection_file, cwd, deadline, &agent_id);
+    let discovery = probe_governance(
+        paths,
+        &connection_file,
+        cwd,
+        deadline,
+        &agent_binding.agent_id,
+    );
     let record = match discovery {
         ProbeResult::Ready { module_id } => {
             match find_ambient_agent_credential(&manifest.detectors) {
@@ -621,10 +645,20 @@ fn project_root_for(cwd: &Path) -> PathBuf {
         .unwrap_or(canonical)
 }
 
-fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<String> {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AgentBinding {
+    repo: String,
+    agent_id: String,
+}
+
+fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBinding> {
     let project_root = project_root_for(cwd);
-    let repository = repository_key_from_origin(&project_root)?;
-    manifest.bindings.get(&repository).cloned()
+    let repo = repository_key_from_origin(&project_root)?;
+    manifest
+        .bindings
+        .get(&repo)
+        .cloned()
+        .map(|agent_id| AgentBinding { repo, agent_id })
 }
 
 fn repository_key_from_origin(project_root: &Path) -> Option<String> {
@@ -1115,14 +1149,19 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     };
     match manifest.tier_for_tuple(&tuple, platform) {
         Some(Tier::Mechanical) => Classification::Mechanical,
-        Some(Tier::Admin) => Classification::Admin { tuple },
-        Some(Tier::Governed) => manifest
+        Some(Tier::Admin) if V1_ADMIN_TUPLES.contains(&tuple.as_str()) => {
+            Classification::Admin { tuple }
+        }
+        Some(Tier::Governed) if V1_GOVERNED_TUPLES.contains(&tuple.as_str()) => manifest
             .canonicalization
             .get(&tuple)
             .cloned()
             .map(|canonical| Classification::Governed { tuple, canonical })
             .unwrap_or(Classification::Unclassified),
-        None => Classification::Unclassified,
+        // Manifest entries outside the v1 tuple set do not acquire a policy from
+        // nearby command names. A reviewed manifest and implementation change are
+        // both required before another write shape can be classified.
+        Some(Tier::Governed | Tier::Admin) | None => Classification::Unclassified,
     }
 }
 
@@ -1168,22 +1207,12 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     if matches.len() != 1 {
         return Classification::Unclassified;
     }
+    // The v1 manifest declares only mechanical API passthrough. API writes are
+    // not normalized into governed or ADMIN equivalents before their exact argv
+    // forms have an audited, reviewed parser contract.
     match matches[0].tier {
         Tier::Mechanical => Classification::Mechanical,
-        Tier::Admin => Classification::Admin {
-            tuple: format!("api {method} {path}"),
-        },
-        // API governed declarations deliberately use their own canonicalization
-        // key. A rule without one is safely unclassified instead of guessed.
-        Tier::Governed => manifest
-            .canonicalization
-            .get(&format!("api {method} {path}"))
-            .cloned()
-            .map(|canonical| Classification::Governed {
-                tuple: format!("api {method} {path}"),
-                canonical,
-            })
-            .unwrap_or(Classification::Unclassified),
+        Tier::Governed | Tier::Admin => Classification::Unclassified,
     }
 }
 
@@ -1203,9 +1232,10 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
             index += 1;
             continue;
         }
-        if matches!(value, "--input" | "-F" | "-f" | "--raw-field" | "--field") {
-            // Stdin and request-field forms can encode an undeclared body action.
-            // They are not guessed from a read-like URL.
+        if is_api_field_argument(value) {
+            // Field-bearing API forms can change request semantics independently
+            // of the endpoint. Until an audited form has a reviewed parser, they
+            // remain unclassified rather than inheriting a read-like API rule.
             return None;
         }
         if value.starts_with('-') {
@@ -1219,6 +1249,16 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
     }
     let path = path?;
     (path != "-").then_some((method, path))
+}
+
+fn is_api_field_argument(value: &str) -> bool {
+    ["--input", "--raw-field", "--field"]
+        .iter()
+        .any(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
+        || value == "-F"
+        || value.starts_with("-F")
+        || value == "-f"
+        || value.starts_with("-f")
 }
 
 #[derive(Clone, Debug)]
@@ -1363,12 +1403,37 @@ enum RouteOutcome {
     Unavailable(String),
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SeamState {
+    bound_holder: Option<String>,
+    agent_binding: Option<AgentBinding>,
+    last_seam_refusal: Option<LastSeamRefusal>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LastSeamRefusal {
+    code: String,
+    at_unix_secs: u64,
+}
+
 fn route_governed(
     paths: &StatePaths,
     determination: &RungRecord,
-    agent_id: &str,
+    agent_binding: &AgentBinding,
     request: GovernedRequest,
+    now: u64,
 ) -> RouteOutcome {
+    if let Err(error) = write_seam_state(
+        paths,
+        SeamState {
+            bound_holder: None,
+            agent_binding: Some(agent_binding.clone()),
+            last_seam_refusal: None,
+        },
+    ) {
+        return RouteOutcome::Unavailable(format!("governed self-report update failed: {error}"));
+    }
+
     let Some(connection_file) = configured_connection_file() else {
         return RouteOutcome::Unavailable(
             "the governance connection file is no longer available".to_string(),
@@ -1377,7 +1442,7 @@ fn route_governed(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = project_root_for(&cwd);
     let record_paths = paths.clone();
-    let agent_id = agent_id.to_string();
+    let agent_binding = agent_binding.clone();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1406,17 +1471,35 @@ fn route_governed(
             })?;
             let route = consumer
                 .open_route(
-                    RouteTarget::ManagementSurface { module_id },
+                    RouteTarget::ManagementSurface {
+                        module_id: module_id.clone(),
+                    },
                     BindIdentity {
                         project_root: project_root.to_string_lossy().into_owned().into(),
                         harness: "aft-gh-shim".to_string(),
-                        session: gh_session_id(&agent_id),
+                        session: gh_session_id(&agent_binding.agent_id),
                     },
                     CallOptions::default(),
                 )
                 .await
                 .map_err(|_| RouteOutcome::UnboundIdentity)?;
-            let wire_request = governed_wire_request(determination, &agent_id, request);
+            if let Err(error) = write_seam_state(
+                &record_paths,
+                SeamState {
+                    bound_holder: Some(module_id.clone()),
+                    agent_binding: Some(agent_binding.clone()),
+                    last_seam_refusal: None,
+                },
+            ) {
+                let _ = consumer
+                    .close_handle(&route, CloseRouteOptions::default())
+                    .await;
+                return Err(RouteOutcome::Unavailable(format!(
+                    "governed self-report update failed: {error}"
+                )));
+            }
+            let wire_request =
+                governed_wire_request(determination, &agent_binding.agent_id, request);
             let body = serde_json::to_vec(&wire_request)
                 .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
             let response = consumer
@@ -1427,9 +1510,52 @@ fn route_governed(
                 .close_handle(&route, CloseRouteOptions::default())
                 .await;
             let response = response?;
-            parse_governed_response(&response)
+            let outcome = parse_governed_response(&response)?;
+            if let RouteOutcome::Refusal(code) = &outcome {
+                write_seam_state(
+                    &record_paths,
+                    SeamState {
+                        bound_holder: Some(module_id),
+                        agent_binding: Some(agent_binding),
+                        last_seam_refusal: Some(LastSeamRefusal {
+                            code: code.clone(),
+                            at_unix_secs: now,
+                        }),
+                    },
+                )
+                .map_err(|error| {
+                    RouteOutcome::Unavailable(format!(
+                        "governed self-report update failed: {error}"
+                    ))
+                })?;
+            }
+            Ok(outcome)
         })
         .unwrap_or_else(|outcome| outcome)
+}
+
+fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
+    fs::create_dir_all(&paths.root)?;
+    let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
+    let temporary = paths.seam_state.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    // A governed result is visible only after its self-report transition is
+    // durable enough to survive a process exit. Failure stays on the seam path
+    // and is surfaced as a refusal instead of falling through to real `gh`.
+    file.sync_data()?;
+    fs::rename(temporary, &paths.seam_state)
+}
+
+fn seam_state(paths: &StatePaths) -> SeamState {
+    fs::read(&paths.seam_state)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn governed_wire_request(
@@ -1488,17 +1614,22 @@ fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
                 })?;
             render_governed_response(result, field_order).map(RouteOutcome::Result)
         }
-        Some("refusal") => Ok(RouteOutcome::Refusal(
-            object
+        Some("refusal") => {
+            let refusal_code = object
                 .get("refusal_code")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
                     RouteOutcome::SchemaMismatch(
-                        "governance refusal omitted refusal_code".to_string(),
+                        "governance refusal omitted a string refusal_code".to_string(),
                     )
-                })?
-                .to_string(),
-        )),
+                })?;
+            if !ACCEPTED_SEAM_REFUSAL_CODES.contains(&refusal_code) {
+                return Err(RouteOutcome::SchemaMismatch(format!(
+                    "governance seam returned unsupported refusal_code {refusal_code}"
+                )));
+            }
+            Ok(RouteOutcome::Refusal(refusal_code.to_string()))
+        }
         Some("unbound_identity") => Ok(RouteOutcome::UnboundIdentity),
         _ => Err(RouteOutcome::SchemaMismatch(
             "governance seam returned an unknown outcome".to_string(),
@@ -1596,6 +1727,9 @@ struct SelfReport {
     shim_version: &'static str,
     gh_routing_schema_floor: u64,
     unexpected_gh_route_advertiser: Option<Vec<String>>,
+    bound_holder: Option<String>,
+    agent_binding: Option<AgentBinding>,
+    last_seam_refusal: Option<LastSeamRefusal>,
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
     bypass_audit: Option<Vec<Value>>,
@@ -1669,10 +1803,14 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         Err(error) => (None, Some(format!("executing image unavailable: {error}"))),
     };
     let (bypass_audit, bypass_audit_error) = read_bypass_audit(paths);
+    let seam_state = seam_state(paths);
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
         unexpected_gh_route_advertiser: unexpected_gh_route_advertisers(paths),
+        bound_holder: seam_state.bound_holder,
+        agent_binding: seam_state.agent_binding,
+        last_seam_refusal: seam_state.last_seam_refusal,
         cached_manifest: cached_manifest_report(paths),
         last_rung: last_rung_report(paths),
         bypass_audit,
@@ -1992,6 +2130,9 @@ mod tests {
                 "shim_version",
                 "gh_routing_schema_floor",
                 "unexpected_gh_route_advertiser",
+                "bound_holder",
+                "agent_binding",
+                "last_seam_refusal",
                 "cached_manifest",
                 "last_rung",
                 "bypass_audit",
@@ -2379,5 +2520,160 @@ mod tests {
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_status_")));
         assert_eq!(REFUSAL_EXIT_STATUS, 86);
+    }
+
+    #[test]
+    fn v1_write_classification_accepts_only_the_reviewed_tuple_sets() {
+        let manifest = fixture_manifest();
+        for tuple in V1_GOVERNED_TUPLES {
+            let args = tuple
+                .split_whitespace()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Governed { .. }
+            ));
+        }
+        for tuple in V1_ADMIN_TUPLES {
+            let args = tuple
+                .split_whitespace()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { .. }
+            ));
+        }
+        for args in [
+            ["release", "create"].as_slice(),
+            ["issue", "create"].as_slice(),
+            ["pr", "reopen"].as_slice(),
+        ] {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+    }
+
+    #[test]
+    fn field_bearing_api_forms_remain_unclassified_without_an_audited_parser() {
+        let manifest = fixture_manifest();
+        for field_flag in [
+            "--field=name=value",
+            "--raw-field=name=value",
+            "--input=body.json",
+            "-fname=value",
+            "-Fname=value",
+        ] {
+            let args = vec![
+                OsString::from("api"),
+                OsString::from("/repos/owner/repo"),
+                OsString::from(field_flag),
+            ];
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+    }
+
+    #[test]
+    fn holder_refusals_are_closed_and_keep_the_holder_code() {
+        for code in ACCEPTED_SEAM_REFUSAL_CODES {
+            let response = json!({"outcome": "refusal", "refusal_code": code});
+            let outcome = parse_governed_response(&serde_json::to_vec(&response).unwrap()).unwrap();
+            assert!(matches!(outcome, RouteOutcome::Refusal(ref actual) if actual == code));
+            assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
+            assert_eq!(
+                seam_refusal_text(code),
+                format!("governance seam refused the action: {code}")
+            );
+            assert_eq!(REFUSAL_EXIT_STATUS, 86);
+        }
+        for response in [
+            json!({"outcome": "refusal", "refusal_code": "unknown"}),
+            json!({"outcome": "refusal", "refusal_code": 7}),
+            json!({"outcome": "refusal", "refusal_code": null}),
+            json!({"outcome": "refusal"}),
+        ] {
+            assert!(matches!(
+                parse_governed_response(&serde_json::to_vec(&response).unwrap()),
+                Err(RouteOutcome::SchemaMismatch(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn governed_self_report_transitions_are_durable_and_mechanical_classification_preserves_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let binding = AgentBinding {
+            repo: "owner/repo".to_string(),
+            agent_id: "agent-7".to_string(),
+        };
+        write_seam_state(
+            &paths,
+            SeamState {
+                bound_holder: None,
+                agent_binding: Some(binding.clone()),
+                last_seam_refusal: None,
+            },
+        )
+        .unwrap();
+        let report = build_self_report(&paths);
+        assert_eq!(report.bound_holder, None);
+        assert_eq!(report.agent_binding, Some(binding.clone()));
+        assert_eq!(report.last_seam_refusal, None);
+
+        write_seam_state(
+            &paths,
+            SeamState {
+                bound_holder: Some(ROUTING_HOLDER_MODULE_ID.to_string()),
+                agent_binding: Some(binding.clone()),
+                last_seam_refusal: Some(LastSeamRefusal {
+                    code: "rate_limited".to_string(),
+                    at_unix_secs: 77,
+                }),
+            },
+        )
+        .unwrap();
+        let report = build_self_report(&paths);
+        assert_eq!(
+            report.bound_holder.as_deref(),
+            Some(ROUTING_HOLDER_MODULE_ID)
+        );
+        assert_eq!(report.agent_binding, Some(binding));
+        assert_eq!(
+            report
+                .last_seam_refusal
+                .as_ref()
+                .map(|refusal| refusal.code.as_str()),
+            Some("rate_limited")
+        );
+
+        let mechanical = [OsString::from("issue"), OsString::from("view")];
+        assert!(matches!(
+            classify(&mechanical, &fixture_manifest(), "macos"),
+            Classification::Mechanical
+        ));
+        assert_eq!(
+            seam_state(&paths)
+                .last_seam_refusal
+                .as_ref()
+                .map(|refusal| refusal.at_unix_secs),
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn governed_self_report_persistence_failure_is_loud() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("not-a-directory");
+        fs::write(&state_root, b"file").unwrap();
+        let paths = StatePaths::from_root(state_root);
+        assert!(write_seam_state(&paths, SeamState::default()).is_err());
     }
 }
