@@ -468,10 +468,15 @@ fn astro_uses_the_nearest_project_typescript_sdk() {
     let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
     assert_eq!(outcomes.successful.len(), 1, "outcomes: {outcomes:?}");
     let initialized = collect_notification(&mut manager, "custom/initialized");
-    assert_eq!(
-        initialized["initializationOptions"]["typescript"]["tsdk"],
-        member_tsdk.to_string_lossy().as_ref()
-    );
+    // Compare with normalized separators: the product joins the tsdk tail with
+    // native separators on Windows, while this fixture's PathBuf keeps the
+    // forward slashes it was built with - a byte comparison of the two
+    // spellings of one path fails on Windows only.
+    let sent_tsdk = initialized["initializationOptions"]["typescript"]["tsdk"]
+        .as_str()
+        .expect("tsdk is a string")
+        .replace('\\', "/");
+    assert_eq!(sent_tsdk, member_tsdk.to_string_lossy().replace('\\', "/"));
 }
 
 #[test]
