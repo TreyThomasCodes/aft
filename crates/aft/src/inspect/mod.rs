@@ -15,6 +15,7 @@ pub mod scanners;
 pub mod tier2_scheduler;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
+pub use diagnostics_category::force_scoped_diagnostic_coverage_for_test;
 pub use dispatch::{
     inspect_pool_size_for_test, inspect_pool_thread_count_for_test, DispatchHandles, InspectWorker,
 };

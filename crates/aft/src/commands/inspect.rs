@@ -66,8 +66,10 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     }
 }
 
-/// Blocking inspections collect diagnostics for the entire root, even without
-/// an explicit response scope. Scope controls rendered results, not freshness.
+/// Diagnostics collection is always the warm working set, with or without a
+/// request scope: scope filters rendered findings and adds per-file authority
+/// (named gaps for scoped files no producer has authoritatively analyzed),
+/// never extra collection work.
 fn handle_inspect_payload(
     req: &RawRequest,
     ctx: &AppContext,
@@ -139,7 +141,7 @@ fn handle_inspect_payload(
                 ctx,
                 &snapshot,
                 &scope,
-                scope_was_provided || force_root_diagnostics,
+                scope_was_provided,
                 applicability_is_empty,
                 producer_failures,
             )
@@ -1048,14 +1050,24 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
             .into_iter()
             .flatten()
         {
-            let producer = gap
-                .get("producer")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown producer");
             let reason = gap
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unavailable");
+            if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
+                let file = gap
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown file");
+                lines.push(format!(
+                    "Incomplete {category}: no authoritative diagnostics for {file} ({reason})"
+                ));
+                continue;
+            }
+            let producer = gap
+                .get("producer")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown producer");
             lines.push(format!(
                 "Incomplete {category}: producer {producer} failed ({reason})"
             ));

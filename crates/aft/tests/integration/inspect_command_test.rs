@@ -262,9 +262,10 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
                     Vec::new(),
                 );
         } else {
-            // Scoped scanner fixtures need their real scope preserved. The fake
-            // pull-capable servers provide the completion evidence that their
-            // assertions intentionally leave outside scope.
+            // Scoped scanner fixtures need their real scope preserved. The
+            // diagnostics prerequisite for an unanalyzed scope comes from
+            // per-file coverage gaps (complete: false), so these fixtures
+            // still reach a fresh diagnostics payload without warming LSP.
             ctx.lsp()
                 .override_binary(ServerKind::Rust, fake_server_path());
             ctx.lsp()
@@ -2562,20 +2563,30 @@ fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
         .is_empty());
 }
 
+/// Scope must not change collection work: a scoped request may not spawn
+/// servers, open documents, or pull diagnostics beyond what the warm path
+/// already did. Assertions target the producer/LSP call surface (server
+/// roster, open-document store, diagnostic reports), not timing.
 #[test]
-fn inspect_command_diagnostics_scope_actively_pulls_cold_file_and_narrows() {
+fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
     let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-scope\"\n");
-    write_file(&root, "src/main.rs", "fn main() {}\n");
-    write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-scope-cost\"\n",
+    );
+    let main_rs = write_file(&root, "src/main.rs", "fn main() {}\n");
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
+    // Pull-capable server: the old scoped path would have opened and pulled
+    // the scoped file, leaving a report and a running server behind.
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    assert!(ctx.lsp().active_server_keys().is_empty());
 
     let response = inspect(
         &ctx,
         json!({
-            "id": "inspect-diagnostics-scoped-pull",
+            "id": "inspect-diagnostics-scoped-no-work",
             "command": "inspect",
             "sections": ["diagnostics"],
             "scope": "src/main.rs",
@@ -2584,18 +2595,243 @@ fn inspect_command_diagnostics_scope_actively_pulls_cold_file_and_narrows() {
     );
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 1);
-    assert_eq!(response["summary"]["diagnostics"]["warnings"], 0);
-    let details = response["details"]["diagnostics"]
+    assert!(
+        ctx.lsp().active_server_keys().is_empty(),
+        "scoped inspect must not spawn servers"
+    );
+    assert!(
+        !ctx.lsp().document_is_open_for_test(&main_rs),
+        "scoped inspect must not open documents"
+    );
+    assert!(
+        !ctx.lsp().has_diagnostic_report_for_file(&main_rs),
+        "scoped inspect must not pull diagnostics into the store"
+    );
+    // The honest consequence of doing no collection work: the never-analyzed
+    // file is named as a gap instead of rendering as clean.
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let gap = response["gaps"]
         .as_array()
-        .expect("diagnostics details");
-    assert_eq!(details.len(), 1, "response: {response:#}");
-    assert_eq!(details[0]["file"], "src/main.rs");
-    assert_eq!(details[0]["message"], "test pull diagnostic");
+        .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+        .unwrap_or_else(|| panic!("uncovered_file gap missing: {response:#}"));
+    assert_eq!(gap["file"], "src/main.rs");
+}
+
+/// A scoped call over a warm root returns only scope-matching findings, and
+/// the same findings appear in the unscoped call.
+#[test]
+fn scoped_diagnostics_filter_warm_findings_to_the_scope() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-scope-filter\"\n",
+    );
+    let main_rs = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let lib_rs = write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    open_with_lsp(&ctx, &main_rs, "fn main() {}\n");
+    open_with_lsp(&ctx, &lib_rs, "pub fn lib() {}\n");
+
+    let scoped = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-scoped-filter",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/main.rs",
+            "topK": 10,
+        }),
+    );
+    assert_eq!(scoped["success"], true, "inspect failed: {scoped:#}");
+    assert!(
+        scoped.get("complete").is_none(),
+        "covered scope must be complete: {scoped:#}"
+    );
+    assert_eq!(scoped["summary"]["diagnostics"]["errors"], 1);
+    assert_eq!(scoped["summary"]["diagnostics"]["warnings"], 1);
+    let scoped_details = scoped["details"]["diagnostics"]
+        .as_array()
+        .expect("scoped diagnostics details");
+    assert_eq!(scoped_details.len(), 2, "response: {scoped:#}");
+    assert!(
+        scoped_details
+            .iter()
+            .all(|item| item["file"] == "src/main.rs"),
+        "scoped details must only contain scope findings: {scoped:#}"
+    );
+
+    let unscoped = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-unscoped-filter",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "topK": 10,
+        }),
+    );
+    assert_eq!(unscoped["success"], true, "inspect failed: {unscoped:#}");
+    assert_eq!(unscoped["summary"]["diagnostics"]["errors"], 2);
+    assert_eq!(unscoped["summary"]["diagnostics"]["warnings"], 2);
+    let unscoped_details = unscoped["details"]["diagnostics"]
+        .as_array()
+        .expect("unscoped diagnostics details");
+    assert_eq!(unscoped_details.len(), 4, "response: {unscoped:#}");
+    // The scoped findings are a subset of the unscoped findings.
+    assert!(
+        scoped_details
+            .iter()
+            .all(|item| unscoped_details.contains(item)),
+        "scoped findings must survive in the unscoped payload: scoped={scoped_details:#?} unscoped={unscoped_details:#?}"
+    );
+}
+
+/// The reporter's scenario: the server reported on file Y only, so a scoped
+/// call for file X must return `complete: false` naming X — never an
+/// empty-clean result. The second half is the mutation control: forcing the
+/// coverage check to "covered" reproduces exactly the confident-empty answer
+/// the assertions above reject, proving they are sensitive to the check.
+#[test]
+fn scoped_diagnostics_name_uncovered_files_instead_of_rendering_clean_empty() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-scope-gap\"\n",
+    );
+    let reported = write_file(&root, "src/main.rs", "fn main() {}\n");
+    write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    // The server only ever analyzes src/main.rs; src/lib.rs is never touched.
+    open_with_lsp(&ctx, &reported, "fn main() {}\n");
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-scoped-uncovered",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/lib.rs",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let summary = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(
+        summary.get("complete").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+        .unwrap_or_else(|| panic!("uncovered_file gap missing: {response:#}"));
+    assert_eq!(gap["file"], "src/lib.rs");
+    assert!(
+        gap["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "coverage gap must carry a reason: {response:#}"
+    );
+    assert!(
+        response["details"]
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty()),
+        "uncovered scope must not render findings: {response:#}"
+    );
+
+    // Mutation control: force every scoped file to read as covered. The gap
+    // disappears and the payload becomes the confident empty answer that the
+    // coverage check exists to prevent — i.e. every assertion above would
+    // fail under this mutation.
+    aft::inspect::force_scoped_diagnostic_coverage_for_test(true);
+    let mutated = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-scoped-uncovered-mutated",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/lib.rs",
+            "topK": 10,
+        }),
+    );
+    aft::inspect::force_scoped_diagnostic_coverage_for_test(false);
+
+    assert_eq!(mutated["success"], true, "inspect failed: {mutated:#}");
+    assert!(
+        mutated.get("complete").is_none(),
+        "forced coverage must remove the gap: {mutated:#}"
+    );
+    assert!(
+        mutated["summary"]["diagnostics"].get("complete").is_none(),
+        "forced coverage must remove the category gap: {mutated:#}"
+    );
+    assert_eq!(mutated["summary"]["diagnostics"]["errors"], 0);
+}
+
+/// Negative control: a scoped file WITH an authoritative report and zero
+/// findings is legitimately clean — coverage gaps must not fire for it.
+#[test]
+fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-scope-clean\"\n",
+    );
+    let lib_rs = write_file(&root, "src/lib.rs", "pub fn lib() {}\n");
+    let ctx = configured_context(&root);
+    // Authoritative checked-clean report: a producer analyzed the file and
+    // found nothing. Published directly so the test does not depend on any
+    // fake-server behavior. Store keys use the canonical product spelling, so
+    // publish with the same form the lookup normalizes to.
+    ctx.lsp()
+        .diagnostics_store_mut_for_test()
+        .publish_with_kind(
+            ServerKind::Rust,
+            crate::helpers::canonicalize_like_product(&lib_rs),
+            Vec::new(),
+        );
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-diagnostics-scoped-clean",
+            "command": "inspect",
+            "sections": ["diagnostics"],
+            "scope": "src/lib.rs",
+            "topK": 10,
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert!(
+        response.get("complete").is_none(),
+        "covered clean scope must not be marked incomplete: {response:#}"
+    );
+    assert!(
+        response["summary"]["diagnostics"].get("complete").is_none(),
+        "covered clean scope must not carry a category gap: {response:#}"
+    );
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(
+        response["details"]
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty()),
+        "clean scope must not render findings: {response:#}"
+    );
 }
 
 #[test]
-fn scoped_diagnostics_drains_events_after_each_file_before_partial_return() {
+fn scoped_diagnostics_drain_events_before_the_warm_collection() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-drain\"\n");
     for name in ["a.rs", "b.rs", "c.rs"] {
@@ -2630,20 +2866,36 @@ fn scoped_diagnostics_drains_events_after_each_file_before_partial_return() {
 
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
-    assert_eq!(response["gaps"][0]["kind"], "failed_producer");
     assert_eq!(
         ctx.lsp().pending_event_count_for_test(),
         0,
-        "the scoped per-file loop must drain events even when server startup fails"
+        "the warm collection must drain queued events before reading the store"
+    );
+    // No producer ever reported on the scoped files, so each one is named as
+    // a coverage gap instead of rendering a confident empty summary.
+    let gaps = response["gaps"].as_array().expect("coverage gaps");
+    let mut uncovered = gaps
+        .iter()
+        .filter(|gap| gap["kind"] == "uncovered_file")
+        .filter_map(|gap| gap["file"].as_str())
+        .collect::<Vec<_>>();
+    uncovered.sort();
+    assert_eq!(
+        uncovered,
+        vec!["src/a.rs", "src/b.rs", "src/c.rs"],
+        "every unanalyzed scoped file must be named: {response:#}"
     );
 }
 
+/// Scoped diagnostics no longer open documents in order to pull them, so the
+/// old open/close bookkeeping has nothing to manage: a scoped request must
+/// leave the document store exactly as the warm path found it.
 #[test]
-fn scoped_diagnostics_closes_only_documents_it_opened_and_can_reopen_them() {
+fn scoped_diagnostics_open_no_documents_and_close_none() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-close\"\n");
     let pre_opened = write_file(&root, "src/a.rs", "fn a() {}\n");
-    let newly_opened = [
+    let never_opened = [
         write_file(&root, "src/b.rs", "fn b() {}\n"),
         write_file(&root, "src/c.rs", "fn c() {}\n"),
     ];
@@ -2663,7 +2915,7 @@ fn scoped_diagnostics_closes_only_documents_it_opened_and_can_reopen_them() {
     let response = inspect(
         &ctx,
         json!({
-            "id": "inspect-diagnostics-closes-new-documents",
+            "id": "inspect-diagnostics-opens-nothing",
             "command": "inspect",
             "sections": ["diagnostics"],
             "scope": "src",
@@ -2672,111 +2924,28 @@ fn scoped_diagnostics_closes_only_documents_it_opened_and_can_reopen_them() {
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
 
     assert!(ctx.lsp().document_is_open_for_test(&pre_opened));
-    for file in &newly_opened {
+    for file in &never_opened {
         assert!(
             !ctx.lsp().document_is_open_for_test(file),
-            "scoped inspect must remove newly-opened documents from its store"
+            "scoped inspect must not open cold documents"
         );
-    }
-
-    let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", newly_opened.len());
-    let mut closed_uris = closed
-        .iter()
-        .map(|params| params["uri"].as_str().expect("closed URI").to_string())
-        .collect::<Vec<_>>();
-    closed_uris.sort();
-    let mut expected_closed_uris = newly_opened
-        .iter()
-        .map(|file| file_uri(file))
-        .collect::<Vec<_>>();
-    expected_closed_uris.sort();
-    assert_eq!(closed_uris, expected_closed_uris);
-    assert!(!closed_uris.contains(&file_uri(&pre_opened)));
-
-    let reopen_result = ctx
-        .lsp()
-        .ensure_file_open(&newly_opened[0], &config)
-        .expect("reopen scoped document");
-    assert_eq!(
-        reopen_result.newly_opened.len(),
-        1,
-        "closed store entries must cause a later didOpen"
-    );
-    let reopened = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
-    assert_eq!(reopened[0]["uri"], file_uri(&newly_opened[0]));
-}
-
-#[test]
-fn scoped_diagnostics_closes_documents_after_collection() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-close\"\n");
-    let files = [
-        write_file(&root, "src/a.rs", "fn a() {}\n"),
-        write_file(&root, "src/b.rs", "fn b() {}\n"),
-    ];
-    let ctx = configured_context(&root);
-    configure_fake_rust_lsp(&ctx);
-    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-diagnostics-close",
-            "command": "inspect",
-            "sections": ["diagnostics"],
-            "scope": "src",
-        }),
-    );
-
-    assert_eq!(response["success"], true, "response: {response:#}");
-    for file in &files {
         assert!(
-            !ctx.lsp().document_is_open_for_test(file),
-            "diagnostics must close inspect-opened documents"
+            !ctx.lsp().has_diagnostic_report_for_file(file),
+            "scoped inspect must not pull cold documents into the store"
         );
     }
-}
-
-#[test]
-fn blocking_scoped_diagnostics_closes_every_document_it_opens() {
-    let (_temp_dir, root) = fixture_project();
-    write_file(
-        &root,
-        "Cargo.toml",
-        "[package]\nname = \"diag-blocking-close\"\n",
+    // The fake server emits one custom/documentOpened per didOpen and one
+    // custom/documentClosed per didClose: after the warmup above, a scoped
+    // inspect that touched documents would leave more of both in the queue.
+    let leftover = ctx.lsp().drain_events().events;
+    assert!(
+        leftover.iter().all(|event| !matches!(
+            event,
+            LspEvent::Notification { method, .. }
+                if method == "custom/documentOpened" || method == "custom/documentClosed"
+        )),
+        "scoped inspect must neither open nor close documents: {leftover:#?}"
     );
-    let files = [
-        write_file(&root, "src/a.rs", "fn a() {}\n"),
-        write_file(&root, "src/b.rs", "fn b() {}\n"),
-    ];
-    let ctx = configured_context(&root);
-    configure_fake_rust_lsp(&ctx);
-    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
-    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "200");
-
-    let response = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-diagnostics-blocking-close",
-            "command": "inspect",
-            "sections": ["diagnostics"],
-            "scope": "src",
-        }),
-    );
-    assert_eq!(response["success"], true, "response: {response:#}");
-    for file in &files {
-        assert!(
-            !ctx.lsp().document_is_open_for_test(file),
-            "blocking diagnostics must close every inspect-opened document"
-        );
-    }
-    let closed = collect_lsp_notifications(&ctx, "custom/documentClosed", files.len());
-    assert!(closed
-        .iter()
-        .any(|event| event["uri"] == file_uri(&files[0])));
-    assert!(closed
-        .iter()
-        .any(|event| event["uri"] == file_uri(&files[1])));
 }
 
 #[test]
@@ -2800,16 +2969,22 @@ fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
         }),
     );
 
+    // The warm path never attempts a spawn, so a missing binary surfaces as
+    // per-file coverage gaps (the file has a registered producer but no
+    // report) rather than a failed-producer entry.
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
     assert_eq!(response["summary"]["diagnostics"]["complete"], false);
     assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
-    assert_eq!(response["gaps"][0]["kind"], "failed_producer");
-    assert_eq!(response["gaps"][0]["producer"], "rust");
-    assert_eq!(response["gaps"][0]["categories"], json!(["diagnostics"]));
-    assert!(response["gaps"][0]["reason"]
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+        .unwrap_or_else(|| panic!("uncovered_file gap missing: {response:#}"));
+    assert_eq!(gap["file"], "src/main.rs");
+    assert_eq!(gap["categories"], json!(["diagnostics"]));
+    assert!(gap["reason"]
         .as_str()
-        .is_some_and(|reason| reason.contains("rust-analyzer")));
+        .is_some_and(|reason| !reason.is_empty()));
 }
 
 #[test]
@@ -2833,9 +3008,19 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
         }),
     );
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["code"], "inspect_not_fresh");
-    assert!(response.get("summary").is_none());
+    // A file no producer applies to is a named coverage gap: incomplete,
+    // never a confident zero result.
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+        .unwrap_or_else(|| panic!("uncovered_file gap missing: {response:#}"));
+    assert_eq!(gap["file"], "docs/readme.md");
+    assert!(gap["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("no LSP producer")));
 }
 
 #[test]
@@ -2897,9 +3082,20 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         }),
     );
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["code"], "inspect_not_fresh");
-    assert!(response.get("summary").is_none());
+    // The producer is registered for the file type but its root marker is
+    // absent, so it never runs and never reports: the scoped file must be a
+    // named coverage gap, never a confident zero result.
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+        .unwrap_or_else(|| panic!("uncovered_file gap missing: {response:#}"));
+    assert_eq!(gap["file"], "src/app.customts");
+    assert!(gap["reason"]
+        .as_str()
+        .is_some_and(|reason| !reason.is_empty()));
 }
 
 #[test]
@@ -2969,6 +3165,16 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     lsp.set_extra_env("AFT_FAKE_LSP_PULL", "1");
     lsp.set_extra_env("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI", &rust_root_uri);
     drop(lsp);
+
+    // The blocking tool call reads the warm working set instead of pulling
+    // per-file, so the TypeScript findings must be warmed through the normal
+    // edit path before the inspection runs.
+    let app_ts = root.join("web/src/app.ts");
+    open_with_lsp(
+        &ctx,
+        &app_ts,
+        "export function tsValue(): number { return 1; }\n",
+    );
 
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({

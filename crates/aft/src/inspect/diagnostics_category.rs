@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
@@ -9,14 +10,17 @@ use crate::config::{
 };
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-use crate::lsp::manager::{
-    ApplicableServerFailure, EnsureServerOutcomes, InspectDiagnosticsWake, PreEditSnapshot,
-    PullFileOutcome, PullFileResult, ServerAttemptResult,
-};
+use crate::lsp::manager::ApplicableServerFailure;
 use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
+/// Configured deadline for blocking diagnostics waits. The warm-collection
+/// path has no blocking LSP phase, so nothing consumes this boundary today;
+/// it stays the reference deadline for any blocking diagnostics wait and is
+/// pinned by the unit test below. The same config value also drives the
+/// plugin-side transport headroom for inspect calls.
+#[cfg_attr(not(test), allow(dead_code))]
 fn diagnostics_phase_timeout(config: &Config) -> Duration {
     Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
         MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -30,6 +34,16 @@ struct CollectedDiagnostic {
     provisional: bool,
 }
 
+/// A scoped file that no producer has authoritatively analyzed. Warm
+/// collection cannot prove per-file cleanliness from the global "some server
+/// reported" signal, so scoped payloads name these files instead of rendering
+/// a confident empty answer.
+#[derive(Debug)]
+struct ScopedCoverageGap {
+    file: PathBuf,
+    reason: &'static str,
+}
+
 #[derive(Default)]
 struct DiagnosticsCollection {
     diagnostics: Vec<CollectedDiagnostic>,
@@ -37,51 +51,26 @@ struct DiagnosticsCollection {
     applicability_is_empty: bool,
     servers_pending: BTreeSet<String>,
     producer_failures: BTreeMap<String, String>,
-    /// An explicit unsupported file prevents the inspected set from being
-    /// mechanically verified, even though it does not have a server to wait on.
-    files_without_server: usize,
-}
-
-struct ScopedInspectDocuments<'a> {
-    ctx: &'a AppContext,
-    opened: Vec<(PathBuf, Vec<ServerKey>)>,
-}
-
-impl<'a> ScopedInspectDocuments<'a> {
-    fn new(ctx: &'a AppContext) -> Self {
-        Self {
-            ctx,
-            opened: Vec::new(),
-        }
-    }
-
-    fn record(&mut self, file: PathBuf, server_keys: Vec<ServerKey>) {
-        if !server_keys.is_empty() {
-            self.opened.push((file, server_keys));
-        }
-    }
-}
-
-impl Drop for ScopedInspectDocuments<'_> {
-    fn drop(&mut self) {
-        let mut lsp = self.ctx.lsp();
-        for (file, server_keys) in std::mem::take(&mut self.opened) {
-            if let Err(err) = lsp.close_file_for_servers(&file, &server_keys) {
-                crate::slog_warn!(
-                    "[inspect:diagnostics] failed to close scoped document {}: {err}",
-                    file.display()
-                );
-            }
-        }
-    }
+    scope_coverage_gaps: Vec<ScopedCoverageGap>,
 }
 
 /// Collect diagnostics for the explicit inspect path.
 ///
-/// A collection becomes Fresh after every producer has either returned verified
-/// results or reached a terminal failure. Terminal producer failures remain named
-/// gaps in the payload; pending or otherwise unverified sources still prevent a
-/// fresh response.
+/// Collection never depends on the request scope: scoped and unscoped
+/// requests both read the warm working set, so a scope cannot switch the
+/// category onto a more expensive collection strategy. Scope only filters
+/// which findings the payload renders.
+///
+/// The authority halves differ by design. An unscoped request makes a
+/// full-root claim, so the global `is_reportable` conjunction over the
+/// full-root collection decides freshness. A scoped request makes per-file
+/// claims: every scoped file must either carry an authoritative producer
+/// report or appear as a named gap, because the global "some server
+/// reported" bit cannot prove that a specific file nothing ever analyzed is
+/// clean. A collection becomes Fresh after every producer has either
+/// returned verified results or reached a terminal failure. Terminal
+/// producer failures remain named gaps in the payload; pending or otherwise
+/// unverified sources still prevent a fresh response.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
@@ -90,26 +79,30 @@ pub(crate) fn run_diagnostics_category(
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
 ) -> JobOutcome {
-    let collection = if applicability_is_empty {
+    let mut collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
         // for; the empty category is authoritative for this applicability snapshot.
         DiagnosticsCollection {
             applicability_is_empty: true,
             ..DiagnosticsCollection::default()
         }
-    } else if scope_was_provided {
-        // A deferred inspection can collect diagnostics for the entire root
-        // without an explicit scope. Scope filters rendered results, not work.
-        match collect_scoped_diagnostics(ctx, snapshot, scope) {
-            Ok(collection) => collection,
-            Err(message) => return JobOutcome::Failed { message },
-        }
     } else {
         collect_warm_working_set(ctx, snapshot)
     };
-
-    let mut collection = collection;
     collection.record_producer_failures(producer_failures);
+
+    if scope_was_provided {
+        collection.apply_scope(scope);
+        collection.record_scope_coverage_gaps(ctx, snapshot, scope);
+        // Per-file coverage gaps make the scoped verdict self-certifying:
+        // every scoped file is either covered by an authoritative report or
+        // named as a gap, so the payload is honest without waiting on global
+        // quiescence signals that may describe files outside the scope.
+        return JobOutcome::Fresh {
+            payload: collection.into_payload(snapshot),
+        };
+    }
+
     if collection.is_reportable() {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
@@ -119,15 +112,14 @@ pub(crate) fn run_diagnostics_category(
     }
 }
 
-#[allow(dead_code)]
 fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     {
         let mut lsp = ctx.lsp();
-        // No-scope inspect is intentionally cheap: drain already queued LSP
-        // events, then read only the warm diagnostics store. It does not open
-        // files or spawn servers.
+        // The only diagnostics collection path, for scoped and unscoped
+        // requests alike: drain already queued LSP events, then read only the
+        // warm diagnostics store. It does not open files or spawn servers.
         lsp.drain_events();
         collection.server_ran = lsp.has_any_diagnostic_reports();
         if !collection.server_ran {
@@ -163,335 +155,79 @@ fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> Dia
     collection
 }
 
-fn collect_scoped_diagnostics(
-    ctx: &AppContext,
-    snapshot: &InspectSnapshot,
-    scope: &JobScope,
-) -> Result<DiagnosticsCollection, String> {
-    let config = ctx.config().clone();
-    let timeout = diagnostics_phase_timeout(&config);
-    let deadline = Instant::now() + timeout;
-    let mut tsconfig_membership = TsconfigMembershipCache::new();
-    let whole_root = JobScope::from_roots(
-        snapshot.project_root.clone(),
-        vec![snapshot.project_root.clone()],
-    );
-    let scoped = scoped_lsp_files(snapshot, &whole_root, &config, &mut tsconfig_membership);
-    let mut files = scoped.files.into_iter().collect::<BTreeSet<_>>();
-    for root in scope.roots().iter().filter(|root| root.is_file()) {
-        files.insert(crate::inspect::job::canonicalize_normalized(root));
-    }
-    let mut collection = DiagnosticsCollection {
-        applicability_is_empty: files.is_empty() && scoped.explicit_files_without_server == 0,
-        files_without_server: scoped.explicit_files_without_server,
-        ..DiagnosticsCollection::default()
-    };
-    let mut opened_documents = ScopedInspectDocuments::new(ctx);
-
-    for file in files {
-        check_diagnostics_phase_boundary(deadline, timeout)?;
-        collect_scoped_file(
-            ctx,
-            &config,
-            &file,
-            &mut collection,
-            &mut opened_documents,
-            deadline,
-            timeout,
-        )?;
-        // Pull-only servers may leave didOpen diagnostics, telemetry, and log
-        // notifications queued because they do not enter the push waiter.
-        ctx.lsp().drain_events();
-    }
-
-    check_diagnostics_phase_boundary(deadline, timeout)?;
-    collection.diagnostics =
-        scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
-    collection.servers_pending.extend(
-        ctx.lsp()
-            .provisional_server_keys()
-            .into_iter()
-            .map(|key| server_id(&key)),
-    );
-    collection.sort_and_dedup();
-    drop(opened_documents);
-    Ok(collection)
+/// Per-file diagnostic coverage verdict for scoped requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopedFileCoverage {
+    /// A registered producer holds an authoritative (neither stale nor
+    /// warming) report for the file, including an empty checked-clean report.
+    Covered,
+    /// No LSP producer is registered for this file type.
+    NoProducer,
+    /// Producers are registered but none has a current report for the file.
+    NoReport,
+    /// Only warming (provisional) reports exist: the reporting server has not
+    /// reached quiescence yet.
+    Warming,
 }
 
-fn wait_for_inspect_diagnostics_without_manager_lock(
-    ctx: &AppContext,
-    file: &Path,
-    expected: &[(ServerKey, PreEditSnapshot)],
-    deadline: Instant,
-    timeout: Duration,
-) -> Result<(), String> {
-    let wait = {
-        let mut lsp = ctx.lsp();
-        lsp.start_inspect_diagnostics_wait(file, expected)
-    };
-    let result = loop {
-        if {
-            let mut lsp = ctx.lsp();
-            lsp.poll_inspect_diagnostics_wait(&wait, None)
-        } {
-            break Ok(());
-        }
-        if let Err(message) = check_diagnostics_phase_boundary(deadline, timeout) {
-            break Err(message);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let Some(wake) = wait.next_event_timeout(Duration::from_millis(50).min(remaining)) else {
-            continue;
-        };
-        if matches!(&wake, InspectDiagnosticsWake::Disconnected) {
-            break Ok(());
-        }
-        if {
-            let mut lsp = ctx.lsp();
-            lsp.poll_inspect_diagnostics_wait(&wait, Some(wake))
-        } {
-            break Ok(());
-        }
-    };
-    ctx.lsp().finish_inspect_diagnostics_wait(wait);
-    result
+/// Test hook: force every scoped file to read as authoritatively covered.
+/// Mutation control for the per-file authority check — with this forced, a
+/// scoped request for a file nothing ever analyzed returns a confident empty
+/// payload instead of a named gap, exactly the regression the coverage gap
+/// exists to prevent.
+pub fn force_scoped_diagnostic_coverage_for_test(forced: bool) {
+    FORCE_SCOPED_DIAGNOSTIC_COVERAGE.store(forced, Ordering::SeqCst);
 }
 
-fn check_diagnostics_phase_boundary(deadline: Instant, timeout: Duration) -> Result<(), String> {
-    if crate::executor::current_job_cancellation()
-        .is_some_and(|token| token.cancel_requested_before_commit())
-    {
-        return Err("inspect request cancelled during LSP quiescence".to_string());
-    }
-    if Instant::now() >= deadline {
-        return Err(format!(
-            "lsp_quiescence_timeout: diagnostics did not complete within {}ms",
-            timeout.as_millis()
-        ));
-    }
-    Ok(())
-}
+static FORCE_SCOPED_DIAGNOSTIC_COVERAGE: AtomicBool = AtomicBool::new(false);
 
-fn collect_scoped_file(
-    ctx: &AppContext,
-    config: &Config,
-    file: &Path,
-    collection: &mut DiagnosticsCollection,
-    opened_documents: &mut ScopedInspectDocuments<'_>,
-    deadline: Instant,
-    timeout: Duration,
-) -> Result<(), String> {
-    check_diagnostics_phase_boundary(deadline, timeout)?;
-    // One canonical form across the LSP boundary: bare fs::canonicalize yields
-    // verbatim paths on Windows, which no longer match normalized server keys.
-    let canonical = crate::inspect::job::canonicalize_normalized(file);
-    let outcomes: EnsureServerOutcomes = {
-        let mut lsp = ctx.lsp();
-        lsp.ensure_server_for_file_detailed(&canonical, config)
-    };
-
-    record_attempt_gaps(&outcomes, collection);
-    if outcomes.only_inapplicable_root_markers() {
-        collection.files_without_server += 1;
-        return Ok(());
+fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> ScopedFileCoverage {
+    if FORCE_SCOPED_DIAGNOSTIC_COVERAGE.load(Ordering::SeqCst) {
+        return ScopedFileCoverage::Covered;
     }
-    if outcomes.no_server_registered() {
-        collection.files_without_server += 1;
-        return Ok(());
+    if servers_for_file(file, config).is_empty() {
+        return ScopedFileCoverage::NoProducer;
     }
-    if outcomes.successful.is_empty() {
-        return Ok(());
-    }
-
-    let pre_push_snapshot = {
-        let lsp = ctx.lsp();
-        lsp.snapshot_pre_edit_state(&canonical)
-    };
-    let pull_results = {
-        let mut lsp = ctx.lsp();
-        match lsp.pull_file_diagnostics_tracked(&canonical, config) {
-            Ok(tracked) => {
-                opened_documents.record(canonical.clone(), tracked.newly_opened);
-                tracked.results
-            }
-            Err(err) => {
-                crate::slog_warn!(
-                    "[inspect:diagnostics] pull_file_diagnostics failed for {}: {err}",
-                    canonical.display()
-                );
-                for key in &outcomes.successful {
-                    collection.servers_pending.insert(server_id(key));
-                }
-                Vec::new()
-            }
-        }
-    };
-    check_diagnostics_phase_boundary(deadline, timeout)?;
-
-    let push_fallback_servers =
-        record_pull_results(&outcomes.successful, &pull_results, collection);
-    if push_fallback_servers.is_empty() {
-        return Ok(());
-    }
-
-    let expected = push_fallback_servers
-        .iter()
-        .map(|key| {
-            (
-                key.clone(),
-                pre_push_snapshot.get(key).copied().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<(ServerKey, PreEditSnapshot)>>();
-    wait_for_inspect_diagnostics_without_manager_lock(
-        ctx, &canonical, &expected, deadline, timeout,
-    )?;
-
     let lsp = ctx.lsp();
-    for key in push_fallback_servers {
-        let pre = pre_push_snapshot.get(&key).copied().unwrap_or_default();
-        if lsp.diagnostic_entry_is_fresh_for_document(&canonical, &key, pre)
-            || lsp.has_diagnostic_report_for_server_file(&key, &canonical)
-        {
-            collection.server_ran = true;
-        } else {
-            collection.servers_pending.insert(server_id(&key));
-        }
+    if lsp.has_authoritative_report_for_file(file) {
+        return ScopedFileCoverage::Covered;
     }
-    Ok(())
-}
-
-fn record_attempt_gaps(outcomes: &EnsureServerOutcomes, collection: &mut DiagnosticsCollection) {
-    for attempt in &outcomes.attempts {
-        match &attempt.result {
-            ServerAttemptResult::Ok { .. } => {}
-            ServerAttemptResult::BinaryNotInstalled { .. }
-            | ServerAttemptResult::SpawnFailed { .. } => {
-                collection
-                    .producer_failures
-                    .insert(attempt.server_id.clone(), attempt.result.failure_reason());
-            }
-            ServerAttemptResult::NoRootMarker { .. } => {
-                // The server is registered for this file's extension but none of
-                // its root markers exist in the project (e.g. oxlint registered
-                // for `.ts` with no `.oxlintrc.json`). That's a filesystem fact
-                // that never changes mid-scan — the server simply does not apply
-                // to this project. It is NOT "pending" (results are never
-                // coming), so treating it as a gap would leave scoped diagnostics
-                // reporting `pending` forever even after every applicable server
-                // answered. Ignore it. The all-not-applicable edge (a file whose
-                // only registered servers all lack root markers) is handled by
-                // the caller, which counts it into `files_without_server`.
-            }
-        }
+    if lsp.has_diagnostic_report_for_file(file) {
+        // Reports exist but every one is warming (provisional): the server
+        // published before reaching quiescence, so its view is not
+        // authoritative yet.
+        return ScopedFileCoverage::Warming;
     }
+    ScopedFileCoverage::NoReport
 }
 
-fn record_pull_results(
-    expected_servers: &[ServerKey],
-    pull_results: &[PullFileResult],
-    collection: &mut DiagnosticsCollection,
-) -> Vec<ServerKey> {
-    let mut push_fallback_servers = Vec::new();
-
-    for key in expected_servers {
-        let Some(result) = pull_results.iter().find(|result| result.server_key == *key) else {
-            collection.servers_pending.insert(server_id(key));
-            continue;
-        };
-
-        match &result.outcome {
-            PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged => {
-                collection.server_ran = true;
-            }
-            PullFileOutcome::PullNotSupported => {
-                push_fallback_servers.push(key.clone());
-            }
-            PullFileOutcome::RequestFailed { reason } if request_failure_needs_push(reason) => {
-                push_fallback_servers.push(key.clone());
-            }
-            PullFileOutcome::PartialNotSupported | PullFileOutcome::RequestFailed { .. } => {
-                collection.servers_pending.insert(server_id(key));
-            }
-        }
-    }
-
-    push_fallback_servers
-}
-
-fn request_failure_needs_push(reason: &str) -> bool {
-    reason == "no_cache_for_unchanged" || reason.starts_with("pull_rejected_push_fallback:")
-}
-
-fn scoped_warm_diagnostics(
-    ctx: &AppContext,
+/// Enumerate the files a scoped diagnostics verdict must cover.
+///
+/// Explicit file roots are always candidates: naming a file is a direct claim
+/// on its diagnostics, including the "no producer applies" case. Directory
+/// roots are walked with the same filters applicability resolution uses;
+/// only files with a registered producer are candidates there, because
+/// directories inevitably contain non-code files nobody expects diagnostics
+/// for. Files a tsconfig excludes from diagnostics are skipped in both cases.
+fn scoped_coverage_candidates(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
+    config: &Config,
     tsconfig_membership: &mut TsconfigMembershipCache,
-) -> Vec<CollectedDiagnostic> {
+) -> Vec<PathBuf> {
     let roots = if scope.roots().is_empty() {
         vec![snapshot.project_root.clone()]
     } else {
         scope.roots().to_vec()
     };
 
-    let lsp = ctx.lsp();
-    roots
-        .iter()
-        .flat_map(|root| {
-            let diagnostics = if root.is_file() {
-                lsp.get_diagnostics_for_file_with_provisional(root)
-            } else {
-                lsp.get_diagnostics_for_directory_with_provisional(root)
-            };
-            diagnostics
-                .into_iter()
-                .filter(|(diagnostic, _)| {
-                    scope.contains(&diagnostic.file)
-                        && diagnostic.file.starts_with(&snapshot.project_root)
-                        && !tsconfig_membership.should_skip_diagnostics(&diagnostic.file)
-                })
-                .map(|(diagnostic, provisional)| CollectedDiagnostic {
-                    diagnostic: diagnostic.clone(),
-                    provisional,
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-struct ScopedLspFiles {
-    files: Vec<PathBuf>,
-    /// Count of explicit file roots with no registered LSP server. Directory
-    /// walks skip non-code files, but an explicitly requested unsupported file
-    /// prevents a fresh diagnostics claim.
-    explicit_files_without_server: usize,
-}
-
-fn scoped_lsp_files(
-    snapshot: &InspectSnapshot,
-    scope: &JobScope,
-    config: &Config,
-    tsconfig_membership: &mut TsconfigMembershipCache,
-) -> ScopedLspFiles {
-    let roots = if scope.roots().is_empty() {
-        vec![snapshot.project_root.clone()]
-    } else {
-        scope.roots().to_vec()
-    };
-
-    let mut files = BTreeSet::new();
-    let mut explicit_files_without_server = 0usize;
+    let mut candidates = BTreeSet::new();
     for root in roots {
         if root.is_file() {
             if tsconfig_membership.should_skip_diagnostics(&root) {
                 continue;
             }
-            if servers_for_file(&root, config).is_empty() {
-                explicit_files_without_server += 1;
-                continue;
-            }
-            files.insert(crate::inspect::job::canonicalize_normalized(&root));
+            candidates.insert(crate::inspect::job::canonicalize_normalized(&root));
             continue;
         }
 
@@ -524,14 +260,27 @@ fn scoped_lsp_files(
             {
                 continue;
             }
-            files.insert(crate::inspect::job::canonicalize_normalized(path));
+            candidates.insert(crate::inspect::job::canonicalize_normalized(path));
         }
     }
 
-    ScopedLspFiles {
-        files: files.into_iter().collect(),
-        explicit_files_without_server,
+    candidates.into_iter().collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_diagnostics_phase_boundary(deadline: Instant, timeout: Duration) -> Result<(), String> {
+    if crate::executor::current_job_cancellation()
+        .is_some_and(|token| token.cancel_requested_before_commit())
+    {
+        return Err("inspect request cancelled during LSP quiescence".to_string());
     }
+    if Instant::now() >= deadline {
+        return Err(format!(
+            "lsp_quiescence_timeout: diagnostics did not complete within {}ms",
+            timeout.as_millis()
+        ));
+    }
+    Ok(())
 }
 
 impl DiagnosticsCollection {
@@ -543,15 +292,62 @@ impl DiagnosticsCollection {
         }
     }
 
-    #[cfg(test)]
-    fn is_complete(&self) -> bool {
-        self.is_reportable() && self.producer_failures.is_empty()
+    /// Render-time scope filter over findings. The warm collection is
+    /// full-root; a scoped payload keeps only in-scope findings. Warming
+    /// (provisional) rows are dropped here because the per-file coverage
+    /// check reports their files as named gaps until the responsible server
+    /// settles, and a warming row must not read as an authoritative finding.
+    fn apply_scope(&mut self, scope: &JobScope) {
+        self.diagnostics.retain(|diagnostic| {
+            !diagnostic.provisional && scope.contains(&diagnostic.diagnostic.file)
+        });
     }
 
+    /// Name every scoped file that no producer has authoritatively analyzed.
+    /// The global `server_ran` signal is per-root, not per-file, so without
+    /// this check a scoped request for a file nothing ever analyzed would
+    /// render as a confident empty answer. Each named file becomes a gap row
+    /// (`complete: false`) instead.
+    fn record_scope_coverage_gaps(
+        &mut self,
+        ctx: &AppContext,
+        snapshot: &InspectSnapshot,
+        scope: &JobScope,
+    ) {
+        let mut tsconfig_membership = TsconfigMembershipCache::new();
+        let candidates =
+            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership);
+        for file in candidates {
+            let reason = match scoped_file_coverage(ctx, &snapshot.config, &file) {
+                ScopedFileCoverage::Covered => continue,
+                ScopedFileCoverage::NoProducer => {
+                    "no LSP producer is registered for this file type"
+                }
+                ScopedFileCoverage::NoReport => {
+                    "no LSP producer has a current diagnostic report for this file"
+                }
+                ScopedFileCoverage::Warming => {
+                    "the reporting LSP server has not reached quiescence yet"
+                }
+            };
+            self.scope_coverage_gaps
+                .push(ScopedCoverageGap { file, reason });
+        }
+    }
+
+    #[cfg(test)]
+    fn is_complete(&self) -> bool {
+        self.is_reportable()
+            && self.producer_failures.is_empty()
+            && self.scope_coverage_gaps.is_empty()
+    }
+
+    /// Full-root authority conjunction for the no-scope path: a full-root
+    /// verdict over the full-root warm collection. Scoped requests use
+    /// per-file authority instead (see `record_scope_coverage_gaps`).
     fn is_reportable(&self) -> bool {
         (self.server_ran || self.applicability_is_empty || !self.producer_failures.is_empty())
             && self.servers_pending.is_empty()
-            && self.files_without_server == 0
             && self
                 .diagnostics
                 .iter()
@@ -559,7 +355,6 @@ impl DiagnosticsCollection {
     }
 
     fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
-        debug_assert!(self.is_reportable());
         self.sort_and_dedup();
         let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self
@@ -575,20 +370,28 @@ impl DiagnosticsCollection {
             "hints": hints,
             "items": items,
         });
-        if !self.producer_failures.is_empty() {
+
+        let mut gaps: Vec<Value> = self
+            .producer_failures
+            .into_iter()
+            .map(|(producer, reason)| {
+                serde_json::json!({
+                    "kind": "failed_producer",
+                    "producer": producer,
+                    "reason": reason,
+                })
+            })
+            .collect();
+        gaps.extend(self.scope_coverage_gaps.iter().map(|gap| {
+            serde_json::json!({
+                "kind": "uncovered_file",
+                "file": display_path(snapshot, &gap.file),
+                "reason": gap.reason,
+            })
+        }));
+        if !gaps.is_empty() {
             payload["complete"] = Value::Bool(false);
-            payload["gaps"] = Value::Array(
-                self.producer_failures
-                    .into_iter()
-                    .map(|(producer, reason)| {
-                        serde_json::json!({
-                            "kind": "failed_producer",
-                            "producer": producer,
-                            "reason": reason,
-                        })
-                    })
-                    .collect(),
-            );
+            payload["gaps"] = Value::Array(gaps);
         }
         payload
     }
@@ -695,10 +498,10 @@ mod payload_count_tests {
 
     use super::{
         check_diagnostics_phase_boundary, diagnostics_phase_timeout, CollectedDiagnostic,
-        DiagnosticsCollection,
+        DiagnosticsCollection, ScopedCoverageGap,
     };
     use crate::config::Config;
-    use crate::inspect::job::InspectSnapshot;
+    use crate::inspect::job::{InspectSnapshot, JobScope};
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use crate::parser::SymbolCache;
 
@@ -799,6 +602,77 @@ mod payload_count_tests {
         assert_eq!(payload["gaps"][0]["kind"], "failed_producer");
         assert_eq!(payload["gaps"][0]["producer"], "astro");
         assert_eq!(payload["gaps"][0]["reason"], "initialize failed");
+    }
+
+    #[test]
+    fn scope_filter_keeps_only_in_scope_authoritative_findings() {
+        let mut collection = collection();
+        collection.diagnostics.push(CollectedDiagnostic {
+            diagnostic: StoredDiagnostic {
+                file: PathBuf::from("/repo/other/outside.rs"),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 2,
+                severity: DiagnosticSeverity::Error,
+                message: "outside scope".into(),
+                code: None,
+                source: None,
+            },
+            provisional: false,
+        });
+        collection.diagnostics.push(CollectedDiagnostic {
+            diagnostic: StoredDiagnostic {
+                file: PathBuf::from("/repo/src/main.rs"),
+                line: 9,
+                column: 1,
+                end_line: 9,
+                end_column: 2,
+                severity: DiagnosticSeverity::Warning,
+                message: "warming lead".into(),
+                code: None,
+                source: None,
+            },
+            provisional: true,
+        });
+
+        let scope = JobScope::from_roots(
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/repo/src/main.rs")],
+        );
+        collection.apply_scope(&scope);
+
+        assert_eq!(
+            collection.diagnostics.len(),
+            1,
+            "scope must drop out-of-scope rows and warming rows"
+        );
+        assert_eq!(
+            collection.diagnostics[0].diagnostic.file,
+            PathBuf::from("/repo/src/main.rs")
+        );
+        assert!(!collection.diagnostics[0].provisional);
+    }
+
+    #[test]
+    fn scope_coverage_gap_renders_a_named_incomplete_file() {
+        let mut collection = collection();
+        collection.scope_coverage_gaps.push(ScopedCoverageGap {
+            file: PathBuf::from("/repo/src/lib.rs"),
+            reason: "no LSP producer has a current diagnostic report for this file",
+        });
+
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["complete"], false);
+        let gap = payload["gaps"]
+            .as_array()
+            .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
+            .expect("uncovered_file gap");
+        assert_eq!(gap["file"], "src/lib.rs");
+        assert_eq!(
+            gap["reason"],
+            "no LSP producer has a current diagnostic report for this file"
+        );
     }
 }
 

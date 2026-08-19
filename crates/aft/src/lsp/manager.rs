@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
@@ -281,11 +280,6 @@ pub struct PullFileResult {
     pub outcome: PullFileOutcome,
 }
 
-pub(crate) struct TrackedPullFileResult {
-    pub results: Vec<PullFileResult>,
-    pub newly_opened: Vec<ServerKey>,
-}
-
 /// Result of `pull_workspace_diagnostics` for a single server.
 #[derive(Debug, Clone)]
 pub struct PullWorkspaceResult {
@@ -353,53 +347,6 @@ impl PostEditDiagnosticsWait {
     }
 }
 
-/// Wait state for blocking inspect diagnostics. It owns only channel receivers
-/// while parked so another LSP request can acquire the manager mutex and drain
-/// or mutate state before the inspect wait is released.
-pub(crate) struct InspectDiagnosticsWait {
-    lookup_path: PathBuf,
-    expected: Vec<(ServerKey, PreEditSnapshot)>,
-    event_rx: Receiver<LspEvent>,
-    wake_rx: Receiver<()>,
-    waiter_id: u64,
-}
-
-pub(crate) enum InspectDiagnosticsWake {
-    Event(LspEvent),
-    StateChanged,
-    Disconnected,
-}
-
-impl InspectDiagnosticsWait {
-    #[cfg(test)]
-    pub(crate) fn next_event(&self) -> InspectDiagnosticsWake {
-        crossbeam_channel::select! {
-            recv(self.event_rx) -> event => match event {
-                Ok(event) => InspectDiagnosticsWake::Event(event),
-                Err(_) => InspectDiagnosticsWake::Disconnected,
-            },
-            recv(self.wake_rx) -> wake => match wake {
-                Ok(()) => InspectDiagnosticsWake::StateChanged,
-                Err(_) => InspectDiagnosticsWake::Disconnected,
-            },
-        }
-    }
-
-    pub(crate) fn next_event_timeout(&self, timeout: Duration) -> Option<InspectDiagnosticsWake> {
-        crossbeam_channel::select! {
-            recv(self.event_rx) -> event => Some(match event {
-                Ok(event) => InspectDiagnosticsWake::Event(event),
-                Err(_) => InspectDiagnosticsWake::Disconnected,
-            }),
-            recv(self.wake_rx) -> wake => Some(match wake {
-                Ok(()) => InspectDiagnosticsWake::StateChanged,
-                Err(_) => InspectDiagnosticsWake::Disconnected,
-            }),
-            default(timeout) => None,
-        }
-    }
-}
-
 impl IntoIterator for DrainedLspEvents {
     type Item = LspEvent;
     type IntoIter = std::vec::IntoIter<LspEvent>;
@@ -428,11 +375,6 @@ pub struct LspManager {
     /// sleep through a diagnostics update consumed by another drain path.
     post_edit_waiters: HashMap<u64, Sender<()>>,
     next_post_edit_waiter_id: u64,
-    /// One-slot wake channels for inspect waits. These mirror post-edit waits
-    /// so an event drained by another request still wakes a lock-released
-    /// blocking inspection to recheck the authoritative store.
-    inspect_waiters: HashMap<u64, Sender<()>>,
-    next_inspect_waiter_id: u64,
     /// Optional binary path overrides used by integration tests.
     binary_overrides: HashMap<ServerKind, PathBuf>,
     /// Extra env vars merged into every spawned LSP child. Used in tests to
@@ -479,8 +421,6 @@ impl LspManager {
             event_rx,
             post_edit_waiters: HashMap::new(),
             next_post_edit_waiter_id: 0,
-            inspect_waiters: HashMap::new(),
-            next_inspect_waiter_id: 0,
             binary_overrides: HashMap::new(),
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
@@ -1733,50 +1673,6 @@ impl LspManager {
             .collect()
     }
 
-    /// Subscribe an inspect wait before releasing the manager mutex. Unlike the
-    /// legacy deadline API, this state carries no time budget: it is completed
-    /// by a publish/state change or remains in phase until a real interruption
-    /// or shutdown policy supplies a terminal result.
-    pub(crate) fn start_inspect_diagnostics_wait(
-        &mut self,
-        file_path: &Path,
-        expected: &[(ServerKey, PreEditSnapshot)],
-    ) -> InspectDiagnosticsWait {
-        let lookup_path = normalize_lookup_path(file_path);
-        let _ = self.drain_events_for_file(&lookup_path);
-        let waiter_id = self.next_inspect_waiter_id;
-        self.next_inspect_waiter_id = self.next_inspect_waiter_id.wrapping_add(1);
-        let (wake_tx, wake_rx) = bounded(1);
-        self.inspect_waiters.insert(waiter_id, wake_tx);
-        InspectDiagnosticsWait {
-            lookup_path,
-            expected: expected.to_vec(),
-            event_rx: self.event_rx.clone(),
-            wake_rx,
-            waiter_id,
-        }
-    }
-
-    /// Apply an event after a lock-released wait and report whether every
-    /// expected server has a usable diagnostic report for this document.
-    pub(crate) fn poll_inspect_diagnostics_wait(
-        &mut self,
-        wait: &InspectDiagnosticsWait,
-        wake: Option<InspectDiagnosticsWake>,
-    ) -> bool {
-        if let Some(InspectDiagnosticsWake::Event(event)) = wake {
-            self.handle_event(&event);
-        }
-        wait.expected.iter().all(|(server, pre)| {
-            self.diagnostic_entry_is_fresh_for_document(&wait.lookup_path, server, *pre)
-                || self.has_diagnostic_report_for_server_file(server, &wait.lookup_path)
-        })
-    }
-
-    pub(crate) fn finish_inspect_diagnostics_wait(&mut self, wait: InspectDiagnosticsWait) {
-        self.inspect_waiters.remove(&wait.waiter_id);
-    }
-
     /// Default timeout for `textDocument/diagnostic` (per-file pull). Servers
     /// usually respond in under 1s for files they've already analyzed; we
     /// allow up to 10s before falling back to push semantics. Currently
@@ -1809,24 +1705,12 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> Result<Vec<PullFileResult>, LspError> {
-        self.pull_file_diagnostics_tracked(file_path, config)
-            .map(|tracked| tracked.results)
-    }
-
-    pub(crate) fn pull_file_diagnostics_tracked(
-        &mut self,
-        file_path: &Path,
-        config: &Config,
-    ) -> Result<TrackedPullFileResult, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         // Make sure servers are running and the document is open with fresh
         // content (handles disk-drift via DocumentStore::is_stale_on_disk).
         let opened = self.ensure_file_open(&canonical_path, config)?;
         if opened.server_keys.is_empty() {
-            return Ok(TrackedPullFileResult {
-                results: Vec::new(),
-                newly_opened: opened.newly_opened,
-            });
+            return Ok(Vec::new());
         }
 
         let uri = uri_for_path(&canonical_path)?;
@@ -1915,10 +1799,7 @@ impl LspManager {
             });
         }
 
-        Ok(TrackedPullFileResult {
-            results,
-            newly_opened: opened.newly_opened,
-        })
+        Ok(results)
     }
 
     /// Issue a `workspace/diagnostic` request to a specific server. Cancels
@@ -2311,6 +2192,16 @@ impl LspManager {
             .has_fresh_report_for_server_file(server, &normalized)
     }
 
+    /// True if any server has an authoritative report for this file: neither
+    /// watcher-stale nor warming-provisional, including an empty checked-clean
+    /// report. Needed for per-file diagnostic authority: a global "some server
+    /// reported" bit cannot prove that a specific file was analyzed.
+    pub fn has_authoritative_report_for_file(&self, file: &Path) -> bool {
+        let normalized = normalize_lookup_path(file);
+        self.diagnostics
+            .has_authoritative_report_for_file(&normalized)
+    }
+
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
         let mut saw_file_diagnostics = false;
         while let Ok(event) = self.event_rx.try_recv() {
@@ -2402,16 +2293,11 @@ impl LspManager {
             _ => None,
         };
         self.wake_post_edit_waiters();
-        self.wake_inspect_waiters();
         published_file
     }
 
     fn wake_post_edit_waiters(&mut self) {
         Self::wake_waiters(&mut self.post_edit_waiters);
-    }
-
-    fn wake_inspect_waiters(&mut self) {
-        Self::wake_waiters(&mut self.inspect_waiters);
     }
 
     fn wake_waiters(waiters: &mut HashMap<u64, Sender<()>>) {
@@ -3287,13 +3173,8 @@ mod clear_diagnostics_tests {
 
 #[cfg(test)]
 mod inspect_path_tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use super::LspManager;
     use crate::config::{Config, UserServerDef};
-    use crate::lsp::client::LspEvent;
     use crate::lsp::registry::ServerKind;
 
     #[test]
@@ -3346,42 +3227,5 @@ mod inspect_path_tests {
 
         assert!(snapshot.server_keys.is_empty());
         assert!(snapshot.candidates.is_empty());
-    }
-
-    #[test]
-    fn inspect_wait_releases_manager_lock_before_receiving() {
-        let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
-        let wait = {
-            let mut manager = manager.lock();
-            manager.start_inspect_diagnostics_wait(&PathBuf::from("/tmp/inspect.rs"), &[])
-        };
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let join = std::thread::spawn(move || {
-            entered_tx.send(()).expect("announce wait");
-            let _ = wait.next_event();
-        });
-        entered_rx.recv().expect("waiter started");
-
-        assert!(
-            manager.try_lock().is_some(),
-            "the manager lock must remain available while inspect waits"
-        );
-        manager
-            .lock()
-            .enqueue_event_for_test(LspEvent::ServerExited {
-                server_kind: ServerKind::Rust,
-                root: PathBuf::from("/tmp"),
-            });
-        join.join().expect("waiter exits after event");
-    }
-
-    #[test]
-    fn inspect_wait_can_stop_at_a_phase_deadline() {
-        let mut manager = LspManager::new();
-        let wait = manager.start_inspect_diagnostics_wait(&PathBuf::from("/tmp/inspect.rs"), &[]);
-        let started = std::time::Instant::now();
-        assert!(wait.next_event_timeout(Duration::from_millis(20)).is_none());
-        assert!(started.elapsed() < Duration::from_secs(1));
-        manager.finish_inspect_diagnostics_wait(wait);
     }
 }

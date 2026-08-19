@@ -430,6 +430,23 @@ impl DiagnosticsStore {
         })
     }
 
+    /// True if any server has an authoritative report for this file: an entry
+    /// that is neither watcher-stale nor warming-provisional. Empty
+    /// checked-clean reports count — they still prove a producer analyzed the
+    /// file. Callers must not treat "no authoritative report" as "clean"; it
+    /// only ever means the analysis evidence is missing or not yet settled.
+    pub fn has_authoritative_report_for_file(&self, file: &Path) -> bool {
+        let Some(servers) = self.by_file.get(file) else {
+            return false;
+        };
+        let file = file.to_path_buf();
+        servers.iter().any(|server| {
+            self.entries
+                .get(&(server.clone(), file.clone()))
+                .is_some_and(|entry| !entry.stale && !entry.provisional)
+        })
+    }
+
     /// True if this exact server instance has an entry (fresh or stale) for
     /// this exact file. Pull diagnostics use stale entries as the previous
     /// resultId cache when asking the server whether diagnostics are unchanged.
@@ -1577,6 +1594,52 @@ mod tests {
             store.filtered_error_warning_counts(|_| true),
             (1, 0),
             "classifier is per-diagnostic: one real syntax error => E1"
+        );
+    }
+
+    #[test]
+    fn authoritative_report_requires_settled_non_stale_entry() {
+        let mut store = DiagnosticsStore::new();
+        let key = server_key(ServerKind::Rust);
+        let file = PathBuf::from("/tmp/auth.rs");
+
+        // Nothing published yet: no authority.
+        assert!(!store.has_authoritative_report_for_file(&file));
+
+        // A warming (provisional) report is evidence, but not authority.
+        store.publish_full_with_provisional(
+            key.clone(),
+            file.clone(),
+            vec![diag(
+                "/tmp/auth.rs",
+                1,
+                "warming",
+                DiagnosticSeverity::Error,
+            )],
+            None,
+            None,
+            true,
+        );
+        assert!(store.has_any_fresh_report_for_file(&file));
+        assert!(!store.has_authoritative_report_for_file(&file));
+
+        // Settling the same server promotes its latest report to authority.
+        store.promote_provisional_for_server(&key);
+        assert!(store.has_authoritative_report_for_file(&file));
+
+        // A watcher-observed edit revokes authority until the next report.
+        assert!(store.mark_stale_for_file(&file).0);
+        assert!(!store.has_authoritative_report_for_file(&file));
+    }
+
+    #[test]
+    fn authoritative_report_includes_empty_checked_clean() {
+        let mut store = DiagnosticsStore::new();
+        let file = PathBuf::from("/tmp/clean.rs");
+        store.publish(server_key(ServerKind::Rust), file.clone(), Vec::new());
+        assert!(
+            store.has_authoritative_report_for_file(&file),
+            "an empty checked-clean report still proves the file was analyzed"
         );
     }
 }
