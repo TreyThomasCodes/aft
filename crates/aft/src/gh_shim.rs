@@ -2058,20 +2058,17 @@ mod tests {
         let home_config = home.join(".config/cortexkit/aft.jsonc");
         fs::create_dir_all(xdg_config.parent().unwrap()).unwrap();
         fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        // Serialize through serde_json so Windows backslash paths are
+        // JSON-escaped; a raw format! of Path::display() writes `C:\Users\...`
+        // into the string, which is invalid JSON and parses to None.
         fs::write(
             &xdg_config,
-            format!(
-                r#"{{"subc":{{"connection_file":"{}"}}}}"#,
-                xdg_connection.display()
-            ),
+            serde_json::json!({"subc": {"connection_file": xdg_connection}}).to_string(),
         )
         .unwrap();
         fs::write(
             &home_config,
-            format!(
-                r#"{{"subc":{{"connection_file":"{}"}}}}"#,
-                home_connection.display()
-            ),
+            serde_json::json!({"subc": {"connection_file": home_connection}}).to_string(),
         )
         .unwrap();
 
