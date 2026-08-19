@@ -210,6 +210,19 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     });
   });
 
+  test("Pi hoisted bash renders CRLF output as text lines", async () => {
+    const { h, bash } = await pluginHarness();
+
+    const result = await callBash(bash, h, {
+      command: "printf 'line1\\r\\nline2\\r\\nline3\\r\\n'",
+      compressed: false,
+    });
+
+    expect(result.output).toBe("line1\nline2\nline3\n");
+    expect(result.output).not.toContain("\r");
+    expect(result.details.exit_code).toBe(0);
+  });
+
   test("foreground non-zero exit is a successful tool response", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness();
 

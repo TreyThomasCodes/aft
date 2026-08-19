@@ -23,13 +23,10 @@ import {
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
-// On Windows, AFT's hoisted bash runs through PowerShell, which emits CRLF
-// (`\r\n`) line endings. The bash adapter returns raw shell output by contract
-// (see packages/opencode-plugin/src/tools/bash.ts), so output text legitimately
-// differs only by line ending across platforms. Normalize CRLF->LF in
-// assertions where the LINE ENDING is incidental to what the test is verifying
-// (e.g. "the command's stdout came back"), so these stay meaningful on Windows
-// without weakening the raw-output contract elsewhere.
+// On Windows, PowerShell can emit CRLF (`\r\n`) line endings. AFT normalizes
+// terminal previews for text renderers, but host-fallback output remains native
+// shell text. Normalize assertions only when line ending is incidental to the
+// behavior under test; saved bash artifacts retain their original bytes.
 const IS_WINDOWS = process.platform === "win32";
 const eol = (text: string): string => text.replace(/\r\n/g, "\n");
 const WAIT_DETACH_COMMAND = IS_WINDOWS
@@ -200,9 +197,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, { command: "echo hello" });
 
-    // Agent-visible output is the raw bash text — NOT a JSON literal that the
-    // model would have to JSON.parse before reading. (CRLF-tolerant: PowerShell
-    // emits "hello\r\n" on Windows; the no-JSON-envelope contract is what matters.)
+    // Agent-visible output is bash text — NOT a JSON literal that the model
+    // would have to JSON.parse before reading.
     expect(eol(result.output)).toBe("hello\n");
     // Exit code, truncation, etc. land in metadata for the UI.
     expect(result.metadata.exit).toBe(0);
@@ -211,6 +207,19 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       foreground_orchestrate: true,
       block_to_completion: false,
     });
+  });
+
+  skipOnWindows("OpenCode hoisted bash renders CRLF output as text lines", async () => {
+    const { h, bash } = await pluginHarness();
+
+    const result = await callPluginBash(bash, h, {
+      command: "printf 'line1\\r\\nline2\\r\\nline3\\r\\n'",
+      compressed: false,
+    });
+
+    expect(result.output).toBe("line1\nline2\nline3\n");
+    expect(result.output).not.toContain("\r");
+    expect(result.metadata.exit).toBe(0);
   });
 
   test("non-zero exit appends [exit code: N] to agent-visible output", async () => {

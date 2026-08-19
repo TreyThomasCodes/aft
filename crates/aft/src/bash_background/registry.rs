@@ -680,35 +680,31 @@ impl BgTaskRegistry {
             };
         }
 
-        if let Some(mut structured) = render_structured_output(
+        let mut rendered = if let Some(structured) = render_structured_output(
             &metadata.command,
             buffer,
             disk_truncation,
             artifact_access.clone(),
         ) {
-            append_pipeline_warning(&mut structured, metadata, paths);
-            return structured;
-        }
-
-        if !metadata.compressed {
-            let mut raw = render_raw_passthrough(buffer, disk_truncation, artifact_access);
-            append_pipeline_warning(&mut raw, metadata, paths);
-            return raw;
-        }
-
-        let raw = buffer.read_combined_head_tail(
-            COMPRESS_INPUT_CAP_BYTES,
-            COMPRESS_INPUT_HEAD_BYTES,
-            COMPRESS_INPUT_TAIL_BYTES,
-        );
-        let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
-        let mut rendered = render_compressed_with_recovery(
-            buffer,
-            compressed,
-            raw.truncated,
-            disk_truncation,
-            artifact_access,
-        );
+            structured
+        } else if !metadata.compressed {
+            render_raw_passthrough(buffer, disk_truncation, artifact_access)
+        } else {
+            let raw = buffer.read_combined_head_tail(
+                COMPRESS_INPUT_CAP_BYTES,
+                COMPRESS_INPUT_HEAD_BYTES,
+                COMPRESS_INPUT_TAIL_BYTES,
+            );
+            let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
+            render_compressed_with_recovery(
+                buffer,
+                compressed,
+                raw.truncated,
+                disk_truncation,
+                artifact_access,
+            )
+        };
+        normalize_piped_display_output(&mut rendered.output_preview);
         append_pipeline_warning(&mut rendered, metadata, paths);
         rendered
     }
@@ -4156,6 +4152,56 @@ fn append_pipeline_warning(
     } else {
         cache.output_preview = format!("{}\n{}", cache.output_preview.trim_end(), footer,);
     }
+}
+
+/// Normalize pipes for text rendering without changing their byte-exact artifacts.
+/// PTY output bypasses this path because its vt100 renderer owns terminal state.
+fn normalize_piped_display_output(text: &mut String) {
+    if !text.contains('\r') {
+        return;
+    }
+
+    let mut rendered = String::with_capacity(text.len());
+    let mut line = Vec::new();
+    let mut column = 0;
+    let mut chars = text.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                for character in &line {
+                    rendered.push(*character);
+                }
+                rendered.push('\n');
+                line.clear();
+                column = 0;
+            }
+            '\r' => column = 0,
+            '\n' => {
+                for character in &line {
+                    rendered.push(*character);
+                }
+                rendered.push('\n');
+                line.clear();
+                column = 0;
+            }
+            character => {
+                if column < line.len() {
+                    line[column] = character;
+                } else {
+                    line.resize(column, ' ');
+                    line.push(character);
+                }
+                column += 1;
+            }
+        }
+    }
+
+    for character in &line {
+        rendered.push(*character);
+    }
+    *text = rendered;
 }
 
 fn render_compressed_with_recovery(

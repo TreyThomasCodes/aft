@@ -1280,3 +1280,49 @@ fn replay_does_not_return_acknowledged_completion_after_restart() {
     );
     assert!(restarted.shutdown().success());
 }
+
+#[cfg(unix)]
+#[test]
+fn piped_terminal_preview_normalizes_crlf_and_overprints_without_changing_artifact() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let crlf_task = spawn_bg_params(
+        &mut aft,
+        "crlf-display-preview",
+        json!({
+            "command": r"printf 'Microsoft Windows [Version 10.0]\r\nDirectory of C:\\work\r\n'",
+            "background": true,
+            "compressed": false,
+        }),
+    );
+    let crlf_terminal = wait_for_status(&mut aft, &crlf_task, "completed");
+    assert_eq!(
+        crlf_terminal["output_preview"],
+        "Microsoft Windows [Version 10.0]\nDirectory of C:\\work\n"
+    );
+    let artifact = std::fs::read(
+        crlf_terminal["output_path"]
+            .as_str()
+            .expect("completed task has a stdout artifact"),
+    )
+    .expect("read stdout artifact");
+    assert_eq!(
+        artifact,
+        b"Microsoft Windows [Version 10.0]\r\nDirectory of C:\\work\r\n"
+    );
+
+    let overprint_task = spawn_bg_params(
+        &mut aft,
+        "carriage-return-overprint-preview",
+        json!({
+            "command": r"printf 'step-one\rstep-two\n'",
+            "background": true,
+            "compressed": false,
+        }),
+    );
+    let overprint_terminal = wait_for_status(&mut aft, &overprint_task, "completed");
+    assert_eq!(overprint_terminal["output_preview"], "step-two\n");
+
+    assert!(aft.shutdown().success());
+}
