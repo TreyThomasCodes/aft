@@ -100,14 +100,18 @@ pub enum DispatchOutcome {
     Deferred(PendingResponse),
 }
 
-pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response>>;
-pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response>;
+pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response> + Send>;
+pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response + Send>;
 
 pub struct PendingResponse {
     pub request_id: String,
     pub session_id: String,
     pub attach_command: String,
     pub poll: PendingResponsePoll,
+    /// Cancellation shared with work that continued after its executor setup
+    /// job returned. Registry replacement and transport shutdown signal it
+    /// before removing the pending entry.
+    pub cancellation: Option<crate::executor::JobCancellation>,
     /// Optional terminal response emitted before this entry is removed during
     /// shutdown. Long-running inspect uses this to avoid silently dropping its
     /// only agent-visible terminal frame.
@@ -127,8 +131,15 @@ pub struct PendingResponses {
 
 impl PendingResponses {
     pub fn register(&mut self, pending: PendingResponse) {
-        self.entries
-            .retain(|entry| entry.request_id != pending.request_id);
+        self.entries.retain(|entry| {
+            let keep = entry.request_id != pending.request_id;
+            if !keep {
+                if let Some(cancellation) = &entry.cancellation {
+                    cancellation.request_cancel();
+                }
+            }
+            keep
+        });
         self.entries.push(pending);
     }
 
@@ -157,7 +168,11 @@ impl PendingResponses {
     }
 
     pub fn drain_on_shutdown(&mut self) {
-        self.entries.clear();
+        for pending in self.entries.drain(..) {
+            if let Some(cancellation) = &pending.cancellation {
+                cancellation.request_cancel();
+            }
+        }
     }
 
     /// Resolve shutdown-aware entries before removing them from the registry.
@@ -166,6 +181,9 @@ impl PendingResponses {
         self.entries
             .drain(..)
             .filter_map(|mut pending| {
+                if let Some(cancellation) = &pending.cancellation {
+                    cancellation.request_cancel();
+                }
                 let response = (pending.on_shutdown.as_mut()?)(ctx);
                 Some(ResolvedPending {
                     response,
@@ -414,6 +432,7 @@ mod tests {
             session_id: String::new(),
             attach_command: String::new(),
             poll: Box::new(|_| None),
+            cancellation: None,
             on_shutdown: Some(Box::new(|_| {
                 Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
             })),

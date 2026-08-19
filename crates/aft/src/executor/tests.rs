@@ -892,6 +892,18 @@ fn bind_blocker_snapshot_names_a_stuck_reader_occupant() {
     assert!(blocker.contains("job=abandoned-inspect"));
     assert!(blocker.contains("lane=SerialLspStatus"));
     assert!(blocker.contains("age_ms="));
+    assert_eq!(snapshot.in_flight_readers.len(), 1);
+    assert_eq!(
+        snapshot.in_flight_readers[0].request_id,
+        "abandoned-inspect"
+    );
+    assert!(snapshot.in_flight_readers[0].started_age_ms >= 60_000);
+    assert!(snapshot.in_flight_readers[0].started_before_oldest_writer);
+    assert!(snapshot.oldest_queued_writer_age_ms.is_some());
+    assert_eq!(
+        snapshot.reader_admissions_while_promoted_writer_waited, 0,
+        "writer promotion must stop new reader admissions"
+    );
 
     release_reader_tx.send(()).expect("release inspect");
     reader
@@ -2132,6 +2144,34 @@ fn cancel_cancellable_mutating_removes_queued_job_and_settles_receiver() {
         .expect("release first mutating job");
     let first_response = recv_async(first_rx, "first mutating blocker completion");
     assert!(first_response.success);
+}
+
+#[test]
+fn detached_thread_installer_rehomes_job_cancellation() {
+    let token = JobCancellation::new();
+    let worker_token = token.clone();
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+    let worker = std::thread::spawn(move || {
+        let _installed = install_job_cancellation(worker_token);
+        started_tx.send(()).expect("detached worker starts");
+        while !current_job_cancellation()
+            .is_some_and(|current| current.cancel_requested_before_commit())
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        finished_tx
+            .send(())
+            .expect("detached worker observes cancel");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("detached worker installs cancellation");
+    token.request_cancel();
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("detached worker observes cancellation promptly");
+    worker.join().expect("detached worker exits");
 }
 
 #[test]

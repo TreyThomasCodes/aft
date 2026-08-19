@@ -80,7 +80,7 @@ impl PhaseTrace {
         self.translate_done = Some(Instant::now());
     }
 
-    fn mark_execute_done(&mut self) {
+    pub(crate) fn mark_execute_done(&mut self) {
         self.execute_done = Some(Instant::now());
     }
 
@@ -210,16 +210,19 @@ fn append_hashline_downgrade_text(text: &mut String) {
     text.push_str(crate::commands::configure::HASHLINE_DOWNGRADE_MESSAGE);
 }
 
-pub fn run_tool_call(
+pub(crate) struct PreparedToolCall {
+    pub(crate) request: RawRequest,
+    pub(crate) surface_downgraded: bool,
+}
+
+pub(crate) fn prepare_tool_call(
     bare_name: &str,
     args: Value,
     format_context: &crate::subc_format::FormatContext,
     ctx: &ToolCallContext,
     app_ctx: &AppContext,
-    dispatch: &DispatchFn<'_>,
-    finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
-) -> ToolCallOutcome {
+) -> Result<PreparedToolCall, ToolCallResult> {
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
         .canonical_cache_root_opt()
@@ -267,7 +270,7 @@ pub fn run_tool_call(
                     trace.mark_format_done();
                     trace.mark_finalize_done();
                 }
-                return ToolCallOutcome::Unary(result);
+                return Err(result);
             }
         }
     } else {
@@ -278,7 +281,7 @@ pub fn run_tool_call(
         (bare_name.to_string(), map)
     };
 
-    let raw_req = match raw_request_from_translated(command, translated_args, ctx) {
+    let request = match raw_request_from_translated(command, translated_args, ctx) {
         Ok(req) => req,
         Err(error) => {
             if let Some(trace) = phase_trace.as_mut() {
@@ -300,21 +303,27 @@ pub fn run_tool_call(
                 trace.mark_format_done();
                 trace.mark_finalize_done();
             }
-            return ToolCallOutcome::Unary(result);
+            return Err(result);
         }
     };
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_translate_done();
     }
 
-    let mut response = if raw_req.command == "inspect" {
-        crate::commands::inspect::handle_inspect_tool_call(&raw_req, app_ctx)
-    } else {
-        dispatch(raw_req, app_ctx)
-    };
-    if let Some(trace) = phase_trace.as_mut() {
-        trace.mark_execute_done();
-    }
+    Ok(PreparedToolCall {
+        request,
+        surface_downgraded,
+    })
+}
+
+pub(crate) fn finish_tool_call_response(
+    bare_name: &str,
+    format_context: &crate::subc_format::FormatContext,
+    mut response: Response,
+    surface_downgraded: bool,
+    finalizer: Option<&FinalizeFn<'_>>,
+    mut phase_trace: Option<&mut PhaseTrace>,
+) -> ToolCallResult {
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);
     }
@@ -332,8 +341,48 @@ pub fn run_tool_call(
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_finalize_done();
     }
+    ToolCallResult { text, response }
+}
 
-    ToolCallOutcome::Unary(ToolCallResult { text, response })
+pub fn run_tool_call(
+    bare_name: &str,
+    args: Value,
+    format_context: &crate::subc_format::FormatContext,
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+    finalizer: Option<&FinalizeFn<'_>>,
+    mut phase_trace: Option<&mut PhaseTrace>,
+) -> ToolCallOutcome {
+    let prepared = match prepare_tool_call(
+        bare_name,
+        args,
+        format_context,
+        ctx,
+        app_ctx,
+        phase_trace.as_deref_mut(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(result) => return ToolCallOutcome::Unary(result),
+    };
+
+    let response = if prepared.request.command == "inspect" {
+        crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
+    } else {
+        dispatch(prepared.request, app_ctx)
+    };
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_execute_done();
+    }
+    let result = finish_tool_call_response(
+        bare_name,
+        format_context,
+        response,
+        prepared.surface_downgraded,
+        finalizer,
+        phase_trace,
+    );
+    ToolCallOutcome::Unary(result)
 }
 
 fn raw_request_from_translated(

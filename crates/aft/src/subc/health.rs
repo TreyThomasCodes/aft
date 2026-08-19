@@ -537,6 +537,9 @@ pub(super) fn warn_slow_pending_binds(
                 configure_state: "scheduler_busy",
                 configure_phase_timings: None,
                 blockers: vec!["scheduler_busy".to_string()],
+                oldest_queued_writer_age_ms: None,
+                in_flight_readers: Vec::new(),
+                reader_admissions_while_promoted_writer_waited: 0,
             });
         crate::slog_warn!(
             "{}",
@@ -567,14 +570,32 @@ fn pending_bind_breadcrumb(
         .configure_phase_timings
         .as_deref()
         .unwrap_or("unavailable");
+    let readers = snapshot
+        .in_flight_readers
+        .iter()
+        .map(|reader| {
+            format!(
+                "job={} command={} lane={:?} age_ms={} started_before_oldest_writer={}",
+                reader.request_id,
+                reader.command,
+                reader.lane,
+                reader.started_age_ms,
+                reader.started_before_oldest_writer
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
-        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}])",
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], reader_admissions_while_promoted_writer_waited={})",
         root_id.as_path().display(),
         duration_millis_u64(age),
         configure_request_id,
         snapshot.configure_state,
         phase_timings,
         blockers,
+        snapshot.oldest_queued_writer_age_ms,
+        readers,
+        snapshot.reader_admissions_while_promoted_writer_waited,
     )
 }
 
@@ -1092,6 +1113,9 @@ mod tests {
                     configure_state: "queued",
                     configure_phase_timings: Some("artifact_owner_claim=12ms".to_string()),
                     blockers: vec![blocker.to_string()],
+                    oldest_queued_writer_age_ms: Some(6_000),
+                    in_flight_readers: Vec::new(),
+                    reader_admissions_while_promoted_writer_waited: 0,
                 },
             );
             assert!(

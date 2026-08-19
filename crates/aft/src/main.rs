@@ -978,10 +978,8 @@ mod pending_response_tests {
         PendingResponses,
     };
     use aft::runtime_registry::RuntimeRegistry;
-    use std::cell::Cell;
     use std::path::Path;
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1123,15 +1121,14 @@ mod pending_response_tests {
         let session_id = "session-registry";
         let fixture = fixture_with_completion_and_status(session_id, "bash-0000000000000502");
         let mut pending = PendingResponses::default();
-        let poll_calls = Rc::new(Cell::new(0usize));
-        let calls_for_poll = Rc::clone(&poll_calls);
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
         pending.register(PendingResponse {
             request_id: "pending-registry".to_string(),
             session_id: session_id.to_string(),
             attach_command: "read".to_string(),
             poll: Box::new(move |_| {
-                let next = calls_for_poll.get() + 1;
-                calls_for_poll.set(next);
+                let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
                 if next <= 2 {
                     None
                 } else {
@@ -1141,6 +1138,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
+            cancellation: None,
             on_shutdown: None,
         });
 
@@ -1151,7 +1149,7 @@ mod pending_response_tests {
                 0
             );
             assert!(writer.is_empty());
-            assert_eq!(poll_calls.get(), expected_calls);
+            assert_eq!(poll_calls.load(Ordering::SeqCst), expected_calls);
         }
 
         assert_eq!(
@@ -1159,7 +1157,7 @@ mod pending_response_tests {
             1
         );
         assert!(pending.is_empty());
-        assert_eq!(poll_calls.get(), 3);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 3);
         let values = line_values(&writer);
         assert_eq!(values.len(), 1);
         assert_eq!(values[0]["id"], "pending-registry");
@@ -1174,7 +1172,7 @@ mod pending_response_tests {
             0
         );
         assert_eq!(line_values(&writer).len(), 1);
-        assert_eq!(poll_calls.get(), 3);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -1325,16 +1323,17 @@ mod pending_response_tests {
             .unwrap();
 
         let mut pending = PendingResponses::default();
-        let poll_calls = Rc::new(Cell::new(0usize));
-        let calls_for_poll = Rc::clone(&poll_calls);
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
         pending.register(PendingResponse {
             request_id: "pending-drain".to_string(),
             session_id: "session-drain".to_string(),
             attach_command: "read".to_string(),
             poll: Box::new(move |_| {
-                calls_for_poll.set(calls_for_poll.get() + 1);
+                calls_for_poll.fetch_add(1, Ordering::SeqCst);
                 None
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         let mut writer = Vec::new();
@@ -1345,7 +1344,7 @@ mod pending_response_tests {
             0
         );
         assert_eq!(drain_frames.load(Ordering::SeqCst), 1);
-        assert_eq!(poll_calls.get(), 2);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 2);
         assert!(writer.is_empty());
         assert!(!pending.is_empty());
     }
@@ -1386,6 +1385,7 @@ mod pending_response_tests {
                 events_for_pending.lock().unwrap().push("pending");
                 Some(Response::success("pending-order", serde_json::json!({})))
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         let mut writer = Vec::new();
@@ -1405,15 +1405,14 @@ mod pending_response_tests {
         let root = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(root.path());
         let mut pending = PendingResponses::default();
-        let poll_calls = Rc::new(Cell::new(0usize));
-        let calls_for_poll = Rc::clone(&poll_calls);
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
         pending.register(PendingResponse {
             request_id: "pending-long".to_string(),
             session_id: "session-long".to_string(),
             attach_command: "read".to_string(),
             poll: Box::new(move |_| {
-                let next = calls_for_poll.get() + 1;
-                calls_for_poll.set(next);
+                let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
                 if next <= 50 {
                     None
                 } else {
@@ -1423,6 +1422,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         let mut writer = Vec::new();
@@ -1433,7 +1433,7 @@ mod pending_response_tests {
                 0
             );
             assert!(writer.is_empty());
-            assert_eq!(poll_calls.get(), expected_calls);
+            assert_eq!(poll_calls.load(Ordering::SeqCst), expected_calls);
         }
 
         assert_eq!(
@@ -1451,8 +1451,8 @@ mod pending_response_tests {
     fn multiple_pending_responses_resolve_independently() {
         let root = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(root.path());
-        let second_ready = Rc::new(Cell::new(false));
-        let second_ready_for_poll = Rc::clone(&second_ready);
+        let second_ready = Arc::new(AtomicBool::new(false));
+        let second_ready_for_poll = Arc::clone(&second_ready);
         let mut pending = PendingResponses::default();
         pending.register(PendingResponse {
             request_id: "pending-ready".to_string(),
@@ -1464,6 +1464,7 @@ mod pending_response_tests {
                     serde_json::json!({"which": "ready"}),
                 ))
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         pending.register(PendingResponse {
@@ -1471,7 +1472,7 @@ mod pending_response_tests {
             session_id: "session-multi".to_string(),
             attach_command: "read".to_string(),
             poll: Box::new(move |_| {
-                if second_ready_for_poll.get() {
+                if second_ready_for_poll.load(Ordering::SeqCst) {
                     Some(Response::success(
                         "pending-later",
                         serde_json::json!({"which": "later"}),
@@ -1480,6 +1481,7 @@ mod pending_response_tests {
                     None
                 }
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         let mut writer = Vec::new();
@@ -1493,7 +1495,7 @@ mod pending_response_tests {
         assert_eq!(values[0]["id"], "pending-ready");
         assert!(!pending.is_empty());
 
-        second_ready.set(true);
+        second_ready.store(true, Ordering::SeqCst);
         assert_eq!(
             write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
             1
@@ -1508,33 +1510,34 @@ mod pending_response_tests {
     fn shutdown_drops_pending_without_polling_or_writing() {
         let root = TempDir::new().unwrap();
         let ctx = make_ctx_with_root(root.path());
-        let poll_calls = Rc::new(Cell::new(0usize));
-        let calls_for_poll = Rc::clone(&poll_calls);
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
         let mut pending = PendingResponses::default();
         pending.register(PendingResponse {
             request_id: "pending-shutdown".to_string(),
             session_id: "session-shutdown".to_string(),
             attach_command: "read".to_string(),
             poll: Box::new(move |_| {
-                calls_for_poll.set(calls_for_poll.get() + 1);
+                calls_for_poll.fetch_add(1, Ordering::SeqCst);
                 Some(Response::success(
                     "pending-shutdown",
                     serde_json::json!({"should_not_write": true}),
                 ))
             }),
+            cancellation: None,
             on_shutdown: None,
         });
         let mut writer = Vec::new();
 
         pending.drain_on_shutdown();
         assert!(pending.is_empty());
-        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
             0
         );
         assert!(writer.is_empty());
-        assert_eq!(poll_calls.get(), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
     }
 }
 

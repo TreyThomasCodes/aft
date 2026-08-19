@@ -228,6 +228,7 @@ pub fn build_bash_outcome(
         session_id,
         attach_command,
         poll,
+        cancellation: None,
         on_shutdown: None,
     })
 }

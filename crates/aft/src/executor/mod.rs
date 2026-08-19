@@ -305,10 +305,22 @@ pub struct MutatingLaneSnapshot {
 
 /// Non-blocking scheduler explanation attached to a delayed RouteBind warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindBlockerReaderSnapshot {
+    pub request_id: String,
+    pub command: String,
+    pub lane: Lane,
+    pub started_age_ms: u64,
+    pub started_before_oldest_writer: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindBlockerSnapshot {
     pub configure_state: &'static str,
     pub configure_phase_timings: Option<String>,
     pub blockers: Vec<String>,
+    pub oldest_queued_writer_age_ms: Option<u64>,
+    pub in_flight_readers: Vec<BindBlockerReaderSnapshot>,
+    pub reader_admissions_while_promoted_writer_waited: u64,
 }
 
 /// Cooperative cancellation for one cancellable executor job.
@@ -413,6 +425,13 @@ impl JobCancellation {
         self.inner.state.load(Ordering::SeqCst)
     }
 
+    /// Request cooperative cancellation without requiring an executor actor.
+    /// Detached continuations use this after their setup job has already left
+    /// the scheduler's running-job table.
+    pub fn request_cancel(&self) {
+        self.signal_cancel();
+    }
+
     /// True when a cancel won the state race and the job must abort.
     pub fn cancel_requested_before_commit(&self) -> bool {
         self.state() == JOB_CANCEL_STATE_CANCELLED
@@ -450,23 +469,32 @@ pub fn current_job_cancellation() -> Option<JobCancellation> {
     CURRENT_JOB_CANCELLATION.with(|slot| slot.borrow().clone())
 }
 
-struct CurrentJobCancellationGuard {
+pub struct JobCancellationContextGuard {
     previous: Option<JobCancellation>,
 }
 
-impl CurrentJobCancellationGuard {
+impl JobCancellationContextGuard {
     fn install(token: Option<JobCancellation>) -> Self {
         let previous = CURRENT_JOB_CANCELLATION.with(|slot| slot.replace(token));
         Self { previous }
     }
 }
 
-impl Drop for CurrentJobCancellationGuard {
+impl Drop for JobCancellationContextGuard {
     fn drop(&mut self) {
         CURRENT_JOB_CANCELLATION.with(|slot| {
             *slot.borrow_mut() = self.previous.take();
         });
     }
+}
+
+/// Install a cancellable executor job's token on a continuation thread.
+///
+/// Executor workers install this automatically. A setup job that hands work to
+/// a detached thread must install the same token there so existing cooperative
+/// checkpoints keep observing route or transport abandonment.
+pub fn install_job_cancellation(token: JobCancellation) -> JobCancellationContextGuard {
+    JobCancellationContextGuard::install(Some(token))
 }
 
 #[derive(Debug, Clone)]
@@ -1201,32 +1229,50 @@ impl SchedulerState {
         request_id: &str,
     ) -> BindBlockerSnapshot {
         let configure_state = self.mutating_job_state_label(root_id, request_id);
-        let mut blockers = Vec::new();
+        let now = Instant::now();
+        let actor = self.actors.get(root_id);
+        let oldest_queued_writer_at = actor.and_then(ActorState::oldest_queued_writer_at);
+        let oldest_queued_writer_age_ms = oldest_queued_writer_at
+            .map(|queued_at| duration_millis_u64(now.saturating_duration_since(queued_at)));
+        let mut in_flight_readers = self
+            .running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| BindBlockerReaderSnapshot {
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                lane: job.lane,
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                started_before_oldest_writer: oldest_queued_writer_at
+                    .is_some_and(|queued_at| job.started_at <= queued_at),
+            })
+            .collect::<Vec<_>>();
+        in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
 
-        if let Some(actor) = self.actors.get(root_id) {
+        let mut blockers = Vec::new();
+        if let Some(actor) = actor {
             if configure_state == "queued" {
                 let configure_count = actor.pending_configure_count();
                 if configure_count > 0 {
                     blockers.push(format!("queued_behind_configure({configure_count})"));
                 }
                 if actor.read_inflight > 0 || actor.lsp_inflight {
-                    let now = Instant::now();
-                    let stuck_readers = self
-                        .running_jobs
-                        .values()
-                        .filter(|job| {
-                            job.root_id == *root_id
-                                && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
-                                && now.saturating_duration_since(job.started_at)
-                                    >= READER_STUCK_CENSUS_AGE
+                    let stuck_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| {
+                            reader.started_age_ms >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
                         })
+                        .map(format_bind_blocker_reader)
                         .collect::<Vec<_>>();
                     if stuck_readers.is_empty() {
                         blockers.push("waiting_on_readers".to_string());
                     } else {
                         blockers.push(format!(
                             "waiting_on_readers_stuck({})",
-                            format_running_jobs(&stuck_readers)
+                            stuck_readers.join("; ")
                         ));
                     }
                 }
@@ -1257,17 +1303,30 @@ impl SchedulerState {
 
         BindBlockerSnapshot {
             configure_state,
-            configure_phase_timings: self
-                .actors
-                .get(root_id)
-                .map(|actor| actor.ctx.configure_ack_phase_snapshot()),
+            configure_phase_timings: actor.map(|actor| actor.ctx.configure_ack_phase_snapshot()),
             blockers,
+            oldest_queued_writer_age_ms,
+            in_flight_readers,
+            reader_admissions_while_promoted_writer_waited: actor
+                .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
+                .unwrap_or(0),
         }
     }
 }
 
 fn is_configure_request(request_id: &str) -> bool {
     request_id.starts_with("subc-bind-")
+}
+
+fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
+    format!(
+        "job={} command={} lane={:?} age_ms={} started_before_oldest_writer={}",
+        reader.request_id,
+        reader.command,
+        reader.lane,
+        reader.started_age_ms,
+        reader.started_before_oldest_writer
+    )
 }
 
 fn format_running_jobs(jobs: &[&RunningJob]) -> String {
@@ -1329,6 +1388,7 @@ struct ActorState {
     writer_inflight: bool,
     maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
+    reader_admissions_while_promoted_writer_waited: u64,
     deficit: isize,
     interactive: ClassQueues,
     maintenance: ClassQueues,
@@ -1346,6 +1406,7 @@ impl ActorState {
             writer_inflight: false,
             maintenance_commit_inflight: false,
             mutating_inflight: None,
+            reader_admissions_while_promoted_writer_waited: 0,
             deficit: 0,
             interactive: ClassQueues::new(),
             maintenance: ClassQueues::new(),
@@ -1413,6 +1474,17 @@ impl ActorState {
         self.interactive
             .remove_cancellable(token)
             .or_else(|| self.maintenance.remove_cancellable(token))
+    }
+
+    fn oldest_queued_writer_at(&self) -> Option<Instant> {
+        [
+            self.interactive.queue(Lane::Mutating).front(),
+            self.maintenance.queue(Lane::Mutating).front(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|job| job.queued_at)
+        .min()
     }
 
     fn pending_configure_count(&self) -> usize {
@@ -2097,6 +2169,15 @@ fn try_admit_actor(
         return None;
     }
 
+    let promoted_writer_waiting = actor.oldest_queued_writer_at().is_some_and(|queued_at| {
+        Instant::now().saturating_duration_since(queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
+    });
+    if promoted_writer_waiting && matches!(lane, Lane::PureRead | Lane::SerialLspStatus) {
+        actor.reader_admissions_while_promoted_writer_waited = actor
+            .reader_admissions_while_promoted_writer_waited
+            .saturating_add(1);
+    }
+
     let queued = actor.pop_front_job(job_class, lane)?;
     actor.deficit -= JOB_COST;
     if let Some(cancellation) = queued.cancellation.as_ref() {
@@ -2176,7 +2257,7 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
 }
 
 fn run_lane_job(run_job: &mut RunJob) -> Response {
-    let _cancellation_ctx = CurrentJobCancellationGuard::install(run_job.cancellation.clone());
+    let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(
         &mut run_job.job,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
 
@@ -25,6 +25,193 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
 const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
+
+static DEFERRED_INSPECT_ROOTS: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+
+#[cfg(test)]
+struct DeferredInspectBodyGate {
+    started: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static DEFERRED_INSPECT_BODY_GATE: LazyLock<Mutex<Option<DeferredInspectBodyGate>>> =
+    LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static DEFERRED_INSPECT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+static DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn deferred_inspect_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    DEFERRED_INSPECT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn install_deferred_inspect_body_gate_for_test(
+) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    *DEFERRED_INSPECT_BODY_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DeferredInspectBodyGate {
+        started: started_tx,
+        release: release_rx,
+    });
+    (started_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn install_deferred_inspect_stat_gate_for_test(
+) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT.store(true, std::sync::atomic::Ordering::SeqCst);
+    install_deferred_inspect_body_gate_for_test()
+}
+
+#[cfg(test)]
+pub(crate) fn deferred_inspect_root_count_for_test() -> usize {
+    DEFERRED_INSPECT_ROOTS
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+#[cfg(test)]
+fn wait_at_deferred_inspect_body_gate_for_test() {
+    let gate = DEFERRED_INSPECT_BODY_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some(gate) = gate else {
+        return;
+    };
+    let _ = gate.started.send(());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if inspect_cancellation_requested() || Instant::now() >= deadline {
+            return;
+        }
+        match gate.release.recv_timeout(Duration::from_millis(5)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_deferred_inspect_body_gate_for_test() {}
+
+#[cfg(test)]
+fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
+    DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
+    false
+}
+
+struct DeferredInspectRootPermit {
+    root: PathBuf,
+}
+
+impl DeferredInspectRootPermit {
+    fn acquire(root: PathBuf) -> Option<Self> {
+        let (roots, changed) = &*DEFERRED_INSPECT_ROOTS;
+        let mut active = roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while active.contains(&root) {
+            if inspect_cancellation_requested() {
+                return None;
+            }
+            let (next, _) = changed
+                .wait_timeout(active, Duration::from_millis(50))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            active = next;
+        }
+        if inspect_cancellation_requested() {
+            return None;
+        }
+        active.insert(root.clone());
+        Some(Self { root })
+    }
+}
+
+impl Drop for DeferredInspectRootPermit {
+    fn drop(&mut self) {
+        let (roots, changed) = &*DEFERRED_INSPECT_ROOTS;
+        let mut active = roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.root);
+        changed.notify_one();
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InspectRootStatSnapshot(Vec<(PathBuf, u64, SystemTime)>);
+
+fn capture_inspect_root_stats(root: &Path) -> Result<InspectRootStatSnapshot, String> {
+    let mut files = Vec::new();
+    for file in crate::callgraph::walk_project_files(root) {
+        match std::fs::metadata(&file) {
+            Ok(metadata) => files.push((
+                file,
+                metadata.len(),
+                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err("a project file changed during inspect stat verification".to_string());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to stat {} during inspect verification: {error}",
+                    file.display()
+                ));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(InspectRootStatSnapshot(files))
+}
+
+fn verify_final_root_stats(
+    project_root: &Path,
+    initial_stats: &InspectRootStatSnapshot,
+    phase_log: &InspectPhaseLog,
+) -> Result<(), InspectTerminal> {
+    let stat_phase = phase_log.start(
+        InspectPhaseEntry::category(InspectPhaseId::StatVerification, InspectCategory::Metrics)
+            .with_also_satisfied(InspectCategory::active().iter().copied()),
+    );
+    match capture_inspect_root_stats(project_root) {
+        Ok(final_stats) if final_stats == *initial_stats => {
+            stat_phase.complete();
+            Ok(())
+        }
+        Ok(_) => {
+            stat_phase.fail("project files changed while inspect was running");
+            Err(InspectTerminal::Interrupted)
+        }
+        Err(detail) => {
+            stat_phase.fail(&detail);
+            Err(InspectTerminal::PhaseFailed {
+                failed_phase: Some(InspectPhaseEntry::category(
+                    InspectPhaseId::StatVerification,
+                    InspectCategory::Metrics,
+                )),
+                failure_reason: "inspect_not_fresh",
+                failure_detail: Some(detail),
+            })
+        }
+    }
+}
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_inspect_payload(req, ctx, false, false, &[])
@@ -184,6 +371,14 @@ fn handle_inspect_payload(
 /// channel. Keep payload construction and checks that require newly scanned data
 /// in `handle_inspect_payload` and the scanners that produce those results.
 pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    handle_inspect_deferred_with_restriction(req, ctx, false)
+}
+
+pub(crate) fn handle_inspect_deferred_with_restriction(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    force_restrict: bool,
+) -> DispatchOutcome {
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
     let snapshot = match inspect_preflight(req, &ctx) {
@@ -239,9 +434,21 @@ pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> Dispat
     };
     let completion_request_id = request_id.clone();
     let shutdown_log = phase_log.clone();
+    let cancellation = crate::executor::current_job_cancellation()
+        .unwrap_or_else(crate::executor::JobCancellation::new);
+    let worker_cancellation = cancellation.clone();
+    let root = snapshot.project_root.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let response = run_blocking_inspect_body(&request, &ctx, applicability, phase_log);
+        let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
+        let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+        // Queueing instead of sharing a response keeps request-specific scopes,
+        // phase logs, and terminals independent while bounding expensive work to
+        // one detached inspect body per root.
+        let response = match DeferredInspectRootPermit::acquire(root) {
+            Some(_permit) => run_blocking_inspect_body(&request, &ctx, applicability, phase_log),
+            None => build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted),
+        };
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {
@@ -249,6 +456,7 @@ pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> Dispat
         session_id: String::new(),
         attach_command: String::new(),
         poll: Box::new(move |_| rx.try_recv().ok()),
+        cancellation: Some(cancellation),
         on_shutdown: Some(inspect_shutdown_terminal(request_id, shutdown_log)),
     })
 }
@@ -270,6 +478,7 @@ fn deferred_response(request_id: String, response: Response) -> DispatchOutcome 
         session_id: String::new(),
         attach_command: String::new(),
         poll: Box::new(move |_| rx.try_recv().ok()),
+        cancellation: None,
         on_shutdown: None,
     })
 }
@@ -371,6 +580,49 @@ fn run_blocking_inspect_body(
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
+    let project_root = match build_snapshot(ctx) {
+        Ok(snapshot) => snapshot.project_root,
+        Err(response) => {
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                InspectTerminal::PhaseFailed {
+                    failed_phase: None,
+                    failure_reason: "root_resolution_failed",
+                    failure_detail: response
+                        .data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            );
+        }
+    };
+    let initial_stats = match capture_inspect_root_stats(&project_root) {
+        Ok(snapshot) => snapshot,
+        Err(detail) => {
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                InspectTerminal::PhaseFailed {
+                    failed_phase: None,
+                    failure_reason: "inspect_not_fresh",
+                    failure_detail: Some(detail),
+                },
+            );
+        }
+    };
+    wait_at_deferred_inspect_body_gate_for_test();
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    if take_deferred_inspect_stat_short_circuit_for_test() {
+        let terminal = match verify_final_root_stats(&project_root, &initial_stats, &phase_log) {
+            Ok(()) => InspectTerminal::Fresh(serde_json::json!({})),
+            Err(terminal) => terminal,
+        };
+        return build_inspect_terminal(&req.id, &phase_log, terminal);
+    }
 
     let starts = applicability
         .server_keys
@@ -460,6 +712,10 @@ fn run_blocking_inspect_body(
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
+
+    if let Err(terminal) = verify_final_root_stats(&project_root, &initial_stats, &phase_log) {
+        return build_inspect_terminal(&req.id, &phase_log, terminal);
+    }
     if let Some(inspect_snapshot) = &inspect_snapshot {
         record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
     }
@@ -515,6 +771,10 @@ fn wait_for_root_quiescence(
 
 fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
     let lsp = ctx.lsp();
+    // Authoritative-report predicates reject watcher-stale and provisional
+    // entries, so delivered file events invalidate this wait immediately. File
+    // delivery is asynchronous, however; the terminal StatVerification phase
+    // compares the scanned file set directly and closes that latency window.
     expected.iter().all(|server| {
         lsp.has_authoritative_report_for_server(server) || !lsp.server_is_warming(server)
     })
@@ -2676,6 +2936,105 @@ mod deferred_terminal_tests {
             (deferred.poll)(&ctx).is_none(),
             "terminal response must be emitted once"
         );
+    }
+
+    fn deferred_test_context(root: &Path) -> Arc<AppContext> {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.to_path_buf());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx
+    }
+
+    fn inspect_request(id: &str) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "command": "inspect"
+        }))
+        .expect("request parses")
+    }
+
+    fn wait_for_pending_terminal(pending: &mut PendingResponse, ctx: &AppContext) -> Response {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(response) = (pending.poll)(ctx) {
+                return response;
+            }
+            assert!(Instant::now() < deadline, "inspect terminal timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn standalone_shutdown_cancels_detached_inspect_before_phase_deadline() {
+        let _serial = deferred_inspect_test_lock();
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").expect("fixture");
+        let ctx = deferred_test_context(root.path());
+        let (started_rx, _release_tx) = install_deferred_inspect_body_gate_for_test();
+        let pending = match handle_inspect_deferred(
+            &inspect_request("inspect-standalone-cancel"),
+            Arc::clone(&ctx),
+        ) {
+            DispatchOutcome::Deferred(pending) => pending,
+            DispatchOutcome::Immediate(_) => panic!("inspect must defer"),
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached inspect reaches body gate");
+
+        let mut registry = crate::response_finalize::PendingResponses::default();
+        registry.register(pending);
+        let shutdown = registry.drain_on_shutdown_with(&ctx);
+        assert_eq!(shutdown.len(), 1);
+        assert_eq!(
+            shutdown[0].response.data["failure_reason"],
+            "daemon_shutdown"
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while deferred_inspect_root_count_for_test() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "detached inspect ignored shutdown cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn final_stat_verification_rejects_mid_wait_mutation_without_watcher_delivery() {
+        let _serial = deferred_inspect_test_lock();
+        let root = tempfile::tempdir().expect("temp root");
+        let file = root.path().join("README.md");
+        std::fs::write(&file, "# Before\n").expect("fixture");
+        let ctx = deferred_test_context(root.path());
+        let (started_rx, release_tx) = install_deferred_inspect_stat_gate_for_test();
+        let mut pending = match handle_inspect_deferred(
+            &inspect_request("inspect-mid-wait-mutation"),
+            Arc::clone(&ctx),
+        ) {
+            DispatchOutcome::Deferred(pending) => pending,
+            DispatchOutcome::Immediate(_) => panic!("inspect must defer"),
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("inspect captured its pre-wait stat snapshot");
+        // No watcher drain runs in this test. The direct terminal stat proof must
+        // therefore detect the mutation even though diagnostic reports were not
+        // marked stale by watcher delivery.
+        std::fs::write(&file, "# Changed while waiting\n").expect("mutate fixture");
+        release_tx.send(()).expect("release inspect body");
+
+        let response = wait_for_pending_terminal(&mut pending, &ctx);
+        assert_eq!(response.data["inspect_terminal"], "interrupted");
+        assert!(response.data["completed_phases"]
+            .as_array()
+            .is_some_and(|phases| phases
+                .iter()
+                .all(|phase| phase["id"] != "stat_verification")));
     }
 
     #[test]
