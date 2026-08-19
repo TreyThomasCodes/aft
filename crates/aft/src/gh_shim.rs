@@ -30,14 +30,7 @@ const ROUTING_OPERATION: &str = "gh.route";
 const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
-const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge"];
-const ACCEPTED_SEAM_REFUSAL_CODES: &[&str] = &[
-    "identity_mismatch",
-    "unmapped_operation",
-    "custody_unavailable",
-    "schema_unsupported",
-    "rate_limited",
-];
+const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
@@ -1423,14 +1416,7 @@ fn route_governed(
     request: GovernedRequest,
     now: u64,
 ) -> RouteOutcome {
-    if let Err(error) = write_seam_state(
-        paths,
-        SeamState {
-            bound_holder: None,
-            agent_binding: Some(agent_binding.clone()),
-            last_seam_refusal: None,
-        },
-    ) {
+    if let Err(error) = write_seam_state(paths, governed_seam_state(paths, None, agent_binding)) {
         return RouteOutcome::Unavailable(format!("governed self-report update failed: {error}"));
     }
 
@@ -1485,11 +1471,7 @@ fn route_governed(
                 .map_err(|_| RouteOutcome::UnboundIdentity)?;
             if let Err(error) = write_seam_state(
                 &record_paths,
-                SeamState {
-                    bound_holder: Some(module_id.clone()),
-                    agent_binding: Some(agent_binding.clone()),
-                    last_seam_refusal: None,
-                },
+                governed_seam_state(&record_paths, Some(module_id.clone()), &agent_binding),
             ) {
                 let _ = consumer
                     .close_handle(&route, CloseRouteOptions::default())
@@ -1532,6 +1514,20 @@ fn route_governed(
             Ok(outcome)
         })
         .unwrap_or_else(|outcome| outcome)
+}
+
+fn governed_seam_state(
+    paths: &StatePaths,
+    bound_holder: Option<String>,
+    agent_binding: &AgentBinding,
+) -> SeamState {
+    SeamState {
+        bound_holder,
+        agent_binding: Some(agent_binding.clone()),
+        // A successful route is not a refusal event, so it must retain the last
+        // holder refusal for operators to inspect its timestamp and code.
+        last_seam_refusal: seam_state(paths).last_seam_refusal,
+    }
 }
 
 fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
@@ -1623,11 +1619,6 @@ fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
                         "governance refusal omitted a string refusal_code".to_string(),
                     )
                 })?;
-            if !ACCEPTED_SEAM_REFUSAL_CODES.contains(&refusal_code) {
-                return Err(RouteOutcome::SchemaMismatch(format!(
-                    "governance seam returned unsupported refusal_code {refusal_code}"
-                )));
-            }
             Ok(RouteOutcome::Refusal(refusal_code.to_string()))
         }
         Some("unbound_identity") => Ok(RouteOutcome::UnboundIdentity),
@@ -2052,6 +2043,13 @@ mod tests {
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
+    ];
+    const FIXTURE_ACCEPTED_SEAM_REFUSAL_CODES: &[&str] = &[
+        "identity_mismatch",
+        "unmapped_operation",
+        "custody_unavailable",
+        "schema_unsupported",
+        "rate_limited",
     ];
 
     fn fixture_manifest() -> Manifest {
@@ -2546,7 +2544,7 @@ mod tests {
             ));
         }
         for args in [
-            ["release", "create"].as_slice(),
+            ["release", "publish"].as_slice(),
             ["issue", "create"].as_slice(),
             ["pr", "reopen"].as_slice(),
         ] {
@@ -2581,8 +2579,8 @@ mod tests {
     }
 
     #[test]
-    fn holder_refusals_are_closed_and_keep_the_holder_code() {
-        for code in ACCEPTED_SEAM_REFUSAL_CODES {
+    fn holder_refusals_preserve_any_string_code_and_reject_non_strings() {
+        for code in FIXTURE_ACCEPTED_SEAM_REFUSAL_CODES {
             let response = json!({"outcome": "refusal", "refusal_code": code});
             let outcome = parse_governed_response(&serde_json::to_vec(&response).unwrap()).unwrap();
             assert!(matches!(outcome, RouteOutcome::Refusal(ref actual) if actual == code));
@@ -2593,8 +2591,18 @@ mod tests {
             );
             assert_eq!(REFUSAL_EXIT_STATUS, 86);
         }
+        let unknown = "quota_exhausted_v2";
+        let response = json!({"outcome": "refusal", "refusal_code": unknown});
+        let outcome = parse_governed_response(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(matches!(outcome, RouteOutcome::Refusal(ref actual) if actual == unknown));
+        assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
+        assert_eq!(
+            seam_refusal_text(unknown),
+            "governance seam refused the action: quota_exhausted_v2"
+        );
+        assert_eq!(REFUSAL_EXIT_STATUS, 86);
+
         for response in [
-            json!({"outcome": "refusal", "refusal_code": "unknown"}),
             json!({"outcome": "refusal", "refusal_code": 7}),
             json!({"outcome": "refusal", "refusal_code": null}),
             json!({"outcome": "refusal"}),
@@ -2645,9 +2653,22 @@ mod tests {
             report.bound_holder.as_deref(),
             Some(ROUTING_HOLDER_MODULE_ID)
         );
-        assert_eq!(report.agent_binding, Some(binding));
+        assert_eq!(report.agent_binding, Some(binding.clone()));
         assert_eq!(
             report
+                .last_seam_refusal
+                .as_ref()
+                .map(|refusal| refusal.code.as_str()),
+            Some("rate_limited")
+        );
+
+        write_seam_state(
+            &paths,
+            governed_seam_state(&paths, Some(ROUTING_HOLDER_MODULE_ID.to_string()), &binding),
+        )
+        .unwrap();
+        assert_eq!(
+            seam_state(&paths)
                 .last_seam_refusal
                 .as_ref()
                 .map(|refusal| refusal.code.as_str()),
