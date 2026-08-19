@@ -81,13 +81,42 @@ fn prepend_path(existing_path: &std::ffi::OsStr, dir: &std::path::Path) -> std::
     std::env::join_paths(paths).unwrap()
 }
 
-/// Serialize tests that install and invoke the rustfmt wrapper so concurrent
-/// runs do not interfere with their response-timeout windows.
+/// Serialize rustfmt-edition tests when `cargo test` runs them in one process.
+///
+/// Nextest runs each test in its own process, so it cannot share this lock; the
+/// dedicated configure helper below supplies the timeout isolation those runs need.
 fn rustfmt_edition_test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Configure the guard-mediated rustfmt tests with a scheduling-tolerant budget.
+///
+/// Each test launches a newly-written command wrapper and the real formatter.
+/// Under Windows shard load, those process hops can exceed the product's normal
+/// 10-second formatter deadline even though this test only verifies the selected
+/// edition arguments. Keep the wider budget local to this fixture so it does not
+/// change the product timeout contract.
+fn configure_rustfmt_edition_test(aft: &mut AftProcess, project_root: &std::path::Path) {
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project_root.display().to_string(),
+            "config": user_config(json!({
+                "format_on_edit": true,
+                "formatter_timeout_secs": 30,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        response["success"], true,
+        "configure should succeed: {response:?}"
+    );
 }
 
 /// Install a rustfmt wrapper that rejects a missing or unexpected edition flag.
@@ -229,7 +258,7 @@ fn format_integration_rustfmt_uses_package_edition() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    aft.configure_format_on_edit(&dir);
+    configure_rustfmt_edition_test(&mut aft, &dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-rust-edition","command":"write","file":{},"content":"async   fn   format_me( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -280,7 +309,7 @@ fn format_integration_rustfmt_uses_workspace_package_edition() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    aft.configure_format_on_edit(&member);
+    configure_rustfmt_edition_test(&mut aft, &member);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -331,7 +360,7 @@ fn format_integration_rustfmt_uses_member_edition_from_virtual_workspace() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    aft.configure_format_on_edit(&workspace);
+    configure_rustfmt_edition_test(&mut aft, &workspace);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-virtual-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -382,7 +411,7 @@ fn format_integration_rustfmt_prefers_member_edition_over_workspace_default() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    aft.configure_format_on_edit(&workspace);
+    configure_rustfmt_edition_test(&mut aft, &workspace);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-member-edition-precedence","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -421,7 +450,7 @@ fn format_integration_rustfmt_preserves_bare_2015_invocation() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    aft.configure_format_on_edit(&dir);
+    configure_rustfmt_edition_test(&mut aft, &dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-no-edition","command":"write","file":{},"content":"fn  main( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
