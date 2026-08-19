@@ -1,0 +1,5 @@
+{
+  "inspect": {
+    "diagnostics_timeout_ms": 180000
+  }
+}

@@ -9,6 +9,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
@@ -23,6 +24,10 @@ import {
   renderSections,
   renderToolCall,
 } from "./render-helpers.js";
+
+// The Rust diagnostics phase may block until its configured deadline. Keep the
+// transport alive long enough to receive that terminal response.
+const INSPECT_TRANSPORT_HEADROOM_MS = 30_000;
 
 const InspectParams = Type.Object({
   sections: Type.Optional(
@@ -438,7 +443,10 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       if (sections !== undefined) rawArgs.sections = sections;
       if (scope !== undefined) rawArgs.scope = scope;
       if (topK !== undefined) rawArgs.topK = topK;
-      const response = await callToolCall(bridge, "inspect", rawArgs, extCtx);
+      const response = await callToolCall(bridge, "inspect", rawArgs, extCtx, {
+        transportTimeoutMs:
+          resolveInspectDiagnosticsTimeoutMs(ctx.config) + INSPECT_TRANSPORT_HEADROOM_MS,
+      });
       const terminal = parseInspectTerminal(response);
       if (terminal) return textResult(renderInspectTerminal(terminal, response.text), response);
       if (response.success === false)

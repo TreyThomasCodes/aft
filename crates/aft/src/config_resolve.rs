@@ -14,7 +14,9 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     BackupConfig, Config, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::jsonc::strip_jsonc;
 
@@ -391,6 +393,8 @@ impl RawExperimentalBash {
 #[serde(default)]
 pub struct RawInspect {
     pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    pub diagnostics_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
     pub tier2_idle_minutes: Option<f64>,
     pub categories: Option<HashMap<String, bool>>,
@@ -404,6 +408,7 @@ pub struct RawInspect {
 impl RawInspect {
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
+            && self.diagnostics_timeout_ms.is_none()
             && self.tier2_idle_minutes.is_none()
             && self.categories.is_none()
             && self.tier2_soft_deadline_ms.is_none()
@@ -970,6 +975,17 @@ fn merge_inspect_config(
 
     let mut inspect = base.unwrap_or_default();
     inspect.enabled = override_inspect.enabled.or(inspect.enabled);
+    if let Some(project_timeout) = override_inspect.diagnostics_timeout_ms {
+        // A project may ask for more time, but it must not silently shrink another
+        // consumer's diagnostic completeness by reducing the user's effective wait.
+        inspect.diagnostics_timeout_ms = Some(
+            project_timeout.max(
+                inspect
+                    .diagnostics_timeout_ms
+                    .unwrap_or(DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS),
+            ),
+        );
+    }
     inspect.tier2_idle_minutes = override_inspect
         .tier2_idle_minutes
         .or(inspect.tier2_idle_minutes);
@@ -1201,6 +1217,12 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
     };
     if let Some(enabled) = raw.enabled {
         inspect.enabled = enabled;
+    }
+    if let Some(value) = raw.diagnostics_timeout_ms {
+        inspect.diagnostics_timeout_ms = value.clamp(
+            MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+            MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+        );
     }
     if let Some(expected_mirrors) = raw
         .duplicates
@@ -1757,7 +1779,7 @@ mod tests {
                 "max_batch_size": 12,
                 "max_files": 3456
               },
-              "inspect": { "enabled": false },
+              "inspect": { "enabled": false, "diagnostics_timeout_ms": 15000 },
               "experimental": { "lsp_ty": true },
               "lsp": {
                 "servers": {
@@ -1809,6 +1831,7 @@ mod tests {
         assert_eq!(result.config.semantic.max_batch_size, 12);
         assert_eq!(result.config.semantic.max_files, 3456);
         assert!(!result.config.inspect.enabled);
+        assert_eq!(result.config.inspect.diagnostics_timeout_ms, 15_000);
         assert!(!result.config.experimental_lsp_ty);
         assert!(result.config.disabled_lsp.contains("ty"));
         assert_eq!(result.config.lsp_servers.len(), 1);
@@ -1880,6 +1903,54 @@ mod tests {
             above_max.config.semantic.query_timeout_ms,
             MAX_SEMANTIC_QUERY_TIMEOUT_MS
         );
+    }
+
+    #[test]
+    fn inspect_diagnostics_timeout_clamps_to_blocking_phase_range() {
+        let below_min = resolve_config(&[tier(
+            "user",
+            r#"{ "inspect": { "diagnostics_timeout_ms": 1 } }"#,
+        )]);
+        assert_eq!(
+            below_min.config.inspect.diagnostics_timeout_ms,
+            MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS
+        );
+
+        let above_max = resolve_config(&[tier(
+            "user",
+            r#"{ "inspect": { "diagnostics_timeout_ms": 700000 } }"#,
+        )]);
+        assert_eq!(
+            above_max.config.inspect.diagnostics_timeout_ms,
+            MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn project_inspect_diagnostics_timeout_can_raise_but_never_lower_user_value() {
+        let lower = resolve_config(&[
+            tier(
+                "user",
+                r#"{ "inspect": { "diagnostics_timeout_ms": 180000 } }"#,
+            ),
+            tier(
+                "project",
+                r#"{ "inspect": { "diagnostics_timeout_ms": 90000 } }"#,
+            ),
+        ]);
+        assert_eq!(lower.config.inspect.diagnostics_timeout_ms, 180_000);
+
+        let higher = resolve_config(&[
+            tier(
+                "user",
+                r#"{ "inspect": { "diagnostics_timeout_ms": 180000 } }"#,
+            ),
+            tier(
+                "project",
+                r#"{ "inspect": { "diagnostics_timeout_ms": 240000 } }"#,
+            ),
+        ]);
+        assert_eq!(higher.config.inspect.diagnostics_timeout_ms, 240_000);
     }
 
     #[test]

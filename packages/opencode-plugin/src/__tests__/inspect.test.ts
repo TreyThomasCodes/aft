@@ -70,6 +70,7 @@ function createInspectHarness(
     name: string,
     args: Record<string, unknown>,
   ) => Promise<BridgeResponse> | BridgeResponse,
+  config: Record<string, unknown> = {},
 ) {
   const toolCallCalls: ToolCallCall[] = [];
   const localBridge = {
@@ -84,7 +85,7 @@ function createInspectHarness(
     },
   };
   const pool = { getBridge: () => localBridge } as unknown as BridgePool;
-  return { toolCallCalls, tools: inspectTools(createPluginContext(pool, {})) };
+  return { toolCallCalls, tools: inspectTools(createPluginContext(pool, config)) };
 }
 
 function freshTerminal() {
@@ -204,8 +205,17 @@ describe("aft_inspect tool", () => {
     expect(toolCallCalls).toHaveLength(1);
   });
 
-  test("sends only explicit inspect arguments and leaves transport policy unset", async () => {
+  test("uses the default diagnostics deadline plus transport headroom", async () => {
     const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal());
+    await tools.aft_inspect.execute({}, createMockSdkContext(projectRoot));
+
+    expect(toolCallCalls[0]?.options).toMatchObject({ transportTimeoutMs: 150_000 });
+  });
+
+  test("sends explicit inspect arguments with the configured diagnostics budget", async () => {
+    const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal(), {
+      inspect: { diagnostics_timeout_ms: 180_000 },
+    });
     await tools.aft_inspect.execute(
       { sections: ["todos", "dead_code"], scope: "src", topK: 7 },
       createMockSdkContext(projectRoot),
@@ -216,6 +226,7 @@ describe("aft_inspect tool", () => {
       sessionId: "inspect-session",
       name: "inspect",
       rawArgs: { sections: ["todos", "dead_code"], scope: join(projectRoot, "src"), topK: 7 },
+      options: { transportTimeoutMs: 210_000 },
     });
     expect(toolCallCalls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");
   });

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
-use crate::config::Config;
+use crate::config::{
+    Config, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+};
 use crate::context::AppContext;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
@@ -15,7 +17,12 @@ use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
-const BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
+fn diagnostics_phase_timeout(config: &Config) -> Duration {
+    Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
+        MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+        MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    ))
+}
 
 #[derive(Debug, Clone)]
 struct CollectedDiagnostic {
@@ -161,8 +168,9 @@ fn collect_scoped_diagnostics(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
 ) -> Result<DiagnosticsCollection, String> {
-    let deadline = Instant::now() + BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT;
     let config = ctx.config().clone();
+    let timeout = diagnostics_phase_timeout(&config);
+    let deadline = Instant::now() + timeout;
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     let whole_root = JobScope::from_roots(
         snapshot.project_root.clone(),
@@ -181,7 +189,7 @@ fn collect_scoped_diagnostics(
     let mut opened_documents = ScopedInspectDocuments::new(ctx);
 
     for file in files {
-        check_diagnostics_phase_boundary(deadline)?;
+        check_diagnostics_phase_boundary(deadline, timeout)?;
         collect_scoped_file(
             ctx,
             &config,
@@ -189,13 +197,14 @@ fn collect_scoped_diagnostics(
             &mut collection,
             &mut opened_documents,
             deadline,
+            timeout,
         )?;
         // Pull-only servers may leave didOpen diagnostics, telemetry, and log
         // notifications queued because they do not enter the push waiter.
         ctx.lsp().drain_events();
     }
 
-    check_diagnostics_phase_boundary(deadline)?;
+    check_diagnostics_phase_boundary(deadline, timeout)?;
     collection.diagnostics =
         scoped_warm_diagnostics(ctx, snapshot, scope, &mut tsconfig_membership);
     collection.servers_pending.extend(
@@ -214,6 +223,7 @@ fn wait_for_inspect_diagnostics_without_manager_lock(
     file: &Path,
     expected: &[(ServerKey, PreEditSnapshot)],
     deadline: Instant,
+    timeout: Duration,
 ) -> Result<(), String> {
     let wait = {
         let mut lsp = ctx.lsp();
@@ -226,7 +236,7 @@ fn wait_for_inspect_diagnostics_without_manager_lock(
         } {
             break Ok(());
         }
-        if let Err(message) = check_diagnostics_phase_boundary(deadline) {
+        if let Err(message) = check_diagnostics_phase_boundary(deadline, timeout) {
             break Err(message);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -247,7 +257,7 @@ fn wait_for_inspect_diagnostics_without_manager_lock(
     result
 }
 
-fn check_diagnostics_phase_boundary(deadline: Instant) -> Result<(), String> {
+fn check_diagnostics_phase_boundary(deadline: Instant, timeout: Duration) -> Result<(), String> {
     if crate::executor::current_job_cancellation()
         .is_some_and(|token| token.cancel_requested_before_commit())
     {
@@ -255,8 +265,8 @@ fn check_diagnostics_phase_boundary(deadline: Instant) -> Result<(), String> {
     }
     if Instant::now() >= deadline {
         return Err(format!(
-            "lsp_quiescence_timeout: diagnostics did not complete within {}s",
-            BLOCKING_DIAGNOSTICS_PHASE_TIMEOUT.as_secs()
+            "lsp_quiescence_timeout: diagnostics did not complete within {}ms",
+            timeout.as_millis()
         ));
     }
     Ok(())
@@ -269,8 +279,9 @@ fn collect_scoped_file(
     collection: &mut DiagnosticsCollection,
     opened_documents: &mut ScopedInspectDocuments<'_>,
     deadline: Instant,
+    timeout: Duration,
 ) -> Result<(), String> {
-    check_diagnostics_phase_boundary(deadline)?;
+    check_diagnostics_phase_boundary(deadline, timeout)?;
     // One canonical form across the LSP boundary: bare fs::canonicalize yields
     // verbatim paths on Windows, which no longer match normalized server keys.
     let canonical = crate::inspect::job::canonicalize_normalized(file);
@@ -315,7 +326,7 @@ fn collect_scoped_file(
             }
         }
     };
-    check_diagnostics_phase_boundary(deadline)?;
+    check_diagnostics_phase_boundary(deadline, timeout)?;
 
     let push_fallback_servers =
         record_pull_results(&outcomes.successful, &pull_results, collection);
@@ -332,7 +343,9 @@ fn collect_scoped_file(
             )
         })
         .collect::<Vec<(ServerKey, PreEditSnapshot)>>();
-    wait_for_inspect_diagnostics_without_manager_lock(ctx, &canonical, &expected, deadline)?;
+    wait_for_inspect_diagnostics_without_manager_lock(
+        ctx, &canonical, &expected, deadline, timeout,
+    )?;
 
     let lsp = ctx.lsp();
     for key in push_fallback_servers {
@@ -680,7 +693,10 @@ mod payload_count_tests {
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
 
-    use super::{CollectedDiagnostic, DiagnosticsCollection};
+    use super::{
+        check_diagnostics_phase_boundary, diagnostics_phase_timeout, CollectedDiagnostic,
+        DiagnosticsCollection,
+    };
     use crate::config::Config;
     use crate::inspect::job::InspectSnapshot;
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
@@ -714,6 +730,24 @@ mod payload_count_tests {
             server_ran: true,
             ..DiagnosticsCollection::default()
         }
+    }
+
+    #[test]
+    fn configured_diagnostics_deadline_drives_the_blocking_phase_boundary() {
+        let config = Config {
+            inspect: crate::config::InspectConfig {
+                diagnostics_timeout_ms: 15_000,
+                ..crate::config::InspectConfig::default()
+            },
+            ..Config::default()
+        };
+        let timeout = diagnostics_phase_timeout(&config);
+
+        assert_eq!(timeout, std::time::Duration::from_millis(15_000));
+        assert_eq!(
+            check_diagnostics_phase_boundary(std::time::Instant::now(), timeout),
+            Err("lsp_quiescence_timeout: diagnostics did not complete within 15000ms".to_string())
+        );
     }
 
     #[test]

@@ -208,6 +208,11 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
   // aft_inspect codebase-health scanner (recommended/all tiers).
   "inspect": {
     "enabled": true,              // set false to drop the aft_inspect tool
+    // Blocking LSP diagnostics deadline. Default 120000; values clamp to
+    // 10000..600000. User config sets the baseline; project config may raise
+    // it but cannot lower it, so a repository cannot silently reduce another
+    // consumer's diagnostic completeness.
+    "diagnostics_timeout_ms": 120000,
     "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
     "duplicates": {
       // Intentional mirror pairs, matched against project-root-relative

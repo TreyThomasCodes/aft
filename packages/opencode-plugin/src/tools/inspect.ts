@@ -1,10 +1,14 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
 import type { PluginContext } from "../types.js";
 import { callToolCall, isEmptyParam, resolvePathArg } from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
+// The Rust diagnostics phase may block until its configured deadline. Keep the
+// transport alive long enough to receive that terminal response.
+const INSPECT_TRANSPORT_HEADROOM_MS = 30_000;
 
 type ToolArg = ToolDefinition["args"][string];
 type StringOrStringArray = string | string[];
@@ -223,6 +227,7 @@ export interface InspectToolConfig {
   disabled_tools?: string[];
   inspect?: {
     enabled?: boolean;
+    diagnostics_timeout_ms?: number;
     tier2_idle_minutes?: number;
   };
 }
@@ -326,7 +331,10 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       if (sections !== undefined) rawArgs.sections = sections;
       if (scoped.scope !== undefined) rawArgs.scope = scoped.scope;
       if (args.topK !== undefined && args.topK !== null) rawArgs.topK = args.topK;
-      const response = await callToolCall(ctx, context, "inspect", rawArgs);
+      const response = await callToolCall(ctx, context, "inspect", rawArgs, {
+        transportTimeoutMs:
+          resolveInspectDiagnosticsTimeoutMs(ctx.config) + INSPECT_TRANSPORT_HEADROOM_MS,
+      });
       const terminal = parseInspectTerminal(response);
       if (terminal) return renderInspectTerminal(terminal, response.text);
       if (response.success === false)

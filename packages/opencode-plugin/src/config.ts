@@ -241,9 +241,29 @@ const SubcConfigSchema = z.object({
   client_reaper: z.boolean().optional(),
 });
 
+export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
+export const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 10_000;
+export const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 600_000;
+
+function clampInspectDiagnosticsTimeoutMs(value: number): number {
+  return Math.min(
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    Math.max(MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, value),
+  );
+}
+
 const InspectConfigSchema = z.object({
   /** Master switch for the aft_inspect tool. Defaults to true. */
   enabled: z.boolean().optional(),
+  /** Blocking diagnostics deadline in milliseconds (clamped to 10000..600000). */
+  diagnostics_timeout_ms: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .transform((value) =>
+      value === undefined ? undefined : clampInspectDiagnosticsTimeoutMs(value),
+    ),
   /** OpenCode session.idle delay before Tier 2 inspect prewarm. Default: 4 minutes. */
   tier2_idle_minutes: z.number().min(0).optional(),
   categories: z.record(z.string(), z.boolean()).optional(),
@@ -403,6 +423,13 @@ export const AftConfigSchema = z.preprocess(
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+
+/** Resolve the blocking diagnostics deadline for tools that wait on `aft_inspect`. */
+export function resolveInspectDiagnosticsTimeoutMs(config: AftConfig): number {
+  return clampInspectDiagnosticsTimeoutMs(
+    config.inspect?.diagnostics_timeout_ms ?? DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+  );
+}
 
 export interface ConfigureLspServer {
   id: string;
@@ -1192,9 +1219,23 @@ function mergeInspectConfig(
   baseInspect: AftConfig["inspect"],
   overrideInspect: AftConfig["inspect"],
 ): AftConfig["inspect"] {
+  const diagnosticsTimeoutConfigured =
+    baseInspect?.diagnostics_timeout_ms !== undefined ||
+    overrideInspect?.diagnostics_timeout_ms !== undefined;
+  // A project may ask for more time, but it must not silently shrink another
+  // consumer's diagnostic completeness by reducing the user's effective wait.
+  const diagnosticsTimeoutMs = Math.max(
+    clampInspectDiagnosticsTimeoutMs(
+      baseInspect?.diagnostics_timeout_ms ?? DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    ),
+    clampInspectDiagnosticsTimeoutMs(
+      overrideInspect?.diagnostics_timeout_ms ?? DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    ),
+  );
   const inspect = {
     ...baseInspect,
     ...overrideInspect,
+    ...(diagnosticsTimeoutConfigured ? { diagnostics_timeout_ms: diagnosticsTimeoutMs } : {}),
     duplicates:
       baseInspect?.duplicates || overrideInspect?.duplicates
         ? {

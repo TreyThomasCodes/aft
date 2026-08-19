@@ -1,0 +1,9 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "inspect": {
+    "diagnostics_timeout_ms": 600000
+  },
+  "restrict_to_project_root": false
+}

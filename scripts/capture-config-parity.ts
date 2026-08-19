@@ -269,6 +269,16 @@ const CASES: ParityCase[] = [
       },
     },
   },
+  {
+    name: "inspect_diagnostics_timeout_project_lower",
+    user: { inspect: { diagnostics_timeout_ms: 180000 } },
+    project: { inspect: { diagnostics_timeout_ms: 90000 } },
+  },
+  {
+    name: "inspect_diagnostics_timeout_clamp",
+    user: { inspect: { diagnostics_timeout_ms: 1 } },
+    project: { inspect: { diagnostics_timeout_ms: 700000 } },
+  },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },
   { name: "bash_empty_obj", user: { bash: {} } },

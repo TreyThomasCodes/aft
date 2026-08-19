@@ -6,9 +6,16 @@ use serde::{Deserialize, Serialize};
 pub(crate) const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
 pub(crate) const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
 pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
 
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
+}
+
+const fn default_inspect_diagnostics_timeout_ms() -> u64 {
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS
 }
 
 use crate::harness::Harness;
@@ -96,6 +103,9 @@ impl Default for SemanticBackendConfig {
 #[serde(default)]
 pub struct InspectConfig {
     pub enabled: bool,
+    /// Deadline for the blocking LSP diagnostics phase of `aft_inspect`.
+    #[serde(default = "default_inspect_diagnostics_timeout_ms")]
+    pub diagnostics_timeout_ms: u64,
     pub duplicates: InspectDuplicatesConfig,
 }
 
@@ -109,6 +119,7 @@ impl Default for InspectConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            diagnostics_timeout_ms: default_inspect_diagnostics_timeout_ms(),
             duplicates: InspectDuplicatesConfig::default(),
         }
     }
