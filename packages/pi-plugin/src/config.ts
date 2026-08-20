@@ -65,6 +65,17 @@ export interface SubcConfig {
   client_reaper?: boolean;
 }
 
+export interface GhShimConfig {
+  /**
+   * Operator hard-off for the `gh` routing shim. Default: true. When false, the
+   * shim short-circuits to byte-transparent passthrough (R1) before any
+   * daemon/catalog probing, so a disabled shim performs zero subc traffic. This
+   * is a fleet-rollout safety gate, not a capability switch. USER-tier ONLY — a
+   * project config cannot disable the shim for the user's host.
+   */
+  enabled?: boolean;
+}
+
 export interface SemanticConfig {
   backend?: SemanticBackend;
   model?: string;
@@ -259,6 +270,7 @@ export interface AftConfig {
   semantic?: SemanticConfig;
   bridge?: BridgeConfig;
   subc?: SubcConfig;
+  gh_shim?: GhShimConfig;
 }
 
 /**
@@ -529,6 +541,17 @@ const SubcConfigSchema = z.object({
   connection_file: z.string().optional(),
 });
 
+const GhShimConfigSchema = z.object({
+  /**
+   * Operator hard-off for the `gh` routing shim. Default: true. When false, the
+   * shim short-circuits to byte-transparent passthrough (R1) before any
+   * daemon/catalog probing, so a disabled shim performs zero subc traffic. This
+   * is a fleet-rollout safety gate, not a capability switch. USER-tier ONLY — a
+   * project config cannot disable the shim for the user's host.
+   */
+  enabled: z.boolean().optional(),
+});
+
 const InspectConfigSchema = z.object({
   enabled: z.boolean().optional(),
   diagnostics_timeout_ms: z
@@ -617,6 +640,7 @@ export const AftConfigSchema = z.preprocess(
       semantic: SemanticConfigSchema.optional(),
       bridge: BridgeConfigSchema.optional(),
       subc: SubcConfigSchema.optional(),
+      gh_shim: GhShimConfigSchema.optional(),
     })
     .strict(),
 );
@@ -1318,6 +1342,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.gh_shim !== undefined) stripped.push("gh_shim");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }

@@ -235,6 +235,15 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
     // Use the experimental Astral `ty` Python type checker.
     // Implied when `lsp.python === "ty"`.
     "lsp_ty": false
+  },
+
+  // Operator hard-off for the `gh` routing shim. Default: true. When false, the
+  // shim short-circuits to byte-transparent passthrough (R1) before any
+  // daemon/catalog probing, so a disabled shim performs zero subc traffic. This
+  // is a fleet-rollout safety gate, not a capability switch. USER-only — a
+  // project config cannot disable the shim for the user's host.
+  "gh_shim": {
+    "enabled": true
   }
 }
 ```
@@ -253,6 +262,10 @@ Set `edit_mode` to `"hashline"` to make `edit` accept exactly `{ "patch": "..." 
 A hashline mutation starts only after every affected path has a backup record. If backup registration cannot complete, the edit fails before any file is changed.
 
 Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
+
+## `gh` routing shim
+
+When AFT is installed as the `gh` argv[0] entry point (a `gh` symlink or `aft gh-shim`), the shim decides whether to route `gh` invocations through a governed daemon seam or pass them through byte-transparently to upstream `gh`. The `gh_shim.enabled` knob is an operator hard-off for that routing: set it to `false` in user config to force every invocation to byte-transparent passthrough (R1) before any daemon/catalog probing, so a disabled shim performs zero subc traffic. It adds no capability beyond today's structural rungs — it only gives fleet operators a hard-off for rollout safety. The knob is USER-only: a project config cannot disable the shim for the user's host.
 
 ## Native command sandbox
 

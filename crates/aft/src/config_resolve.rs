@@ -13,8 +13,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    BackupConfig, Config, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    BackupConfig, Config, GhShimConfig, InspectConfig, SandboxConfig, SemanticBackend,
+    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
@@ -115,6 +115,7 @@ pub struct RawAftConfig {
     pub inspect: Option<RawInspect>,
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
+    pub gh_shim: Option<RawGhShim>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -456,6 +457,12 @@ impl RawWorktree {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawGhShim {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawBackup {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
@@ -674,6 +681,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.worktree.is_some() {
         base.worktree = override_config.worktree;
+    }
+    if override_config.gh_shim.is_some() {
+        base.gh_shim = override_config.gh_shim;
     }
     if override_config.sandbox.is_some() {
         base.sandbox = override_config.sandbox;
@@ -1052,6 +1062,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.backup.is_some() {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
+    if raw.gh_shim.is_some() {
+        push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
+    }
     if let Some(sandbox) = &raw.sandbox {
         // enabled:true is an accepted project-tier hardening opt-in (merged by
         // merge_project_sandbox); only the weakening direction is dropped.
@@ -1170,6 +1183,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
+    config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
@@ -1256,6 +1270,14 @@ fn resolve_worktree_config(raw: Option<&RawWorktree>) -> WorktreeConfig {
         worktree.ram_overlay = value;
     }
     worktree
+}
+
+fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
+    let mut gh_shim = GhShimConfig::default();
+    if let Some(value) = raw.and_then(|raw| raw.enabled) {
+        gh_shim.enabled = value;
+    }
+    gh_shim
 }
 
 fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {

@@ -241,6 +241,17 @@ const SubcConfigSchema = z.object({
   client_reaper: z.boolean().optional(),
 });
 
+const GhShimConfigSchema = z.object({
+  /**
+   * Operator hard-off for the `gh` routing shim. Default: true. When false, the
+   * shim short-circuits to byte-transparent passthrough (R1) before any
+   * daemon/catalog probing, so a disabled shim performs zero subc traffic. This
+   * is a fleet-rollout safety gate, not a capability switch. USER-tier ONLY — a
+   * project config cannot disable the shim for the user's host.
+   */
+  enabled: z.boolean().optional(),
+});
+
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
 export const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 10_000;
 export const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 600_000;
@@ -418,6 +429,8 @@ export const AftConfigSchema = z.preprocess(
       bridge: BridgeConfigSchema.optional(),
       /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
       subc: SubcConfigSchema.optional(),
+      /** `gh` routing shim operator gate (USER-only; default on). */
+      gh_shim: GhShimConfigSchema.optional(),
     })
     .strict(),
 );
@@ -1415,6 +1428,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.gh_shim !== undefined) stripped.push("gh_shim");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }

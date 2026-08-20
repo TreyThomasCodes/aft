@@ -143,6 +143,24 @@ impl Default for BackupConfig {
     }
 }
 
+/// `gh` routing shim operator hard-off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GhShimConfig {
+    /// When false, the `gh` routing shim short-circuits to byte-transparent
+    /// passthrough (R1) before any daemon/catalog probing, so a disabled shim
+    /// performs zero subc traffic. Default true. This is an operator hard-off
+    /// for fleet rollout safety; it adds no capability beyond today's
+    /// structural rungs.
+    pub enabled: bool,
+}
+
+impl Default for GhShimConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Linked-worktree behavior that never writes shared on-disk artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -264,6 +282,8 @@ pub struct Config {
     pub backup: BackupConfig,
     /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
     pub worktree: WorktreeConfig,
+    /// `gh` routing shim operator gate. Default on; see [`GhShimConfig`].
+    pub gh_shim: GhShimConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -350,6 +370,7 @@ impl Default for Config {
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
             worktree: WorktreeConfig::default(),
+            gh_shim: GhShimConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

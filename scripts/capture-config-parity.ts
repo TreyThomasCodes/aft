@@ -61,6 +61,12 @@ function goldenParamsFromMerged(merged: ReturnType<typeof loadAftConfig>): Recor
   if (merged.url_fetch_allow_private !== undefined) {
     params.url_fetch_allow_private = merged.url_fetch_allow_private;
   }
+  // gh_shim is a user-only operator gate read directly by the shim from disk;
+  // it is not part of the configure-params surface, so carry it through the
+  // golden explicitly to keep the Rust resolver in parity.
+  if (merged.gh_shim !== undefined) {
+    params.gh_shim = merged.gh_shim;
+  }
   return sortKeysDeep(params) as Record<string, unknown>;
 }
 
@@ -278,6 +284,18 @@ const CASES: ParityCase[] = [
     name: "inspect_diagnostics_timeout_clamp",
     user: { inspect: { diagnostics_timeout_ms: 1 } },
     project: { inspect: { diagnostics_timeout_ms: 700000 } },
+  },
+  {
+    // User disables the gh routing shim; the resolved config must carry the
+    // disabled gate so the Rust resolver matches.
+    name: "gh_shim_user_disabled",
+    user: { gh_shim: { enabled: false } },
+  },
+  {
+    // A project trying to disable the shim must be stripped (user-tier only).
+    name: "gh_shim_project_stripped",
+    user: {},
+    project: { gh_shim: { enabled: false } },
   },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },

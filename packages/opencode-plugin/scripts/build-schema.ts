@@ -631,6 +631,21 @@ function buildSchema(): Record<string, unknown> {
           "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
       },
 
+      gh_shim: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: true,
+            description:
+              "Operator hard-off for the gh routing shim. When false, the shim short-circuits to byte-transparent passthrough (R1) before any daemon/catalog probing, so a disabled shim performs zero subc traffic. Fleet-rollout safety gate, not a capability switch. User-scoped only — a project config cannot disable the shim for the user's host.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "gh routing shim operator gate. User-scoped only — a project config cannot disable the shim for the user's host.",
+      },
+
       auto_update: {
         type: "boolean",
         default: true,

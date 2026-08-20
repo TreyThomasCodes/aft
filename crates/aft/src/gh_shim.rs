@@ -387,7 +387,33 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
     // The budget starts before the config read and connection-file stat. This
     // keeps a slow filesystem from silently extending discovery beyond 150ms.
     let deadline = std::time::Instant::now() + DISCOVERY_BUDGET;
-    let Some(connection_file) = configured_connection_file() else {
+    let config_doc = read_user_config_doc();
+    determine_rung_from_doc(paths, cwd, now, deadline, config_doc.as_deref())
+}
+
+/// Pure rung determination over the user config document. `config_doc` is the
+/// raw user-tier `aft.jsonc` text (already read by the caller); `None` means the
+/// config file was absent or unreadable. Splitting the config read from the
+/// decision keeps the disabled short-circuit testable without mutating process
+/// env (which races under the parallel test runner).
+fn determine_rung_from_doc(
+    paths: &StatePaths,
+    cwd: &Path,
+    now: u64,
+    deadline: std::time::Instant,
+    config_doc: Option<&str>,
+) -> RungRecord {
+    // Operator hard-off: when the user disables the shim, short-circuit to
+    // byte-transparent passthrough (R1) before any daemon/catalog probing, so a
+    // disabled shim performs zero subc traffic. This is a structural gate for
+    // fleet rollout safety, not a rung the manifest can reach.
+    if gh_shim_enabled_from_config_doc(config_doc.unwrap_or("")) == Some(false) {
+        return RungRecord::r1(now, "disabled_by_config");
+    }
+
+    let Some(connection_file) =
+        connection_file_from_config_doc(config_doc.unwrap_or("")).filter(|path| path.is_file())
+    else {
         // R1 has no daemon dial and no durable determination write.
         return RungRecord::r1(now, "absent_or_unparseable");
     };
@@ -488,6 +514,25 @@ fn configured_connection_file_from(
     let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
+}
+
+/// Read the raw user-tier `aft.jsonc` document for the shim's config gates.
+/// `None` means the config file was absent or unreadable, which the rung
+/// determination treats as "no user config" (structural rungs decide).
+fn read_user_config_doc() -> Option<String> {
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let config_path =
+        crate::subc_config::user_config_path_from(xdg_config_home.as_deref(), home.as_deref())?;
+    fs::read_to_string(config_path).ok()
+}
+
+/// Read the `gh_shim.enabled` operator gate from the user config document.
+/// `None` means the key is absent or the document is unparseable, in which case
+/// the shim stays enabled (default true). Only an explicit `false` disables.
+fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
+    let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).ok()?;
+    value.get("gh_shim")?.get("enabled")?.as_bool()
 }
 
 fn connection_file_from_config_doc(doc: &str) -> Option<PathBuf> {
@@ -1795,6 +1840,16 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
     };
     let (bypass_audit, bypass_audit_error) = read_bypass_audit(paths);
     let seam_state = seam_state(paths);
+    // When the operator hard-off is set, the shim is byte-transparent passthrough
+    // and never probes the daemon or catalog, so the status report reflects that
+    // disabled determination instead of whatever stale rung/manifest cache exists.
+    let disabled = gh_shim_enabled_from_config_doc(read_user_config_doc().as_deref().unwrap_or(""))
+        == Some(false);
+    let (cached_manifest, last_rung) = if disabled {
+        (disabled_manifest_report(), disabled_last_rung_report())
+    } else {
+        (cached_manifest_report(paths), last_rung_report(paths))
+    };
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
@@ -1802,8 +1857,8 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         bound_holder: seam_state.bound_holder,
         agent_binding: seam_state.agent_binding,
         last_seam_refusal: seam_state.last_seam_refusal,
-        cached_manifest: cached_manifest_report(paths),
-        last_rung: last_rung_report(paths),
+        cached_manifest,
+        last_rung,
         bypass_audit,
         bypass_audit_error,
         executing_image: image
@@ -1813,6 +1868,35 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         executing_image_error: image.err(),
         real_gh_resolution,
         real_gh_resolution_error,
+    }
+}
+
+/// Self-report for the disabled-by-config state: the shim is a hard passthrough
+/// and never consults the manifest, so the cached-manifest slot reports that
+/// disabled state rather than a stale on-disk manifest.
+fn disabled_manifest_report() -> CachedManifestReport {
+    CachedManifestReport {
+        version: None,
+        version_error: None,
+        state: Some("disabled"),
+        state_error: None,
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Self-report for the disabled-by-config state: R1 passthrough with the
+/// disabled determination input, matching what `determine_rung` would produce.
+fn disabled_last_rung_report() -> LastRungReport {
+    LastRungReport {
+        rung: Some(Rung::R1.label()),
+        rung_error: None,
+        as_of_unix_secs: Some(unix_seconds()),
+        as_of_unix_secs_error: None,
+        determination_inputs: Some(BTreeMap::from([(
+            "connection_file".to_string(),
+            "disabled_by_config".to_string(),
+        )])),
+        determination_inputs_error: None,
     }
 }
 
@@ -2181,6 +2265,52 @@ mod tests {
                 "another-module".to_string(),
                 "other-module".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn disabled_by_config_short_circuits_to_r1_without_connection_file_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // A disabled shim must resolve R1 with the named reason even when a
+        // connection file is configured, and must not touch the daemon/catalog.
+        let doc = serde_json::json!({
+            "gh_shim": { "enabled": false },
+            "subc": { "connection_file": "/nonexistent/connection.json" }
+        })
+        .to_string();
+        let record = determine_rung_from_doc(
+            &paths,
+            Path::new("/cwd"),
+            123,
+            std::time::Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(
+            record.inputs.get("connection_file").map(String::as_str),
+            Some("disabled_by_config")
+        );
+        // R1 is never written durably.
+        assert!(!paths.root.join("rung-cache.json").exists());
+    }
+
+    #[test]
+    fn enabled_default_keeps_structural_rungs() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // No gh_shim key (default true) and no connection file → structural R1.
+        let record = determine_rung_from_doc(
+            &paths,
+            Path::new("/cwd"),
+            1,
+            std::time::Instant::now() + DISCOVERY_BUDGET,
+            Some("{}"),
+        );
+        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(
+            record.inputs.get("connection_file").map(String::as_str),
+            Some("absent_or_unparseable")
         );
     }
 
