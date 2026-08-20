@@ -3011,6 +3011,59 @@ fn blocking_inspect_deadline_error_names_the_configured_budget() {
     );
 }
 
+/// A producer that declares quiescence without publishing any report is
+/// complete. The wait already treated that producer as settled; the freshness
+/// gate must use the same predicate rather than requiring a published report.
+#[test]
+fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"diag-blocking-quiesce-empty\"\n",
+    );
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    // Blocking tool calls run every active category, so the Tier-2
+    // prerequisites (callgraph store, aggregates) must be ready first.
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    configure_fake_rust_lsp(&ctx);
+    // Default fake rust-analyzer declares quiescence on `initialized` and
+    // only publishes on didOpen. Blocking inspect starts producers without
+    // opening documents, so the store stays empty after settlement.
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-blocking-quiesce-empty",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh");
+    let phases = response["wait_stamp"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("wait_stamp.phases missing: {response:#}"));
+    assert!(
+        phases.iter().any(|phase| phase["id"] == "lsp_quiescence"),
+        "quiescence must complete before the fresh terminal: {response:#}"
+    );
+    let summary = response["summary"]["diagnostics"]
+        .as_object()
+        .expect("diagnostics summary");
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
+    assert!(
+        !summary.contains_key("status"),
+        "settled empty diagnostics must be complete, not pending: {response:#}"
+    );
+}
+
 #[test]
 fn scoped_diagnostics_drain_events_before_the_warm_collection() {
     let (_temp_dir, root) = fixture_project();

@@ -2220,6 +2220,23 @@ impl LspManager {
             .is_some_and(|client| client.diagnostics_are_provisional())
     }
 
+    /// A producer has settled when it holds a current authoritative report or
+    /// has stopped warming. The blocking inspect wait and the unscoped
+    /// diagnostics freshness gate both use this predicate so a complete
+    /// producer set cannot be judged incomplete by a second, stricter check.
+    pub fn producer_has_settled(&self, server: &ServerKey) -> bool {
+        self.has_authoritative_report_for_server(server) || !self.server_is_warming(server)
+    }
+
+    /// True when every expected producer has settled. Empty input is vacuously
+    /// true; callers that mean "no producer was started" must not treat that
+    /// as a fresh diagnostics collection.
+    pub fn producers_settled(&self, expected: &[ServerKey]) -> bool {
+        expected
+            .iter()
+            .all(|server| self.producer_has_settled(server))
+    }
+
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
         let mut saw_file_diagnostics = false;
         while let Ok(event) = self.event_rx.try_recv() {

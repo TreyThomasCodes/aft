@@ -214,7 +214,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[])
+    handle_inspect_payload(req, ctx, false, false, &[], &[])
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -266,6 +266,7 @@ fn handle_inspect_payload(
     force_root_diagnostics: bool,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
+    expected_producers: &[ServerKey],
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -334,6 +335,7 @@ fn handle_inspect_payload(
                 scope_was_provided,
                 applicability_is_empty,
                 producer_failures,
+                expected_producers,
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline)) = tier2_receivers.remove(category) {
@@ -708,6 +710,7 @@ fn run_blocking_inspect_body(
         true,
         applicability.server_keys.is_empty(),
         &start_outcomes.failures,
+        &start_outcomes.successful,
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -770,14 +773,13 @@ fn wait_for_root_quiescence(
 }
 
 fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
-    let lsp = ctx.lsp();
     // Authoritative-report predicates reject watcher-stale and provisional
     // entries, so delivered file events invalidate this wait immediately. File
     // delivery is asynchronous, however; the terminal StatVerification phase
     // compares the scanned file set directly and closes that latency window.
-    expected.iter().all(|server| {
-        lsp.has_authoritative_report_for_server(server) || !lsp.server_is_warming(server)
-    })
+    // The unscoped diagnostics gate uses this same producer-settled check, so
+    // a wait that returns cannot then be judged incomplete for lack of reports.
+    ctx.lsp().producers_settled(expected)
 }
 
 fn quiescence_failure_reason(message: &str) -> &'static str {

@@ -50,6 +50,11 @@ struct DiagnosticsCollection {
     servers_pending: BTreeSet<String>,
     producer_failures: BTreeMap<String, String>,
     scope_coverage_gaps: Vec<ScopedCoverageGap>,
+    /// True when the producer set this collection is responsible for has all
+    /// settled (authoritative report or no longer warming). Distinct from
+    /// `server_ran`: a quiesced producer may never publish, and that empty
+    /// store is still a complete answer.
+    producers_settled: bool,
 }
 
 /// Collect diagnostics for the explicit inspect path.
@@ -60,15 +65,16 @@ struct DiagnosticsCollection {
 /// which findings the payload renders.
 ///
 /// The authority halves differ by design. An unscoped request makes a
-/// full-root claim, so the global `is_reportable` conjunction over the
-/// full-root collection decides freshness. A scoped request makes per-file
-/// claims: every scoped file must either carry an authoritative producer
-/// report or appear as a named gap, because the global "some server
-/// reported" bit cannot prove that a specific file nothing ever analyzed is
-/// clean. A collection becomes Fresh after every producer has either
-/// returned verified results or reached a terminal failure. Terminal
-/// producer failures remain named gaps in the payload; pending or otherwise
-/// unverified sources still prevent a fresh response.
+/// full-root claim, so producer settlement over the started set decides
+/// freshness — the same predicate the blocking wait uses. A scoped request
+/// makes per-file claims: every scoped file must either carry an
+/// authoritative producer report or appear as a named gap, because a
+/// settled producer cannot prove that a specific file nothing ever analyzed
+/// is clean. A collection becomes Fresh after every expected producer has
+/// settled (authoritative report or no longer warming) or reached a
+/// terminal failure. Terminal producer failures remain named gaps in the
+/// payload; producers still warming without an authoritative report still
+/// prevent a fresh response.
 pub(crate) fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
@@ -76,6 +82,7 @@ pub(crate) fn run_diagnostics_category(
     scope_was_provided: bool,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
+    expected_producers: &[ServerKey],
 ) -> JobOutcome {
     let mut collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
@@ -85,7 +92,7 @@ pub(crate) fn run_diagnostics_category(
             ..DiagnosticsCollection::default()
         }
     } else {
-        collect_warm_working_set(ctx, snapshot)
+        collect_warm_working_set(ctx, snapshot, expected_producers)
     };
     collection.record_producer_failures(producer_failures);
 
@@ -110,7 +117,11 @@ pub(crate) fn run_diagnostics_category(
     }
 }
 
-fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> DiagnosticsCollection {
+fn collect_warm_working_set(
+    ctx: &AppContext,
+    snapshot: &InspectSnapshot,
+    expected_producers: &[ServerKey],
+) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     {
@@ -120,18 +131,23 @@ fn collect_warm_working_set(ctx: &AppContext, snapshot: &InspectSnapshot) -> Dia
         // warm diagnostics store. It does not open files or spawn servers.
         lsp.drain_events();
         collection.server_ran = lsp.has_any_diagnostic_reports();
-        if !collection.server_ran {
-            collection.servers_pending.extend(
-                lsp.active_server_keys()
-                    .into_iter()
-                    .map(|key| server_id(&key)),
-            );
+        // Pending producers are those that have not settled. The blocking wait
+        // uses the same `producer_has_settled` check, so a quiesced producer
+        // with no published report is complete rather than forever pending.
+        // When the caller started a specific set, that set is the obligation;
+        // otherwise the currently running clients are.
+        let producers = if expected_producers.is_empty() {
+            lsp.active_server_keys()
+        } else {
+            expected_producers.to_vec()
+        };
+        for server in &producers {
+            if !lsp.producer_has_settled(server) {
+                collection.servers_pending.insert(server_id(server));
+            }
         }
-        collection.servers_pending.extend(
-            lsp.provisional_server_keys()
-                .into_iter()
-                .map(|key| server_id(&key)),
-        );
+        collection.producers_settled =
+            !producers.is_empty() && collection.servers_pending.is_empty();
         collection.diagnostics = lsp
             .get_all_diagnostics_with_provisional()
             .into_iter()
@@ -345,19 +361,31 @@ impl DiagnosticsCollection {
             && self.scope_coverage_gaps.is_empty()
     }
 
-    /// Full-root authority conjunction for the no-scope path: a full-root
-    /// verdict over the full-root warm collection. Scoped requests use
-    /// per-file authority instead (see `record_scope_coverage_gaps`).
+    /// Full-root authority conjunction for the no-scope path. Completeness is
+    /// producer settlement — the same predicate the blocking wait uses — not
+    /// "some server published a report". A quiesced producer with no reports
+    /// is complete; a still-warming producer without an authoritative report
+    /// is not. Scoped requests use per-file authority instead (see
+    /// `record_scope_coverage_gaps`).
     fn is_reportable(&self) -> bool {
-        (self.server_ran || self.applicability_is_empty || !self.producer_failures.is_empty())
-            && self.servers_pending.is_empty()
-            && self
-                .diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.provisional)
+        self.servers_pending.is_empty()
+            && (self.server_ran
+                || self.applicability_is_empty
+                || !self.producer_failures.is_empty()
+                || self.producers_settled)
+            && (self.producers_settled
+                || self
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.provisional))
     }
 
     fn into_payload(mut self, snapshot: &InspectSnapshot) -> Value {
+        // Warming rows are not findings. After producers settle, leftover
+        // provisional entries are dropped rather than blocking the payload;
+        // the wait already treated those producers as complete.
+        self.diagnostics
+            .retain(|diagnostic| !diagnostic.provisional);
         self.sort_and_dedup();
         let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self
@@ -578,6 +606,46 @@ mod payload_count_tests {
         let mut collection = collection();
         collection.diagnostics[0].provisional = true;
         assert!(!collection.is_complete());
+    }
+
+    #[test]
+    fn settled_producers_without_reports_are_reportable() {
+        let collection = DiagnosticsCollection {
+            producers_settled: true,
+            ..DiagnosticsCollection::default()
+        };
+        // The previous full-root check required `server_ran` (any published
+        // report) and treated a settled empty store as incomplete. That
+        // disagreed with producer settlement, which is complete once every
+        // producer holds an authoritative report or has stopped warming.
+        let old_predicate = (collection.server_ran
+            || collection.applicability_is_empty
+            || !collection.producer_failures.is_empty())
+            && collection.servers_pending.is_empty()
+            && collection
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.provisional);
+        assert!(
+            !old_predicate,
+            "the old reportable check must reject a settled empty store, otherwise this test cannot catch the wait/gate split"
+        );
+        assert!(collection.is_reportable());
+        assert!(collection.is_complete());
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["errors"], 0);
+        assert!(payload.get("complete").is_none());
+    }
+
+    #[test]
+    fn settled_producers_drop_leftover_provisional_rows_instead_of_refusing() {
+        let mut collection = collection();
+        collection.producers_settled = true;
+        collection.diagnostics[0].provisional = true;
+        assert!(collection.is_reportable());
+        let payload = collection.into_payload(&snapshot());
+        assert_eq!(payload["errors"], 0);
+        assert!(payload["items"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
