@@ -94,6 +94,7 @@ struct Tier2ReuseOptions {
     force_rescan_paths: BTreeSet<PathBuf>,
     allow_callgraph_cold_build: bool,
     require_callgraph_snapshot: bool,
+    interactive: bool,
 }
 
 impl Tier2ReuseOptions {
@@ -108,6 +109,28 @@ impl Default for Tier2ReuseOptions {
             force_rescan_paths: BTreeSet::new(),
             allow_callgraph_cold_build: true,
             require_callgraph_snapshot: false,
+            interactive: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InspectBuilderState {
+    Building,
+    QueuedBehindColdBuilds,
+    GatedBySemanticSeed,
+    BuildDenied,
+    Absent,
+}
+
+impl InspectBuilderState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+            Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
+            Self::GatedBySemanticSeed => "gated_by_semantic_seed",
+            Self::BuildDenied => "build_denied (borrow-only)",
+            Self::Absent => "absent",
         }
     }
 }
@@ -144,7 +167,9 @@ pub struct InspectManager {
     soft_deadline: Duration,
     next_job_id: AtomicU64,
     heavy_root_work_allowed: Arc<AtomicBool>,
+    semantic_cold_seed_active: Arc<AtomicBool>,
     cold_build_limiter: Mutex<Arc<cold_build_limiter::ColdBuildLimiter>>,
+    builder_states: Mutex<HashMap<JobKey, InspectBuilderState>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -164,10 +189,18 @@ impl InspectManager {
     }
 
     pub fn with_heavy_root_work_gate(heavy_root_work_allowed: Arc<AtomicBool>) -> Self {
-        Self::with_worker_and_gate(
+        Self::with_root_work_gates(heavy_root_work_allowed, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_root_work_gates(
+        heavy_root_work_allowed: Arc<AtomicBool>,
+        semantic_cold_seed_active: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_worker_and_gates(
             default_worker(),
             DEFAULT_SOFT_DEADLINE,
             heavy_root_work_allowed,
+            semantic_cold_seed_active,
         )
     }
 
@@ -182,6 +215,20 @@ impl InspectManager {
         soft_deadline: Duration,
         heavy_root_work_allowed: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_worker_and_gates(
+            worker,
+            soft_deadline,
+            heavy_root_work_allowed,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn with_worker_and_gates(
+        worker: InspectWorker,
+        soft_deadline: Duration,
+        heavy_root_work_allowed: Arc<AtomicBool>,
+        semantic_cold_seed_active: Arc<AtomicBool>,
+    ) -> Self {
         let handles = start_dispatch_loop(worker);
         Self {
             request_tx: handles.request_tx,
@@ -195,7 +242,9 @@ impl InspectManager {
             soft_deadline,
             next_job_id: AtomicU64::new(1),
             heavy_root_work_allowed,
+            semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
+            builder_states: Mutex::new(HashMap::new()),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
@@ -225,6 +274,59 @@ impl InspectManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
+        if let Ok(mut states) = self.builder_states.lock() {
+            states.insert(key.clone(), state);
+        }
+    }
+
+    fn clear_builder_state(&self, key: &JobKey) {
+        if let Ok(mut states) = self.builder_states.lock() {
+            states.remove(key);
+        }
+    }
+
+    pub(crate) fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
+        let key = JobKey::for_project_category(category);
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(state) = states.get(&key) {
+                return *state;
+            }
+        }
+        if self
+            .in_flight
+            .lock()
+            .map(|in_flight| in_flight.contains_key(&key))
+            .unwrap_or(false)
+        {
+            InspectBuilderState::Building
+        } else {
+            InspectBuilderState::Absent
+        }
+    }
+
+    fn builder_state_for_job(&self, job: &InspectJob) -> InspectBuilderState {
+        if !job.inspect_writer || !job.callgraph_writer {
+            InspectBuilderState::BuildDenied
+        } else {
+            self.tier2_builder_state(job.category)
+        }
+    }
+
+    pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
+        if !snapshot.config.callgraph_store {
+            return false;
+        }
+        callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
+            .into_iter()
+            .any(|dir| {
+                matches!(
+                    CallGraphStore::open_readonly(dir, snapshot.project_root.clone()),
+                    Ok(Some(_))
+                )
+            })
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -387,7 +489,13 @@ impl InspectManager {
             return Ok(Some(key));
         }
         let limiter = self.cold_build_limiter();
-        let Some(permit) = limiter.try_acquire() else {
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+            format!("tier2-background:{}", category.as_str()),
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let Some(permit) =
+            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
+        else {
             return Err(format!(
                 "cold build concurrency limit ({}) reached; retrying later",
                 limiter.limit()
@@ -480,7 +588,13 @@ impl InspectManager {
         }
 
         let limiter = self.cold_build_limiter();
-        let Some(permit) = limiter.try_acquire() else {
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "tier2-serial-background",
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let Some(permit) =
+            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
+        else {
             let deferred = submission.newly_queued_categories.clone();
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 for category in &deferred {
@@ -514,6 +628,27 @@ impl InspectManager {
             .lock()
             .map(|in_flight| in_flight.keys().any(|key| key.category.is_tier2()))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn try_tier2_any_in_flight(&self) -> Option<bool> {
+        self.in_flight
+            .try_lock()
+            .ok()
+            .map(|in_flight| in_flight.keys().any(|key| key.category.is_tier2()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
+        let key = JobKey::for_project_category(category);
+        let mut jobs = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if in_flight {
+            jobs.entry(key).or_default();
+        } else {
+            jobs.remove(&key);
+        }
     }
 
     /// Release per-project inspect caches so their SQLite readers and writer
@@ -923,6 +1058,7 @@ impl InspectManager {
                 job,
                 Tier2ReuseOptions {
                     require_callgraph_snapshot,
+                    interactive: true,
                     ..Tier2ReuseOptions::default()
                 },
             );
@@ -992,9 +1128,15 @@ impl InspectManager {
     }
 
     fn spawn_tier2_reuse_job(self: &Arc<Self>, job: InspectJob, options: Tier2ReuseOptions) {
+        // Rebinds retain the persisted contribution cache. Let quick reuse prove
+        // that cache before joining the cold-build queue, so an unchanged root can
+        // answer immediately even while unrelated background builds own the slots.
+        self.set_builder_state(&job.key, InspectBuilderState::Building);
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
+        let cancellation = crate::executor::current_job_cancellation();
         pool.spawn_fifo(move || {
+            let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let result = manager.tier2_run_with_reuse_job_result_catching(job, options);
             manager.route_tier2_reuse_completion(result);
         });
@@ -1299,6 +1441,46 @@ impl InspectManager {
                 return result;
             }
         }
+
+        // Automatic scans use the background seed gate to serialize their work.
+        // A blocking inspect that proves it needs real work joins the interactive
+        // class instead: it never preempts an in-flight build, but it takes a
+        // released slot before another maintenance build can extend the wait.
+        let _interactive_permit = if options.interactive {
+            let queued_state = if self.semantic_cold_seed_active.load(Ordering::SeqCst) {
+                InspectBuilderState::GatedBySemanticSeed
+            } else {
+                InspectBuilderState::QueuedBehindColdBuilds
+            };
+            self.set_builder_state(&job.key, queued_state);
+            let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+                format!("inspect:{}:{}", job.project_root.display(), job.job_id),
+                cold_build_limiter::ColdBuildAdmissionClass::InspectTriggered,
+            );
+            let permit = cold_build_limiter::acquire_blocking_while_cancellable_with_limiter(
+                &self.cold_build_limiter(),
+                "explicit inspect Tier-2 run",
+                request,
+                || self.heavy_root_work_allowed(),
+                || {
+                    crate::executor::current_job_cancellation()
+                        .is_some_and(|token| token.cancel_requested_before_commit())
+                },
+            );
+            let Some(permit) = permit else {
+                let result = InspectResult::failed(
+                    &job,
+                    "explicit inspect Tier-2 cold-build admission was cancelled",
+                    started.elapsed(),
+                );
+                log_tier2_benchmark_category_end(&result);
+                return result;
+            };
+            self.set_builder_state(&job.key, InspectBuilderState::Building);
+            Some(permit)
+        } else {
+            None
+        };
 
         let result = match self.tier2_run_with_reuse_job(&job, &cache, &options) {
             Ok(success) => InspectResult::success(&job, success, started.elapsed()),
@@ -1701,7 +1883,10 @@ impl InspectManager {
             && aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            return Err("dead_code callgraph did not complete".to_string());
+            return Err(format!(
+                "tier2 dead_code aggregate did not complete; builder_state={}",
+                self.builder_state_for_job(job).as_str()
+            ));
         }
         let rollup_started = Instant::now();
         let contributions = load_contributions(cache, &aggregate_job)?;
@@ -1896,6 +2081,7 @@ impl InspectManager {
     }
 
     fn route_tier2_reuse_completion(&self, result: InspectResult) {
+        self.clear_builder_state(&result.key);
         let outcome = match result.outcome.clone() {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
@@ -4155,6 +4341,192 @@ mod guard_tests {
         }
     }
 
+    #[test]
+    fn blocking_inspect_overtakes_queued_maintenance_after_active_seed_releases() {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        std::fs::create_dir_all(root.join("src")).expect("create source directory");
+        std::fs::write(
+            root.join("src/main.ts"),
+            "export function plantedDead() { return 1; }\n",
+        )
+        .expect("write source fixture");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let snapshot = InspectSnapshot::new_with_capabilities(
+            root.clone(),
+            inspect_dir,
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                callgraph_store: true,
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            true,
+            true,
+        );
+
+        let limiter = cold_build_limiter::test_limiter(1);
+        let active_request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "active-semantic-seed",
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let active =
+            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &active_request)
+                .expect("active semantic seed holds the only slot");
+        let semantic_seed_active = Arc::new(AtomicBool::new(true));
+        let manager = Arc::new(InspectManager::with_root_work_gates(
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&semantic_seed_active),
+        ));
+        manager.set_cold_build_limiter(Arc::clone(&limiter));
+
+        let inspect_manager = Arc::clone(&manager);
+        let scope = JobScope::for_project(root);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = inspect_manager.tier2_run_with_reuse_blocking_fresh(
+                snapshot,
+                InspectCategory::DeadCode,
+                scope,
+            );
+            outcome_tx.send(outcome).expect("send inspect outcome");
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.tier2_builder_state(InspectCategory::DeadCode)
+            != InspectBuilderState::GatedBySemanticSeed
+        {
+            assert!(
+                Instant::now() < deadline,
+                "inspect must queue while the active seed owns the slot"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            outcome_rx.try_recv().is_err(),
+            "in-flight work is not preempted"
+        );
+
+        let maintenance_limiter = Arc::clone(&limiter);
+        let maintenance = std::thread::spawn(move || {
+            cold_build_limiter::acquire_blocking_while_with_limiter(
+                &maintenance_limiter,
+                "queued background refresh",
+                || true,
+            )
+            .expect("background refresh eventually resumes")
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        semantic_seed_active.store(false, Ordering::SeqCst);
+        drop(active);
+
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("blocking inspect completes after the active seed releases");
+        let payload = outcome.payload().expect("blocking inspect is fresh");
+        assert_eq!(
+            payload.get("callgraph_available").and_then(Value::as_bool),
+            Some(true)
+        );
+        drop(maintenance.join().expect("background waiter joins"));
+
+        let events = limiter.admission_events();
+        assert_eq!(
+            events[0].class,
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance
+        );
+        assert_eq!(
+            events[1].class,
+            cold_build_limiter::ColdBuildAdmissionClass::InspectTriggered,
+            "explicit inspect takes the first released slot"
+        );
+        assert_eq!(
+            events[2].class,
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance
+        );
+    }
+
+    #[test]
+    fn post_eviction_rebind_serves_unchanged_tier2_aggregate_without_cold_slot() {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        std::fs::create_dir_all(root.join("src")).expect("create source directory");
+        std::fs::write(
+            root.join("src/main.ts"),
+            "export function plantedDead() { return 1; }\n",
+        )
+        .expect("write source fixture");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let snapshot = InspectSnapshot::new_with_capabilities(
+            root.clone(),
+            inspect_dir,
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                callgraph_store: true,
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            true,
+            true,
+        );
+        let limiter = cold_build_limiter::test_limiter(1);
+        let manager = Arc::new(InspectManager::new());
+        manager.set_cold_build_limiter(Arc::clone(&limiter));
+        let first = manager.tier2_run_with_reuse_blocking_fresh(
+            snapshot.clone(),
+            InspectCategory::DeadCode,
+            JobScope::for_project(root.clone()),
+        );
+        assert!(
+            first.payload().is_some(),
+            "initial scan persists a fresh aggregate"
+        );
+        assert!(!manager.tier2_any_in_flight());
+        manager.evict_idle_caches();
+
+        let maintenance_request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "post-eviction-search-verify",
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let maintenance =
+            cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &maintenance_request)
+                .expect("background verification owns the only cold slot");
+        let events_before = limiter.admission_events().len();
+        let rebound_manager = Arc::clone(&manager);
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = rebound_manager.tier2_run_with_reuse_blocking_fresh(
+                snapshot,
+                InspectCategory::DeadCode,
+                JobScope::for_project(root),
+            );
+            outcome_tx.send(outcome).expect("send rebound outcome");
+        });
+
+        let rebound = outcome_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("unchanged persisted aggregate bypasses the occupied cold-build queue");
+        assert!(rebound.payload().is_some());
+        assert_eq!(
+            limiter.admission_events().len(),
+            events_before,
+            "quick reuse must not request an interactive cold-build permit"
+        );
+        drop(maintenance);
+    }
+
     fn generated_unused_exports_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -4749,6 +5121,7 @@ export function bannerUnused() {}
                     force_rescan_paths: [deleted.clone()].into_iter().collect(),
                     allow_callgraph_cold_build: true,
                     require_callgraph_snapshot: false,
+                    interactive: false,
                 },
             )
             .outcome

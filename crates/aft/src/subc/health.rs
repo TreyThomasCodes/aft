@@ -8,6 +8,8 @@ use super::{
     StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
 use crate::context::App;
+#[cfg(test)]
+use crate::context::AppContext;
 use crate::executor::BindBlockerSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1088,6 +1090,50 @@ mod tests {
             Some(1)
         );
         assert_eq!(hot_runtime["bg_arm_misses_60s_total"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn tier2_first_scan_keeps_root_in_warming_rollup() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-tier2-first-scan");
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().to_path_buf());
+        config.search_index = false;
+        config.semantic_search = false;
+        config.callgraph_store = false;
+        config.inspect.enabled = true;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &crate::context::App::default_shared(),
+        );
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("1 root(s) warming background indexes (serving normally)")
+        );
+        let metrics = report.metrics.expect("health metrics");
+        assert_eq!(metrics["roots"][0]["search_index"]["status"], "disabled");
+        assert_eq!(metrics["roots"][0]["semantic_index"]["status"], "disabled");
+        assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "disabled");
+        assert_eq!(metrics["roots"][0]["tier2"]["status"], "building");
+
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub use job::{
     InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, InspectTier, JobKey,
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
+#[cfg(test)]
+pub(crate) use manager::InspectBuilderState;
 pub use manager::{InspectManager, Tier2RunSubmission, Tier2RunSubmissionError};
 pub use phase_log::{
     format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,

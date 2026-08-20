@@ -1907,6 +1907,7 @@ impl AppContext {
         let progress_sender: SharedProgressSender = Arc::new(Mutex::new(None));
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let heavy_root_work_allowed = Arc::new(AtomicBool::new(true));
+        let semantic_cold_seed_active = Arc::new(AtomicBool::new(false));
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<TreeSitterProvider>()
@@ -1960,9 +1961,10 @@ impl AppContext {
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
-            inspect_manager: Arc::new(InspectManager::with_heavy_root_work_gate(Arc::clone(
-                &heavy_root_work_allowed,
-            ))),
+            inspect_manager: Arc::new(InspectManager::with_root_work_gates(
+                Arc::clone(&heavy_root_work_allowed),
+                Arc::clone(&semantic_cold_seed_active),
+            )),
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
             pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
@@ -1974,7 +1976,7 @@ impl AppContext {
             semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
             artifact_reload_lock: parking_lot::Mutex::new(()),
-            semantic_cold_seed_active: Arc::new(AtomicBool::new(false)),
+            semantic_cold_seed_active,
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
             semantic_callgraph_warm_deferred: AtomicBool::new(false),
@@ -2168,6 +2170,10 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
+        let tier2_in_flight = match self.inspect_manager.try_tier2_any_in_flight() {
+            Some(in_flight) => in_flight,
+            None => return RootHealthSummary::busy(),
+        };
         let bash = match self.bash_background.try_health_counts() {
             Some(counts) => counts,
             None => return RootHealthSummary::busy(),
@@ -2229,6 +2235,10 @@ impl AppContext {
             || !self.inspect_manager.automatic_tier2_refresh_enabled();
         let tier2_status = if tier2_complete {
             "ready"
+        } else if tier2_in_flight {
+            // A first scan has no aggregate to expose yet, but it is still warming.
+            // Keep the root in the health rollup until that worker publishes.
+            "building"
         } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
             // A partial snapshot can be "building" only when this root is
             // allowed to run the refresh that would complete it.
@@ -4070,7 +4080,13 @@ impl AppContext {
         }
 
         let limiter = self.cold_build_limiter();
-        let Some(permit) = limiter.try_acquire() else {
+        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "callgraph-background",
+            crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let Some(permit) =
+            crate::cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
+        else {
             crate::slog_info!(
                 "callgraph store background work deferred by cold build limit ({})",
                 limiter.limit()

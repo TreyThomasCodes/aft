@@ -10,6 +10,8 @@ use crate::context::AppContext;
 use crate::inspect::diagnostics_category::{
     check_diagnostics_phase_boundary, diagnostics_phase_timeout, run_diagnostics_category,
 };
+#[cfg(test)]
+use crate::inspect::InspectBuilderState;
 use crate::inspect::{
     format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
@@ -214,7 +216,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[])
+    handle_inspect_payload(req, ctx, false, false, &[], &[], None)
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -267,6 +269,7 @@ fn handle_inspect_payload(
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
     expected_producers: &[ServerKey],
+    phase_log: Option<&InspectPhaseLog>,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -304,8 +307,31 @@ fn handle_inspect_payload(
         let manager = manager.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
+        let callgraph_phase = phase_log.and_then(|phase_log| {
+            if category != InspectCategory::DeadCode {
+                return None;
+            }
+            let phase = phase_log.start(InspectPhaseEntry::category(
+                InspectPhaseId::CallgraphReady,
+                category,
+            ));
+            if manager.callgraph_ready_for_snapshot(&snapshot) {
+                phase.complete();
+                None
+            } else {
+                Some(phase)
+            }
+        });
+        let tier2_phase = phase_log.map(|phase_log| {
+            phase_log.start(InspectPhaseEntry::category(
+                InspectPhaseId::Tier2Rescan,
+                category,
+            ))
+        });
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancellation = crate::executor::current_job_cancellation();
         std::thread::spawn(move || {
+            let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let outcome = if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
             } else {
@@ -315,7 +341,12 @@ fn handle_inspect_payload(
         });
         tier2_receivers.insert(
             category,
-            (rx, std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT),
+            (
+                rx,
+                std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT,
+                callgraph_phase,
+                tier2_phase,
+            ),
         );
     }
 
@@ -338,9 +369,14 @@ fn handle_inspect_payload(
                 expected_producers,
             )
         } else if category.is_tier2() {
-            if let Some((rx, deadline)) = tier2_receivers.remove(category) {
-                match receive_tier2_completion_until(rx, *category, deadline) {
-                    Some(outcome) => outcome,
+            if let Some((rx, deadline, callgraph_phase, tier2_phase)) =
+                tier2_receivers.remove(category)
+            {
+                match receive_tier2_completion_until(rx, manager.as_ref(), *category, deadline) {
+                    Some(outcome) => {
+                        finish_tier2_phases(&outcome, callgraph_phase, tier2_phase);
+                        outcome
+                    }
                     None => return inspect_interrupted_response(&req.id),
                 }
             } else {
@@ -711,6 +747,7 @@ fn run_blocking_inspect_body(
         applicability.server_keys.is_empty(),
         &start_outcomes.failures,
         &start_outcomes.successful,
+        Some(&phase_log),
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -1043,8 +1080,46 @@ fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     ))
 }
 
+fn finish_tier2_phases(
+    outcome: &JobOutcome,
+    callgraph_phase: Option<crate::inspect::phase_log::InspectPhaseHandle>,
+    tier2_phase: Option<crate::inspect::phase_log::InspectPhaseHandle>,
+) {
+    match outcome {
+        JobOutcome::Fresh { payload } => {
+            if let Some(callgraph_phase) = callgraph_phase {
+                if payload.get("callgraph_available").and_then(Value::as_bool) == Some(true) {
+                    callgraph_phase.complete();
+                } else {
+                    callgraph_phase.fail("dead_code aggregate has no ready callgraph snapshot");
+                }
+            }
+            if let Some(tier2_phase) = tier2_phase {
+                tier2_phase.complete();
+            }
+        }
+        JobOutcome::Failed { message } => {
+            if let Some(callgraph_phase) = callgraph_phase {
+                callgraph_phase.fail(message);
+            }
+            if let Some(tier2_phase) = tier2_phase {
+                tier2_phase.fail(message);
+            }
+        }
+        JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => {
+            if let Some(callgraph_phase) = callgraph_phase {
+                callgraph_phase.fail("dead_code aggregate did not become fresh");
+            }
+            if let Some(tier2_phase) = tier2_phase {
+                tier2_phase.fail("Tier-2 aggregate did not become fresh");
+            }
+        }
+    }
+}
+
 fn receive_tier2_completion_until(
     rx: std::sync::mpsc::Receiver<JobOutcome>,
+    manager: &crate::inspect::InspectManager,
     category: InspectCategory,
     deadline: std::time::Instant,
 ) -> Option<JobOutcome> {
@@ -1053,9 +1128,10 @@ fn receive_tier2_completion_until(
         if now >= deadline {
             return Some(JobOutcome::Failed {
                 message: format!(
-                    "inspect_phase_timeout: {} did not complete within {}s",
+                    "inspect_phase_timeout: tier2 {} aggregate did not complete within {}s; builder_state={}",
                     category.as_str(),
-                    BLOCKING_TIER2_PHASE_TIMEOUT.as_secs()
+                    BLOCKING_TIER2_PHASE_TIMEOUT.as_secs(),
+                    manager.tier2_builder_state(category).as_str(),
                 ),
             });
         }
@@ -3094,15 +3170,38 @@ mod deferred_terminal_tests {
     #[test]
     fn blocking_tier2_wait_has_a_hard_phase_deadline() {
         let (_tx, rx) = std::sync::mpsc::channel();
+        let manager = crate::inspect::InspectManager::new();
         let outcome = receive_tier2_completion_until(
             rx,
+            &manager,
             InspectCategory::DeadCode,
             std::time::Instant::now() + Duration::from_millis(20),
         )
         .expect("deadline produces an honest failure");
         assert!(matches!(
             outcome,
-            JobOutcome::Failed { message } if message.contains("inspect_phase_timeout")
+            JobOutcome::Failed { message }
+                if message.contains("inspect_phase_timeout")
+                    && message.contains("tier2 dead_code aggregate")
+                    && message.contains("builder_state=absent")
         ));
+    }
+
+    #[test]
+    fn inspect_builder_state_detail_uses_stable_honest_names() {
+        assert_eq!(InspectBuilderState::Building.as_str(), "building");
+        assert_eq!(
+            InspectBuilderState::QueuedBehindColdBuilds.as_str(),
+            "queued_behind_cold_builds"
+        );
+        assert_eq!(
+            InspectBuilderState::GatedBySemanticSeed.as_str(),
+            "gated_by_semantic_seed"
+        );
+        assert_eq!(
+            InspectBuilderState::BuildDenied.as_str(),
+            "build_denied (borrow-only)"
+        );
+        assert_eq!(InspectBuilderState::Absent.as_str(), "absent");
     }
 }

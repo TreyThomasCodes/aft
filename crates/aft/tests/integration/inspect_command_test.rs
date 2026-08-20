@@ -3053,6 +3053,16 @@ fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
         phases.iter().any(|phase| phase["id"] == "lsp_quiescence"),
         "quiescence must complete before the fresh terminal: {response:#}"
     );
+    assert!(
+        phases
+            .iter()
+            .any(|phase| { phase["id"] == "callgraph_ready" && phase["category"] == "dead_code" }),
+        "fresh dead_code must record the ready callgraph phase: {response:#}"
+    );
+    assert!(
+        phases.iter().any(|phase| phase["id"] == "tier2_rescan"),
+        "fresh Tier-2 work must appear in the completed phases: {response:#}"
+    );
     let summary = response["summary"]["diagnostics"]
         .as_object()
         .expect("diagnostics summary");
