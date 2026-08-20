@@ -2,6 +2,7 @@
   "artifact_id": "gh-routing-manifest",
   "manifest_version": 1,
   "schema_floor": 1,
+  "issued_at_unix_secs": 1787184000,
   "detectors": {
     "wrapper_config_dirs": ["~/.config/gh-alfonso-*/"],
     "credential_env_names": ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"]

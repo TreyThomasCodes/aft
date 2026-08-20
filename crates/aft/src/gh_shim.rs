@@ -3,6 +3,12 @@
 //! The shim is intentionally a small process boundary: R1/R2 and declared
 //! mechanical R3 operations replace this process with upstream `gh`, while the
 //! governed path is the only path that interprets a declared command shape.
+//!
+//! Governed invocations are executed seam-side by the route holder under full
+//! GitHub App installation tokens held in custody; the shim carries a routed
+//! request one way and a result-or-refusal the other, and holds no token in
+//! either direction. Operation gating is holder-side classification over the
+//! routed request, not a property of any token the shim can see or hold.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -21,11 +27,18 @@ use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
 
 pub const SCHEMA_FLOOR: u64 = 1;
+/// Envelope version that carries the manifest as exact signed bytes. Envelope
+/// v1 re-serialized the parsed manifest at verify time; envelope v2 verifies
+/// the distributed bytes themselves (see the verifier-site contract).
+pub const ENVELOPE_VERSION: u64 = 2;
 pub const REFUSAL_EXIT_STATUS: i32 = 86;
 const DISCOVERY_BUDGET: Duration = Duration::from_millis(150);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
 const MANIFEST_TTL: Duration = Duration::from_secs(15 * 60);
 const MANIFEST_STALE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Clock skew tolerated before a manifest's signed issue time counts as being
+/// in the future and therefore invalid.
+const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
 const ROUTING_OPERATION: &str = "gh.route";
 const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
@@ -41,6 +54,7 @@ pub enum RefusalCode {
     AdminTier,
     ManifestStale,
     ManifestBelowFloor,
+    ManifestRegressed,
     SeamSchemaMismatch,
     UnboundIdentity,
     BypassAuditUnavailable,
@@ -50,11 +64,12 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestStale,
         Self::ManifestBelowFloor,
+        Self::ManifestRegressed,
         Self::SeamSchemaMismatch,
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
@@ -69,6 +84,7 @@ impl RefusalCode {
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestStale => "gh_shim_manifest_stale",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
+            Self::ManifestRegressed => "gh_shim_manifest_regressed",
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
@@ -88,15 +104,19 @@ pub enum SelfReportDiagnostic {
     ManifestInvalid,
     ManifestBelowFloor,
     ManifestStale,
+    ManifestRegressed,
+    ManifestRollback,
     RungUnavailable,
 }
 
 impl SelfReportDiagnostic {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::ManifestUnavailable,
         Self::ManifestInvalid,
         Self::ManifestBelowFloor,
         Self::ManifestStale,
+        Self::ManifestRegressed,
+        Self::ManifestRollback,
         Self::RungUnavailable,
     ];
 
@@ -106,6 +126,8 @@ impl SelfReportDiagnostic {
             Self::ManifestInvalid => "gh_shim_status_manifest_invalid",
             Self::ManifestBelowFloor => "gh_shim_status_manifest_below_floor",
             Self::ManifestStale => "gh_shim_status_manifest_stale",
+            Self::ManifestRegressed => "gh_shim_status_manifest_regressed",
+            Self::ManifestRollback => "gh_shim_status_manifest_rollback",
             Self::RungUnavailable => "gh_shim_status_rung_unavailable",
         }
     }
@@ -194,6 +216,19 @@ fn run(args: &[OsString]) -> i32 {
 
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Presence-based regressed-manifest arm. Decided from the installed
+    // artifact BEFORE any rung probe so a governed refusal never depends on
+    // daemon reachability: past the last-valid grace window, governed/admin
+    // tuples refuse and mechanical operations pass through whatever the rung
+    // cache says.
+    if let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) {
+        return match regressed_disposition(args, &manifest, current_platform()) {
+            RegressedDisposition::Passthrough => delegate(args),
+            RegressedDisposition::Refuse { code, text } => refuse(code, &text),
+        };
+    }
+
     let determination = determine_rung(&paths, &cwd, now);
     if determination.rung != Rung::R3 {
         return delegate(args);
@@ -201,11 +236,17 @@ fn run(args: &[OsString]) -> i32 {
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or expires between those
-    // two moments, B1 requires whole-invocation R2 passthrough instead of a
-    // classification-shaped refusal.
-    let manifest = match load_manifest(&paths, now) {
-        Ok(manifest) => manifest,
-        Err(_) => return delegate(args),
+    // two moments, the whole invocation falls back to R2 passthrough instead
+    // of a classification-shaped refusal.
+    let manifest = match resolve_manifest(&paths, now) {
+        ManifestResolution::Active(manifest) | ManifestResolution::GraceCache(manifest) => manifest,
+        ManifestResolution::Regressed(manifest) => {
+            return match regressed_disposition(args, &manifest, current_platform()) {
+                RegressedDisposition::Passthrough => delegate(args),
+                RegressedDisposition::Refuse { code, text } => refuse(code, &text),
+            }
+        }
+        ManifestResolution::Dormant => return delegate(args),
     };
     let Some(agent_binding) = resolved_agent_binding(&manifest, &cwd) else {
         return delegate(args);
@@ -297,6 +338,8 @@ struct StatePaths {
     bypass_audit: PathBuf,
     unexpected_gh_route_advertisers: PathBuf,
     seam_state: PathBuf,
+    last_valid_manifest: PathBuf,
+    version_high_water: PathBuf,
 }
 
 impl StatePaths {
@@ -323,6 +366,8 @@ impl StatePaths {
             bypass_audit: root.join("operator-bypass.jsonl"),
             unexpected_gh_route_advertisers: root.join("unexpected-gh-route-advertisers.json"),
             seam_state: root.join("seam-state.json"),
+            last_valid_manifest: root.join("last-valid-manifest.json"),
+            version_high_water: root.join("manifest-version-high-water.json"),
             root,
         }
     }
@@ -426,9 +471,9 @@ fn determine_rung_from_doc(
     }
     if let Some(record) = cached.as_ref().filter(|record| record.fresh_at(now)) {
         if record.rung != Rung::R3
-            || load_manifest(paths, now)
-                .ok()
-                .and_then(|manifest| resolved_agent_binding(&manifest, cwd))
+            || resolve_manifest(paths, now)
+                .manifest()
+                .and_then(|manifest| resolved_agent_binding(manifest, cwd))
                 .is_some()
         {
             return record.clone();
@@ -437,13 +482,13 @@ fn determine_rung_from_doc(
 
     // The signed manifest supplies the binding before the probe opens a route, so
     // rate accounting and audit records use the same agent session on every run.
-    let manifest = match load_manifest(paths, now) {
-        Ok(manifest) => manifest,
-        Err(_) => {
-            let record = RungRecord::r2(now, "manifest_unavailable", None);
-            write_rung_record_silently(paths, &record);
-            return record;
-        }
+    // A failing artifact inside the last-valid grace window still supplies the
+    // cached manifest; the regressed arm itself is decided in `run` before any
+    // probe.
+    let Some(manifest) = resolve_manifest(paths, now).into_manifest() else {
+        let record = RungRecord::r2(now, "manifest_unavailable", None);
+        write_rung_record_silently(paths, &record);
+        return record;
     };
     let Some(agent_binding) = resolved_agent_binding(&manifest, cwd) else {
         let record = RungRecord::r2(
@@ -885,6 +930,10 @@ struct Manifest {
     artifact_id: String,
     manifest_version: u64,
     schema_floor: u64,
+    /// When the signer issued this manifest. Lives inside the signed bytes so
+    /// freshness cannot be re-stamped locally; the verifier keys TTL/grace off
+    /// this field and never off the envelope-side fetch time.
+    issued_at_unix_secs: u64,
     #[serde(default)]
     detectors: Detectors,
     #[serde(default)]
@@ -1042,21 +1091,42 @@ fn platform_matches(platforms: &[String], current: &str) -> bool {
         .any(|platform| platform.eq_ignore_ascii_case(current))
 }
 
+/// Envelope v2: the manifest body travels as the EXACT bytes the signer
+/// published. `manifest_bytes` is an opaque string holding that file's
+/// contents verbatim; the verifier checks the signature over those bytes
+/// BEFORE parsing them, so the signature contract is "the signer signed the
+/// file it publishes" and no canonicalization rule exists on this side.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SignedManifest {
     artifact_id: String,
+    envelope_version: u64,
     key_id: String,
+    /// Advisory local metadata only: when this machine stored the artifact.
+    /// Freshness is keyed off the signed `issued_at_unix_secs` inside
+    /// `manifest_bytes`; this field is never consulted for staleness, so
+    /// re-stamping it locally buys nothing.
     fetched_at_unix_secs: u64,
     signature: String,
-    manifest: Manifest,
+    manifest_bytes: String,
 }
 
 #[derive(Clone, Debug)]
 enum ManifestProblem {
     Missing,
     Invalid(String),
-    BelowFloor { manifest_floor: u64 },
-    Stale { manifest_version: u64 },
+    BelowFloor {
+        manifest_floor: u64,
+    },
+    Stale {
+        manifest_version: u64,
+    },
+    /// The manifest is validly signed but its version is below the newest
+    /// version ever accepted on this machine: a rollback incident, never an
+    /// ordinary out-of-order arrival.
+    RolledBack {
+        manifest_version: u64,
+        newest_accepted: u64,
+    },
 }
 
 impl ManifestProblem {
@@ -1066,6 +1136,7 @@ impl ManifestProblem {
             Self::Invalid(_) => SelfReportDiagnostic::ManifestInvalid,
             Self::BelowFloor { .. } => SelfReportDiagnostic::ManifestBelowFloor,
             Self::Stale { .. } => SelfReportDiagnostic::ManifestStale,
+            Self::RolledBack { .. } => SelfReportDiagnostic::ManifestRollback,
         }
     }
 
@@ -1081,41 +1152,140 @@ impl ManifestProblem {
                 "{} (manifest version {manifest_version})",
                 RefusalCode::ManifestStale.as_str()
             ),
+            Self::RolledBack {
+                manifest_version,
+                newest_accepted,
+            } => format!(
+                "{} (manifest version {manifest_version}, newest accepted version {newest_accepted})",
+                SelfReportDiagnostic::ManifestRollback.as_str()
+            ),
         }
     }
 }
 
+/// Verifier-site contract for the signed routing manifest.
+///
+/// RAW DISTRIBUTED BYTES. The manifest body travels inside the envelope as the
+/// exact bytes the signer published (`manifest_bytes`). This function verifies
+/// the received bytes FIRST and parses them into a `Manifest` SECOND. The
+/// signer signs the file it publishes; no canonicalization rule exists on this
+/// side, so no field reorder, re-indent, or re-encode can break (or silently
+/// reshape) the signature contract across languages. Verifying a parsed and
+/// re-serialized struct instead would make every serializer a party to the
+/// signature.
+///
+/// SIGNED FRESHNESS. Freshness is keyed off `issued_at_unix_secs`, which lives
+/// inside the signed bytes. The envelope-side fetch time is advisory local
+/// metadata only: an envelope-side timestamp can be re-stamped locally, which
+/// would let an old signed manifest replay forever and dodge exactly the
+/// governed-set additions shipped in a newer manifest.
+///
+/// TWO-SIDED BOUND (the custody bar stays at config integrity). The governed
+/// EXECUTION vocabulary is compiled into the route holder (vendored
+/// classification); no manifest can widen what the holder executes. The
+/// manifest governs shim-side routing selection only. Manifest tampering is
+/// therefore bounded above by the holder's vendored set and below by the
+/// shim's refusal arms. If classification ever moves INTO the manifest, the
+/// trust root flips from integrity to authority and the custody design must be
+/// revisited first.
+///
+/// Delta property, phrased for the manifest approver: NARROWING a manifest
+/// WIDENS the key-compromise surface. The delta is the compiled vocabulary
+/// minus what this manifest routes; every operation a manifest stops routing
+/// joins the set a compromised signing key could re-enable. The approval
+/// question for a narrowing change is "am I content that a key compromise
+/// re-enables exactly the operations this manifest stops routing", not "does
+/// this look tighter". The holder-side vendored vocabulary guards the widening
+/// direction; this line guards the narrowing one.
+///
+/// DORMANCY VALVE AND LOCAL STATE. With no manifest artifact on disk the shim
+/// is dormant and passes invocations through (R2, reason
+/// `manifest_unavailable`). That valve's weakness — a local downgrade to
+/// dormant by deleting the artifact — is only reachable by an adversary with
+/// local write access, who can equally patch the compiled-in trust set or this
+/// verifier itself; the weakness is only reachable by an adversary the design
+/// already cannot survive. The same argument covers the local state this
+/// verifier maintains: the last-valid manifest cache and the monotonic version
+/// high-water mark are enforcement conveniences, not a security boundary, and
+/// an adversary who can delete, forge, or lower them can patch the verifier.
+///
+/// TOKEN LANGUAGE. The holder executes governed calls under full-installation
+/// GitHub App tokens held in custody; operation gating is holder-side
+/// classification over the routed request. The shim never holds any token in
+/// either direction.
 fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProblem> {
     let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
     let envelope: SignedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
-    if envelope.artifact_id != MANIFEST_ARTIFACT_ID
-        || envelope.manifest.artifact_id != MANIFEST_ARTIFACT_ID
-    {
+    if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
         return Err(ManifestProblem::Invalid("artifact id mismatch".to_string()));
     }
-    verify_manifest_signature(&envelope)?;
-    envelope
-        .manifest
-        .validate()
-        .map_err(ManifestProblem::Invalid)?;
-    if envelope.manifest.schema_floor < SCHEMA_FLOOR {
+    if envelope.envelope_version != ENVELOPE_VERSION {
+        return Err(ManifestProblem::Invalid(format!(
+            "unsupported envelope version {} (this shim verifies envelope version {ENVELOPE_VERSION})",
+            envelope.envelope_version
+        )));
+    }
+    // Verify the received bytes FIRST, parse SECOND (contract above).
+    let manifest = verify_manifest_signature(&envelope)?;
+    manifest.validate().map_err(ManifestProblem::Invalid)?;
+    if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
-            manifest_floor: envelope.manifest.schema_floor,
+            manifest_floor: manifest.schema_floor,
         });
     }
-    if now.saturating_sub(envelope.fetched_at_unix_secs)
+    // Monotonic version high-water mark: a manifest older than the newest ever
+    // accepted here is refused as a rollback incident. Checked before the
+    // issue-time rules so a rollback is never masked by staleness: any past
+    // manifest that once carried a wider vocabulary still verifies inside the
+    // staleness window, so replaying it must fail on version, not time.
+    let newest_accepted = version_high_water(paths);
+    if manifest.manifest_version < newest_accepted {
+        return Err(ManifestProblem::RolledBack {
+            manifest_version: manifest.manifest_version,
+            newest_accepted,
+        });
+    }
+    if manifest.issued_at_unix_secs > now + ISSUED_AT_FUTURE_SKEW.as_secs() {
+        return Err(ManifestProblem::Invalid(format!(
+            "issued_at_unix_secs {} is more than {} seconds in the future",
+            manifest.issued_at_unix_secs,
+            ISSUED_AT_FUTURE_SKEW.as_secs()
+        )));
+    }
+    if now.saturating_sub(manifest.issued_at_unix_secs)
         > MANIFEST_TTL.as_secs() + MANIFEST_STALE_GRACE.as_secs()
     {
         return Err(ManifestProblem::Stale {
-            manifest_version: envelope.manifest.manifest_version,
+            manifest_version: manifest.manifest_version,
         });
     }
-    Ok(envelope.manifest)
+    // Accepted: advance the high-water mark and refresh the last-valid cache
+    // that the regressed-manifest arm classifies from. Both are local state
+    // under the dormancy-valve argument documented above.
+    if manifest.manifest_version > newest_accepted {
+        write_version_high_water(paths, manifest.manifest_version);
+    }
+    write_last_valid_manifest(paths, now, &manifest);
+    Ok(manifest)
 }
 
-fn verify_manifest_signature(envelope: &SignedManifest) -> Result<(), ManifestProblem> {
-    let Some(key) = trusted_manifest_key(&envelope.key_id) else {
+/// Verify the signature over the envelope's exact manifest bytes, then parse.
+/// No manifest content is interpreted before its bytes verify.
+fn verify_manifest_signature(envelope: &SignedManifest) -> Result<Manifest, ManifestProblem> {
+    verify_manifest_signature_with(envelope, compiled_manifest_trust_set())
+}
+
+fn verify_manifest_signature_with(
+    envelope: &SignedManifest,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<Manifest, ManifestProblem> {
+    let Some(key) = trust_set
+        .iter()
+        .flatten()
+        .find(|slot| slot.key_id == envelope.key_id)
+        .map(|slot| slot.public_key)
+    else {
         return Err(ManifestProblem::Invalid(format!(
             "untrusted manifest key id {}",
             envelope.key_id
@@ -1124,11 +1294,22 @@ fn verify_manifest_signature(envelope: &SignedManifest) -> Result<(), ManifestPr
     let signature = base64::engine::general_purpose::STANDARD
         .decode(&envelope.signature)
         .map_err(|_| ManifestProblem::Invalid("invalid detached signature encoding".to_string()))?;
-    let bytes = serde_json::to_vec(&envelope.manifest)
-        .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
     UnparsedPublicKey::new(&ED25519, key)
-        .verify(&bytes, &signature)
-        .map_err(|_| ManifestProblem::Invalid("detached signature verification failed".to_string()))
+        .verify(envelope.manifest_bytes.as_bytes(), &signature)
+        .map_err(|_| {
+            ManifestProblem::Invalid("detached signature verification failed".to_string())
+        })?;
+    serde_json::from_str(&envelope.manifest_bytes).map_err(|error| {
+        ManifestProblem::Invalid(format!("signed manifest bytes failed to parse: {error}"))
+    })
+}
+
+/// One trusted manifest signing key: a stable key id plus the Ed25519 public
+/// key bytes that id binds.
+#[derive(Clone, Copy)]
+struct ManifestTrustKey {
+    key_id: &'static str,
+    public_key: &'static [u8],
 }
 
 // A manifest signature is the barrier preventing an agent from editing its own
@@ -1137,8 +1318,35 @@ fn verify_manifest_signature(envelope: &SignedManifest) -> Result<(), ManifestPr
 // release build has no trust root until the separately reviewed CKCRED custody
 // release supplies one, which keeps release binaries at R2 rather than making a
 // governance claim with a test key.
+//
+// TWO-KEY TRUST SET. The release trust array ships with TWO key slots from day
+// one: the live signing key and a cold standby with a distinct key id. The dev
+// set keeps its single test key.
+//
+// The production signing keys are minted and held by the key-custody process
+// outside this repository; a separately reviewed release copies each approved
+// public key into these slots (the private half never approaches the build).
+// Until that happens both slots stay empty and release binaries remain at R2.
+//
+// Two-release rotation procedure once the slots are filled:
+//   1. Ship a release whose standby slot carries the standby key. Both slots
+//      verify; the live key still signs. The standby key comes from custody,
+//      never from a self-generated filler.
+//   2. Promote the standby by shipping a manifest signed by it. The trust set
+//      already accepts it, so promotion does not depend on updating binaries
+//      first.
+//   3. One release later, remove the old key. Between promotion and removal a
+//      compromise of the old key can still sign, so the removal release is
+//      part of the rotation rather than optional cleanup.
+//
+// Slot layout: index 0 is the LIVE signing key, index 1 is the COLD STANDBY.
+// The first manifest signature verifying under a newly installed live key is
+// the stored-key-equals-published-half acceptance test for that installation.
 #[cfg(not(debug_assertions))]
-const RELEASE_MANIFEST_KEYS: &[(&str, &[u8])] = &[];
+const RELEASE_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
+    None, // live
+    None, // cold standby
+];
 
 #[cfg(debug_assertions)]
 const DEV_MANIFEST_KEY_ID: &str = "gh-routing-dev-test-key-v1";
@@ -1147,18 +1355,180 @@ const DEV_MANIFEST_PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
+#[cfg(debug_assertions)]
+const DEV_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 1] = &[Some(ManifestTrustKey {
+    key_id: DEV_MANIFEST_KEY_ID,
+    public_key: &DEV_MANIFEST_PUBLIC_KEY,
+})];
 
-fn trusted_manifest_key(key_id: &str) -> Option<&'static [u8]> {
+fn compiled_manifest_trust_set() -> &'static [Option<ManifestTrustKey>] {
     #[cfg(debug_assertions)]
-    if key_id == DEV_MANIFEST_KEY_ID {
-        return Some(&DEV_MANIFEST_PUBLIC_KEY);
+    {
+        DEV_MANIFEST_TRUST_SET
     }
     #[cfg(not(debug_assertions))]
-    if let Some((_, key)) = RELEASE_MANIFEST_KEYS.iter().find(|(id, _)| *id == key_id) {
-        return Some(*key);
+    {
+        RELEASE_MANIFEST_TRUST_SET
     }
-    let _ = key_id;
-    None
+}
+
+/// Outcome of resolving the installed manifest artifact for an invocation.
+///
+/// The state is keyed on what is INSTALLED on disk, never on memory of past
+/// validation: every call re-reads the artifact and re-derives its
+/// disposition from the artifact plus the local last-valid cache.
+#[derive(Debug)]
+enum ManifestResolution {
+    /// The installed artifact verified: normal classification.
+    Active(Manifest),
+    /// The installed artifact FAILED verification, but the last-valid manifest
+    /// cache is inside its grace window: classify from that cache.
+    GraceCache(Manifest),
+    /// The installed artifact FAILED verification and the grace window of the
+    /// last-valid cache has expired: governed/admin tuples the cache
+    /// classifies are refused; mechanical operations pass through.
+    Regressed(Manifest),
+    /// No manifest artifact on disk (dormant), or a failing artifact on a
+    /// machine that never validated one: whole-invocation R2 passthrough.
+    Dormant,
+}
+
+impl ManifestResolution {
+    fn manifest(&self) -> Option<&Manifest> {
+        match self {
+            Self::Active(manifest) | Self::GraceCache(manifest) | Self::Regressed(manifest) => {
+                Some(manifest)
+            }
+            Self::Dormant => None,
+        }
+    }
+
+    fn into_manifest(self) -> Option<Manifest> {
+        match self {
+            Self::Active(manifest) | Self::GraceCache(manifest) | Self::Regressed(manifest) => {
+                Some(manifest)
+            }
+            Self::Dormant => None,
+        }
+    }
+}
+
+fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
+    match load_manifest(paths, now) {
+        Ok(manifest) => return ManifestResolution::Active(manifest),
+        Err(ManifestProblem::Missing) => return ManifestResolution::Dormant,
+        Err(_) => {}
+    }
+    // Artifact present but failing. Classify from the last-valid cache while
+    // inside its grace window; past grace the refusal arm takes over. No cache
+    // at all means this machine never validated a manifest, so there is
+    // nothing to regress from and the shim stays dormant.
+    match read_last_valid_manifest(paths) {
+        Some(cache) if cache_within_grace(&cache, now) => {
+            ManifestResolution::GraceCache(cache.manifest)
+        }
+        Some(cache) => ManifestResolution::Regressed(cache.manifest),
+        None => ManifestResolution::Dormant,
+    }
+}
+
+/// Disposition of one invocation under the regressed-manifest arm.
+///
+/// Governed and admin tuples, as classified by the last-valid manifest, fail
+/// closed with a stable refusal; mechanical operations pass through
+/// byte-transparently. The operator bypass does not apply here: a broken
+/// manifest means the classification itself is untrusted, so no bypass can
+/// promote it.
+fn regressed_disposition(
+    args: &[OsString],
+    manifest: &Manifest,
+    platform: &str,
+) -> RegressedDisposition {
+    match classify(args, manifest, platform) {
+        Classification::Mechanical => RegressedDisposition::Passthrough,
+        Classification::Governed { tuple, .. } | Classification::Admin { tuple } => {
+            RegressedDisposition::Refuse {
+                code: RefusalCode::ManifestRegressed,
+                text: format!(
+                    "the manifest artifact fails validation past the last-valid grace window; {tuple} is refused until the manifest is repaired"
+                ),
+            }
+        }
+        Classification::Unclassified => RegressedDisposition::Refuse {
+            code: RefusalCode::Unclassified,
+            text: "no manifest declaration for this invocation (manifest artifact fails validation)"
+                .to_string(),
+        },
+    }
+}
+
+#[derive(Debug)]
+enum RegressedDisposition {
+    Passthrough,
+    Refuse { code: RefusalCode, text: String },
+}
+
+/// Last manifest that fully verified on this machine, plus when it was last
+/// accepted. Local state under the dormancy-valve argument at the verifier
+/// site: it lets the regressed-manifest arm keep classifying while a broken
+/// artifact is repaired, and it is not a security boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LastValidManifest {
+    accepted_at_unix_secs: u64,
+    manifest: Manifest,
+}
+
+fn cache_within_grace(cache: &LastValidManifest, now: u64) -> bool {
+    now.saturating_sub(cache.accepted_at_unix_secs) <= MANIFEST_STALE_GRACE.as_secs()
+}
+
+fn read_last_valid_manifest(paths: &StatePaths) -> Option<LastValidManifest> {
+    serde_json::from_slice(&fs::read(&paths.last_valid_manifest).ok()?).ok()
+}
+
+fn write_last_valid_manifest(paths: &StatePaths, accepted_at_unix_secs: u64, manifest: &Manifest) {
+    let record = LastValidManifest {
+        accepted_at_unix_secs,
+        manifest: manifest.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&paths.root);
+    let temporary = paths.last_valid_manifest.with_extension("tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(temporary, &paths.last_valid_manifest);
+    }
+}
+
+/// Monotonic high-water mark: the newest `manifest_version` ever accepted on
+/// this machine. A manifest below it is refused as a rollback incident. Local
+/// state under the same dormancy-valve argument as the last-valid cache: an
+/// adversary who can lower it can patch this verifier.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VersionHighWater {
+    newest_accepted_version: u64,
+}
+
+fn version_high_water(paths: &StatePaths) -> u64 {
+    fs::read(&paths.version_high_water)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<VersionHighWater>(&bytes).ok())
+        .map(|record| record.newest_accepted_version)
+        .unwrap_or(0)
+}
+
+fn write_version_high_water(paths: &StatePaths, newest_accepted_version: u64) {
+    let Ok(bytes) = serde_json::to_vec(&VersionHighWater {
+        newest_accepted_version,
+    }) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&paths.root);
+    let temporary = paths.version_high_water.with_extension("tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(temporary, &paths.version_high_water);
+    }
 }
 
 #[derive(Debug)]
@@ -1901,7 +2271,11 @@ fn disabled_last_rung_report() -> LastRungReport {
 }
 
 fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
-    match load_manifest(paths, unix_seconds()) {
+    cached_manifest_report_at(paths, unix_seconds())
+}
+
+fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestReport {
+    match load_manifest(paths, now) {
         Ok(manifest) => CachedManifestReport {
             version: Some(manifest.manifest_version),
             version_error: None,
@@ -1909,14 +2283,51 @@ fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
             state_error: None,
             diagnostics: Vec::new(),
         },
-        Err(problem) => {
-            let error = problem.status_label();
+        Err(ManifestProblem::Missing) => {
+            let error = ManifestProblem::Missing.status_label();
             CachedManifestReport {
                 version: None,
                 version_error: Some(error.clone()),
                 state: None,
                 state_error: Some(error),
-                diagnostics: vec![problem.diagnostic().as_str()],
+                diagnostics: vec![SelfReportDiagnostic::ManifestUnavailable.as_str()],
+            }
+        }
+        Err(problem) => {
+            // Artifact present but failing. The regressed-manifest arm is loud
+            // in self-report: name the arm state first, then the artifact
+            // fault that triggered it.
+            match read_last_valid_manifest(paths) {
+                Some(cache) if cache_within_grace(&cache, now) => CachedManifestReport {
+                    version: Some(cache.manifest.manifest_version),
+                    version_error: None,
+                    state: Some("regressed_grace"),
+                    state_error: None,
+                    diagnostics: vec![
+                        SelfReportDiagnostic::ManifestRegressed.as_str(),
+                        problem.diagnostic().as_str(),
+                    ],
+                },
+                Some(cache) => CachedManifestReport {
+                    version: Some(cache.manifest.manifest_version),
+                    version_error: None,
+                    state: Some("regressed"),
+                    state_error: None,
+                    diagnostics: vec![
+                        SelfReportDiagnostic::ManifestRegressed.as_str(),
+                        problem.diagnostic().as_str(),
+                    ],
+                },
+                None => {
+                    let error = problem.status_label();
+                    CachedManifestReport {
+                        version: None,
+                        version_error: Some(error.clone()),
+                        state: None,
+                        state_error: Some(error),
+                        diagnostics: vec![problem.diagnostic().as_str()],
+                    }
+                }
             }
         }
     }
@@ -2128,6 +2539,17 @@ mod tests {
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
     ];
+    /// Seed for the standby-slot fixture key. Test-only material: the compiled
+    /// dev trust set keeps exactly one key, and this second keypair exists so
+    /// the two-slot trust-set mechanics (standby accepted, unknown refused)
+    /// can be exercised against an injected set.
+    const STANDBY_TEST_SEED: [u8; 32] = *b"gh-shim-standby-fixture-seed-001";
+    const DEV_STANDBY_MANIFEST_KEY_ID: &str = "gh-routing-dev-standby-key-v1";
+    /// Issue time baked into the canonical manifest fixture; every test clock
+    /// is expressed relative to it because freshness is keyed off the signed
+    /// `issued_at_unix_secs`.
+    const FIXTURE_ISSUED_AT: u64 = 1_787_184_000;
+    const TEST_NOW: u64 = FIXTURE_ISSUED_AT + 60;
     const FIXTURE_ACCEPTED_SEAM_REFUSAL_CODES: &[&str] = &[
         "identity_mismatch",
         "unmapped_operation",
@@ -2143,26 +2565,47 @@ mod tests {
         .expect("initial manifest fixture")
     }
 
-    fn signed(manifest: Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
-        let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test key");
-        assert_eq!(key.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
-        let bytes = serde_json::to_vec(&manifest).expect("manifest bytes");
+    fn signed_with(
+        manifest: &Manifest,
+        fetched_at_unix_secs: u64,
+        seed: &[u8; 32],
+        key_id: &str,
+    ) -> SignedManifest {
+        let key = Ed25519KeyPair::from_seed_unchecked(seed).expect("test key");
+        let bytes = serde_json::to_vec(manifest).expect("manifest bytes");
         SignedManifest {
             artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
-            key_id: DEV_MANIFEST_KEY_ID.to_string(),
+            envelope_version: ENVELOPE_VERSION,
+            key_id: key_id.to_string(),
             fetched_at_unix_secs,
             signature: base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),
-            manifest,
+            manifest_bytes: String::from_utf8(bytes).expect("manifest bytes are UTF-8"),
         }
+    }
+
+    fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
+        let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test key");
+        assert_eq!(key.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
+        signed_with(
+            manifest,
+            fetched_at_unix_secs,
+            &TEST_SEED,
+            DEV_MANIFEST_KEY_ID,
+        )
     }
 
     fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
         fs::create_dir_all(&paths.root).expect("state root");
         fs::write(
             &paths.manifest,
-            serde_json::to_vec(&signed(manifest, now)).expect("signed manifest"),
+            serde_json::to_vec(&signed(&manifest, now)).expect("signed manifest"),
         )
         .expect("manifest cache");
+    }
+
+    fn write_envelope_fixture(paths: &StatePaths, envelope_json: &str) {
+        fs::create_dir_all(&paths.root).expect("state root");
+        fs::write(&paths.manifest, envelope_json.as_bytes()).expect("manifest cache");
     }
 
     #[test]
@@ -2459,21 +2902,32 @@ mod tests {
     fn signed_cache_rejects_tampering_staleness_and_old_schema_floor() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let now = 1_000_000;
+        let now = TEST_NOW;
         write_signed_manifest(&paths, fixture_manifest(), now);
         assert_eq!(load_manifest(&paths, now).unwrap().manifest_version, 1);
 
+        // Tamper with the signed manifest bytes inside the envelope: the
+        // signature verifies the distributed bytes, so any edit is fatal.
         let mut value: Value = serde_json::from_slice(&fs::read(&paths.manifest).unwrap()).unwrap();
-        value["manifest"]["tiers"]["mechanical"][0]["tuple"] =
-            Value::String("issue comment".to_string());
+        let tampered =
+            value["manifest_bytes"]
+                .as_str()
+                .unwrap()
+                .replacen("issue view", "issue View", 1);
+        value["manifest_bytes"] = Value::String(tampered);
         fs::write(&paths.manifest, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(matches!(
             load_manifest(&paths, now),
             Err(ManifestProblem::Invalid(_))
         ));
+        // The accepted copy is still inside its grace window, so the self
+        // report names the regressed arm first and the artifact fault second.
         assert_eq!(
             cached_manifest_report(&paths).diagnostics,
-            vec![SelfReportDiagnostic::ManifestInvalid.as_str()]
+            vec![
+                SelfReportDiagnostic::ManifestRegressed.as_str(),
+                SelfReportDiagnostic::ManifestInvalid.as_str(),
+            ]
         );
 
         let mut below_floor = fixture_manifest();
@@ -2484,14 +2938,29 @@ mod tests {
             Err(ManifestProblem::BelowFloor { manifest_floor: 0 })
         ));
 
-        write_signed_manifest(
-            &paths,
-            fixture_manifest(),
-            now - MANIFEST_TTL.as_secs() - MANIFEST_STALE_GRACE.as_secs() - 1,
-        );
+        // Freshness keys off the signed issued_at, not the envelope fetch time.
+        let mut stale = fixture_manifest();
+        stale.issued_at_unix_secs =
+            now - MANIFEST_TTL.as_secs() - MANIFEST_STALE_GRACE.as_secs() - 1;
+        write_signed_manifest(&paths, stale, now);
         assert!(matches!(
             load_manifest(&paths, now),
             Err(ManifestProblem::Stale { .. })
+        ));
+
+        // An issue time inside the small future skew stays acceptable; beyond
+        // it the manifest is invalid.
+        let mut skewed = fixture_manifest();
+        skewed.issued_at_unix_secs = now + ISSUED_AT_FUTURE_SKEW.as_secs();
+        write_signed_manifest(&paths, skewed, now);
+        assert!(load_manifest(&paths, now).is_ok());
+
+        let mut future = fixture_manifest();
+        future.issued_at_unix_secs = now + ISSUED_AT_FUTURE_SKEW.as_secs() + 1;
+        write_signed_manifest(&paths, future, now);
+        assert!(matches!(
+            load_manifest(&paths, now),
+            Err(ManifestProblem::Invalid(_))
         ));
     }
 
@@ -2639,11 +3108,11 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 10);
+        assert_eq!(RefusalCode::ALL.len(), 11);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
-        assert_eq!(SelfReportDiagnostic::ALL.len(), 5);
+        assert_eq!(SelfReportDiagnostic::ALL.len(), 7);
         assert!(SelfReportDiagnostic::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_status_")));
@@ -2826,5 +3295,462 @@ mod tests {
         fs::write(&state_root, b"file").unwrap();
         let paths = StatePaths::from_root(state_root);
         assert!(write_seam_state(&paths, SeamState::default()).is_err());
+    }
+
+    #[test]
+    fn raw_bytes_round_trip_verifies_then_parses_from_the_fixture_envelope() {
+        let envelope: SignedManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/gh_shim/signed-envelope-v2.json"
+        ))
+        .expect("signed envelope fixture");
+        // The embedded bytes are exactly the published manifest file.
+        assert_eq!(
+            envelope.manifest_bytes,
+            include_str!("../tests/fixtures/gh_shim/initial-manifest-v1.json")
+        );
+        // Verify the received bytes first, parse second.
+        let manifest = verify_manifest_signature(&envelope).expect("fixture signature verifies");
+        assert_eq!(manifest.manifest_version, 1);
+        assert_eq!(manifest.issued_at_unix_secs, FIXTURE_ISSUED_AT);
+        manifest.validate().expect("fixture manifest validates");
+    }
+
+    #[test]
+    fn tampered_single_byte_fixture_fails_signature_verification() {
+        let canonical: SignedManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/gh_shim/signed-envelope-v2.json"
+        ))
+        .expect("canonical envelope fixture");
+        let tampered: SignedManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"
+        ))
+        .expect("tampered envelope fixture");
+        // The tampering is exactly one substituted byte inside the signed
+        // bytes; the signature is untouched.
+        assert_eq!(
+            canonical.manifest_bytes.len(),
+            tampered.manifest_bytes.len()
+        );
+        assert_eq!(
+            canonical
+                .manifest_bytes
+                .bytes()
+                .zip(tampered.manifest_bytes.bytes())
+                .filter(|(left, right)| left != right)
+                .count(),
+            1
+        );
+        assert_eq!(canonical.signature, tampered.signature);
+        assert!(matches!(
+            verify_manifest_signature(&tampered),
+            Err(ManifestProblem::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn future_and_stale_issued_at_fixtures_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-future-issued-at.json"),
+        );
+        match load_manifest(&paths, TEST_NOW) {
+            Err(ManifestProblem::Invalid(error)) => {
+                assert!(error.contains("future"), "unexpected error: {error}")
+            }
+            other => panic!("expected future issued_at refusal, got {other:?}"),
+        }
+
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-stale-issued-at.json"),
+        );
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Stale {
+                manifest_version: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn standby_key_fixture_verifies_under_a_two_slot_trust_set_and_unknown_key_ids_are_refused() {
+        let envelope: SignedManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/gh_shim/signed-envelope-v2-standby-key.json"
+        ))
+        .expect("standby envelope fixture");
+
+        let standby = Ed25519KeyPair::from_seed_unchecked(&STANDBY_TEST_SEED).expect("standby key");
+        assert_ne!(standby.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
+        let standby_public: &'static [u8] =
+            Box::leak(standby.public_key().as_ref().to_vec().into_boxed_slice());
+        let trust_set = [
+            Some(ManifestTrustKey {
+                key_id: DEV_MANIFEST_KEY_ID,
+                public_key: &DEV_MANIFEST_PUBLIC_KEY,
+            }),
+            Some(ManifestTrustKey {
+                key_id: DEV_STANDBY_MANIFEST_KEY_ID,
+                public_key: standby_public,
+            }),
+        ];
+
+        // A standby-signed manifest is accepted under the two-slot set.
+        let manifest =
+            verify_manifest_signature_with(&envelope, &trust_set).expect("standby slot verifies");
+        assert_eq!(
+            manifest.manifest_version,
+            fixture_manifest().manifest_version
+        );
+
+        // A third, unknown key id is refused by the same set.
+        let mut unknown = envelope.clone();
+        unknown.key_id = "gh-routing-unknown-key".to_string();
+        assert!(matches!(
+            verify_manifest_signature_with(&unknown, &trust_set),
+            Err(ManifestProblem::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn compiled_trust_set_shape_matches_the_two_slot_design() {
+        let slots = compiled_manifest_trust_set();
+        #[cfg(debug_assertions)]
+        {
+            // The dev set keeps exactly one test key.
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].unwrap().key_id, DEV_MANIFEST_KEY_ID);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // The release set ships two slots (live + cold standby), empty
+            // until the custody ceremony release fills them.
+            assert_eq!(slots.len(), 2);
+            assert!(slots.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn envelope_v1_shapes_are_refused_by_the_v2_verifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = fixture_manifest();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
+        let signature = base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref());
+
+        // The pre-v2 shape carried the parsed manifest object in the envelope.
+        let v1_object = json!({
+            "artifact_id": MANIFEST_ARTIFACT_ID,
+            "key_id": DEV_MANIFEST_KEY_ID,
+            "fetched_at_unix_secs": TEST_NOW,
+            "signature": signature,
+            "manifest": serde_json::to_value(&manifest).unwrap(),
+        });
+        fs::write(&paths.manifest, serde_json::to_vec(&v1_object).unwrap()).unwrap();
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Invalid(_))
+        ));
+
+        // An envelope naming an older version is refused even with raw bytes.
+        let mut old_version = signed(&manifest, TEST_NOW);
+        old_version.envelope_version = 1;
+        fs::write(&paths.manifest, serde_json::to_vec(&old_version).unwrap()).unwrap();
+        match load_manifest(&paths, TEST_NOW) {
+            Err(ManifestProblem::Invalid(error)) => {
+                assert!(
+                    error.contains("envelope version"),
+                    "unexpected error: {error}"
+                )
+            }
+            other => panic!("expected envelope version refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dormant_resolution_is_presence_based() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // No artifact on disk: dormant.
+        assert!(matches!(
+            resolve_manifest(&paths, TEST_NOW),
+            ManifestResolution::Dormant
+        ));
+
+        // A failing artifact with no last-valid cache is also dormant: nothing
+        // was ever governed on this machine, so there is nothing to regress
+        // from.
+        let untrusted = signed_with(
+            &fixture_manifest(),
+            TEST_NOW,
+            &STANDBY_TEST_SEED,
+            "gh-routing-unknown-key",
+        );
+        fs::write(&paths.manifest, serde_json::to_vec(&untrusted).unwrap()).unwrap();
+        assert!(matches!(
+            resolve_manifest(&paths, TEST_NOW),
+            ManifestResolution::Dormant
+        ));
+    }
+
+    #[test]
+    fn regressed_past_grace_refuses_governed_and_admin_and_passes_mechanical() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let accepted_at = TEST_NOW;
+
+        // Accept the canonical manifest; this writes the last-valid cache.
+        write_signed_manifest(&paths, fixture_manifest(), accepted_at);
+        load_manifest(&paths, accepted_at).expect("canonical manifest verifies");
+
+        // Break the installed artifact: signed bytes tampered after signing.
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"),
+        );
+
+        // Inside the last-valid grace window the cache still classifies.
+        assert!(matches!(
+            resolve_manifest(&paths, accepted_at + MANIFEST_STALE_GRACE.as_secs()),
+            ManifestResolution::GraceCache(_)
+        ));
+
+        // Past grace the regressed arm takes over.
+        let now = accepted_at + MANIFEST_STALE_GRACE.as_secs() + 1;
+        let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) else {
+            panic!("expected the regressed arm");
+        };
+        let governed = [
+            OsString::from("issue"),
+            OsString::from("comment"),
+            OsString::from("42"),
+            OsString::from("--body"),
+            OsString::from("hello"),
+        ];
+        assert!(matches!(
+            regressed_disposition(&governed, &manifest, "macos"),
+            RegressedDisposition::Refuse {
+                code: RefusalCode::ManifestRegressed,
+                ..
+            }
+        ));
+        let admin = [
+            OsString::from("pr"),
+            OsString::from("merge"),
+            OsString::from("1"),
+        ];
+        assert!(matches!(
+            regressed_disposition(&admin, &manifest, "macos"),
+            RegressedDisposition::Refuse {
+                code: RefusalCode::ManifestRegressed,
+                ..
+            }
+        ));
+        let mechanical = [OsString::from("issue"), OsString::from("view")];
+        assert!(matches!(
+            regressed_disposition(&mechanical, &manifest, "macos"),
+            RegressedDisposition::Passthrough
+        ));
+        let undeclared = [OsString::from("alias"), OsString::from("set")];
+        assert!(matches!(
+            regressed_disposition(&undeclared, &manifest, "macos"),
+            RegressedDisposition::Refuse {
+                code: RefusalCode::Unclassified,
+                ..
+            }
+        ));
+
+        // The self report is loud about the regressed state.
+        let report = cached_manifest_report_at(&paths, now);
+        assert_eq!(report.state, Some("regressed"));
+        assert_eq!(report.version, Some(1));
+        assert_eq!(
+            report.diagnostics,
+            vec![
+                SelfReportDiagnostic::ManifestRegressed.as_str(),
+                SelfReportDiagnostic::ManifestInvalid.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn version_high_water_refuses_rollbacks_and_the_incident_is_visible_in_self_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        // Accept the newer manifest first.
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-version-2.json"),
+        );
+        assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 2);
+        assert_eq!(version_high_water(&paths), 2);
+
+        // A validly-signed OLDER manifest is then refused as a rollback
+        // incident, never as ordinary out-of-order arrival.
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2.json"),
+        );
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::RolledBack {
+                manifest_version: 1,
+                newest_accepted: 2,
+            })
+        ));
+        let report = cached_manifest_report_at(&paths, TEST_NOW);
+        assert_eq!(
+            report.diagnostics,
+            vec![
+                SelfReportDiagnostic::ManifestRegressed.as_str(),
+                SelfReportDiagnostic::ManifestRollback.as_str(),
+            ]
+        );
+        // That rollback is also visible through the --status document.
+        let document = render_self_report(&paths).expect("self report");
+        assert!(document.contains(SelfReportDiagnostic::ManifestRollback.as_str()));
+
+        // Re-presenting the newest accepted version is not a rollback.
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-version-2.json"),
+        );
+        assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 2);
+    }
+
+    fn fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gh_shim")
+    }
+
+    fn canonical_manifest_bytes() -> Vec<u8> {
+        fs::read(fixture_dir().join("initial-manifest-v1.json"))
+            .expect("canonical manifest fixture")
+    }
+
+    fn envelope_json(envelope: &SignedManifest) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(envelope).expect("envelope serialization");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// Deterministic generator for every dev-signed envelope fixture. The
+    /// canonical fixture's signature covers the exact bytes of the checked-in
+    /// manifest file; variant fixtures re-sign their serialized variant bytes.
+    fn generate_envelope_fixtures() -> Vec<(String, Vec<u8>)> {
+        let sign = |bytes: &[u8], seed: &[u8; 32]| {
+            let key = Ed25519KeyPair::from_seed_unchecked(seed).expect("fixture key");
+            base64::engine::general_purpose::STANDARD.encode(key.sign(bytes).as_ref())
+        };
+        let envelope = |key_id: &str, seed: &[u8; 32], manifest_bytes: String| {
+            envelope_json(&SignedManifest {
+                artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
+                envelope_version: ENVELOPE_VERSION,
+                key_id: key_id.to_string(),
+                fetched_at_unix_secs: FIXTURE_ISSUED_AT,
+                signature: sign(manifest_bytes.as_bytes(), seed),
+                manifest_bytes,
+            })
+        };
+
+        let canonical = canonical_manifest_bytes();
+        let canonical_text = String::from_utf8(canonical.clone()).expect("UTF-8 manifest");
+        let canonical_signature = sign(&canonical, &TEST_SEED);
+
+        let mut fixtures = Vec::new();
+        // Raw-bytes round-trip golden: signature over the published file.
+        fixtures.push((
+            "signed-envelope-v2.json".to_string(),
+            envelope_json(&SignedManifest {
+                artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
+                envelope_version: ENVELOPE_VERSION,
+                key_id: DEV_MANIFEST_KEY_ID.to_string(),
+                fetched_at_unix_secs: FIXTURE_ISSUED_AT,
+                signature: canonical_signature.clone(),
+                manifest_bytes: canonical_text.clone(),
+            }),
+        ));
+        // Tampered-single-byte case: one substitution inside the signed bytes,
+        // keeping the ORIGINAL signature so verification must fail.
+        let tampered = canonical_text.replacen("issue view", "issue View", 1);
+        assert_ne!(tampered, canonical_text);
+        fixtures.push((
+            "signed-envelope-v2-tampered.json".to_string(),
+            envelope_json(&SignedManifest {
+                artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
+                envelope_version: ENVELOPE_VERSION,
+                key_id: DEV_MANIFEST_KEY_ID.to_string(),
+                fetched_at_unix_secs: FIXTURE_ISSUED_AT,
+                signature: canonical_signature,
+                manifest_bytes: tampered,
+            }),
+        ));
+
+        let mut variant = |name: &str, mutate: fn(&mut Manifest), seed: &[u8; 32], key_id: &str| {
+            let mut manifest = fixture_manifest();
+            mutate(&mut manifest);
+            let bytes = serde_json::to_vec(&manifest).expect("variant manifest bytes");
+            fixtures.push((
+                name.to_string(),
+                envelope(
+                    key_id,
+                    seed,
+                    String::from_utf8(bytes).expect("UTF-8 variant bytes"),
+                ),
+            ));
+        };
+        variant(
+            "signed-envelope-v2-future-issued-at.json",
+            |manifest| {
+                manifest.issued_at_unix_secs =
+                    FIXTURE_ISSUED_AT + ISSUED_AT_FUTURE_SKEW.as_secs() + 3300;
+            },
+            &TEST_SEED,
+            DEV_MANIFEST_KEY_ID,
+        );
+        variant(
+            "signed-envelope-v2-stale-issued-at.json",
+            |manifest| {
+                manifest.issued_at_unix_secs = FIXTURE_ISSUED_AT - 2_000_000;
+            },
+            &TEST_SEED,
+            DEV_MANIFEST_KEY_ID,
+        );
+        variant(
+            "signed-envelope-v2-version-2.json",
+            |manifest| {
+                manifest.manifest_version = 2;
+            },
+            &TEST_SEED,
+            DEV_MANIFEST_KEY_ID,
+        );
+        variant(
+            "signed-envelope-v2-standby-key.json",
+            |_manifest| {},
+            &STANDBY_TEST_SEED,
+            DEV_STANDBY_MANIFEST_KEY_ID,
+        );
+        fixtures
+    }
+
+    #[test]
+    fn signed_envelope_fixtures_match_their_generator() {
+        let regen = std::env::var_os("AFT_GH_SHIM_REGEN").is_some();
+        for (name, bytes) in generate_envelope_fixtures() {
+            let path = fixture_dir().join(&name);
+            if regen {
+                fs::write(&path, &bytes).expect("write fixture");
+                continue;
+            }
+            let disk = fs::read(&path)
+                .unwrap_or_else(|error| panic!("fixture {name} is missing: {error}"));
+            assert_eq!(
+                disk, bytes,
+                "fixture {name} drifted from its generator; rerun with AFT_GH_SHIM_REGEN=1"
+            );
+        }
     }
 }
