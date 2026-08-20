@@ -95,6 +95,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   # content-derived (name + hash), so every rebuild mints a new one and any
   # macOS grant keyed to the identifier (TCC etc.) silently dies per stage.
   codesign --force --sign - --identifier "$(basename "$BINARY_PATH")" "$BINARY_PATH"
+  # Post-sign digest sidecar: ad-hoc signing shifts the bytes, so any later
+  # placement verification must compare against the digest AFTER signing.
+  # Emitting it next to the binary moves that rule from operator memory into
+  # artifact shape - the file carries the correct comparison value.
+  shasum -a 256 "$BINARY_PATH" | awk '{print $1}' > "${BINARY_PATH}.sha256.postsign"
 
   # Preserve the dSYM for the staged binary. `ditto` dereferences the `aft.dSYM`
   # symlink cargo emits (it points at a hash-named bundle under deps/) and
