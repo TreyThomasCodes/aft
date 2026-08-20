@@ -634,43 +634,50 @@ fn probe_governance(
         return ProbeResult::Unreachable;
     };
 
-    match runtime.block_on(tokio::time::timeout(remaining, async move {
-        let options = ConsumerOptions {
-            call_timeout: remaining,
-            ..ConsumerOptions::default()
-        };
-        let consumer = SubcConsumer::connect(&connection_file, options)
-            .await
-            .map_err(|_| ProbeResult::Unreachable)?;
-        let catalog = consumer
-            .catalog_list()
-            .await
-            .map_err(|_| ProbeResult::Unreachable)?;
-        let holder = route_holder(&catalog.modules);
-        record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
-        let Some(module_id) = holder.module_id else {
-            return Err(ProbeResult::NoRoute);
-        };
-        let identity = BindIdentity {
-            project_root: project_root.to_string_lossy().into_owned().into(),
-            harness: "aft-gh-shim".to_string(),
-            session: gh_session_id(&agent_id),
-        };
-        let route = consumer
-            .open_route(
-                RouteTarget::ManagementSurface {
-                    module_id: module_id.clone(),
-                },
-                identity,
-                CallOptions::default(),
-            )
-            .await
-            .map_err(|_| ProbeResult::Unbound)?;
-        let _ = consumer
-            .close_handle(&route, CloseRouteOptions::default())
-            .await;
-        Ok(module_id)
-    })) {
+    // `tokio::time::timeout` creates its timer immediately. Building that
+    // future as a `block_on` argument happens before the runtime enters its
+    // context, so the timer's reactor lookup panics in this synchronous CLI.
+    // Construct it from inside the entered future instead.
+    match runtime.block_on(async move {
+        tokio::time::timeout(remaining, async move {
+            let options = ConsumerOptions {
+                call_timeout: remaining,
+                ..ConsumerOptions::default()
+            };
+            let consumer = SubcConsumer::connect(&connection_file, options)
+                .await
+                .map_err(|_| ProbeResult::Unreachable)?;
+            let catalog = consumer
+                .catalog_list()
+                .await
+                .map_err(|_| ProbeResult::Unreachable)?;
+            let holder = route_holder(&catalog.modules);
+            record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
+            let Some(module_id) = holder.module_id else {
+                return Err(ProbeResult::NoRoute);
+            };
+            let identity = BindIdentity {
+                project_root: project_root.to_string_lossy().into_owned().into(),
+                harness: "aft-gh-shim".to_string(),
+                session: gh_session_id(&agent_id),
+            };
+            let route = consumer
+                .open_route(
+                    RouteTarget::ManagementSurface {
+                        module_id: module_id.clone(),
+                    },
+                    identity,
+                    CallOptions::default(),
+                )
+                .await
+                .map_err(|_| ProbeResult::Unbound)?;
+            let _ = consumer
+                .close_handle(&route, CloseRouteOptions::default())
+                .await;
+            Ok(module_id)
+        })
+        .await
+    }) {
         Ok(Ok(module_id)) => ProbeResult::Ready { module_id },
         Ok(Err(result)) => result,
         Err(_) => ProbeResult::TimedOut,
