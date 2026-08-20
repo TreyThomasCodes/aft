@@ -1814,6 +1814,59 @@ fn install_callgraph_build_start_gate(
 }
 
 #[cfg(test)]
+pub(crate) fn install_callgraph_build_start_gate_for_test(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    install_callgraph_build_start_gate(root)
+}
+
+#[cfg(test)]
+static CALLGRAPH_BUILD_WAIT_MS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct CallgraphBuildWaitMsGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for CallgraphBuildWaitMsGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK for this guard's
+        // lifetime, and restored before the lock is released.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
+                None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
+            }
+        }
+    }
+}
+
+/// Serialize test overrides of the query-op inline wait. Configure-tail tests
+/// share this with query-op tests so they cannot clobber each other's env.
+#[cfg(test)]
+pub(crate) fn override_callgraph_build_wait_ms_for_test(ms: u64) -> CallgraphBuildWaitMsGuard {
+    let guard = CALLGRAPH_BUILD_WAIT_MS_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
+    // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK and restored on drop.
+    unsafe {
+        std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
+    }
+    CallgraphBuildWaitMsGuard {
+        _guard: guard,
+        previous,
+    }
+}
+
+#[cfg(test)]
 fn wait_on_callgraph_build_start_gate(root: &Path) {
     let mut slot = CALLGRAPH_BUILD_START_GATE
         .get_or_init(|| parking_lot::Mutex::new(None))
@@ -3765,6 +3818,22 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_with_wait(callgraph_build_wait_window())
+    }
+
+    /// Warm the callgraph store from the transport loop without the query-op wait.
+    ///
+    /// `callgraph_store_for_ops` honors `AFT_CALLGRAPH_BUILD_WAIT_MS` so tests can
+    /// resolve a tiny fixture to `Ready` on the first query. Configure maintenance
+    /// and semantic-cold-seed resume run on the same loop that reads stdin; blocking
+    /// that loop for the wait window means stdin EOF is not observed until the cold
+    /// build finishes or the wait expires, so the process stays alive after the
+    /// client has already closed the pipe.
+    pub(crate) fn schedule_callgraph_store_warm(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO)
+    }
+
+    fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
@@ -3858,9 +3927,9 @@ impl AppContext {
         // `Building` so the agent retries (the watcher keeps the store fresh
         // once it lands). By default this never blocks the request thread.
         //
-        // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
-        // window inline for the build to land before returning `Building`; tests
-        // set it large so fixture builds resolve to `Ready` synchronously.
+        // `wait` is the query-op inline window (`AFT_CALLGRAPH_BUILD_WAIT_MS`,
+        // default 0). Transport-loop warmers pass zero so stdin EOF stays
+        // observable while the cold build runs in the background.
         let work = if let Some(force_token) = force_token {
             CallgraphBackgroundWork::ForceRebuild(force_token)
         } else {
@@ -3871,7 +3940,6 @@ impl AppContext {
             return CallgraphStoreAccess::Building;
         }
 
-        let wait = callgraph_build_wait_window();
         if !wait.is_zero() {
             let (received, receiver_generation, receiver_epoch) = {
                 let rx_ref = self.callgraph_store_rx.lock();
@@ -4026,7 +4094,10 @@ impl AppContext {
         roots.insert(current_root.to_path_buf());
         roots
             .iter()
-            .map(|root| crate::search_index::artifact_cache_key(root))
+            // Configure already derived these keys. Re-running the git
+            // root-commit probe here would block the transport loop on spawn
+            // retries when git is missing from PATH.
+            .map(|root| self.memoized_artifact_cache_key(root))
             .collect()
     }
 
@@ -5225,7 +5296,7 @@ impl AppContext {
             return;
         }
 
-        match self.callgraph_store_for_ops() {
+        match self.schedule_callgraph_store_warm() {
             CallgraphStoreAccess::Ready(_) => {
                 crate::slog_debug!(
                     "deferred callgraph store warm completed after semantic cold seed gate cleared"
@@ -7145,47 +7216,15 @@ mod callgraph_store_for_ops_tests {
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
-    use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::{Barrier, Mutex as StdMutex, MutexGuard, OnceLock};
+    use std::sync::Barrier;
     use tempfile::TempDir;
 
-    struct CallgraphWaitWindowEnvGuard {
-        _guard: MutexGuard<'static, ()>,
-        previous: Option<OsString>,
+    fn callgraph_build_wait_ms(ms: u64) -> super::CallgraphBuildWaitMsGuard {
+        super::override_callgraph_build_wait_ms_for_test(ms)
     }
 
-    impl Drop for CallgraphWaitWindowEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by the process-local guard held for this
-            // helper's lifetime, and restored before the guard is released.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
-                    None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
-                }
-            }
-        }
-    }
-
-    fn callgraph_build_wait_ms(ms: u64) -> CallgraphWaitWindowEnvGuard {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
-        // SAFETY: serialized by LOCK above and restored by the returned guard.
-        unsafe {
-            std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
-        }
-        CallgraphWaitWindowEnvGuard {
-            _guard: guard,
-            previous,
-        }
-    }
-
-    fn force_async_callgraph_builds() -> CallgraphWaitWindowEnvGuard {
+    fn force_async_callgraph_builds() -> super::CallgraphBuildWaitMsGuard {
         callgraph_build_wait_ms(0)
     }
 
