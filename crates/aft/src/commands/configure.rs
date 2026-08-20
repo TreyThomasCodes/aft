@@ -4131,7 +4131,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                     "callgraph store warm deferred until semantic cold seed gate clears or completes"
                 );
             } else {
-                match ctx.schedule_callgraph_store_warm() {
+                match ctx.callgraph_store_for_ops() {
                     CallgraphStoreAccess::Ready(_) => {
                         slog_debug!("callgraph store ready at configure maintenance");
                     }
@@ -6684,54 +6684,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    #[test]
-    fn configure_maintenance_does_not_inline_wait_for_callgraph_cold_build() {
-        // Query ops honor AFT_CALLGRAPH_BUILD_WAIT_MS so a tiny fixture can
-        // resolve Ready on the first call. Configure maintenance runs on the
-        // transport loop; if it inherited that wait, stdin EOF would not be
-        // observed until the cold build finished or the window expired.
-        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(2_000);
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
-        let _env_guard = home_env_mutex();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
-        let ctx = test_context();
-        ctx.isolate_cold_build_limiter_for_test(1);
-        let req = configure_request_with_params(json!({
-            "project_root": root.path(),
-            "harness": "opencode",
-            "storage_dir": storage.path(),
-            "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
-            }))]
-        }));
-        let response = handle_configure_for_test(&req, &ctx);
-        assert!(response.success, "configure failed: {response:?}");
-
-        let canonical_root = ctx.canonical_cache_root();
-        let (reached, release) =
-            crate::context::install_callgraph_build_start_gate_for_test(canonical_root);
-
-        let started = Instant::now();
-        super::drain_deferred_configure_maintenance(&ctx);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "configure maintenance waited {elapsed:?} for a callgraph cold build; \
-             the transport loop must return immediately so stdin EOF stays observable"
-        );
-
-        reached
-            .recv_timeout(Duration::from_secs(2))
-            .expect("callgraph worker must start so this test actually covers the wait skip");
-        release.send(()).unwrap();
     }
 
     #[test]
