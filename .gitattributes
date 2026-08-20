@@ -1,3 +1,7 @@
+# Signed-envelope fixtures are byte-exact inputs to signature verification:
+# CRLF checkout conversion on Windows changes the signed bytes and breaks
+# the generator-match and signature tests.
+crates/aft/tests/fixtures/gh_shim/** -text
 crates/aft/tests/fixtures/pty_render/*.raw binary
 # Golden render outputs are compared byte-exact against `\n`-joined screen
 # output, so they must stay LF on every platform (Windows autocrlf would
