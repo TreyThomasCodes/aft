@@ -4363,7 +4363,7 @@ export function bannerUnused() {}
         let initial_generation = store.sqlite_path().to_path_buf();
         drop(store);
         let project_key = crate::search_index::artifact_cache_key(&root);
-        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+        crate::root_cache::enable_writer_lease_acquisition_counts_for_test();
 
         let root_for_observer = root.clone();
         let dir_for_observer = callgraph_dir.clone();

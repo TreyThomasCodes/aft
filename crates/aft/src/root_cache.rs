@@ -367,12 +367,17 @@ fn record_writer_lease_acquisition(domain: RootCacheDomain, key: &str, project_r
     }
 }
 
+/// Turn the acquisition counter on for the test process without clearing it.
+///
+/// There is deliberately no reset: the counter map is keyed by
+/// (domain, key, project_root) and every consuming test uses its own fresh
+/// temp-dir root, so each test's key starts at zero by construction. A global
+/// clear here was the only cross-test coupling - under parallel execution it
+/// wiped entries between another test's setup and its assertion, producing
+/// isolated-green/parallel-red flakes.
 #[doc(hidden)]
-pub fn reset_writer_lease_acquisition_counts_for_test() {
+pub fn enable_writer_lease_acquisition_counts_for_test() {
     WRITER_LEASE_ACQUISITION_COUNTER_ENABLED.store(true, Ordering::Relaxed);
-    if let Ok(mut counts) = writer_lease_acquisition_counts().lock() {
-        counts.clear();
-    }
 }
 
 #[doc(hidden)]
@@ -1322,7 +1327,7 @@ mod tests {
         )
         .unwrap()
         .expect("parent writer lease");
-        reset_writer_lease_acquisition_counts_for_test();
+        enable_writer_lease_acquisition_counts_for_test();
 
         let worktree_lease = WriterLease::acquire_shared(
             RootCacheDomain::Callgraph,
@@ -1358,7 +1363,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let shared_key = "unregistered-shared-key";
         let cache_dir = storage.path().join("callgraph").join(shared_key);
-        reset_writer_lease_acquisition_counts_for_test();
+        enable_writer_lease_acquisition_counts_for_test();
 
         let lease = WriterLease::acquire_shared(
             RootCacheDomain::Callgraph,
@@ -1397,7 +1402,7 @@ mod tests {
         assert_ne!(stale_key, canonical_key, "fixture must exercise the alias");
 
         let cache_dir = storage.path().join("callgraph").join(&stale_key);
-        reset_writer_lease_acquisition_counts_for_test();
+        enable_writer_lease_acquisition_counts_for_test();
         let lease = WriterLease::acquire_shared(
             RootCacheDomain::Callgraph,
             &cache_dir,

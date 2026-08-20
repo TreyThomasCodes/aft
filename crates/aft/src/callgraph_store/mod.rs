@@ -12352,7 +12352,7 @@ mod refresh_worker_tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, _main, root, project_key, callgraph_dir) = linked_worktree_fixture();
         crate::root_cache::configure_artifact_access(&root, &project_key, true);
-        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+        crate::root_cache::enable_writer_lease_acquisition_counts_for_test();
         let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let publications_for_observer = Arc::clone(&publications);
         set_cold_build_swap_observer(Some(Arc::new(move |_, _| {
@@ -12440,7 +12440,7 @@ mod refresh_worker_tests {
         set_cold_build_swap_observer(Some(Arc::new(move |_, _| {
             publications_for_observer.fetch_add(1, AtomicOrdering::SeqCst);
         })));
-        crate::root_cache::reset_writer_lease_acquisition_counts_for_test();
+        crate::root_cache::enable_writer_lease_acquisition_counts_for_test();
 
         let repaired = CallGraphStore::open_ready_repairing(callgraph_dir.clone(), owner.clone())
             .unwrap()
