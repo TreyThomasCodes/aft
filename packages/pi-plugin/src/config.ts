@@ -389,7 +389,12 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   };
 }
 
-// TODO: move this schema to a shared package/module with aft-opencode to avoid drift.
+// This schema is intentionally duplicated with aft-opencode's config.ts rather
+// than shared: the two plugins bundle independently and a shared package would
+// couple their release artifacts. Drift between the copies (and against the
+// Rust resolver) is enforced by the cross-language config parity fixtures in
+// crates/aft/tests/integration/config_parity_test.rs - schema changes that
+// disagree across the three resolvers fail that gate.
 
 const FormatterEnum = z.enum([
   "biome",
