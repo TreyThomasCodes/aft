@@ -1814,6 +1814,59 @@ fn install_callgraph_build_start_gate(
 }
 
 #[cfg(test)]
+pub(crate) fn install_callgraph_build_start_gate_for_test(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    install_callgraph_build_start_gate(root)
+}
+
+#[cfg(test)]
+static CALLGRAPH_BUILD_WAIT_MS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct CallgraphBuildWaitMsGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for CallgraphBuildWaitMsGuard {
+    fn drop(&mut self) {
+        // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK for this guard's
+        // lifetime, and restored before the lock is released.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
+                None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
+            }
+        }
+    }
+}
+
+/// Serialize test overrides of the query-op inline wait. Configure-tail tests
+/// share this with query-op tests so they cannot clobber each other's env.
+#[cfg(test)]
+pub(crate) fn override_callgraph_build_wait_ms_for_test(ms: u64) -> CallgraphBuildWaitMsGuard {
+    let guard = CALLGRAPH_BUILD_WAIT_MS_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
+    // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK and restored on drop.
+    unsafe {
+        std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
+    }
+    CallgraphBuildWaitMsGuard {
+        _guard: guard,
+        previous,
+    }
+}
+
+#[cfg(test)]
 fn wait_on_callgraph_build_start_gate(root: &Path) {
     let mut slot = CALLGRAPH_BUILD_START_GATE
         .get_or_init(|| parking_lot::Mutex::new(None))
@@ -3775,6 +3828,21 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_with_wait(callgraph_build_wait_window())
+    }
+
+    /// Warm the callgraph store from the transport loop without the query-op wait.
+    ///
+    /// Query operations can wait up to `AFT_CALLGRAPH_BUILD_WAIT_MS` for a cold
+    /// build to become ready. Configure maintenance and work resumed after semantic
+    /// index initialization run on the loop that reads stdin; waiting there would
+    /// delay EOF handling until the build or wait window finishes, leaving the
+    /// process alive after the client closes the pipe.
+    pub(crate) fn schedule_callgraph_store_warm(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO)
+    }
+
+    fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
@@ -3807,81 +3875,87 @@ impl AppContext {
             return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason));
         }
 
-        // A background build is already running; don't start a second one.
-        if self.callgraph_store_rx.lock().is_some() {
-            return CallgraphStoreAccess::Building;
-        }
+        // Query ops share an existing build instead of starting a second one.
+        // Their bounded wait below must cover work scheduled by maintenance as
+        // well as work started by the query itself.
+        let build_in_flight = self.callgraph_store_rx.lock().is_some();
 
         let Some(project_root) = self.callgraph_project_root() else {
             return CallgraphStoreAccess::Unavailable;
         };
         let callgraph_dir = self.callgraph_store_dir();
 
-        if force_token.is_none() {
-            match CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone()) {
-                Ok(Some(store)) => {
-                    let store = Arc::new(store);
-                    let installed = self.run_if_subc_bound_generation(operation_generation, || {
-                        let mut guard = self
-                            .callgraph_store
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard = Some(Arc::clone(&store));
-                        Arc::clone(&store)
-                    });
-                    let Some(store) = installed else {
-                        return CallgraphStoreAccess::Unavailable;
-                    };
-                    self.clear_callgraph_store_build_denied();
-                    self.schedule_legacy_callgraph_migration_if_needed(
-                        store.as_ref(),
-                        project_root.clone(),
-                        callgraph_dir.clone(),
-                    );
-                    return CallgraphStoreAccess::Ready(store);
-                }
-                Ok(None) => {
-                    if !self.callgraph_writer() {
-                        return CallgraphStoreAccess::Unavailable;
+        if !build_in_flight {
+            if force_token.is_none() {
+                match CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone()) {
+                    Ok(Some(store)) => {
+                        let store = Arc::new(store);
+                        let installed =
+                            self.run_if_subc_bound_generation(operation_generation, || {
+                                let mut guard = self
+                                    .callgraph_store
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                *guard = Some(Arc::clone(&store));
+                                Arc::clone(&store)
+                            });
+                        let Some(store) = installed else {
+                            return CallgraphStoreAccess::Unavailable;
+                        };
+                        self.clear_callgraph_store_build_denied();
+                        self.schedule_legacy_callgraph_migration_if_needed(
+                            store.as_ref(),
+                            project_root.clone(),
+                            callgraph_dir.clone(),
+                        );
+                        return CallgraphStoreAccess::Ready(store);
+                    }
+                    Ok(None) => {
+                        if !self.callgraph_writer() {
+                            return CallgraphStoreAccess::Unavailable;
+                        }
+                    }
+                    Err(error) => {
+                        if !self.callgraph_writer() {
+                            return CallgraphStoreAccess::Unavailable;
+                        }
+                        crate::slog_warn!(
+                            "callgraph read-only open failed before writer promotion: {}",
+                            error
+                        );
                     }
                 }
-                Err(error) => {
-                    if !self.callgraph_writer() {
-                        return CallgraphStoreAccess::Unavailable;
-                    }
-                    crate::slog_warn!(
-                        "callgraph read-only open failed before writer promotion: {}",
-                        error
-                    );
-                }
+            } else if !self.callgraph_writer() {
+                return CallgraphStoreAccess::Unavailable;
             }
-        } else if !self.callgraph_writer() {
-            return CallgraphStoreAccess::Unavailable;
+
+            if self.semantic_cold_seed_active() {
+                self.defer_callgraph_store_warm_for_semantic_cold_seed();
+                return CallgraphStoreAccess::Building;
+            }
+
+            // Cold build required: run it off the request thread and return
+            // `Building` so the agent retries (the watcher keeps the store fresh
+            // once it lands). By default this never blocks the request thread.
+            //
+            // `wait` is the query-op inline window (`AFT_CALLGRAPH_BUILD_WAIT_MS`,
+            // default 0). Transport-loop warmers pass zero so stdin EOF stays
+            // observable while the cold build runs in the background.
+            let work = if let Some(force_token) = force_token {
+                CallgraphBackgroundWork::ForceRebuild(force_token)
+            } else {
+                CallgraphBackgroundWork::Ensure
+            };
+            // A concurrent caller may have installed a receiver after the
+            // snapshot above. The spawn path deduplicates that race, and the
+            // common wait path below joins whichever build won.
+            let _ = self.spawn_callgraph_store_cold_build(
+                project_root.clone(),
+                callgraph_dir.clone(),
+                work,
+            );
         }
 
-        if self.semantic_cold_seed_active() {
-            self.defer_callgraph_store_warm_for_semantic_cold_seed();
-            return CallgraphStoreAccess::Building;
-        }
-
-        // Cold build required: run it off the request thread and return
-        // `Building` so the agent retries (the watcher keeps the store fresh
-        // once it lands). By default this never blocks the request thread.
-        //
-        // `AFT_CALLGRAPH_BUILD_WAIT_MS` (default 0) optionally waits a bounded
-        // window inline for the build to land before returning `Building`; tests
-        // set it large so fixture builds resolve to `Ready` synchronously.
-        let work = if let Some(force_token) = force_token {
-            CallgraphBackgroundWork::ForceRebuild(force_token)
-        } else {
-            CallgraphBackgroundWork::Ensure
-        };
-        if !self.spawn_callgraph_store_cold_build(project_root.clone(), callgraph_dir.clone(), work)
-        {
-            return CallgraphStoreAccess::Building;
-        }
-
-        let wait = callgraph_build_wait_window();
         if !wait.is_zero() {
             let (received, receiver_generation, receiver_epoch) = {
                 let rx_ref = self.callgraph_store_rx.lock();
@@ -4036,7 +4110,10 @@ impl AppContext {
         roots.insert(current_root.to_path_buf());
         roots
             .iter()
-            .map(|root| crate::search_index::artifact_cache_key(root))
+            // Configure already derived these keys. Re-running the git
+            // root-commit probe here would block the transport loop on spawn
+            // retries when git is missing from PATH.
+            .map(|root| self.memoized_artifact_cache_key(root))
             .collect()
     }
 
@@ -5241,7 +5318,7 @@ impl AppContext {
             return;
         }
 
-        match self.callgraph_store_for_ops() {
+        match self.schedule_callgraph_store_warm() {
             CallgraphStoreAccess::Ready(_) => {
                 crate::slog_debug!(
                     "deferred callgraph store warm completed after semantic cold seed gate cleared"
@@ -7161,47 +7238,15 @@ mod callgraph_store_for_ops_tests {
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
-    use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::{Barrier, Mutex as StdMutex, MutexGuard, OnceLock};
+    use std::sync::Barrier;
     use tempfile::TempDir;
 
-    struct CallgraphWaitWindowEnvGuard {
-        _guard: MutexGuard<'static, ()>,
-        previous: Option<OsString>,
+    fn callgraph_build_wait_ms(ms: u64) -> super::CallgraphBuildWaitMsGuard {
+        super::override_callgraph_build_wait_ms_for_test(ms)
     }
 
-    impl Drop for CallgraphWaitWindowEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: serialized by the process-local guard held for this
-            // helper's lifetime, and restored before the guard is released.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
-                    None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
-                }
-            }
-        }
-    }
-
-    fn callgraph_build_wait_ms(ms: u64) -> CallgraphWaitWindowEnvGuard {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
-        // SAFETY: serialized by LOCK above and restored by the returned guard.
-        unsafe {
-            std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
-        }
-        CallgraphWaitWindowEnvGuard {
-            _guard: guard,
-            previous,
-        }
-    }
-
-    fn force_async_callgraph_builds() -> CallgraphWaitWindowEnvGuard {
+    fn force_async_callgraph_builds() -> super::CallgraphBuildWaitMsGuard {
         callgraph_build_wait_ms(0)
     }
 
@@ -7626,6 +7671,59 @@ mod callgraph_store_for_ops_tests {
             Some(Tier2TriggerReason::ConfigureWarm),
             "root B must not inherit root A's semantic cold gate"
         );
+    }
+
+    #[test]
+    fn query_wait_joins_callgraph_build_scheduled_without_wait() {
+        let _env_guard = callgraph_build_wait_ms(10_000);
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
+        let project_root = std::fs::canonicalize(project.path()).expect("canonical project root");
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        ));
+        let (reached, release) = install_callgraph_build_start_gate(project_root);
+
+        assert!(matches!(
+            ctx.schedule_callgraph_store_warm(),
+            CallgraphStoreAccess::Building
+        ));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("scheduled callgraph worker did not reach start barrier");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let query_ctx = Arc::clone(&ctx);
+        let query = std::thread::spawn(move || {
+            result_tx
+                .send(query_ctx.callgraph_store_for_ops())
+                .expect("send query result");
+        });
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "query returned while the scheduled callgraph build was still in flight"
+        );
+
+        release.send(()).expect("release callgraph worker");
+        assert!(matches!(
+            result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("query did not settle after the callgraph build completed"),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        query.join().expect("callgraph query thread");
     }
 
     #[test]
