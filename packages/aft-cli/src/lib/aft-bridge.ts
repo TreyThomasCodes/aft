@@ -153,10 +153,22 @@ export async function sendAftRequests(
       finish(() => reject(buildBridgeError({ binaryPath, code, stderr, noiseLines, responses })));
     });
 
-    for (const request of requests) {
-      child.stdin.write(`${JSON.stringify(request)}\n`);
+    // A binary that crashes at startup can close its stdin before (or
+    // while) we write the requests. That surfaces as EPIPE/ERR_STREAM_*
+    // on the stdin stream - and an un-listened stream error is fatal to
+    // the process on newer runtimes. The write failing is not the
+    // outcome we report: the "close" handler owns early-exit reporting
+    // and produces the actionable error with stderr and noise context.
+    child.stdin.on("error", () => {});
+    try {
+      for (const request of requests) {
+        child.stdin.write(`${JSON.stringify(request)}\n`);
+      }
+      child.stdin.end();
+    } catch {
+      // Synchronous write/end failure (already-destroyed stream) - same
+      // story: let the close handler report the binary's exit.
     }
-    child.stdin.end();
   });
 }
 
