@@ -4364,6 +4364,16 @@ export function bannerUnused() {}
         drop(store);
         let project_key = crate::search_index::artifact_cache_key(&root);
         crate::root_cache::enable_writer_lease_acquisition_counts_for_test();
+        // Delta-based counting: the enable flag is process-global and another
+        // parallel test may have switched it on before this test's own setup
+        // acquired its cold-build lease, so the absolute count is
+        // enable-order-dependent. Only acquisitions inside the observed window
+        // below are this assertion's business.
+        let lease_count_before = crate::root_cache::writer_lease_acquisition_count_for_test(
+            crate::root_cache::RootCacheDomain::Callgraph,
+            &project_key,
+            &root,
+        );
 
         let root_for_observer = root.clone();
         let dir_for_observer = callgraph_dir.clone();
@@ -4399,7 +4409,7 @@ export function bannerUnused() {}
                 crate::root_cache::RootCacheDomain::Callgraph,
                 &project_key,
                 &root,
-            ),
+            ) - lease_count_before,
             3,
             "only the three observer publications may acquire a writer lease; tier2 must stay read-only"
         );

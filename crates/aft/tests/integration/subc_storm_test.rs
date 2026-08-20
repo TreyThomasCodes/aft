@@ -1166,7 +1166,7 @@ async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
         aft::search_index::artifact_cache_key(&worktree_root),
         "linked worktree must borrow the parent's artifact key"
     );
-    aft::root_cache::reset_writer_lease_acquisition_counts_for_test();
+    aft::root_cache::enable_writer_lease_acquisition_counts_for_test();
 
     corr += 1;
     let bind_corr = corr;
