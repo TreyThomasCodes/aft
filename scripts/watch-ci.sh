@@ -3,9 +3,17 @@
 # without waiting for the rest of the run. Exit 0 only when the whole run
 # succeeds. Prints the first failing job's failed-test lines on the way out.
 #
+# WATCH_CI_SETTLE=1: on failure, keep waiting until the RUN completes before
+# exiting nonzero. Chains that intend to `gh run rerun --failed` need this -
+# a rerun request against a still-running run is refused ("cannot be rerun;
+# This workflow is already running"), which has burned rerun-then-watch
+# chains twice. Fail-fast reporting still prints immediately; only the exit
+# is deferred to rerun-safety.
+#
 # Usage:
 #   scripts/watch-ci.sh            # newest run on main
 #   scripts/watch-ci.sh <run-id>
+#   WATCH_CI_SETTLE=1 scripts/watch-ci.sh <run-id>
 set -uo pipefail
 
 REPO="${REPO:-cortexkit/aft}"
@@ -43,6 +51,12 @@ while true; do
     echo "CI_EARLY_FAIL job='$NAME' run=$RID"
     gh run view --repo "$REPO" --job "$JID" --log-failed 2>/dev/null \
       | grep -aE "FAIL \[|panicked at|error\[|bash startup failure" | head -8
+    if [ "${WATCH_CI_SETTLE:-0}" = "1" ]; then
+      echo "settling: waiting for run completion so a rerun is accepted"
+      while [ "$(gh run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
+        sleep 45
+      done
+    fi
     exit 1
   fi
 
