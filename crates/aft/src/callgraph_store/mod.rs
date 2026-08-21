@@ -53,13 +53,18 @@ const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 const ROOT_REPAIR_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const CALLGRAPH_WRITE_METRIC_WINDOW: Duration = Duration::from_secs(60);
 const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
+/// Keep SQLite's per-connection page cache below the staged build working-set
+/// budget; negative values are KiB per SQLite's `cache_size` pragma.
+const CALLGRAPH_SQLITE_CACHE_KIB: i64 = -8 * 1024;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 // Cold-build working-set limits are implementation constants rather than user
 // knobs so a large non-git root cannot accidentally opt back into an OOM path.
 const COLD_BUILD_EXTRACT_BATCH_FILES: usize = 256;
 const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
-const COLD_BUILD_RESOLVE_WINDOW: usize = 100_000;
+// A 20k-reference resolver window kept peak RSS working-set shaped in the
+// committed 20k/40k corpus harness; 100k rows did not.
+const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
@@ -352,8 +357,12 @@ mod write_amplification_tests {
         let autocheckpoint: i64 = conn
             .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
             .unwrap();
+        let cache_size: i64 = conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
         assert_eq!(synchronous, 1, "NORMAL synchronous mode is value 1");
         assert_eq!(autocheckpoint, CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES);
+        assert_eq!(cache_size, CALLGRAPH_SQLITE_CACHE_KIB);
         drop(conn);
         store.cold_build(std::slice::from_ref(&source)).unwrap();
         drop(store);
@@ -6035,6 +6044,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
             CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES
         },
     )?;
+    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
@@ -6052,6 +6062,7 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
             "NORMAL"
         },
     )?;
+    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
