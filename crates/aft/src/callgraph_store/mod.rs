@@ -74,6 +74,32 @@ fn write_amplification_baseline_enabled() -> bool {
 }
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
+pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
+
+static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
+    OnceLock::new();
+
+/// Install a process-local phase hook for the reproducible cold-build harness.
+/// Production callers leave it unset, so phase reporting adds no allocation on
+/// the build path.
+pub fn set_cold_build_phase_observer(observer: Option<Arc<ColdBuildPhaseObserver>>) {
+    *COLD_BUILD_PHASE_OBSERVER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("cold build phase observer mutex poisoned") = observer;
+}
+
+fn note_cold_build_phase(phase: &'static str) {
+    if let Some(observer) = COLD_BUILD_PHASE_OBSERVER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("cold build phase observer mutex poisoned")
+        .as_ref()
+        .cloned()
+    {
+        observer(phase);
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RebuildCooldownKey {
@@ -2828,6 +2854,7 @@ impl CallGraphStore {
         chunk_size: usize,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
+        note_cold_build_phase("enumeration");
         let files = normalize_file_list(&self.project_root, files)?;
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
@@ -2854,6 +2881,7 @@ impl CallGraphStore {
         // A crashed extraction pass has already committed complete batches. Compare the
         // staged content identity with the current file before parsing so unchanged
         // committed files are not restarted from zero after adoption.
+        note_cold_build_phase("extraction");
         if phase.as_deref() == Some("extracting") {
             let current_paths = files
                 .iter()
@@ -2938,6 +2966,7 @@ impl CallGraphStore {
         // Secondary indexes are intentionally created only after every extract is
         // durable, so pass 1 remains bulk-load shaped and pass 2 sees a complete
         // corpus-wide symbol/export table.
+        note_cold_build_phase("symbol_export_index");
         if phase.as_deref() == Some("indexing") {
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
@@ -2948,6 +2977,7 @@ impl CallGraphStore {
             self.record_commit(total_changes_before, &conn);
         }
 
+        note_cold_build_phase("resolution");
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
         let mut resolve_cursor = staged_u64(&conn, STAGED_RESOLVE_CURSOR)?;
         loop {
@@ -2996,6 +3026,7 @@ impl CallGraphStore {
             resolve_cursor = last_rowid;
         }
 
+        note_cold_build_phase("publication");
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
