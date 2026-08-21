@@ -4175,20 +4175,18 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
 }
 
 fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
-    // The integration harness deliberately uses tiny non-git fixture trees and
-    // disables watchers; preserving its historical eager warm keeps its first
-    // navigation assertion about the query API rather than filesystem identity.
+    // Integration fixtures disable the watcher and historically expect their
+    // tiny non-repository callgraphs to be ready before the first request.
     if std::env::var_os("AFT_TEST_DISABLE_FILE_WATCHER").is_some() {
         return true;
     }
-    // A configured subdirectory inside a repository still shares that
-    // repository's durable artifacts. Only a root with no Git worktree marker
-    // in its ancestry is truly non-git and must defer callgraph construction.
+    // Allow callgraph warming unless the Git-root probe confirms this is not a
+    // repository. Transient probe failures, including process-spawn errors, keep
+    // warming enabled so a temporary Git failure cannot disable a real repo.
     ctx.is_worktree_bridge()
-        || ctx.callgraph_project_root().is_some_and(|root| {
-            root.ancestors()
-                .any(|ancestor| ancestor.join(".git").exists())
-        })
+        || ctx
+            .callgraph_project_root()
+            .is_some_and(|root| !crate::search_index::git_root_probe_confirms_non_repo(&root))
 }
 
 #[cfg(test)]
@@ -6762,6 +6760,148 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("callgraph worker must start so this test actually covers the wait skip");
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn non_git_configure_defers_callgraph_until_navigation_and_reports_trip_terminally() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let ctx = test_context();
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let request = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true
+            }))]
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let limiter = ctx.cold_build_limiter();
+        assert!(
+            limiter.admission_events().is_empty(),
+            "non-git configure must not admit a callgraph cold-build job"
+        );
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(
+            !ctx.callgraph_store_dir()
+                .join("build-breaker.sqlite")
+                .exists(),
+            "configure must not reach breaker attempt admission"
+        );
+
+        let canonical_root = ctx.callgraph_project_root().unwrap();
+        let (reached, release) =
+            crate::context::install_callgraph_build_start_gate_for_test(canonical_root);
+        let navigation = RawRequest {
+            id: "navigation".to_string(),
+            command: "callers".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file": source, "symbol": "marker"}),
+        };
+        let first = crate::commands::callers::handle_callers(&navigation, &ctx);
+        assert!(!first.success);
+        assert_eq!(first.data["code"], json!("callgraph_building"));
+        reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first navigation query must enter the background build path");
+        assert_eq!(limiter.admission_events().len(), 1);
+        let second = crate::commands::callers::handle_callers(&navigation, &ctx);
+        assert_eq!(second.data["code"], json!("callgraph_building"));
+        assert_eq!(
+            limiter.admission_events().len(),
+            1,
+            "the retry must join the existing single-flight build"
+        );
+        release.send(()).unwrap();
+        let completion_deadline = Instant::now() + Duration::from_secs(10);
+        while ctx.callgraph_store_rx().lock().is_some() {
+            crate::runtime_drain::drain_callgraph_store_events(&ctx);
+            assert!(
+                Instant::now() < completion_deadline,
+                "navigation-started callgraph build did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let suspended_root = tempfile::tempdir().unwrap();
+        let suspended_storage = tempfile::tempdir().unwrap();
+        let suspended_source = suspended_root.path().join("lib.rs");
+        std::fs::write(&suspended_source, "pub fn suspended_marker() {}\n").unwrap();
+        let suspended_ctx = test_context();
+        suspended_ctx.isolate_cold_build_limiter_for_test(1);
+        let suspended_request = configure_request_with_params(json!({
+            "project_root": suspended_root.path(),
+            "harness": "opencode",
+            "storage_dir": suspended_storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true
+            }))]
+        }));
+        assert!(handle_configure_for_test(&suspended_request, &suspended_ctx).success);
+        super::drain_deferred_configure_maintenance(&suspended_ctx);
+        let project_root = suspended_ctx.callgraph_project_root().unwrap();
+        let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+        let breaker_key = crate::build_breaker::BreakerKey::new(
+            project_root.display().to_string(),
+            crate::build_breaker::BuildDomain::CallgraphCold,
+            crate::callgraph_store::callgraph_corpus_fingerprint(&project_root, &files).unwrap(),
+        );
+        let breaker = crate::build_breaker::BuildDeathBreaker::open(
+            suspended_ctx
+                .callgraph_store_dir()
+                .join("build-breaker.sqlite"),
+        )
+        .unwrap();
+        let now = crate::callgraph_store::unix_millis_now();
+        for offset in 0..3 {
+            let crate::build_breaker::BreakerAdmission::Admitted(attempt) =
+                breaker.admit_at(&breaker_key, 0, now + offset).unwrap()
+            else {
+                panic!("breaker tripped before the third zero-credit death");
+            };
+            breaker
+                .record_attributed_death_at(&breaker_key, &attempt.attempt_id, 0, 0, now + offset)
+                .unwrap();
+        }
+
+        let suspended_navigation = RawRequest {
+            id: "suspended-navigation".to_string(),
+            command: "callers".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file": suspended_source, "symbol": "suspended_marker"}),
+        };
+        let suspended =
+            crate::commands::callers::handle_callers(&suspended_navigation, &suspended_ctx);
+        assert!(!suspended.success);
+        assert_eq!(suspended.data["code"], json!("build_suspended"));
+        let message = suspended.data["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("callers: build_suspended domain=callgraph_cold deaths=3 age_ms=")
+        );
+        assert!(message.ends_with(
+            " reason=zero_credit_death_limit; run doctor reset-build-breaker to resume"
+        ));
+        assert!(
+            suspended_ctx
+                .cold_build_limiter()
+                .admission_events()
+                .is_empty(),
+            "a terminal suspension must refuse before limiter admission"
+        );
     }
 
     #[test]

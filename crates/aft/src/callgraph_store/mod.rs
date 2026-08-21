@@ -101,6 +101,14 @@ fn note_cold_build_phase(phase: &'static str) {
     }
 }
 
+#[cfg(test)]
+fn note_cold_build_commit_barrier(phase: &'static str) {
+    note_cold_build_phase(phase);
+}
+
+#[cfg(not(test))]
+fn note_cold_build_commit_barrier(_phase: &'static str) {}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RebuildCooldownKey {
     callgraph_dir: PathBuf,
@@ -2951,7 +2959,9 @@ impl CallGraphStore {
                     }
                 }
                 increment_staged_extracted_bytes(&tx, extracted_bytes)?;
+                note_cold_build_commit_barrier("extraction_batch_before_commit");
                 tx.commit()?;
+                note_cold_build_commit_barrier("extraction_batch_committed");
                 self.record_commit(total_changes_before, &conn);
             }
 
@@ -12353,7 +12363,10 @@ fn ref_id(parts: &[&str]) -> String {
     hash_to_hex(blake3::hash(joined.as_bytes()))
 }
 
-fn callgraph_corpus_fingerprint(project_root: &Path, files: &[PathBuf]) -> Result<String> {
+pub(crate) fn callgraph_corpus_fingerprint(
+    project_root: &Path,
+    files: &[PathBuf],
+) -> Result<String> {
     let mut paths = normalize_file_list(project_root, files)?;
     paths.sort();
     let mut hasher = blake3::Hasher::new();
@@ -15897,6 +15910,199 @@ mod bounded_build_breaker_tests {
             "the already committed batch and its credit survive adoption; only the new batch increments credit"
         );
         assert_eq!(staged_build_phase(&conn).unwrap().as_deref(), Some("ready"));
+    }
+
+    const SPECIMEN_CHILD_TEST: &str =
+        "callgraph_store::bounded_build_breaker_tests::respawn_loop_build_child";
+    const SPECIMEN_CHILD_ROOT: &str = "AFT_SPECIMEN_CHILD_ROOT";
+    const SPECIMEN_CHILD_STORE: &str = "AFT_SPECIMEN_CHILD_STORE";
+    const SPECIMEN_CHILD_PHASE: &str = "AFT_SPECIMEN_CHILD_PHASE";
+    const SPECIMEN_CHILD_SIGNAL: &str = "AFT_SPECIMEN_CHILD_SIGNAL";
+
+    fn wait_for_child_barrier(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "callgraph child did not reach barrier {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn spawn_build_child(root: &Path, store: &Path, phase: Option<&str>) -> std::process::Child {
+        let signal = store.join("specimen-child.reached");
+        let _ = std::fs::remove_file(&signal);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(SPECIMEN_CHILD_TEST)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPECIMEN_CHILD_ROOT, root)
+            .env(SPECIMEN_CHILD_STORE, store)
+            .env(SPECIMEN_CHILD_SIGNAL, &signal)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(phase) = phase {
+            command.env(SPECIMEN_CHILD_PHASE, phase);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn staging_path(root: &Path, store: &Path) -> PathBuf {
+        let project_key = crate::search_index::artifact_cache_key(root);
+        store.join(format!("{project_key}.staging.sqlite.tmp.resume"))
+    }
+
+    fn durable_staging_state(path: &Path) -> (u64, u64) {
+        if !path.exists() {
+            return (0, 0);
+        }
+        let conn = Connection::open(path).unwrap();
+        (
+            query_count(&conn, "SELECT COUNT(*) FROM files").unwrap(),
+            staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES).unwrap(),
+        )
+    }
+
+    fn kill_barrier_child(child: &mut std::process::Child, signal: &Path) {
+        wait_for_child_barrier(signal);
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+    }
+
+    #[test]
+    fn respawn_loop_build_child() {
+        let Some(root) = std::env::var_os(SPECIMEN_CHILD_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let store = PathBuf::from(std::env::var_os(SPECIMEN_CHILD_STORE).unwrap());
+        if let Some(phase) = std::env::var_os(SPECIMEN_CHILD_PHASE) {
+            let phase = phase.to_string_lossy().into_owned();
+            let signal = PathBuf::from(std::env::var_os(SPECIMEN_CHILD_SIGNAL).unwrap());
+            set_cold_build_phase_observer(Some(Arc::new(move |observed| {
+                if observed == phase {
+                    std::fs::write(&signal, observed.as_bytes()).unwrap();
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+            })));
+        }
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        CallGraphStore::cold_build_with_lease_chunked(store, root, &files, 1).unwrap();
+    }
+
+    #[test]
+    fn issue_250_respawn_loop_converges_or_trips_without_false_readiness() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("resumable-root");
+        let store = temp.path().join("resumable-store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        for index in 0..3 {
+            std::fs::write(
+                root.join(format!("file-{index}.ts")),
+                format!("export function specimen{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
+        let stage = staging_path(&root, &store);
+        let signal = store.join("specimen-child.reached");
+
+        let mut first = spawn_build_child(&root, &store, Some("extraction_batch_committed"));
+        kill_barrier_child(&mut first, &signal);
+        let (first_rows, first_bytes) = durable_staging_state(&stage);
+        assert_eq!(first_rows, 1);
+        assert!(first_bytes > 0);
+
+        let mut second = spawn_build_child(&root, &store, Some("extraction_batch_committed"));
+        kill_barrier_child(&mut second, &signal);
+        let (second_rows, second_bytes) = durable_staging_state(&stage);
+        assert_eq!(second_rows, 2);
+        assert!(
+            second_bytes > first_bytes,
+            "a replacement process must adopt committed bytes instead of restarting from zero"
+        );
+
+        let status = spawn_build_child(&root, &store, None).wait().unwrap();
+        assert!(status.success(), "uninterrupted replacement build failed");
+        assert!(!stage.exists(), "published staging file must be renamed");
+        let ready = CallGraphStore::open_readonly(store.clone(), root.clone())
+            .unwrap()
+            .expect("replacement attempts must converge to a published graph");
+        assert_eq!(ready.indexed_file_count().unwrap(), 3);
+
+        let fast_root = temp.path().join("zero-credit-root");
+        let fast_store = temp.path().join("zero-credit-store");
+        std::fs::create_dir_all(&fast_root).unwrap();
+        std::fs::create_dir_all(&fast_store).unwrap();
+        std::fs::write(
+            fast_root.join("main.ts"),
+            "export function neverCommitted() {}\n",
+        )
+        .unwrap();
+        let fast_stage = staging_path(&fast_root, &fast_store);
+        let fast_signal = fast_store.join("specimen-child.reached");
+        let breaker_path = fast_store.join("build-breaker.sqlite");
+        let now = unix_millis_now();
+
+        for death in 0..3 {
+            let mut child = spawn_build_child(&fast_root, &fast_store, Some("enumeration"));
+            wait_for_child_barrier(&fast_signal);
+            let attempt_id = Connection::open(&breaker_path)
+                .unwrap()
+                .query_row(
+                    "SELECT attempt_id FROM breaker_attempts
+                     WHERE death_charged = 0 ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let (_, committed_bytes) = durable_staging_state(&fast_stage);
+            assert_eq!(
+                committed_bytes, 0,
+                "the fast-kill schedule must not cross an extraction commit"
+            );
+            child.kill().unwrap();
+            let _ = child.wait().unwrap();
+
+            let files = crate::callgraph::walk_project_files(&fast_root).collect::<Vec<_>>();
+            let key = BreakerKey::new(
+                fast_root.display().to_string(),
+                BuildDomain::CallgraphCold,
+                callgraph_corpus_fingerprint(&fast_root, &files).unwrap(),
+            );
+            BuildDeathBreaker::open(&breaker_path)
+                .unwrap()
+                .record_attributed_death_at(&key, &attempt_id, committed_bytes, 0, now + death)
+                .unwrap();
+        }
+
+        let files = crate::callgraph::walk_project_files(&fast_root).collect::<Vec<_>>();
+        let suspension = CallGraphStore::cold_build_suspension(&fast_store, &fast_root)
+            .unwrap()
+            .expect("three zero-credit process deaths must suspend the root");
+        assert_eq!(suspension.reason, "zero_credit_death_limit");
+        assert_eq!(suspension.death_count, 3);
+        let response = crate::commands::callgraph_store_adapter::suspended_response(
+            "specimen",
+            "callers",
+            &suspension,
+        );
+        assert_eq!(response.data["code"], serde_json::json!("build_suspended"));
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("callers: build_suspended domain=callgraph_cold deaths=3 age_ms=")
+        );
+        assert!(message.ends_with(
+            " reason=zero_credit_death_limit; run doctor reset-build-breaker to resume"
+        ));
+        let refused =
+            CallGraphStore::cold_build_with_lease_chunked(fast_store, fast_root, &files, 1)
+                .expect_err("a suspended root must not report a perpetually building worker");
+        assert!(matches!(refused, CallGraphStoreError::Suspended(_)));
     }
 
     #[test]

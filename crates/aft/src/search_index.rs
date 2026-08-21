@@ -4276,6 +4276,15 @@ fn root_git_marker_state(project_root: &Path, git_common_dir: Option<&Path>) -> 
     }
 }
 
+/// Return true only when the normal identity probe deterministically proves
+/// that the project is not a Git repository. Transient failures stay unknown.
+pub(crate) fn git_root_probe_confirms_non_repo(project_root: &Path) -> bool {
+    matches!(
+        repo_root_commit_with_retry(project_root),
+        RootCommitResolution::NotARepo
+    )
+}
+
 /// Resolve the repository root commit, retrying transient git failures.
 ///
 /// The distinction matters because the fallback is not benign: two clones of

@@ -13,6 +13,11 @@ pub const ZERO_CREDIT_DEATH_LIMIT: u64 = 3;
 pub const CREDITED_DEATH_LIMIT: u64 = 6;
 pub const IN_BUILD_BURN_LIMIT_MS: u64 = 30 * 60 * 1_000;
 pub const TRIP_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const ATTEMPT_MARKER_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+pub const ATTEMPT_MARKER_RECENT_HEARTBEAT_MS: u64 = 15_000;
+pub const TEMP_DELETE_AGE_FLOOR_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const SWEEP_AMBIGUITY_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+pub const SWEEP_STAT_CHECK_CAP: usize = 64;
 pub const BREAKER_CONFIGURATION_VERSION: &str = "v1";
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
@@ -498,6 +503,10 @@ fn unix_millis_now() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "build_breaker_audit_tests.rs"]
+mod audit_matrix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -517,6 +526,25 @@ mod tests {
                 panic!("unexpected suspension: {suspension:?}")
             }
         }
+    }
+
+    fn durable_tallies(breaker: &BuildDeathBreaker, key: &BreakerKey) -> (u64, u64, u64) {
+        Connection::open(breaker.path())
+            .unwrap()
+            .query_row(
+                "SELECT zero_credit_deaths, credited_deaths, in_build_burn_ms
+                 FROM breaker_records
+                 WHERE root_id = ?1 AND domain = ?2 AND corpus_fingerprint = ?3",
+                params![key.root_id, key.domain.as_str(), key.corpus_fingerprint],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -551,17 +579,24 @@ mod tests {
     fn one_batch_per_death_still_trips_after_six_credited_attempts() {
         let breaker = breaker();
         let key = key(BuildDomain::CallgraphCold);
-        for now in 1..=6 {
+        for now in 1..=5 {
             let attempt = admitted(&breaker, &key, now);
-            let suspension = breaker
+            assert!(breaker
                 .record_attributed_death_at(&key, &attempt.attempt_id, 11, 0, now)
-                .unwrap();
-            if now < 6 {
-                assert!(suspension.is_none());
-            } else {
-                assert_eq!(suspension.unwrap().reason, "credited_death_limit");
-            }
+                .unwrap()
+                .is_none());
         }
+        assert_eq!(durable_tallies(&breaker, &key), (0, 5, 0));
+        assert!(breaker.suspension_at(&key, 6).unwrap().is_none());
+
+        let sixth = admitted(&breaker, &key, 6);
+        let suspension = breaker
+            .record_attributed_death_at(&key, &sixth.attempt_id, 11, 0, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(suspension.reason, "credited_death_limit");
+        assert_eq!(suspension.death_count, 6);
+        assert_eq!(durable_tallies(&breaker, &key), (0, 6, 0));
     }
 
     #[test]
@@ -574,38 +609,81 @@ mod tests {
                 .record_attributed_death_at(&key, &attempt.attempt_id, 10, 0, now)
                 .unwrap();
         }
-        assert!(matches!(
-            breaker.admit_at(&key, 10, TRIP_TTL_MS + 4).unwrap(),
-            BreakerAdmission::Admitted(_)
-        ));
-        let retry = admitted(&breaker, &key, TRIP_TTL_MS + 5);
+        assert_eq!(durable_tallies(&breaker, &key), (3, 0, 0));
+
+        let BreakerAdmission::Admitted(retry) =
+            breaker.admit_at(&key, 10, TRIP_TTL_MS + 4).unwrap()
+        else {
+            panic!("expired suspension must admit exactly one probe");
+        };
+        assert_eq!(
+            durable_tallies(&breaker, &key),
+            (3, 0, 0),
+            "TTL expiry lifts scheduling without erasing durable history"
+        );
+
         let suspension = breaker
             .record_attributed_death_at(&key, &retry.attempt_id, 10, 0, TRIP_TTL_MS + 5)
             .unwrap()
             .unwrap();
+        assert_eq!(suspension.reason, "zero_credit_death_limit");
         assert_eq!(suspension.death_count, 4);
+        assert_eq!(durable_tallies(&breaker, &key), (4, 0, 0));
     }
 
     #[test]
     fn root_and_domain_histories_are_isolated() {
-        let breaker = breaker();
-        let callgraph = key(BuildDomain::CallgraphCold);
-        let search = key(BuildDomain::SearchCold);
-        for now in 1..=3 {
-            let attempt = admitted(&breaker, &callgraph, now);
-            breaker
-                .record_attributed_death_at(&callgraph, &attempt.attempt_id, 10, 0, now)
-                .unwrap();
+        for tripped_domain in BuildDomain::ALL {
+            let breaker = breaker();
+            let tripped = BreakerKey::new(
+                format!("root-{}", tripped_domain.as_str()),
+                tripped_domain,
+                "corpus-a",
+            );
+            for now in 1..=3 {
+                let attempt = admitted(&breaker, &tripped, now);
+                breaker
+                    .record_attributed_death_at(&tripped, &attempt.attempt_id, 10, 0, now)
+                    .unwrap();
+            }
+            let report = breaker.suspension_at(&tripped, 4).unwrap().unwrap();
+            assert_eq!(report.domain, tripped_domain);
+            assert_eq!(report.death_count, 3);
+
+            let mut siblings = BuildDomain::ALL
+                .into_iter()
+                .filter(|domain| *domain != tripped_domain)
+                .map(|domain| BreakerKey::new(tripped.root_id.clone(), domain, "corpus-a"))
+                .collect::<Vec<_>>();
+            siblings.push(BreakerKey::new(
+                format!("{}-sibling", tripped.root_id),
+                tripped_domain,
+                "corpus-a",
+            ));
+
+            for (index, sibling) in siblings.iter().enumerate() {
+                assert!(breaker.suspension_at(sibling, 4).unwrap().is_none());
+                let attempt = admitted(&breaker, sibling, 10 + index as u64);
+                breaker
+                    .record_attributed_death_at(
+                        sibling,
+                        &attempt.attempt_id,
+                        10,
+                        0,
+                        10 + index as u64,
+                    )
+                    .unwrap();
+                assert_eq!(durable_tallies(&breaker, sibling), (1, 0, 0));
+            }
+
+            breaker.explicit_reset(&siblings[0]).unwrap();
+            assert_eq!(durable_tallies(&breaker, &siblings[0]), (0, 0, 0));
+            assert!(breaker.suspension_at(&tripped, 20).unwrap().is_some());
+
+            breaker.explicit_reset(&tripped).unwrap();
+            assert!(breaker.suspension_at(&tripped, 21).unwrap().is_none());
+            assert_eq!(durable_tallies(&breaker, &siblings[1]), (1, 0, 0));
         }
-        assert!(matches!(
-            breaker.admit_at(&search, 10, 4).unwrap(),
-            BreakerAdmission::Admitted(_)
-        ));
-        let other_root = BreakerKey::new("root-b", BuildDomain::CallgraphCold, "corpus-a");
-        assert!(matches!(
-            breaker.admit_at(&other_root, 10, 4).unwrap(),
-            BreakerAdmission::Admitted(_)
-        ));
     }
 
     #[test]
