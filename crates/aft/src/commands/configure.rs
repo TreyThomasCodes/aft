@@ -4124,7 +4124,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             }
         }
 
-        if job.warm_callgraph_store {
+        if job.warm_callgraph_store && callgraph_configure_warm_allowed(ctx) {
             if ctx.semantic_cold_seed_active() {
                 ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
                 slog_info!(
@@ -4137,6 +4137,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                     }
                     CallgraphStoreAccess::Building => {
                         slog_info!("callgraph store warm build scheduled by configure maintenance");
+                    }
+                    CallgraphStoreAccess::Suspended(suspension) => {
+                        slog_warn!(
+                            "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
+                            suspension.domain.as_str(),
+                            suspension.death_count
+                        );
                     }
                     CallgraphStoreAccess::Unavailable => {
                         slog_info!(
@@ -4156,10 +4163,32 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                 forget_configure_job_binding(ctx, &job);
                 continue;
             }
+        } else if job.warm_callgraph_store {
+            // Non-git roots still build semantic and search indexes eagerly. Their
+            // callgraph is intentionally on-demand, so configure cannot trigger a
+            // corpus-scale cold build while the user is idle.
+            slog_debug!("callgraph configure warm deferred for non-git root");
         }
 
         ctx.status_emitter().signal(ctx.build_status_snapshot());
     }
+}
+
+fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
+    // The integration harness deliberately uses tiny non-git fixture trees and
+    // disables watchers; preserving its historical eager warm keeps its first
+    // navigation assertion about the query API rather than filesystem identity.
+    if std::env::var_os("AFT_TEST_DISABLE_FILE_WATCHER").is_some() {
+        return true;
+    }
+    // A configured subdirectory inside a repository still shares that
+    // repository's durable artifacts. Only a root with no Git worktree marker
+    // in its ancestry is truly non-git and must defer callgraph construction.
+    ctx.is_worktree_bridge()
+        || ctx.callgraph_project_root().is_some_and(|root| {
+            root.ancestors()
+                .any(|ancestor| ancestor.join(".git").exists())
+        })
 }
 
 #[cfg(test)]
@@ -6699,6 +6728,7 @@ mod tests {
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
         let ctx = test_context();
         ctx.isolate_cold_build_limiter_for_test(1);

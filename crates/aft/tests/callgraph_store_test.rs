@@ -1517,6 +1517,9 @@ fn app_context_revalidates_to_newer_published_generation() {
                 .name
                 .clone(),
             CallgraphStoreAccess::Building => panic!("expected Ready store, got Building"),
+            CallgraphStoreAccess::Suspended(suspension) => {
+                panic!("expected Ready store, got Suspended: {suspension:?}")
+            }
             CallgraphStoreAccess::Unavailable => panic!("expected Ready store, got Unavailable"),
             CallgraphStoreAccess::Error(error) => {
                 panic!("expected Ready store, got Error: {error}")
@@ -2824,6 +2827,9 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
             panic!("warm read must not fail on writer lease: {error}")
         }
         CallgraphStoreAccess::Building => panic!("expected ready read-only store, got building"),
+        CallgraphStoreAccess::Suspended(suspension) => {
+            panic!("expected ready read-only store, got suspended: {suspension:?}")
+        }
         CallgraphStoreAccess::Unavailable => {
             panic!("expected ready read-only store, got unavailable")
         }

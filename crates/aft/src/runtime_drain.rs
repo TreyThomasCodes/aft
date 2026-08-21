@@ -520,6 +520,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     let (
         latest,
         denied,
+        suspended,
         settled,
         disconnected,
         fulfilled_force_token,
@@ -533,6 +534,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
 
         let mut latest = None;
         let mut denied = None;
+        let mut suspended = None;
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
@@ -556,6 +558,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                     }
                 }
                 Ok(CallGraphStoreBuildEvent::Denied { reason }) => denied = Some(reason),
+                Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
+                    suspended = Some(suspension)
+                }
                 Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -567,6 +572,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         (
             latest,
             denied,
+            suspended,
             settled,
             disconnected,
             fulfilled_force_token,
@@ -576,7 +582,8 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     };
 
     let ready_received = latest.is_some();
-    let terminal = ready_received || denied.is_some() || settled || disconnected;
+    let terminal =
+        ready_received || denied.is_some() || suspended.is_some() || settled || disconnected;
     if !terminal {
         return;
     }
@@ -627,6 +634,9 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             };
             if let Some(reason) = denied {
                 ctx.record_callgraph_store_build_denied(receiver_generation, reason);
+            }
+            if let Some(suspension) = suspended {
+                ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
             }
             if terminal {
                 *receiver = None;

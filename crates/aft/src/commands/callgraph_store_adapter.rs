@@ -1762,6 +1762,27 @@ pub fn building_response(req_id: &str, operation: &str) -> Response {
     )
 }
 
+/// A tripped breaker is terminal for this request. It deliberately does not
+/// reuse `Unavailable`: the store is configured, but its builder was suspended.
+pub fn suspended_response(
+    req_id: &str,
+    operation: &str,
+    suspension: &crate::build_breaker::BuildSuspension,
+) -> Response {
+    let age_ms = crate::callgraph_store::unix_millis_now()
+        .saturating_sub(suspension.suspended_since_unix_ms);
+    Response::error(
+        req_id,
+        "build_suspended",
+        format!(
+            "{operation}: build_suspended domain={} deaths={} age_ms={age_ms} reason={}; run doctor reset-build-breaker to resume",
+            suspension.domain.as_str(),
+            suspension.death_count,
+            suspension.reason,
+        ),
+    )
+}
+
 pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Response {
     let message = if worktree {
         format!(

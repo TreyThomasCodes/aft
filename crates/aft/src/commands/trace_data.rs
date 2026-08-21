@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, store_error_response, trace_data_result, unavailable_response,
 };
@@ -98,6 +99,9 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
         CallgraphStoreAccess::Building => return building_response(&req.id, "trace_data"),
+        CallgraphStoreAccess::Suspended(suspension) => {
+            return suspended_response(&req.id, "trace_data", &suspension)
+        }
         CallgraphStoreAccess::Unavailable => {
             return unavailable_response(&req.id, "trace_data", ctx.is_worktree_bridge())
         }

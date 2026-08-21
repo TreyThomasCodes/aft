@@ -624,6 +624,9 @@ pub enum CallGraphStoreBuildEvent {
     Denied {
         reason: String,
     },
+    Suspended {
+        suspension: crate::build_breaker::BuildSuspension,
+    },
     Settled,
 }
 
@@ -659,6 +662,13 @@ impl CallGraphStoreBuildSettlement {
 
     fn denied(&mut self, reason: String) {
         let _ = self.tx.send(CallGraphStoreBuildEvent::Denied { reason });
+        self.sent = true;
+    }
+
+    fn suspended(&mut self, suspension: crate::build_breaker::BuildSuspension) {
+        let _ = self
+            .tx
+            .send(CallGraphStoreBuildEvent::Suspended { suspension });
         self.sent = true;
     }
 }
@@ -1574,6 +1584,8 @@ pub struct AppContext {
     callgraph_store_rx_generation: AtomicU64,
     callgraph_store_rx_epoch: AtomicU64,
     callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
+    callgraph_store_build_suspension:
+        parking_lot::Mutex<Option<(u64, crate::build_breaker::BuildSuspension)>>,
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
@@ -1769,6 +1781,9 @@ pub enum CallgraphStoreAccess {
     Ready(Arc<ReadonlyCallGraphStore>),
     /// A cold build is in flight (or was just started); retry shortly.
     Building,
+    /// The durable build-death breaker refuses this domain until an explicit reset
+    /// or a time-to-live check confirms the suspension has expired.
+    Suspended(crate::build_breaker::BuildSuspension),
     /// Not configured, or a read-only worktree whose store was never built.
     Unavailable,
     /// A store open/build check failed with a real error (DB/IO).
@@ -2002,6 +2017,7 @@ impl AppContext {
             callgraph_store_rx_generation: AtomicU64::new(0),
             callgraph_store_rx_epoch: AtomicU64::new(0),
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
+            callgraph_store_build_suspension: parking_lot::Mutex::new(None),
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -3640,8 +3656,33 @@ impl AppContext {
     }
 
     #[doc(hidden)]
+    pub fn record_callgraph_store_build_suspension(
+        &self,
+        generation: u64,
+        suspension: crate::build_breaker::BuildSuspension,
+    ) {
+        *self.callgraph_store_build_suspension.lock() = Some((generation, suspension));
+    }
+
+    #[doc(hidden)]
     pub fn clear_callgraph_store_build_denied(&self) {
         *self.callgraph_store_build_denied.lock() = None;
+        *self.callgraph_store_build_suspension.lock() = None;
+    }
+
+    fn callgraph_store_build_suspension(&self) -> Option<crate::build_breaker::BuildSuspension> {
+        let generation = self.configure_generation();
+        let mut suspended = self.callgraph_store_build_suspension.lock();
+        match suspended.as_ref() {
+            Some((suspended_generation, value)) if *suspended_generation == generation => {
+                Some(value.clone())
+            }
+            Some(_) => {
+                *suspended = None;
+                None
+            }
+            None => None,
+        }
     }
 
     fn callgraph_store_build_denial(&self) -> Option<String> {
@@ -3876,6 +3917,9 @@ impl AppContext {
             }
         }
 
+        if let Some(suspension) = self.callgraph_store_build_suspension() {
+            return CallgraphStoreAccess::Suspended(suspension);
+        }
         if let Some(reason) = self.callgraph_store_build_denial() {
             return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason));
         }
@@ -3889,6 +3933,14 @@ impl AppContext {
             return CallgraphStoreAccess::Unavailable;
         };
         let callgraph_dir = self.callgraph_store_dir();
+
+        if !build_in_flight {
+            match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
+                Ok(Some(suspension)) => return CallgraphStoreAccess::Suspended(suspension),
+                Ok(None) => {}
+                Err(error) => return CallgraphStoreAccess::Error(error),
+            }
+        }
 
         if !build_in_flight {
             if force_token.is_none() {
@@ -4045,6 +4097,21 @@ impl AppContext {
                         let _ = self.request_tier2_refresh_pull();
                     }
                     return outcome;
+                }
+                Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
+                    let suspended = self.with_current_callgraph_store_rx(
+                        receiver_generation,
+                        receiver_epoch,
+                        |receiver| {
+                            *receiver = None;
+                            self.record_callgraph_store_build_suspension(
+                                receiver_generation,
+                                suspension.clone(),
+                            );
+                            CallgraphStoreAccess::Suspended(suspension)
+                        },
+                    );
+                    return suspended.unwrap_or(CallgraphStoreAccess::Unavailable);
                 }
                 Ok(CallGraphStoreBuildEvent::Denied { reason }) => {
                     let denied = self.with_current_callgraph_store_rx(
@@ -4278,6 +4345,13 @@ impl AppContext {
                             "callgraph store disk publication skipped for superseded epoch {}",
                             persist_epoch
                         );
+                    }
+                    Err(crate::callgraph_store::CallGraphStoreError::Suspended(suspension)) => {
+                        crate::slog_warn!(
+                            "callgraph store background work suspended: {}",
+                            suspension.reason
+                        );
+                        settlement.suspended(suspension);
                     }
                     Err(crate::callgraph_store::CallGraphStoreError::Unavailable(reason))
                         if reason.ends_with("could not acquire writer capability") =>
@@ -5332,6 +5406,13 @@ impl AppContext {
             CallgraphStoreAccess::Building => {
                 crate::slog_info!(
                     "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
+                );
+            }
+            CallgraphStoreAccess::Suspended(suspension) => {
+                crate::slog_warn!(
+                    "deferred callgraph store warm suspended for {} after {} deaths",
+                    suspension.domain.as_str(),
+                    suspension.death_count
                 );
             }
             CallgraphStoreAccess::Unavailable => {

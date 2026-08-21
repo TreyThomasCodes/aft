@@ -609,6 +609,11 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
         // Building (or just-started cold build) -> drive to completion via the
         // wait loop draining `callgraph_store_rx`.
         CallgraphStoreAccess::Building => None,
+        CallgraphStoreAccess::Suspended(suspension) => Some(SubsystemState::Failed(format!(
+            "build_suspended domain={} deaths={}",
+            suspension.domain.as_str(),
+            suspension.death_count
+        ))),
         // Read-only worktree or not configured: nothing to build here.
         CallgraphStoreAccess::Unavailable => Some(SubsystemState::Ready),
         CallgraphStoreAccess::Error(error) => Some(SubsystemState::Failed(error.to_string())),
@@ -623,6 +628,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
     let (
         latest,
         denied,
+        suspended,
         settled,
         disconnected,
         fulfilled_force_token,
@@ -635,6 +641,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         };
         let mut latest = None;
         let mut denied = None;
+        let mut suspended = None;
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
@@ -654,6 +661,9 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                     }
                 }
                 Ok(CallGraphStoreBuildEvent::Denied { reason }) => denied = Some(reason),
+                Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
+                    suspended = Some(suspension)
+                }
                 Ok(CallGraphStoreBuildEvent::Settled) => settled = true,
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -665,6 +675,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         (
             latest,
             denied,
+            suspended,
             settled,
             disconnected,
             fulfilled_force_token,
@@ -673,7 +684,8 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         )
     };
 
-    let terminal = latest.is_some() || denied.is_some() || settled || disconnected;
+    let terminal =
+        latest.is_some() || denied.is_some() || suspended.is_some() || settled || disconnected;
     if !terminal {
         return;
     }
@@ -704,6 +716,9 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
             };
             if let Some(reason) = denied {
                 ctx.record_callgraph_store_build_denied(receiver_generation, reason);
+            }
+            if let Some(suspension) = suspended {
+                ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
             }
             *receiver = None;
             if installed {

@@ -55,6 +55,15 @@ const CALLGRAPH_WRITE_METRIC_WINDOW: Duration = Duration::from_secs(60);
 const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
+// Cold-build working-set limits are implementation constants rather than user
+// knobs so a large non-git root cannot accidentally opt back into an OOM path.
+const COLD_BUILD_EXTRACT_BATCH_FILES: usize = 256;
+const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+const COLD_BUILD_RESOLVE_WINDOW: usize = 100_000;
+const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
+const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
+const STAGED_BUILD_PHASE: &str = "staged_build_phase";
+
 fn write_amplification_baseline_enabled() -> bool {
     std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE").is_some()
 }
@@ -582,6 +591,7 @@ pub enum CallGraphStoreError {
     Lock(crate::fs_lock::AcquireError),
     MissingCallerData { file: String },
     Unavailable(String),
+    Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
     StaleFiles(Vec<String>),
 }
@@ -600,6 +610,13 @@ impl fmt::Display for CallGraphStoreError {
             Self::Unavailable(message) => {
                 write!(formatter, "callgraph store unavailable: {message}")
             }
+            Self::Suspended(suspension) => write!(
+                formatter,
+                "callgraph build suspended for {} after {} deaths ({})",
+                suspension.domain.as_str(),
+                suspension.death_count,
+                suspension.reason
+            ),
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
             }
@@ -1877,6 +1894,15 @@ struct RawRef {
     dependencies: BTreeSet<String>,
 }
 
+/// A raw reference read from the durable staging table with its SQLite ordering
+/// key. The ordering key is advanced only in the same transaction that writes
+/// the resolved result, so a crash resumes at a committed window boundary.
+#[derive(Debug)]
+struct StagedRef {
+    rowid: u64,
+    raw: RawRef,
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedRef {
     raw: RawRef,
@@ -2412,16 +2438,43 @@ impl CallGraphStore {
                 remaining.as_millis()
             )));
         }
+        let breaker = crate::build_breaker::BuildDeathBreaker::open(
+            callgraph_dir.join("build-breaker.sqlite"),
+        )
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        let breaker_key = crate::build_breaker::BreakerKey::new(
+            project_root.display().to_string(),
+            crate::build_breaker::BuildDomain::CallgraphCold,
+            callgraph_corpus_fingerprint(project_root, files)?,
+        );
+        match breaker
+            .admit(&breaker_key, 0)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
+        {
+            crate::build_breaker::BreakerAdmission::Admitted(_) => {}
+            crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
+                return Err(CallGraphStoreError::Suspended(suspension));
+            }
+        }
+
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
-        let temp_path = callgraph_dir.join(format!(
-            "{generation}.tmp.{}.{}",
-            std::process::id(),
-            now_nanos()
-        ));
-        remove_sqlite_file_set(&temp_path);
+        // A writer lease makes this root/domain's staging generation exclusive.
+        // Keep its identity stable so a replacement process adopts committed
+        // batches instead of minting a second temp and starting from zero.
+        let temp_path = callgraph_dir.join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let adopting_staging = temp_path.exists();
+        if !adopting_staging {
+            remove_sqlite_file_set(&temp_path);
+        }
 
         let stats = {
+            if adopting_staging {
+                crate::slog_info!(
+                    "resuming callgraph cold build from staged generation {}",
+                    temp_path.display()
+                );
+            }
             let temp_store = Self::open_at_path(
                 project_root.to_path_buf(),
                 project_key.to_string(),
@@ -2470,6 +2523,11 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
         publication?;
+        // Pointer publication is the only automatic breaker reset. The staging
+        // batches above never reset history because a process can die after them.
+        breaker
+            .record_ready_publication(&breaker_key)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
         record_successful_rebuild(callgraph_dir, project_key, project_root, Instant::now());
         Ok((stats, generation))
     }
@@ -2501,6 +2559,29 @@ impl CallGraphStore {
         // A cold build is needed unless a ready generation (or ready legacy DB)
         // is currently published.
         Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())
+    }
+
+    /// Check the durable callgraph-domain breaker before a query starts a cold
+    /// worker. This only runs while no ready generation exists; it never builds
+    /// inline and lets a tripped root return a terminal answer instead of an
+    /// endless `Building` response.
+    pub fn cold_build_suspension(
+        callgraph_dir: &Path,
+        project_root: &Path,
+    ) -> Result<Option<crate::build_breaker::BuildSuspension>> {
+        let breaker_path = callgraph_dir.join("build-breaker.sqlite");
+        if !breaker_path.exists() {
+            return Ok(None);
+        }
+        let files = crate::callgraph::walk_project_files(project_root).collect::<Vec<_>>();
+        let key = crate::build_breaker::BreakerKey::new(
+            project_root.display().to_string(),
+            crate::build_breaker::BuildDomain::CallgraphCold,
+            callgraph_corpus_fingerprint(project_root, &files)?,
+        );
+        crate::build_breaker::BuildDeathBreaker::open(breaker_path)
+            .and_then(|breaker| breaker.suspension(&key))
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))
     }
 
     fn open_at_path(
@@ -2726,230 +2807,224 @@ impl CallGraphStore {
     }
 
     pub fn cold_build(&self, files: &[PathBuf]) -> Result<ColdBuildStats> {
-        self.cold_build_chunked(files, 0)
+        self.cold_build_chunked(files, COLD_BUILD_EXTRACT_BATCH_FILES)
     }
 
+    /// Build in two durable passes. Extraction commits only bounded batches; resolution
+    /// consumes the staged raw references in bounded windows after the complete symbol
+    /// table exists. A partially written temporary database is therefore safe to adopt.
     pub fn cold_build_chunked(
         &self,
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
-        let bench = std::env::var("AFT_BENCH_COLD").is_ok();
-        macro_rules! phase {
-            ($label:expr, $t:expr) => {
-                if bench {
-                    eprintln!("  cold_build[{}]: {} ms", $label, $t.elapsed().as_millis());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
-            };
-        }
         let files = normalize_file_list(&self.project_root, files)?;
+        let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
+        let workspace_root = self.project_root.display().to_string();
+        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
-        if chunk_size == 0 {
-            let t = Instant::now();
-            let build = build_extracts_parallel(&self.project_root, &files);
-            phase!("extract_parallel", t);
-            let extracts = build.extracts;
-            let failures = build.failures;
-            let node_count = extracts.iter().map(|extract| extract.nodes.len()).sum();
-
-            let t = Instant::now();
-            let index = ProjectIndex::from_extracts(&self.project_root, &extracts);
-            phase!("build_index", t);
-            let t = Instant::now();
-            let mut resolved_refs = Vec::new();
-            for extract in &extracts {
-                for raw_ref in &extract.raw_refs {
-                    resolved_refs.push(resolve_ref(raw_ref.clone(), &index)?);
-                }
-            }
-            phase!("resolve_refs", t);
-            let ref_count = resolved_refs.len();
-            let edge_count = resolved_refs
-                .iter()
-                .filter(|item| item.edge.is_some())
-                .count();
-
-            let t = Instant::now();
-            self.verify_writer_lease()?;
-            let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.verify_writer_lease()?;
+        let mut phase = staged_build_phase(&conn)?;
+        if phase.as_deref().is_none_or(|phase| phase == "ready") {
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
+            tx.execute("DELETE FROM staging_ref_context", [])?;
             insert_meta(&tx)?;
             drop_cold_build_secondary_indexes(&tx)?;
-            {
-                let workspace_root = self.project_root.display().to_string();
-                let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-                for extract in &extracts {
-                    insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
-                }
-                for failure in &failures {
-                    insert_backend_state_prepared(
-                        &mut inserts.backend_state,
-                        &workspace_root,
-                        &failure.rel_path,
-                        failure
-                            .freshness
-                            .as_ref()
-                            .map(|freshness| &freshness.content_hash),
-                        "stale",
-                    )?;
-                }
-                for resolved in &resolved_refs {
-                    insert_resolved_ref_prepared(&mut inserts, resolved)?;
-                }
-            }
-            create_cold_build_secondary_indexes(&tx)?;
-            let supplemental_edge_count =
-                insert_method_dispatch_edges(&tx, &self.project_root, None)?;
-            set_meta_ready(&tx, true)?;
+            set_meta_ready(&tx, false)?;
+            set_staged_build_phase(&tx, "extracting")?;
+            set_staged_u64(&tx, STAGED_COMMITTED_EXTRACTED_BYTES, 0)?;
+            set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, 0)?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
-            phase!("sqlite_insert", t);
-
-            let elapsed_ms = started.elapsed().as_millis();
-            crate::slog_info!(
-                "perf callgraph_store cold_build: files={} nodes={} refs={} edges={} ms={}",
-                extracts.len(),
-                node_count,
-                ref_count,
-                edge_count + supplemental_edge_count,
-                elapsed_ms
-            );
-            return Ok(ColdBuildStats {
-                files: extracts.len(),
-                nodes: node_count,
-                refs: ref_count,
-                edges: edge_count + supplemental_edge_count,
-                failed_files: failures
-                    .into_iter()
-                    .map(|failure| failure.rel_path)
-                    .collect(),
-                elapsed_ms,
-            });
+            phase = Some("extracting".to_string());
         }
 
-        // Chunked implementation: parse and resolve in batches to reduce peak
-        // memory during cold build without changing the persisted graph.
-        let t = Instant::now();
+        // A crashed extraction pass has already committed complete batches. Compare the
+        // staged content identity with the current file before parsing so unchanged
+        // committed files are not restarted from zero after adoption.
+        if phase.as_deref() == Some("extracting") {
+            let current_paths = files
+                .iter()
+                .map(|path| relative_path(&self.project_root, path))
+                .collect::<HashSet<_>>();
+            prune_staged_files_not_in(&mut conn, &current_paths)?;
+
+            let mut offset = 0;
+            while offset < files.len() {
+                let mut batch = Vec::with_capacity(batch_files);
+                let mut batch_bytes = 0u64;
+                while offset < files.len() && batch.len() < batch_files {
+                    let path = files[offset].clone();
+                    let file_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                    if !batch.is_empty()
+                        && batch_bytes.saturating_add(file_bytes) > COLD_BUILD_EXTRACT_BATCH_BYTES
+                    {
+                        break;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(file_bytes);
+                    batch.push(path);
+                    offset += 1;
+                }
+                // A single oversized source still gets a one-file transaction, which
+                // keeps progress durable without making a later batch unbounded.
+                if batch.is_empty() {
+                    batch.push(files[offset].clone());
+                    offset += 1;
+                }
+
+                let mut needs_extract = Vec::new();
+                for path in batch {
+                    if !staged_content_matches(&conn, &self.project_root, &path)? {
+                        needs_extract.push(path);
+                    }
+                }
+                if needs_extract.is_empty() {
+                    continue;
+                }
+
+                let build = build_extracts_parallel(&self.project_root, &needs_extract);
+                self.verify_writer_lease()?;
+                let total_changes_before = conn.total_changes();
+                let tx = conn.transaction()?;
+                let mut extracted_bytes = 0u64;
+                {
+                    let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+                    for extract in &build.extracts {
+                        delete_staged_file_rows(&tx, &extract.rel_path)?;
+                        insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                        for raw in &extract.raw_refs {
+                            insert_staged_ref_prepared(&mut inserts, raw)?;
+                        }
+                        extracted_bytes = extracted_bytes.saturating_add(extract.freshness.size);
+                    }
+                    for failure in &build.failures {
+                        insert_backend_state_prepared(
+                            &mut inserts.backend_state,
+                            &workspace_root,
+                            &failure.rel_path,
+                            failure
+                                .freshness
+                                .as_ref()
+                                .map(|freshness| &freshness.content_hash),
+                            "stale",
+                        )?;
+                    }
+                }
+                increment_staged_extracted_bytes(&tx, extracted_bytes)?;
+                tx.commit()?;
+                self.record_commit(total_changes_before, &conn);
+            }
+
+            let total_changes_before = conn.total_changes();
+            let tx = conn.transaction()?;
+            set_staged_build_phase(&tx, "indexing")?;
+            tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
+            phase = Some("indexing".to_string());
+        }
+
+        // Secondary indexes are intentionally created only after every extract is
+        // durable, so pass 1 remains bulk-load shaped and pass 2 sees a complete
+        // corpus-wide symbol/export table.
+        if phase.as_deref() == Some("indexing") {
+            self.verify_writer_lease()?;
+            let total_changes_before = conn.total_changes();
+            let tx = conn.transaction()?;
+            create_cold_build_secondary_indexes(&tx)?;
+            set_staged_build_phase(&tx, "resolving")?;
+            tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
+        }
+
+        let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        let mut resolve_cursor = staged_u64(&conn, STAGED_RESOLVE_CURSOR)?;
+        loop {
+            let staged = load_staged_ref_window(&conn, resolve_cursor, COLD_BUILD_RESOLVE_WINDOW)?;
+            let Some(last_rowid) = staged.last().map(|entry| entry.rowid) else {
+                break;
+            };
+
+            // Reparse only callers represented by this resolve window. The staged
+            // references remain the source of truth; this short-lived caller data is
+            // discarded at the next window boundary.
+            let mut caller_extracts = HashMap::new();
+            for caller_file in staged.iter().map(|entry| &entry.raw.caller_file) {
+                if caller_extracts.contains_key(caller_file) {
+                    continue;
+                }
+                let path = self.project_root.join(caller_file);
+                if let Ok(extract) = build_file_extract(&self.project_root, &path) {
+                    caller_extracts.insert(caller_file.clone(), extract);
+                }
+            }
+
+            self.verify_writer_lease()?;
+            let total_changes_before = conn.total_changes();
+            let tx = conn.transaction()?;
+            let index = ProjectIndex::from_db_and_callers(
+                &tx,
+                &self.project_root,
+                &caller_extracts,
+                workspace_crate_prefixes.clone(),
+            )?;
+            {
+                let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+                for staged_ref in staged {
+                    let resolved = if caller_extracts.contains_key(&staged_ref.raw.caller_file) {
+                        resolve_ref(staged_ref.raw, &index)?
+                    } else {
+                        unresolved_staged_ref(staged_ref.raw)
+                    };
+                    insert_resolved_ref_prepared(&mut inserts, &resolved)?;
+                }
+            }
+            set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, last_rowid)?;
+            tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
+            resolve_cursor = last_rowid;
+        }
+
         self.verify_writer_lease()?;
-        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
-        clear_tables(&tx)?;
-        insert_meta(&tx)?;
-        drop_cold_build_secondary_indexes(&tx)?;
-
-        let mut all_raw_refs = Vec::new();
-        let mut failures = Vec::new();
-        let mut node_count = 0;
-        let mut files_parsed = 0;
-
-        let mut persistent_call_data = Vec::new();
-        let mut file_to_call_data_index = HashMap::new();
-        let mut files_index = HashMap::new();
-
-        let workspace_root = self.project_root.display().to_string();
-
-        {
-            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-            for chunk in files.chunks(chunk_size) {
-                let build = build_extracts_parallel(&self.project_root, chunk);
-                failures.extend(build.failures.clone());
-
-                for extract in build.extracts {
-                    files_parsed += 1;
-                    node_count += extract.nodes.len();
-                    insert_file_extract_prepared(&mut inserts, &workspace_root, &extract)?;
-
-                    let db_file_index = DbFileIndex::from_extract(&self.project_root, &extract);
-                    files_index.insert(extract.rel_path.clone(), db_file_index);
-
-                    persistent_call_data.push(extract.data);
-                    let idx = persistent_call_data.len() - 1;
-                    file_to_call_data_index.insert(extract.rel_path.clone(), idx);
-
-                    all_raw_refs.push((extract.rel_path, extract.raw_refs));
-                }
-                for failure in &build.failures {
-                    insert_backend_state_prepared(
-                        &mut inserts.backend_state,
-                        &workspace_root,
-                        &failure.rel_path,
-                        failure
-                            .freshness
-                            .as_ref()
-                            .map(|freshness| &freshness.content_hash),
-                        "stale",
-                    )?;
-                }
-            }
-        }
-
-        let mut caller_data = HashMap::new();
-        for (rel_path, idx) in &file_to_call_data_index {
-            caller_data.insert(rel_path.clone(), &persistent_call_data[*idx]);
-        }
-        let indexed_caller_files = files_index.keys().cloned().collect::<BTreeSet<_>>();
-        let index = ProjectIndex::from_parts(
-            &self.project_root,
-            files_index,
-            caller_data,
-            WorkspaceCratePrefixCache::default(),
-        );
-
-        let mut resolved_refs = Vec::new();
-        for (_, raw_refs) in all_raw_refs {
-            for raw_ref in raw_refs {
-                resolved_refs.push(resolve_ref(raw_ref, &index)?);
-            }
-        }
-
-        let ref_count = resolved_refs.len();
-        let edge_count = resolved_refs
-            .iter()
-            .filter(|item| item.edge.is_some())
-            .count();
-
-        {
-            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-            for resolved in &resolved_refs {
-                insert_resolved_ref_prepared(&mut inserts, resolved)?;
-            }
-        }
-        create_cold_build_secondary_indexes(&tx)?;
-        let supplemental_edge_count = insert_method_dispatch_edges_chunked(
+        let caller_files = staged_caller_files(&tx)?;
+        let _supplemental_edge_count = insert_method_dispatch_edges_chunked(
             &tx,
             &self.project_root,
-            &indexed_caller_files,
-            chunk_size,
+            &caller_files,
+            batch_files,
         )?;
         set_meta_ready(&tx, true)?;
+        set_staged_build_phase(&tx, "ready")?;
+        tx.execute("DELETE FROM staging_ref_context", [])?;
         bump_projection_write_revision(&tx)?;
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
-        phase!("sqlite_insert", t);
 
+        let files = query_count(&conn, "SELECT COUNT(*) FROM files")? as usize;
+        let nodes = query_count(&conn, "SELECT COUNT(*) FROM nodes")? as usize;
+        let refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
+        let edges = query_count(&conn, "SELECT COUNT(*) FROM edges")? as usize;
+        let failed_files = staged_failed_files(&conn)?;
         let elapsed_ms = started.elapsed().as_millis();
         crate::slog_info!(
-            "perf callgraph_store cold_build (chunked): files={} nodes={} refs={} edges={} ms={}",
-            files_parsed,
-            node_count,
-            ref_count,
-            edge_count + supplemental_edge_count,
+            "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
+            files,
+            nodes,
+            refs,
+            edges,
+            staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
             elapsed_ms
         );
         Ok(ColdBuildStats {
-            files: files_parsed,
-            nodes: node_count,
-            refs: ref_count,
-            edges: edge_count + supplemental_edge_count,
-            failed_files: failures
-                .into_iter()
-                .map(|failure| failure.rel_path)
-                .collect(),
+            files,
+            nodes,
+            refs,
+            edges,
+            failed_files,
             elapsed_ms,
         })
     }
@@ -5965,7 +6040,9 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 }
 
 fn configure_build_connection(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    // The staging database commits independently recoverable batches. WAL keeps
+    // those commits durable without forcing a rollback journal rewrite per batch.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(
         None,
         "synchronous",
@@ -6131,6 +6208,14 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS meta (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL
+        );
+
+        -- Context needed only while a generation is staged. Raw refs live in
+        -- `refs` with status `staged`; this table preserves the caller symbol
+        -- needed to avoid inventing self edges during the later resolve pass.
+        CREATE TABLE IF NOT EXISTS staging_ref_context (
+            ref_id        TEXT PRIMARY KEY,
+            caller_symbol TEXT
         );",
     )?;
     insert_meta(conn)?;
@@ -6238,7 +6323,8 @@ fn schema_fingerprint() -> String {
 
 fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
-        "DELETE FROM edges;
+        "DELETE FROM staging_ref_context;
+         DELETE FROM edges;
          DELETE FROM file_dependencies;
          DELETE FROM refs;
          DELETE FROM dispatch_hints;
@@ -6248,6 +6334,194 @@ fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
          DELETE FROM files;",
     )?;
     Ok(())
+}
+
+fn staged_build_phase(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT v FROM meta WHERE k = ?1",
+        params![STAGED_BUILD_PHASE],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn staged_u64(conn: &Connection, key: &str) -> Result<u64> {
+    let value = conn
+        .query_row("SELECT v FROM meta WHERE k = ?1", params![key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
+}
+
+fn set_staged_build_phase(tx: &Transaction<'_>, phase: &str) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+        params![STAGED_BUILD_PHASE, phase],
+    )?;
+    Ok(())
+}
+
+fn set_staged_u64(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
+/// The extract rows and this counter update share a SQLite transaction. This is
+/// intentionally not inferred from file/page growth: rollback removes both the
+/// rows and the claimed credit, while page reuse cannot fabricate credit.
+fn increment_staged_extracted_bytes(tx: &Transaction<'_>, bytes: u64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO meta(k, v) VALUES(?1, ?2)
+         ON CONFLICT(k) DO UPDATE SET v = CAST(meta.v AS INTEGER) + excluded.v",
+        params![STAGED_COMMITTED_EXTRACTED_BYTES, bytes.to_string()],
+    )?;
+    Ok(())
+}
+
+fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -> Result<bool> {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let Ok(freshness) = collect_source_freshness(path, &source) else {
+        return Ok(false);
+    };
+    let rel_path = relative_path(project_root, path);
+    let staged_hash = conn
+        .query_row(
+            "SELECT content_hash FROM files WHERE path = ?1",
+            params![rel_path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(staged_hash.as_deref() == Some(hash_to_hex(freshness.content_hash).as_str()))
+}
+
+fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM staging_ref_context
+         WHERE ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?1)",
+        params![rel_path],
+    )?;
+    delete_file_rows(tx, rel_path)
+}
+
+fn prune_staged_files_not_in(conn: &mut Connection, current_paths: &HashSet<String>) -> Result<()> {
+    let mut statement = conn.prepare("SELECT path FROM files")?;
+    let staged_paths = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    let removed = staged_paths
+        .into_iter()
+        .filter(|path| !current_paths.contains(path))
+        .collect::<Vec<_>>();
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for path in removed {
+        delete_staged_file_rows(&tx, &path)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn load_staged_ref_window(
+    conn: &Connection,
+    after_rowid: u64,
+    limit: usize,
+) -> Result<Vec<StagedRef>> {
+    let mut statement = conn.prepare(
+        "SELECT refs.rowid, refs.ref_id, refs.caller_node, refs.caller_file, refs.kind,
+                refs.short_name, refs.full_ref, refs.module_path, refs.import_kind,
+                refs.local_name, refs.requested_name, refs.namespace_alias, refs.wildcard,
+                refs.line, refs.byte_start, refs.byte_end, staging_ref_context.caller_symbol
+         FROM refs
+         LEFT JOIN staging_ref_context ON staging_ref_context.ref_id = refs.ref_id
+         WHERE refs.status = 'staged' AND refs.rowid > ?1
+         ORDER BY refs.rowid
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![after_rowid as i64, limit as i64], |row| {
+        Ok(StagedRef {
+            rowid: row.get::<_, i64>(0)? as u64,
+            raw: RawRef {
+                ref_id: row.get(1)?,
+                caller_node: row.get(2)?,
+                caller_file: row.get(3)?,
+                kind: row.get(4)?,
+                short_name: row.get(5)?,
+                full_ref: row.get(6)?,
+                module_path: row.get(7)?,
+                import_kind: row.get(8)?,
+                local_name: row.get(9)?,
+                requested_name: row.get(10)?,
+                namespace_alias: row.get(11)?,
+                wildcard: row.get::<_, i64>(12)? != 0,
+                line: row.get::<_, i64>(13)? as u32,
+                byte_start: row.get::<_, i64>(14)? as usize,
+                byte_end: row.get::<_, i64>(15)? as usize,
+                caller_symbol: row.get(16)?,
+                dependencies: BTreeSet::new(),
+            },
+        })
+    })?;
+    let mut refs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut dependencies = HashMap::<String, BTreeSet<String>>::new();
+    let mut dependency_statement = conn
+        .prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file")?;
+    for raw in refs.iter_mut().map(|entry| &mut entry.raw) {
+        if !dependencies.contains_key(&raw.caller_file) {
+            let rows =
+                dependency_statement.query_map(params![raw.caller_file], |row| row.get(0))?;
+            let values = rows.collect::<std::result::Result<BTreeSet<_>, _>>()?;
+            dependencies.insert(raw.caller_file.clone(), values);
+        }
+        raw.dependencies = dependencies
+            .get(&raw.caller_file)
+            .cloned()
+            .unwrap_or_default();
+    }
+    Ok(refs)
+}
+
+fn unresolved_staged_ref(raw: RawRef) -> ResolvedRef {
+    ResolvedRef {
+        dependencies: raw.dependencies.clone(),
+        raw,
+        status: "unresolved".to_string(),
+        target_node: None,
+        target_file: None,
+        target_symbol: None,
+        edge: None,
+    }
+}
+
+fn staged_caller_files(tx: &Transaction<'_>) -> Result<BTreeSet<String>> {
+    let mut statement = tx.prepare("SELECT DISTINCT caller_file FROM refs")?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<BTreeSet<_>, _>>()?)
+}
+
+fn query_count(conn: &Connection, query: &str) -> Result<u64> {
+    conn.query_row(query, [], |row| row.get::<_, i64>(0))
+        .map(|count| count.max(0) as u64)
+        .map_err(Into::into)
+}
+
+fn staged_failed_files(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT file_path FROM backend_file_state WHERE status = 'stale' ORDER BY file_path",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
@@ -8387,22 +8661,6 @@ impl<'a> ProjectIndex<'a> {
         }
     }
 
-    fn from_extracts(project_root: &Path, extracts: &'a [FileExtract]) -> Self {
-        let mut files = HashMap::new();
-        let mut caller_data = HashMap::new();
-        for extract in extracts {
-            let index = DbFileIndex::from_extract(project_root, extract);
-            caller_data.insert(extract.rel_path.clone(), &extract.data);
-            files.insert(extract.rel_path.clone(), index);
-        }
-        Self::from_parts(
-            project_root,
-            files,
-            caller_data,
-            WorkspaceCratePrefixCache::default(),
-        )
-    }
-
     fn from_db_and_callers(
         tx: &Transaction<'_>,
         project_root: &Path,
@@ -8749,6 +9007,7 @@ struct ColdBuildInsertStatements<'stmt> {
     dispatch_hint: Statement<'stmt>,
     backend_state: Statement<'stmt>,
     reference: Statement<'stmt>,
+    staging_ref_context: Statement<'stmt>,
     edge: Statement<'stmt>,
 }
 
@@ -8788,6 +9047,9 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     byte_start, byte_end, status, target_node, target_file, target_symbol,
                     provenance
                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?,
+            staging_ref_context: tx.prepare(
+                "INSERT OR REPLACE INTO staging_ref_context(ref_id, caller_symbol) VALUES(?1, ?2)",
             )?,
             edge: tx.prepare(
                 "INSERT OR REPLACE INTO edges(
@@ -8884,6 +9146,38 @@ fn insert_backend_state_prepared(
         status,
         unix_seconds_now(),
     ])?;
+    Ok(())
+}
+
+fn insert_staged_ref_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    raw: &RawRef,
+) -> Result<()> {
+    statements.reference.execute(params![
+        raw.ref_id,
+        raw.caller_node,
+        raw.caller_file,
+        raw.kind,
+        raw.short_name,
+        raw.full_ref,
+        raw.module_path,
+        raw.import_kind,
+        raw.local_name,
+        raw.requested_name,
+        raw.namespace_alias,
+        bool_int(raw.wildcard),
+        raw.line as i64,
+        raw.byte_start as i64,
+        raw.byte_end as i64,
+        "staged",
+        Option::<String>::None,
+        Option::<String>::None,
+        Option::<String>::None,
+        ref_provenance(raw),
+    ])?;
+    statements
+        .staging_ref_context
+        .execute(params![raw.ref_id, raw.caller_symbol])?;
     Ok(())
 }
 
@@ -12017,6 +12311,34 @@ fn ref_id(parts: &[&str]) -> String {
     hash_to_hex(blake3::hash(joined.as_bytes()))
 }
 
+fn callgraph_corpus_fingerprint(project_root: &Path, files: &[PathBuf]) -> Result<String> {
+    let mut paths = normalize_file_list(project_root, files)?;
+    paths.sort();
+    let mut hasher = blake3::Hasher::new();
+    for path in paths {
+        let rel_path = relative_path(project_root, &path);
+        hasher.update(rel_path.as_bytes());
+        hasher.update(&[0]);
+        match std::fs::read(&path) {
+            Ok(source) => {
+                hasher.update(blake3::hash(&source).as_bytes());
+            }
+            // A file racing deletion is still a content movement, never an
+            // opportunity to retain a prior fingerprint's suspension forever.
+            Err(error) => {
+                hasher.update(format!("missing:{error}").as_bytes());
+            }
+        }
+        hasher.update(&[0]);
+    }
+    let ignore_rules = project_root.join(".gitignore");
+    if let Ok(contents) = std::fs::read(ignore_rules) {
+        hasher.update(b".gitignore\0");
+        hasher.update(blake3::hash(&contents).as_bytes());
+    }
+    Ok(hash_to_hex(hasher.finalize()))
+}
+
 fn hash_to_hex(hash: blake3::Hash) -> String {
     hash.to_hex().to_string()
 }
@@ -12092,7 +12414,7 @@ fn ns_to_system_time(value: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
 }
 
-fn unix_millis_now() -> u64 {
+pub(crate) fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -15462,5 +15784,110 @@ class OnlyService {
             .position(|line| line.contains(needle))
             .map(|index| index as u32 + 1)
             .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+    }
+}
+
+#[cfg(test)]
+mod bounded_build_breaker_tests {
+    use super::*;
+    use crate::build_breaker::{BreakerAdmission, BreakerKey, BuildDeathBreaker, BuildDomain};
+    use tempfile::tempdir;
+
+    #[test]
+    fn resumed_stage_preserves_committed_batch_and_counter() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.ts");
+        let second = root.join("second.ts");
+        std::fs::write(&first, "export function first() {}\n").unwrap();
+        std::fs::write(&second, "export function second() { first(); }\n").unwrap();
+        let staging = temp.path().join("stage.sqlite");
+        let writer_lease = acquire_writer_lease(temp.path(), "test-key", &root)
+            .unwrap()
+            .expect("test root may write its private staging database");
+        let store = CallGraphStore::open_at_path(
+            root.clone(),
+            "test-key".to_string(),
+            staging,
+            None,
+            true,
+            Some(writer_lease),
+            None,
+        )
+        .unwrap()
+        .store;
+        let first_extract = build_file_extract(&root, &first).unwrap();
+        let first_bytes = first_extract.freshness.size;
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            clear_tables(&tx).unwrap();
+            insert_meta(&tx).unwrap();
+            drop_cold_build_secondary_indexes(&tx).unwrap();
+            set_meta_ready(&tx, false).unwrap();
+            set_staged_build_phase(&tx, "extracting").unwrap();
+            set_staged_u64(&tx, STAGED_COMMITTED_EXTRACTED_BYTES, 0).unwrap();
+            {
+                let mut inserts = ColdBuildInsertStatements::new(&tx).unwrap();
+                insert_file_extract_prepared(
+                    &mut inserts,
+                    &root.display().to_string(),
+                    &first_extract,
+                )
+                .unwrap();
+                for raw in &first_extract.raw_refs {
+                    insert_staged_ref_prepared(&mut inserts, raw).unwrap();
+                }
+            }
+            increment_staged_extracted_bytes(&tx, first_bytes).unwrap();
+            tx.commit().unwrap();
+        }
+
+        store
+            .cold_build_chunked(&[first.clone(), second.clone()], 1)
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(query_count(&conn, "SELECT COUNT(*) FROM files").unwrap(), 2);
+        assert_eq!(
+            staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES).unwrap(),
+            first_bytes + std::fs::metadata(second).unwrap().len(),
+            "the already committed batch and its credit survive adoption; only the new batch increments credit"
+        );
+        assert_eq!(staged_build_phase(&conn).unwrap().as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn published_callgraph_build_respects_durable_domain_suspension() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let store_dir = temp.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        std::fs::write(&source, "export function marker() {}\n").unwrap();
+        let files = vec![source];
+        let key = BreakerKey::new(
+            root.display().to_string(),
+            BuildDomain::CallgraphCold,
+            callgraph_corpus_fingerprint(&root, &files).unwrap(),
+        );
+        let breaker = BuildDeathBreaker::open(store_dir.join("build-breaker.sqlite")).unwrap();
+        for _ in 0..3 {
+            let BreakerAdmission::Admitted(attempt) = breaker.admit(&key, 0).unwrap() else {
+                panic!("unexpected early suspension");
+            };
+            breaker
+                .record_attributed_death(&key, &attempt.attempt_id, 0, 0)
+                .unwrap();
+        }
+
+        let error = CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &files, 1)
+            .expect_err("durably tripped callgraph domain must refuse a new cold build");
+        assert!(matches!(
+            error,
+            CallGraphStoreError::Suspended(ref suspension)
+                if suspension.domain == BuildDomain::CallgraphCold
+                    && suspension.death_count == 3
+        ));
     }
 }

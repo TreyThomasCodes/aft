@@ -219,6 +219,9 @@ fn ensure_callgraph_store_ready(ctx: &AppContext) {
                 );
                 thread::sleep(Duration::from_millis(10));
             }
+            CallgraphStoreAccess::Suspended(suspension) => {
+                panic!("callgraph store unexpectedly suspended in test: {suspension:?}")
+            }
             CallgraphStoreAccess::Unavailable => {
                 panic!("callgraph store unexpectedly unavailable in test")
             }

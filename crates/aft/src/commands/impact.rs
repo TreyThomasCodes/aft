@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, impact_result, store_error_response, unavailable_response,
 };
@@ -68,6 +69,9 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
         CallgraphStoreAccess::Building => return building_response(&req.id, "impact"),
+        CallgraphStoreAccess::Suspended(suspension) => {
+            return suspended_response(&req.id, "impact", &suspension)
+        }
         CallgraphStoreAccess::Unavailable => {
             return unavailable_response(&req.id, "impact", ctx.is_worktree_bridge())
         }
