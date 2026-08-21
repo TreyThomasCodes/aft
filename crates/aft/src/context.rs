@@ -3853,7 +3853,8 @@ impl AppContext {
         else {
             return Ok(None);
         };
-        let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
+        // Let the store walk directly into its staging table. Keeping discovery
+        // inside the builder prevents a second corpus-sized path inventory here.
         let (store, _stats) = crate::callgraph_store::with_publish_epoch(
             persist_epoch_flag.clone(),
             persist_epoch,
@@ -3862,7 +3863,7 @@ impl AppContext {
                     CallGraphStore::force_cold_build_with_lease_chunked(
                         callgraph_dir.clone(),
                         project_root.clone(),
-                        &files,
+                        &[],
                         self.config().callgraph_chunk_size,
                     )
                     .map(|(store, _stats)| (store, ()))
@@ -3870,7 +3871,7 @@ impl AppContext {
                     CallGraphStore::ensure_built_with_lease_chunked(
                         callgraph_dir.clone(),
                         project_root.clone(),
-                        &files,
+                        &[],
                         self.config().callgraph_chunk_size,
                     )
                     .map(|(store, _stats)| (store, ()))

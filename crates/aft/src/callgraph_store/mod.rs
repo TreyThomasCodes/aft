@@ -68,6 +68,7 @@ const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
+const STAGED_CORPUS_FINGERPRINT: &str = "staged_corpus_fingerprint";
 
 fn write_amplification_baseline_enabled() -> bool {
     std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE").is_some()
@@ -2042,15 +2043,385 @@ struct ProjectIndex<'a> {
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
 }
 
-impl ProjectIndex<'_> {
-    /// Resolve a crate name to its `src` prefix, building the workspace map on
-    /// first use. Refresh-worker indexes for the same root share this cache.
+/// Resolution reads symbols and exports through one interface. Incremental
+/// refreshes use the in-memory index, while cold builds query only the rows
+/// needed by the active caller from SQLite.
+trait ResolverIndex {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData>;
+    fn lang_for(&self, file: &str) -> Option<LangId>;
+    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
+    fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
+    fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
+    fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
+    fn export_alias(&self, file: &str, symbol: &str) -> Option<String>;
+    fn has_export(&self, file: &str, symbol: &str) -> bool;
+    fn default_export(&self, file: &str) -> Option<String>;
+    fn contains_file(&self, file: &str) -> bool;
+    fn crate_src_prefix(&self, crate_name: &str) -> Option<String>;
+    fn inline_scoped_target(
+        &self,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)>;
+}
+
+impl ResolverIndex for ProjectIndex<'_> {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
+        self.caller_data.get(file).copied()
+    }
+
+    fn lang_for(&self, file: &str) -> Option<LangId> {
+        self.lang_for(file)
+    }
+
+    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
+        self.module_target(caller_file, module_path)
+    }
+
+    fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
+        self.reexports_for(file).to_vec()
+    }
+
+    fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String> {
+        self.node_for_symbol(file, symbol)
+    }
+
+    fn node_is_callable(&self, file: &str, node_id: &str) -> bool {
+        self.node_is_callable(file, node_id)
+    }
+
+    fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
+        self.files
+            .get(file)
+            .and_then(|item| item.export_aliases.get(symbol))
+            .cloned()
+    }
+
+    fn has_export(&self, file: &str, symbol: &str) -> bool {
+        self.files
+            .get(file)
+            .is_some_and(|item| item.exports.contains(symbol))
+    }
+
+    fn default_export(&self, file: &str) -> Option<String> {
+        self.files
+            .get(file)
+            .and_then(|item| item.default_export.clone())
+    }
+
+    fn contains_file(&self, file: &str) -> bool {
+        self.files.contains_key(file)
+    }
+
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
         self.workspace_crate_prefixes
             .0
             .get_or_init(|| build_workspace_crate_prefixes(&self.project_root))
             .get(crate_name)
             .cloned()
+    }
+
+    fn inline_scoped_target(
+        &self,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)> {
+        let src_prefix = rust_src_prefix(caller_file);
+        let mut file_paths = self.files.keys().cloned().collect::<Vec<_>>();
+        file_paths.sort();
+        if let Some(position) = file_paths.iter().position(|file| file == caller_file) {
+            let caller = file_paths.remove(position);
+            file_paths.insert(0, caller);
+        }
+        for file_path in file_paths {
+            if self.lang_for(&file_path) != Some(LangId::Rust)
+                || rust_src_prefix(&file_path) != src_prefix
+            {
+                continue;
+            }
+            let file_module_segments = rust_module_segments_for_rel(&file_path);
+            if !module_segments.starts_with(&file_module_segments) {
+                continue;
+            }
+            let scoped_segments = &module_segments[file_module_segments.len()..];
+            if scoped_segments.is_empty() {
+                continue;
+            }
+            let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+            if self.node_for_symbol(&file_path, &scoped_symbol).is_some() {
+                return Some((file_path, scoped_symbol));
+            }
+        }
+        None
+    }
+}
+
+/// A cold-build resolver view that loads one file's index at a time. Keeping the
+/// complete staged corpus in SQLite makes the heap proportional to the active
+/// reference window rather than to the number of project files.
+struct DiskProjectIndex<'a> {
+    project_root: &'a Path,
+    conn: &'a Connection,
+    caller_file: &'a str,
+    caller_data: &'a FileCallData,
+    workspace_crate_prefixes: WorkspaceCratePrefixCache,
+}
+
+impl DiskProjectIndex<'_> {
+    fn file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
+        let lang: String = self
+            .conn
+            .query_row(
+                "SELECT lang FROM files WHERE path = ?1",
+                params![rel_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()??;
+        let mut index = DbFileIndex {
+            lang: lang_from_label(&lang),
+            exports: HashSet::new(),
+            default_export: None,
+            export_aliases: HashMap::new(),
+            node_by_scoped: HashMap::new(),
+            node_by_bare: HashMap::new(),
+            node_kind_by_id: HashMap::new(),
+            module_targets: HashMap::new(),
+            reexports: Vec::new(),
+        };
+        let mut nodes = self
+            .conn
+            .prepare(
+                "SELECT id, name, scoped_name, kind, exported, is_default_export
+                 FROM nodes WHERE file_path = ?1",
+            )
+            .ok()?;
+        let rows = nodes
+            .query_map(params![rel_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .ok()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        drop(nodes);
+        for (id, name, scoped_name, kind, exported, is_default_export) in rows {
+            if exported {
+                index.exports.insert(name.clone());
+                index.exports.insert(scoped_name.clone());
+            }
+            if is_default_export {
+                index.default_export = Some(scoped_name.clone());
+            }
+            index.node_by_scoped.insert(scoped_name, id.clone());
+            index.node_by_bare.entry(name).or_insert(id.clone());
+            index.node_kind_by_id.insert(id, kind);
+        }
+
+        let mut refs = self
+            .conn
+            .prepare(
+                "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
+                 FROM refs
+                 WHERE caller_file = ?1 AND kind IN ('import', 'reexport', 'export_alias')",
+            )
+            .ok()?;
+        let rows = refs
+            .query_map(params![rel_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .ok()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        drop(refs);
+        for (ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name) in rows {
+            if kind == "export_alias" {
+                if let (Some(exported), Some(source)) = (local_name, requested_name) {
+                    index.export_aliases.insert(exported, source);
+                }
+                continue;
+            }
+            let Some(module_path) = module_path else {
+                continue;
+            };
+            let target_file = self.disk_module_target(rel_path, &module_path).or_else(|| {
+                self.conn
+                    .query_row(
+                        "SELECT d.dep_file
+                         FROM file_dependencies d
+                         JOIN files f ON f.path = d.dep_file
+                         WHERE d.file_path = ?1
+                         ORDER BY d.dep_file
+                         LIMIT 1",
+                        params![rel_path],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
+            index
+                .module_targets
+                .entry(module_path.clone())
+                .or_insert_with(|| target_file.clone());
+            if kind == "reexport" {
+                let raw = RawRef {
+                    ref_id,
+                    caller_node: None,
+                    caller_symbol: None,
+                    caller_file: rel_path.to_string(),
+                    kind,
+                    short_name: None,
+                    full_ref,
+                    module_path: Some(module_path),
+                    import_kind: Some("reexport".to_string()),
+                    local_name: None,
+                    requested_name: None,
+                    namespace_alias: None,
+                    wildcard,
+                    line: 0,
+                    byte_start: 0,
+                    byte_end: 0,
+                    dependencies: BTreeSet::new(),
+                };
+                index
+                    .reexports
+                    .push(reexport_index_from_raw(&raw, target_file));
+            }
+        }
+        Some(index)
+    }
+
+    fn disk_module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
+        let caller_dir = self.project_root.join(caller_file).parent()?.to_path_buf();
+        let candidate = callgraph::resolve_module_path(&caller_dir, module_path)?;
+        let rel_path = relative_path(self.project_root, &canonicalize_path(&candidate));
+        self.contains_file(&rel_path).then_some(rel_path)
+    }
+}
+
+impl ResolverIndex for DiskProjectIndex<'_> {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
+        (file == self.caller_file).then_some(self.caller_data)
+    }
+
+    fn lang_for(&self, file: &str) -> Option<LangId> {
+        self.file_index(file).and_then(|index| index.lang)
+    }
+
+    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
+        self.file_index(caller_file)
+            .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
+    }
+
+    fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
+        self.file_index(file)
+            .map(|index| index.reexports)
+            .unwrap_or_default()
+    }
+
+    fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String> {
+        self.file_index(file).and_then(|index| {
+            index
+                .node_by_scoped
+                .get(symbol)
+                .cloned()
+                .or_else(|| index.node_by_bare.get(symbol).cloned())
+        })
+    }
+
+    fn node_is_callable(&self, file: &str, node_id: &str) -> bool {
+        self.file_index(file)
+            .and_then(|index| index.node_kind_by_id.get(node_id).cloned())
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+    }
+
+    fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
+        self.file_index(file)
+            .and_then(|index| index.export_aliases.get(symbol).cloned())
+    }
+
+    fn has_export(&self, file: &str, symbol: &str) -> bool {
+        self.file_index(file)
+            .is_some_and(|index| index.exports.contains(symbol))
+    }
+
+    fn default_export(&self, file: &str) -> Option<String> {
+        self.file_index(file).and_then(|index| index.default_export)
+    }
+
+    fn contains_file(&self, file: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM files WHERE path = ?1 LIMIT 1",
+                params![file],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
+        self.workspace_crate_prefixes
+            .0
+            .get_or_init(|| build_workspace_crate_prefixes(self.project_root))
+            .get(crate_name)
+            .cloned()
+    }
+
+    fn inline_scoped_target(
+        &self,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)> {
+        let src_prefix = rust_src_prefix(caller_file);
+        let check = |file_path: String| {
+            let file_module_segments = rust_module_segments_for_rel(&file_path);
+            if rust_src_prefix(&file_path) != src_prefix
+                || !module_segments.starts_with(&file_module_segments)
+            {
+                return None;
+            }
+            let scoped_segments = &module_segments[file_module_segments.len()..];
+            if scoped_segments.is_empty() {
+                return None;
+            }
+            let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+            self.node_for_symbol(&file_path, &scoped_symbol)
+                .map(|_| (file_path, scoped_symbol))
+        };
+        if let Some(target) = check(caller_file.to_string()) {
+            return Some(target);
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path")
+            .ok()?;
+        let rows = statement
+            .query_map(params![caller_file], |row| row.get::<_, String>(0))
+            .ok()?;
+        for path in rows.flatten() {
+            if let Some(target) = check(path) {
+                return Some(target);
+            }
+        }
+        None
     }
 }
 
@@ -2485,20 +2856,6 @@ impl CallGraphStore {
             callgraph_dir.join("build-breaker.sqlite"),
         )
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        let breaker_key = crate::build_breaker::BreakerKey::new(
-            project_root.display().to_string(),
-            crate::build_breaker::BuildDomain::CallgraphCold,
-            callgraph_corpus_fingerprint(project_root, files)?,
-        );
-        match breaker
-            .admit(&breaker_key, 0)
-            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
-        {
-            crate::build_breaker::BreakerAdmission::Admitted(_) => {}
-            crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
-                return Err(CallGraphStoreError::Suspended(suspension));
-            }
-        }
 
         let generation = generation_file_name(project_key);
         let gen_path = callgraph_dir.join(&generation);
@@ -2511,7 +2868,7 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
 
-        let stats = {
+        let (stats, breaker_key) = {
             if adopting_staging {
                 crate::slog_info!(
                     "resuming callgraph cold build from staged generation {}",
@@ -2528,10 +2885,37 @@ impl CallGraphStore {
                 None,
             )?
             .store;
-            let stats = temp_store.cold_build_chunked(files, chunk_size)?;
+            // Admission must precede every expensive build phase and every
+            // staging write: a suspended root is refused before the process
+            // spends anything, and a death during enumeration is attributable
+            // to an admitted attempt. The breaker key needs the corpus
+            // fingerprint, so that one input is resolved by a standalone
+            // streaming walk first (sanctioned pre-admission work) - the
+            // inventory pass below recomputes it while staging; the staged
+            // value governs resume cursors, while the admission key stays
+            // pinned to the admitted fingerprint so a file racing the walk
+            // cannot detach the attempt from its breaker record.
+            let admission_fingerprint = corpus_fingerprint_for(project_root, files)?;
+            let breaker_key = crate::build_breaker::BreakerKey::new(
+                project_root.display().to_string(),
+                crate::build_breaker::BuildDomain::CallgraphCold,
+                admission_fingerprint,
+            );
+            match breaker
+                .admit(&breaker_key, 0)
+                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
+            {
+                crate::build_breaker::BreakerAdmission::Admitted(_) => {}
+                crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
+                    return Err(CallGraphStoreError::Suspended(suspension));
+                }
+            }
+            let corpus_fingerprint = temp_store.stage_cold_build_file_inventory(files)?;
+            let stats = temp_store
+                .cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)?;
             let _ = temp_store.checkpoint_wal_truncate();
             temp_store.prepare_for_atomic_swap()?;
-            stats
+            (stats, breaker_key)
         };
 
         notify_cold_build_before_publish_observer();
@@ -2616,11 +3000,10 @@ impl CallGraphStore {
         if !breaker_path.exists() {
             return Ok(None);
         }
-        let files = crate::callgraph::walk_project_files(project_root).collect::<Vec<_>>();
         let key = crate::build_breaker::BreakerKey::new(
             project_root.display().to_string(),
             crate::build_breaker::BuildDomain::CallgraphCold,
-            callgraph_corpus_fingerprint(project_root, &files)?,
+            callgraph_corpus_fingerprint(project_root)?,
         );
         crate::build_breaker::BuildDeathBreaker::open(breaker_path)
             .and_then(|breaker| breaker.suspension(&key))
@@ -2853,24 +3236,98 @@ impl CallGraphStore {
         self.cold_build_chunked(files, COLD_BUILD_EXTRACT_BATCH_FILES)
     }
 
-    /// Build in two durable passes. Extraction commits only bounded batches; resolution
-    /// consumes the staged raw references in bounded windows after the complete symbol
-    /// table exists. A partially written temporary database is therefore safe to adopt.
+    /// Build in two durable passes. Discovery first commits a disk-backed file
+    /// inventory, extraction consumes bounded batches from that inventory, and
+    /// resolution pages through staged raw references after all symbols exist.
     pub fn cold_build_chunked(
         &self,
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<ColdBuildStats> {
-        let started = Instant::now();
+        let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
+        self.cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)
+    }
+
+    fn stage_cold_build_file_inventory(&self, files: &[PathBuf]) -> Result<String> {
         note_cold_build_phase("enumeration");
-        let files = normalize_file_list(&self.project_root, files)?;
+        if files.is_empty() {
+            self.stage_cold_build_file_inventory_from(callgraph::walk_project_files(
+                &self.project_root,
+            ))
+        } else {
+            self.stage_cold_build_file_inventory_from(files.iter().cloned())
+        }
+    }
+
+    fn stage_cold_build_file_inventory_from<I>(&self, paths: I) -> Result<String>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.verify_writer_lease()?;
+        let total_changes_before = conn.total_changes();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM staging_file_inventory", [])?;
+        tx.commit()?;
+        self.record_commit(total_changes_before, &conn);
+
+        let mut batch = Vec::with_capacity(COLD_BUILD_EXTRACT_BATCH_FILES);
+        for path in paths {
+            let path = normalize_file_path(&self.project_root, &path)?;
+            let rel_path = relative_path(&self.project_root, &path);
+            let size = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            batch.push((rel_path, size));
+            if batch.len() == COLD_BUILD_EXTRACT_BATCH_FILES {
+                self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+        }
+
+        staged_corpus_fingerprint(&conn, &self.project_root)
+    }
+
+    fn insert_staged_file_inventory_batch(
+        &self,
+        conn: &mut Connection,
+        batch: &[(String, u64)],
+    ) -> Result<()> {
+        self.verify_writer_lease()?;
+        let total_changes_before = conn.total_changes();
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO staging_file_inventory(path, size) VALUES(?1, ?2)",
+            )?;
+            for (path, size) in batch {
+                insert.execute(params![path, *size as i64])?;
+            }
+        }
+        tx.commit()?;
+        self.record_commit(total_changes_before, conn);
+        Ok(())
+    }
+
+    fn cold_build_chunked_from_staged_inventory(
+        &self,
+        chunk_size: usize,
+        corpus_fingerprint: &str,
+    ) -> Result<ColdBuildStats> {
+        let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
         let mut phase = staged_build_phase(&conn)?;
-        if phase.as_deref().is_none_or(|phase| phase == "ready") {
+        let staged_fingerprint = staged_string(&conn, STAGED_CORPUS_FINGERPRINT)?;
+        if phase.as_deref().is_none_or(|phase| phase == "ready")
+            || staged_fingerprint.as_deref() != Some(corpus_fingerprint)
+        {
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
@@ -2879,6 +3336,7 @@ impl CallGraphStore {
             drop_cold_build_secondary_indexes(&tx)?;
             set_meta_ready(&tx, false)?;
             set_staged_build_phase(&tx, "extracting")?;
+            set_staged_string(&tx, STAGED_CORPUS_FINGERPRINT, corpus_fingerprint)?;
             set_staged_u64(&tx, STAGED_COMMITTED_EXTRACTED_BYTES, 0)?;
             set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, 0)?;
             tx.commit()?;
@@ -2891,37 +3349,24 @@ impl CallGraphStore {
         // committed files are not restarted from zero after adoption.
         note_cold_build_phase("extraction");
         if phase.as_deref() == Some("extracting") {
-            let current_paths = files
-                .iter()
-                .map(|path| relative_path(&self.project_root, path))
-                .collect::<HashSet<_>>();
-            prune_staged_files_not_in(&mut conn, &current_paths)?;
+            prune_staged_files_not_in_inventory(&mut conn)?;
 
-            let mut offset = 0;
-            while offset < files.len() {
-                let mut batch = Vec::with_capacity(batch_files);
-                let mut batch_bytes = 0u64;
-                while offset < files.len() && batch.len() < batch_files {
-                    let path = files[offset].clone();
-                    let file_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-                    if !batch.is_empty()
-                        && batch_bytes.saturating_add(file_bytes) > COLD_BUILD_EXTRACT_BATCH_BYTES
-                    {
-                        break;
-                    }
-                    batch_bytes = batch_bytes.saturating_add(file_bytes);
-                    batch.push(path);
-                    offset += 1;
-                }
-                // A single oversized source still gets a one-file transaction, which
-                // keeps progress durable without making a later batch unbounded.
-                if batch.is_empty() {
-                    batch.push(files[offset].clone());
-                    offset += 1;
-                }
+            let mut after_path = String::new();
+            loop {
+                let Some(batch) = load_staged_file_batch(
+                    &conn,
+                    &self.project_root,
+                    &after_path,
+                    batch_files,
+                    COLD_BUILD_EXTRACT_BATCH_BYTES,
+                )?
+                else {
+                    break;
+                };
+                after_path = batch.last_path;
 
-                let mut needs_extract = Vec::new();
-                for path in batch {
+                let mut needs_extract = Vec::with_capacity(batch.paths.len());
+                for path in batch.paths {
                     if !staged_content_matches(&conn, &self.project_root, &path)? {
                         needs_extract.push(path);
                     }
@@ -2996,38 +3441,42 @@ impl CallGraphStore {
                 break;
             };
 
-            // Reparse only callers represented by this resolve window. The staged
-            // references remain the source of truth; this short-lived caller data is
-            // discarded at the next window boundary.
-            let mut caller_extracts = HashMap::new();
-            for caller_file in staged.iter().map(|entry| &entry.raw.caller_file) {
-                if caller_extracts.contains_key(caller_file) {
-                    continue;
-                }
-                let path = self.project_root.join(caller_file);
-                if let Ok(extract) = build_file_extract(&self.project_root, &path) {
-                    caller_extracts.insert(caller_file.clone(), extract);
-                }
-            }
-
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
-            let index = ProjectIndex::from_db_and_callers(
-                &tx,
-                &self.project_root,
-                &caller_extracts,
-                workspace_crate_prefixes.clone(),
-            )?;
             {
                 let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-                for staged_ref in staged {
-                    let resolved = if caller_extracts.contains_key(&staged_ref.raw.caller_file) {
-                        resolve_ref(staged_ref.raw, &index)?
+                let mut offset = 0;
+                while offset < staged.len() {
+                    let caller_file = staged[offset].raw.caller_file.clone();
+                    let end = staged[offset..]
+                        .iter()
+                        .position(|entry| entry.raw.caller_file != caller_file)
+                        .map(|relative| offset + relative)
+                        .unwrap_or(staged.len());
+                    let caller_extract = build_file_extract(
+                        &self.project_root,
+                        &self.project_root.join(&caller_file),
+                    );
+                    if let Ok(caller_extract) = caller_extract {
+                        let index = DiskProjectIndex {
+                            project_root: &self.project_root,
+                            conn: &tx,
+                            caller_file: &caller_file,
+                            caller_data: &caller_extract.data,
+                            workspace_crate_prefixes: workspace_crate_prefixes.clone(),
+                        };
+                        for staged_ref in &staged[offset..end] {
+                            let resolved = resolve_ref(staged_ref.raw.clone(), &index)?;
+                            insert_resolved_ref_prepared(&mut inserts, &resolved)?;
+                        }
                     } else {
-                        unresolved_staged_ref(staged_ref.raw)
-                    };
-                    insert_resolved_ref_prepared(&mut inserts, &resolved)?;
+                        for staged_ref in &staged[offset..end] {
+                            let unresolved = unresolved_staged_ref(staged_ref.raw.clone());
+                            insert_resolved_ref_prepared(&mut inserts, &unresolved)?;
+                        }
+                    }
+                    offset = end;
                 }
             }
             set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, last_rowid)?;
@@ -3040,15 +3489,11 @@ impl CallGraphStore {
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
-        let caller_files = staged_caller_files(&tx)?;
-        let _supplemental_edge_count = insert_method_dispatch_edges_chunked(
-            &tx,
-            &self.project_root,
-            &caller_files,
-            batch_files,
-        )?;
+        let _supplemental_edge_count =
+            insert_method_dispatch_edges_chunked(&tx, &self.project_root, batch_files)?;
         set_meta_ready(&tx, true)?;
         set_staged_build_phase(&tx, "ready")?;
+        tx.execute("DELETE FROM staging_file_inventory", [])?;
         tx.execute("DELETE FROM staging_ref_context", [])?;
         bump_projection_write_revision(&tx)?;
         tx.commit()?;
@@ -6262,6 +6707,13 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             v TEXT NOT NULL
         );
 
+        -- The file walk is staged on disk so extraction can page through a
+        -- deterministic inventory without retaining every source path in heap.
+        CREATE TABLE IF NOT EXISTS staging_file_inventory (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
         -- Context needed only while a generation is staged. Raw refs live in
         -- `refs` with status `staged`; this table preserves the caller symbol
         -- needed to avoid inventing self edges during the later resolve pass.
@@ -6399,12 +6851,16 @@ fn staged_build_phase(conn: &Connection) -> Result<Option<String>> {
 }
 
 fn staged_u64(conn: &Connection, key: &str) -> Result<u64> {
-    let value = conn
-        .query_row("SELECT v FROM meta WHERE k = ?1", params![key], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()?;
+    let value = staged_string(conn, key)?;
     Ok(value.and_then(|value| value.parse().ok()).unwrap_or(0))
+}
+
+fn staged_string(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT v FROM meta WHERE k = ?1", params![key], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+    .map_err(Into::into)
 }
 
 fn set_staged_build_phase(tx: &Transaction<'_>, phase: &str) -> Result<()> {
@@ -6416,9 +6872,13 @@ fn set_staged_build_phase(tx: &Transaction<'_>, phase: &str) -> Result<()> {
 }
 
 fn set_staged_u64(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
+    set_staged_string(tx, key, &value.to_string())
+}
+
+fn set_staged_string(tx: &Transaction<'_>, key: &str, value: &str) -> Result<()> {
     tx.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-        params![key, value.to_string()],
+        params![key, value],
     )?;
     Ok(())
 }
@@ -6462,25 +6922,86 @@ fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
     delete_file_rows(tx, rel_path)
 }
 
-fn prune_staged_files_not_in(conn: &mut Connection, current_paths: &HashSet<String>) -> Result<()> {
-    let mut statement = conn.prepare("SELECT path FROM files")?;
-    let staged_paths = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    drop(statement);
-    let removed = staged_paths
-        .into_iter()
-        .filter(|path| !current_paths.contains(path))
-        .collect::<Vec<_>>();
-    if removed.is_empty() {
-        return Ok(());
+fn prune_staged_files_not_in_inventory(conn: &mut Connection) -> Result<()> {
+    loop {
+        let removed = {
+            let mut statement = conn.prepare(
+                "SELECT path
+                 FROM files
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM staging_file_inventory inventory
+                     WHERE inventory.path = files.path
+                 )
+                 ORDER BY path
+                 LIMIT ?1",
+            )?;
+            let paths = statement
+                .query_map(params![COLD_BUILD_EXTRACT_BATCH_FILES as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            paths
+        };
+        if removed.is_empty() {
+            return Ok(());
+        }
+        let tx = conn.transaction()?;
+        for path in removed {
+            delete_staged_file_rows(&tx, &path)?;
+        }
+        tx.commit()?;
     }
-    let tx = conn.transaction()?;
-    for path in removed {
-        delete_staged_file_rows(&tx, &path)?;
+}
+
+struct StagedFileBatch {
+    paths: Vec<PathBuf>,
+    last_path: String,
+}
+
+fn load_staged_file_batch(
+    conn: &Connection,
+    project_root: &Path,
+    after_path: &str,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<Option<StagedFileBatch>> {
+    let mut statement = conn.prepare(
+        "SELECT path, size
+         FROM staging_file_inventory
+         WHERE path > ?1
+         ORDER BY path
+         LIMIT ?2",
+    )?;
+    let mut rows = statement.query(params![after_path, max_files.max(1) as i64])?;
+    let mut paths = Vec::with_capacity(max_files.max(1));
+    let mut last_path = String::new();
+    let mut batch_bytes = 0u64;
+    while let Some(row) = rows.next()? {
+        let rel_path = row.get::<_, String>(0)?;
+        let size = row.get::<_, i64>(1)?.max(0) as u64;
+        if !paths.is_empty() && batch_bytes.saturating_add(size) > max_bytes {
+            break;
+        }
+        batch_bytes = batch_bytes.saturating_add(size);
+        last_path.clone_from(&rel_path);
+        paths.push(project_root.join(rel_path));
     }
-    tx.commit()?;
-    Ok(())
+    if paths.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(StagedFileBatch { paths, last_path }))
+    }
+}
+
+fn staged_corpus_fingerprint(conn: &Connection, project_root: &Path) -> Result<String> {
+    let mut statement = conn.prepare("SELECT path FROM staging_file_inventory ORDER BY path")?;
+    let mut rows = statement.query([])?;
+    let mut fingerprint = CorpusFingerprint::default();
+    while let Some(row) = rows.next()? {
+        let rel_path = row.get::<_, String>(0)?;
+        fingerprint.add_path(project_root, &project_root.join(rel_path));
+    }
+    Ok(fingerprint.finish(project_root))
 }
 
 fn load_staged_ref_window(
@@ -6554,12 +7075,6 @@ fn unresolved_staged_ref(raw: RawRef) -> ResolvedRef {
         target_symbol: None,
         edge: None,
     }
-}
-
-fn staged_caller_files(tx: &Transaction<'_>) -> Result<BTreeSet<String>> {
-    let mut statement = tx.prepare("SELECT DISTINCT caller_file FROM refs")?;
-    let rows = statement.query_map([], |row| row.get(0))?;
-    Ok(rows.collect::<std::result::Result<BTreeSet<_>, _>>()?)
 }
 
 fn query_count(conn: &Connection, query: &str) -> Result<u64> {
@@ -7970,7 +8485,7 @@ fn surface_fingerprint(
     hash_to_hex(blake3::hash(parts.join("\n").as_bytes()))
 }
 
-fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
+fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> {
     if !matches!(raw.kind.as_str(), "call" | "value_ref") {
         return Ok(ResolvedRef {
             dependencies: raw.dependencies.clone(),
@@ -7984,11 +8499,12 @@ fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
     }
 
     let caller_file = raw.caller_file.clone();
-    let caller_data = index.caller_data.get(&caller_file).ok_or_else(|| {
-        CallGraphStoreError::MissingCallerData {
-            file: caller_file.clone(),
-        }
-    })?;
+    let caller_data =
+        index
+            .caller_data(&caller_file)
+            .ok_or_else(|| CallGraphStoreError::MissingCallerData {
+                file: caller_file.clone(),
+            })?;
     let full_ref = raw.full_ref.as_deref().unwrap_or_default();
     let short_name = raw.short_name.as_deref().unwrap_or_default();
     let mut dependencies = raw.dependencies.clone();
@@ -8064,8 +8580,8 @@ fn resolve_ref(raw: RawRef, index: &ProjectIndex<'_>) -> Result<ResolvedRef> {
     })
 }
 
-fn resolve_js_ts_target(
-    index: &ProjectIndex<'_>,
+fn resolve_js_ts_target<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -8102,9 +8618,7 @@ fn resolve_js_ts_target(
                 let (file, symbol) = resolve_exported_symbol(index, &target_file, "default", 0)
                     .or_else(|| {
                         index
-                            .files
-                            .get(&target_file)
-                            .and_then(|file| file.default_export.clone())
+                            .default_export(&target_file)
                             .map(|symbol| (target_file.clone(), symbol))
                     })
                     .unwrap_or_else(|| {
@@ -8122,12 +8636,7 @@ fn resolve_js_ts_target(
 
     for import in &caller_data.import_block.imports {
         if let Some(target_file) = index.module_target(caller_file, &import.module_path) {
-            if index
-                .files
-                .get(&target_file)
-                .map(|file| file.exports.contains(short_name))
-                .unwrap_or(false)
-            {
+            if index.has_export(&target_file, short_name) {
                 return Some(("resolved".to_string(), target_file, short_name.to_string()));
             }
         }
@@ -8136,8 +8645,8 @@ fn resolve_js_ts_target(
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
-fn resolve_exported_symbol(
-    index: &ProjectIndex<'_>,
+fn resolve_exported_symbol<I: ResolverIndex>(
+    index: &I,
     file: &str,
     requested: &str,
     depth: usize,
@@ -8154,8 +8663,8 @@ fn resolve_exported_symbol(
 /// remaining depth budget (a shallower re-visit can reach leaves the deeper
 /// first visit had to cut off at the cap, so plain visited-set pruning would
 /// lose resolutions the capped walk finds).
-fn resolve_exported_symbol_inner(
-    index: &ProjectIndex<'_>,
+fn resolve_exported_symbol_inner<I: ResolverIndex>(
+    index: &I,
     file: &str,
     requested: &str,
     depth: usize,
@@ -8165,26 +8674,13 @@ fn resolve_exported_symbol_inner(
         return None;
     }
     if requested != "default" {
-        if let Some(source_symbol) = index
-            .files
-            .get(file)
-            .and_then(|item| item.export_aliases.get(requested))
-        {
-            return Some((file.to_string(), source_symbol.clone()));
+        if let Some(source_symbol) = index.export_alias(file, requested) {
+            return Some((file.to_string(), source_symbol));
         }
-        if index
-            .files
-            .get(file)
-            .map(|item| item.exports.contains(requested))
-            .unwrap_or(false)
-        {
+        if index.has_export(file, requested) {
             return Some((file.to_string(), requested.to_string()));
         }
-    } else if let Some(default) = index
-        .files
-        .get(file)
-        .and_then(|item| item.default_export.clone())
-    {
+    } else if let Some(default) = index.default_export(file) {
         return Some((file.to_string(), default));
     }
 
@@ -8231,8 +8727,8 @@ fn resolve_exported_symbol_inner(
     None
 }
 
-fn resolve_rust_target(
-    index: &ProjectIndex<'_>,
+fn resolve_rust_target<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -8258,8 +8754,8 @@ fn resolve_rust_target(
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
-fn rust_target_for_qualified(
-    index: &ProjectIndex<'_>,
+fn rust_target_for_qualified<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -8311,8 +8807,8 @@ fn rust_target_symbol(full_ref: &str, short_name: &str) -> String {
         .to_string()
 }
 
-fn rust_resolve_reexport_if_symbol_missing(
-    index: &ProjectIndex<'_>,
+fn rust_resolve_reexport_if_symbol_missing<I: ResolverIndex>(
+    index: &I,
     target_file: String,
     target_symbol: String,
 ) -> (String, String) {
@@ -8396,46 +8892,17 @@ fn rust_module_alias_segments(import: &ImportStatement) -> Option<(String, Vec<S
     ))
 }
 
-fn rust_inline_scoped_target(
-    index: &ProjectIndex<'_>,
+fn rust_inline_scoped_target<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     module_segments: &[String],
     short_name: &str,
 ) -> Option<(String, String)> {
-    let src_prefix = rust_src_prefix(caller_file);
-    let mut file_paths = index.files.keys().cloned().collect::<Vec<_>>();
-    file_paths.sort();
-    if let Some(position) = file_paths.iter().position(|file| file == caller_file) {
-        let caller = file_paths.remove(position);
-        file_paths.insert(0, caller);
-    }
-
-    for file_path in file_paths {
-        if index.lang_for(&file_path) != Some(LangId::Rust)
-            || rust_src_prefix(&file_path) != src_prefix
-        {
-            continue;
-        }
-        let file_module_segments = rust_module_segments_for_rel(&file_path);
-        if !module_segments.starts_with(&file_module_segments) {
-            continue;
-        }
-        let scoped_segments = &module_segments[file_module_segments.len()..];
-        if scoped_segments.is_empty() {
-            continue;
-        }
-        let mut scoped_symbol = scoped_segments.join("::");
-        scoped_symbol.push_str("::");
-        scoped_symbol.push_str(short_name);
-        if index.node_for_symbol(&file_path, &scoped_symbol).is_some() {
-            return Some((file_path, scoped_symbol));
-        }
-    }
-    None
+    index.inline_scoped_target(caller_file, module_segments, short_name)
 }
 
-fn rust_target_for_use(
-    index: &ProjectIndex<'_>,
+fn rust_target_for_use<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     import: &ImportStatement,
     short_name: &str,
@@ -8469,7 +8936,10 @@ fn rust_target_for_use(
     Some((file, segments.last().unwrap_or(&short_name).to_string()))
 }
 
-fn rust_workspace_file_for_segments(index: &ProjectIndex<'_>, segments: &[&str]) -> Option<String> {
+fn rust_workspace_file_for_segments<I: ResolverIndex>(
+    index: &I,
+    segments: &[&str],
+) -> Option<String> {
     let crate_name = segments.first().copied()?;
     let src_prefix = index.crate_src_prefix(crate_name)?;
     let module_segments = segments[1..]
@@ -8620,16 +9090,16 @@ fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<Str
     }
 }
 
-fn rust_file_for_segments(
-    index: &ProjectIndex<'_>,
+fn rust_file_for_segments<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     segments: &[String],
 ) -> Option<String> {
     rust_file_for_src_prefix(index, &rust_src_prefix(caller_file), segments)
 }
 
-fn rust_file_for_src_prefix(
-    index: &ProjectIndex<'_>,
+fn rust_file_for_src_prefix<I: ResolverIndex>(
+    index: &I,
     src_prefix: &str,
     segments: &[String],
 ) -> Option<String> {
@@ -8638,12 +9108,12 @@ fn rust_file_for_src_prefix(
     } else {
         format!("{}/{}.rs", src_prefix, segments.join("/"))
     };
-    if index.files.contains_key(&candidate) {
+    if index.contains_file(&candidate) {
         return Some(candidate);
     }
     if !segments.is_empty() {
         let mod_candidate = format!("{}/{}/mod.rs", src_prefix, segments.join("/"));
-        if index.files.contains_key(&mod_candidate) {
+        if index.contains_file(&mod_candidate) {
             return Some(mod_candidate);
         }
     }
@@ -8677,8 +9147,8 @@ fn rust_module_segments_for_rel(rel_path: &str) -> Vec<String> {
         .collect()
 }
 
-fn resolve_local_target(
-    _index: &ProjectIndex<'_>,
+fn resolve_local_target<I: ResolverIndex>(
+    _index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -9512,27 +9982,30 @@ fn insert_method_dispatch_edges(
 fn insert_method_dispatch_edges_chunked(
     tx: &Transaction<'_>,
     project_root: &Path,
-    caller_files: &BTreeSet<String>,
     chunk_size: usize,
 ) -> Result<usize> {
-    if caller_files.is_empty() {
-        return Ok(0);
-    }
-    if chunk_size == 0 || caller_files.len() <= chunk_size {
-        return insert_method_dispatch_edges(tx, project_root, Some(caller_files));
-    }
-
     let mut inserted = 0usize;
-    let mut batch = BTreeSet::new();
-    for caller_file in caller_files {
-        batch.insert(caller_file.clone());
-        if batch.len() == chunk_size {
-            inserted += insert_method_dispatch_edges(tx, project_root, Some(&batch))?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        inserted += insert_method_dispatch_edges(tx, project_root, Some(&batch))?;
+    let mut after_file = String::new();
+    loop {
+        let caller_files = {
+            let mut statement = tx.prepare(
+                "SELECT DISTINCT caller_file
+                 FROM refs
+                 WHERE caller_file > ?1
+                 ORDER BY caller_file
+                 LIMIT ?2",
+            )?;
+            let rows = statement
+                .query_map(params![after_file, chunk_size.max(1) as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            rows.collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        let Some(last_file) = caller_files.last().cloned() else {
+            break;
+        };
+        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?;
+        after_file = last_file;
     }
     Ok(inserted)
 }
@@ -12363,43 +12836,100 @@ fn ref_id(parts: &[&str]) -> String {
     hash_to_hex(blake3::hash(joined.as_bytes()))
 }
 
-pub(crate) fn callgraph_corpus_fingerprint(
-    project_root: &Path,
-    files: &[PathBuf],
-) -> Result<String> {
-    let mut paths = normalize_file_list(project_root, files)?;
-    paths.sort();
-    let mut hasher = blake3::Hasher::new();
-    for path in paths {
-        let rel_path = relative_path(project_root, &path);
-        hasher.update(rel_path.as_bytes());
-        hasher.update(&[0]);
-        match std::fs::read(&path) {
-            Ok(source) => {
-                hasher.update(blake3::hash(&source).as_bytes());
-            }
-            // A file racing deletion is still a content movement, never an
-            // opportunity to retain a prior fingerprint's suspension forever.
-            Err(error) => {
-                hasher.update(format!("missing:{error}").as_bytes());
-            }
+fn callgraph_corpus_fingerprint(project_root: &Path) -> Result<String> {
+    let mut fingerprint = CorpusFingerprint::default();
+    for path in callgraph::walk_project_files(project_root) {
+        fingerprint.add_path(project_root, &path);
+    }
+    Ok(fingerprint.finish(project_root))
+}
+
+/// Pre-admission fingerprint over the same source set the staging inventory
+/// will consume: the walk when no explicit list is supplied, the list
+/// otherwise. Streaming accumulator - no staging writes, bounded memory.
+fn corpus_fingerprint_for(project_root: &Path, files: &[PathBuf]) -> Result<String> {
+    if files.is_empty() {
+        return callgraph_corpus_fingerprint(project_root);
+    }
+    let mut fingerprint = CorpusFingerprint::default();
+    for path in files {
+        fingerprint.add_path(project_root, path);
+    }
+    Ok(fingerprint.finish(project_root))
+}
+
+#[derive(Default)]
+struct CorpusFingerprint {
+    xor: [u8; 32],
+    sums: [u64; 4],
+    files: u64,
+}
+
+impl CorpusFingerprint {
+    fn add_path(&mut self, project_root: &Path, path: &Path) {
+        let mut record = blake3::Hasher::new();
+        record.update(relative_path(project_root, path).as_bytes());
+        record.update(&[0]);
+        match hash_file_bounded(path) {
+            Ok(content_hash) => record.update(content_hash.as_bytes()),
+            // Encoding a missing file as a distinct record changes the corpus
+            // fingerprint, so breaker state keyed to the previous corpus is not reused.
+            Err(error) => record.update(format!("missing:{error}").as_bytes()),
+        };
+        record.update(&[0]);
+        let record = record.finalize();
+        for (index, byte) in record.as_bytes().iter().copied().enumerate() {
+            self.xor[index] ^= byte;
         }
-        hasher.update(&[0]);
+        for (index, chunk) in record.as_bytes().chunks_exact(8).enumerate() {
+            let value = u64::from_le_bytes(chunk.try_into().expect("eight-byte digest chunk"));
+            self.sums[index] = self.sums[index].wrapping_add(value);
+        }
+        self.files = self.files.saturating_add(1);
     }
-    let ignore_rules = project_root.join(".gitignore");
-    if let Ok(contents) = std::fs::read(ignore_rules) {
-        hasher.update(b".gitignore\0");
-        hasher.update(blake3::hash(&contents).as_bytes());
+
+    fn finish(self, project_root: &Path) -> String {
+        // Combining both xor and modular sums keeps the digest independent of
+        // walk order while retaining duplicate sensitivity for generic callers.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"callgraph-corpus-fingerprint-v2\0");
+        hasher.update(&self.files.to_le_bytes());
+        hasher.update(&self.xor);
+        for sum in self.sums {
+            hasher.update(&sum.to_le_bytes());
+        }
+        let ignore_rules = project_root.join(".gitignore");
+        if let Ok(contents) = std::fs::read(ignore_rules) {
+            hasher.update(b".gitignore\0");
+            hasher.update(blake3::hash(&contents).as_bytes());
+        }
+        hash_to_hex(hasher.finalize())
     }
-    Ok(hash_to_hex(hasher.finalize()))
+}
+
+fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize())
 }
 
 #[cfg(test)]
 pub(crate) fn callgraph_corpus_fingerprint_for_test(
     project_root: &Path,
-    files: &[PathBuf],
+    _files: &[PathBuf],
 ) -> Result<String> {
-    callgraph_corpus_fingerprint(project_root, files)
+    // The streaming fingerprint walks the corpus itself (order-independent
+    // accumulator, no resident file list); the test seam keeps its historical
+    // signature so callers need not thread a walk of their own.
+    callgraph_corpus_fingerprint(project_root)
 }
 
 fn hash_to_hex(hash: blake3::Hash) -> String {
@@ -15857,6 +16387,62 @@ mod bounded_build_breaker_tests {
     use tempfile::tempdir;
 
     #[test]
+    fn staged_inventory_drives_ordered_bounded_file_batches() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("a.ts");
+        let second = root.join("b.ts");
+        let third = root.join("c.ts");
+        for path in [&first, &second, &third] {
+            std::fs::write(path, "export function item() {}\n").unwrap();
+        }
+        let writer_lease = acquire_writer_lease(temp.path(), "inventory-key", &root)
+            .unwrap()
+            .expect("test root may write its private staging database");
+        let store = CallGraphStore::open_at_path(
+            root.clone(),
+            "inventory-key".to_string(),
+            temp.path().join("inventory.sqlite"),
+            None,
+            true,
+            Some(writer_lease),
+            None,
+        )
+        .unwrap()
+        .store;
+        let fingerprint = store
+            .stage_cold_build_file_inventory(&[
+                third.clone(),
+                first.clone(),
+                second.clone(),
+                first.clone(),
+            ])
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            query_count(&conn, "SELECT COUNT(*) FROM staging_file_inventory").unwrap(),
+            3,
+            "the primary key deduplicates caller-supplied paths on disk"
+        );
+        let first_batch = load_staged_file_batch(&conn, &root, "", 2, u64::MAX)
+            .unwrap()
+            .expect("first batch");
+        assert_eq!(first_batch.paths, vec![first.clone(), second]);
+        let second_batch =
+            load_staged_file_batch(&conn, &root, &first_batch.last_path, 2, u64::MAX)
+                .unwrap()
+                .expect("second batch");
+        assert_eq!(second_batch.paths, vec![third]);
+        assert_eq!(
+            fingerprint,
+            callgraph_corpus_fingerprint(&root).unwrap(),
+            "staged and direct streaming fingerprints agree without walk-order dependence"
+        );
+    }
+
+    #[test]
     fn resumed_stage_preserves_committed_batch_and_counter() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
@@ -15880,6 +16466,9 @@ mod bounded_build_breaker_tests {
         )
         .unwrap()
         .store;
+        let corpus_fingerprint = store
+            .stage_cold_build_file_inventory(&[first.clone(), second.clone()])
+            .unwrap();
         let first_extract = build_file_extract(&root, &first).unwrap();
         let first_bytes = first_extract.freshness.size;
         {
@@ -15890,6 +16479,7 @@ mod bounded_build_breaker_tests {
             drop_cold_build_secondary_indexes(&tx).unwrap();
             set_meta_ready(&tx, false).unwrap();
             set_staged_build_phase(&tx, "extracting").unwrap();
+            set_staged_string(&tx, STAGED_CORPUS_FINGERPRINT, &corpus_fingerprint).unwrap();
             set_staged_u64(&tx, STAGED_COMMITTED_EXTRACTED_BYTES, 0).unwrap();
             {
                 let mut inserts = ColdBuildInsertStatements::new(&tx).unwrap();
@@ -16076,11 +16666,10 @@ mod bounded_build_breaker_tests {
             child.kill().unwrap();
             let _ = child.wait().unwrap();
 
-            let files = crate::callgraph::walk_project_files(&fast_root).collect::<Vec<_>>();
             let key = BreakerKey::new(
                 fast_root.display().to_string(),
                 BuildDomain::CallgraphCold,
-                callgraph_corpus_fingerprint(&fast_root, &files).unwrap(),
+                callgraph_corpus_fingerprint(&fast_root).unwrap(),
             );
             BuildDeathBreaker::open(&breaker_path)
                 .unwrap()
@@ -16125,7 +16714,7 @@ mod bounded_build_breaker_tests {
         let key = BreakerKey::new(
             root.display().to_string(),
             BuildDomain::CallgraphCold,
-            callgraph_corpus_fingerprint(&root, &files).unwrap(),
+            callgraph_corpus_fingerprint(&root).unwrap(),
         );
         let breaker = BuildDeathBreaker::open(store_dir.join("build-breaker.sqlite")).unwrap();
         for _ in 0..3 {

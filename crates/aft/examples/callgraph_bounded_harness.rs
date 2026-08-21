@@ -65,14 +65,11 @@ fn main() {
 }
 
 fn run_harness(corpus: &Path, storage: &Path, file_count: usize) {
-    let mut files = aft::callgraph::walk_project_files(corpus).collect::<Vec<_>>();
-    files.sort();
-    assert_eq!(files.len(), file_count, "generated corpus file count");
     let samples = Arc::new(Mutex::new(Samples {
         phase: "enumeration",
         ..Samples::default()
     }));
-    let sampling = install_rss_sampler(Arc::clone(&samples));
+    let (sampling, sampler) = install_rss_sampler(Arc::clone(&samples));
     let observer_samples = Arc::clone(&samples);
     set_cold_build_phase_observer(Some(Arc::new(move |phase| {
         observer_samples
@@ -82,26 +79,32 @@ fn run_harness(corpus: &Path, storage: &Path, file_count: usize) {
     })));
 
     let cold_started = Instant::now();
-    let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+    let (store, stats) = CallGraphStore::cold_build_with_lease_chunked(
         storage.to_path_buf(),
         corpus.to_path_buf(),
-        &files,
+        &[],
         256,
     )
     .expect("cold build");
     let cold_ms = cold_started.elapsed().as_millis();
+    assert_eq!(
+        stats.files, file_count,
+        "streamed discovery must stage every generated source file"
+    );
     drop(store);
+    sampling.store(true, Ordering::Release);
+    sampler.join().expect("RSS sampler thread");
+    set_cold_build_phase_observer(None);
+
     let warm_store =
         CallGraphStore::open(storage.to_path_buf(), corpus.to_path_buf()).expect("open warm store");
     let warm_started = Instant::now();
     warm_store
-        .cold_build_chunked(&files, 256)
+        .cold_build_chunked(&[], 256)
         .expect("warm full build");
     let warm_ms = warm_started.elapsed().as_millis();
     drop(warm_store);
 
-    sampling.store(true, Ordering::Release);
-    set_cold_build_phase_observer(None);
     let samples = samples.lock().expect("phase samples poisoned");
     let full_peak = samples.peak_bytes.values().copied().max().unwrap_or(0);
     assert!(
@@ -109,20 +112,22 @@ fn run_harness(corpus: &Path, storage: &Path, file_count: usize) {
         "cold build peak {} exceeds the 1.0 GiB cap",
         full_peak
     );
+    let warm_overhead_ratio = warm_ms as f64 / cold_ms.max(1) as f64;
+    assert!(
+        warm_overhead_ratio <= 1.10,
+        "warm build ratio {warm_overhead_ratio:.4} exceeds the 1.10 cap"
+    );
     println!(
-        "{{\"files\":{file_count},\"cold_ms\":{cold_ms},\"warm_ms\":{warm_ms},\"warm_overhead_ratio\":{:.4},\"phase_peak_rss_bytes\":{:?}}}",
-        warm_ms as f64 / cold_ms.max(1) as f64,
+        "{{\"files\":{file_count},\"cold_ms\":{cold_ms},\"warm_ms\":{warm_ms},\"warm_overhead_ratio\":{warm_overhead_ratio:.4},\"phase_peak_rss_bytes\":{:?}}}",
         samples.peak_bytes
     );
 }
 
-fn generate_corpus(root: &Path, count: usize) -> Vec<PathBuf> {
+fn generate_corpus(root: &Path, count: usize) {
     let source_dir = root.join("src");
     std::fs::create_dir_all(&source_dir).expect("create source directory");
     let target = source_dir.join("target.ts");
     std::fs::write(&target, "export function target() { return 1; }\n").expect("write target");
-    let mut files = Vec::with_capacity(count);
-    files.push(target);
     for index in 1..count {
         let path = source_dir.join(format!("unit_{index:05}.ts"));
         std::fs::write(
@@ -132,15 +137,13 @@ fn generate_corpus(root: &Path, count: usize) -> Vec<PathBuf> {
             ),
         )
         .expect("write source");
-        files.push(path);
     }
-    files
 }
 
-fn install_rss_sampler(samples: Arc<Mutex<Samples>>) -> Arc<AtomicBool> {
+fn install_rss_sampler(samples: Arc<Mutex<Samples>>) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&stopped);
-    thread::spawn(move || {
+    let sampler = thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
             if let Some(bytes) = process_rss_bytes() {
                 let mut samples = samples.lock().expect("phase samples poisoned");
@@ -151,7 +154,7 @@ fn install_rss_sampler(samples: Arc<Mutex<Samples>>) -> Arc<AtomicBool> {
             thread::sleep(Duration::from_millis(20));
         }
     });
-    stopped
+    (stopped, sampler)
 }
 
 fn process_rss_bytes() -> Option<u64> {

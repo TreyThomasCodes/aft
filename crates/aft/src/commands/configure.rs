@@ -6853,11 +6853,11 @@ mod tests {
         assert!(handle_configure_for_test(&suspended_request, &suspended_ctx).success);
         super::drain_deferred_configure_maintenance(&suspended_ctx);
         let project_root = suspended_ctx.callgraph_project_root().unwrap();
-        let files = crate::callgraph::walk_project_files(&project_root).collect::<Vec<_>>();
         let breaker_key = crate::build_breaker::BreakerKey::new(
             project_root.display().to_string(),
             crate::build_breaker::BuildDomain::CallgraphCold,
-            crate::callgraph_store::callgraph_corpus_fingerprint(&project_root, &files).unwrap(),
+            crate::callgraph_store::callgraph_corpus_fingerprint_for_test(&project_root, &[])
+                .unwrap(),
         );
         let breaker = crate::build_breaker::BuildDeathBreaker::open(
             suspended_ctx
