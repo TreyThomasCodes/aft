@@ -8651,6 +8651,29 @@ mod health_warming_honesty_tests {
                 .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
             crate::inspect::InspectBuilderState::Absent
         );
+
+        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+            crate::inspect::InspectCategory::DeadCode,
+            crate::inspect::JobOutcome::Fresh {
+                payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+            },
+        );
+        assert_eq!(
+            health_tier2_status(&ctx),
+            "ready",
+            "a finished callgraph_unavailable attempt must not keep health.tier2=building"
+        );
+        assert_eq!(
+            ctx.inspect_manager()
+                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+            crate::inspect::InspectBuilderState::Absent
+        );
+        assert!(
+            ctx.inspect_manager()
+                .tier2_builder_state_detail(crate::inspect::InspectCategory::DeadCode)
+                .starts_with("last attempt failed: callgraph_unavailable (attempt 1, first at "),
+            "inspect refusals must carry the failed-attempt history the health surface no longer treats as busy"
+        );
     }
 
     #[test]

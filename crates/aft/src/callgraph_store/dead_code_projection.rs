@@ -68,6 +68,9 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
     let write_revision = projection_write_revision(&tx)?;
 
     let project_root = project_root_from_backend_state(&tx)?;
+    // Same predicate as InspectManager::callgraph_ready_for_snapshot: a store
+    // that still has stale backend rows is not ready for dead_code, even if
+    // the SQLite file opens and meta.ready=1.
     if stale_backend_file_count(&tx, &project_root)? > 0 {
         return Err(CallGraphStoreError::Unavailable(
             "callgraph has stale files pending refresh".to_string(),
@@ -510,6 +513,17 @@ mod tests {
             ),
             other => panic!("expected Unavailable for stale backend rows, got {other:?}"),
         }
+
+        let stats = store
+            .refresh_files(std::slice::from_ref(&source))
+            .expect("refresh unchanged stale file");
+        assert_eq!(stats.refreshed_own_files, 0);
+        assert_eq!(stats.changed_files, vec!["src/lib.ts".to_string()]);
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect(
+            "refresh of unchanged files must clear leftover stale rows so projection can proceed",
+        );
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(store.stale_files().expect("read stale files").is_empty());
     }
 
     #[test]

@@ -138,29 +138,74 @@ impl InspectBuilderState {
 /// One admission into the inspect builder registry. Health's `tier2` field and
 /// inspect refusals both read this map so a published aggregate cannot report
 /// ready while a rebuild is still registered.
+///
+/// Failed attempts keep their history here after the in-flight state is
+/// cleared. A fast-failing rebuild that restarts on every probe would otherwise
+/// look like a brand-new warm-up (`building` at age 0) even though the same
+/// terminal keeps repeating.
 struct BuilderStateEntry {
-    state: InspectBuilderState,
+    state: Option<InspectBuilderState>,
     started_at: Instant,
     started_unix: u64,
+    first_attempt_unix: u64,
+    attempt_count: u64,
+    last_failure: Option<String>,
 }
 
 impl BuilderStateEntry {
     fn new(state: InspectBuilderState) -> Self {
+        let now = unix_now_secs();
         Self {
-            state,
+            state: Some(state),
             started_at: Instant::now(),
-            started_unix: unix_now_secs(),
+            started_unix: now,
+            first_attempt_unix: now,
+            attempt_count: 0,
+            last_failure: None,
         }
     }
 
+    fn is_in_flight(&self) -> bool {
+        self.state.is_some_and(|state| {
+            matches!(
+                state,
+                InspectBuilderState::Building
+                    | InspectBuilderState::QueuedBehindColdBuilds
+                    | InspectBuilderState::GatedBySemanticSeed
+            )
+        })
+    }
+
+    fn begin_attempt(&mut self, state: InspectBuilderState) {
+        self.state = Some(state);
+        self.started_at = Instant::now();
+        self.started_unix = unix_now_secs();
+        if self.attempt_count == 0 && self.last_failure.is_none() {
+            self.first_attempt_unix = self.started_unix;
+        }
+    }
+
+    fn record_failure(&mut self, terminal: String) {
+        self.state = None;
+        self.attempt_count = self.attempt_count.saturating_add(1);
+        self.last_failure = Some(terminal);
+    }
+
     fn detail(&self) -> String {
+        if let Some(terminal) = self.last_failure.as_deref() {
+            return format!(
+                "last attempt failed: {terminal} (attempt {}, first at {})",
+                self.attempt_count, self.first_attempt_unix
+            );
+        }
         match self.state {
-            InspectBuilderState::Building => format!(
+            Some(InspectBuilderState::Building) => format!(
                 "building since {} (age_s={})",
                 self.started_unix,
                 self.started_at.elapsed().as_secs()
             ),
-            other => other.as_str().to_string(),
+            Some(other) => other.as_str().to_string(),
+            None => InspectBuilderState::Absent.as_str().to_string(),
         }
     }
 }
@@ -170,6 +215,63 @@ fn unix_now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+enum BuilderAttemptTerminal {
+    Succeeded,
+    Failed(String),
+    Inconclusive,
+}
+
+fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
+    match outcome {
+        JobOutcome::Fresh { payload } if callgraph_unavailable_payload(payload) => {
+            BuilderAttemptTerminal::Failed("callgraph_unavailable".to_string())
+        }
+        JobOutcome::Fresh { .. } => BuilderAttemptTerminal::Succeeded,
+        JobOutcome::Failed { message } => {
+            BuilderAttemptTerminal::Failed(builder_failure_terminal(message))
+        }
+        JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => {
+            BuilderAttemptTerminal::Inconclusive
+        }
+    }
+}
+
+fn callgraph_unavailable_payload(payload: &Value) -> bool {
+    payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+        || payload
+            .get("notes")
+            .and_then(Value::as_array)
+            .is_some_and(|notes| {
+                notes
+                    .iter()
+                    .any(|note| note.as_str() == Some("callgraph_unavailable"))
+            })
+}
+
+fn builder_failure_terminal(message: &str) -> String {
+    if message.contains("callgraph_unavailable") {
+        "callgraph_unavailable".to_string()
+    } else {
+        message
+            .lines()
+            .next()
+            .unwrap_or("failed")
+            .chars()
+            .take(64)
+            .collect()
+    }
+}
+
+fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: PathBuf) -> bool {
+    match CallGraphStore::open_readonly(callgraph_dir, project_root) {
+        Ok(Some(store)) => store
+            .stale_files()
+            .ok()
+            .is_some_and(|files| files.is_empty()),
+        _ => false,
+    }
 }
 
 /// Drops the builder-registry entry (and any leftover waiters) if a reuse
@@ -340,7 +442,7 @@ impl InspectManager {
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
         if let Ok(mut states) = self.builder_states.lock() {
             if let Some(entry) = states.get_mut(key) {
-                entry.state = state;
+                entry.begin_attempt(state);
             } else {
                 states.insert(key.clone(), BuilderStateEntry::new(state));
             }
@@ -357,14 +459,41 @@ impl InspectManager {
         self.set_builder_state(key, InspectBuilderState::Building);
     }
 
+    fn record_builder_attempt_outcome(&self, key: &JobKey, outcome: &JobOutcome) {
+        let Ok(mut states) = self.builder_states.lock() else {
+            return;
+        };
+        match builder_attempt_terminal(outcome) {
+            BuilderAttemptTerminal::Succeeded => {
+                states.remove(key);
+            }
+            BuilderAttemptTerminal::Failed(terminal) => {
+                if let Some(entry) = states.get_mut(key) {
+                    entry.record_failure(terminal);
+                } else {
+                    let mut entry = BuilderStateEntry::new(InspectBuilderState::Building);
+                    entry.record_failure(terminal);
+                    states.insert(key.clone(), entry);
+                }
+            }
+            BuilderAttemptTerminal::Inconclusive => {
+                if let Some(entry) = states.get_mut(key) {
+                    entry.state = None;
+                    if entry.last_failure.is_none() && entry.attempt_count == 0 {
+                        states.remove(key);
+                    }
+                }
+            }
+        }
+    }
+
     fn tier2_flight_exit_guard(&self, key: JobKey) -> Tier2FlightExitGuard<'_> {
         Tier2FlightExitGuard { manager: self, key }
     }
 
-    /// Remove the registry entry and wake leftover waiters. Idempotent: a
+    /// Record the attempt outcome and wake leftover waiters. Idempotent: a
     /// second call after the completion router already ran is a no-op.
     fn finish_tier2_flight(&self, key: &JobKey, outcome: JobOutcome) {
-        self.clear_builder_state(key);
         let Some(waiters) = self
             .in_flight
             .lock()
@@ -373,6 +502,7 @@ impl InspectManager {
         else {
             return;
         };
+        self.record_builder_attempt_outcome(key, &outcome);
         self.reuse_completions.fetch_add(1, Ordering::SeqCst);
         for waiter in waiters {
             let _ = waiter.tx.send(outcome.clone());
@@ -383,7 +513,9 @@ impl InspectManager {
         let key = JobKey::for_project_category(category);
         if let Ok(states) = self.builder_states.lock() {
             if let Some(entry) = states.get(&key) {
-                return entry.state;
+                if let Some(state) = entry.state {
+                    return state;
+                }
             }
         }
         if self
@@ -421,25 +553,28 @@ impl InspectManager {
     /// two surfaces cannot disagree about a live rebuild.
     pub(crate) fn try_tier2_builder_busy(&self) -> Option<bool> {
         let states = self.builder_states.try_lock().ok()?;
-        if states.keys().any(|key| key.category.is_tier2()) {
+        if states
+            .iter()
+            .any(|(key, entry)| key.category.is_tier2() && entry.is_in_flight())
+        {
             return Some(true);
         }
         drop(states);
         self.try_tier2_any_in_flight()
     }
 
+    /// Whether a published callgraph store can back a dead_code snapshot.
+    ///
+    /// This is the same readiness predicate the builder uses before projection:
+    /// a store that opens but still has `backend_file_state='stale'` rows is
+    /// not ready, because `project_dead_code_snapshot` refuses those rows.
     pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
         if !snapshot.config.callgraph_store {
             return false;
         }
         callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
             .into_iter()
-            .any(|dir| {
-                matches!(
-                    CallGraphStore::open_readonly(dir, snapshot.project_root.clone()),
-                    Ok(Some(_))
-                )
-            })
+            .any(|dir| callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone()))
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -782,6 +917,24 @@ impl InspectManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn record_tier2_attempt_outcome_for_test(
+        &self,
+        category: InspectCategory,
+        outcome: JobOutcome,
+    ) {
+        let key = JobKey::for_project_category(category);
+        {
+            let mut jobs = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            jobs.entry(key.clone()).or_default();
+        }
+        self.record_flight_start(&key);
+        self.finish_tier2_flight(&key, outcome);
+    }
+
     /// Release per-project inspect caches so their SQLite readers and writer
     /// leases do not remain open after a root has gone idle. Callers must check
     /// [`Self::tier2_any_in_flight`] first so a running scan never loses its
@@ -793,6 +946,11 @@ impl InspectManager {
         self.clear_callgraph_projection();
         if let Ok(mut facts) = self.oxc_facts_cache.lock() {
             *facts = OxcFactsCache::new();
+        }
+        // A new corpus after idle eviction must not inherit the previous
+        // root's failed-attempt history.
+        if let Ok(mut states) = self.builder_states.lock() {
+            states.retain(|_, entry| entry.is_in_flight());
         }
     }
 
@@ -2207,8 +2365,8 @@ impl InspectManager {
     }
 
     fn route_completion(&self, result: InspectResult) {
-        self.clear_builder_state(&result.key);
         let outcome = self.completion_outcome(result.clone());
+        self.record_builder_attempt_outcome(&result.key, &outcome);
         let waiters = self
             .in_flight
             .lock()
@@ -2606,6 +2764,75 @@ fn open_or_build_blocking_callgraph_store(
     }
 }
 
+fn merge_callgraph_refresh_paths(
+    project_root: &Path,
+    refresh_paths: &[PathBuf],
+    stale: impl IntoIterator<Item = String>,
+) -> Vec<PathBuf> {
+    let mut paths = refresh_paths.to_vec();
+    for rel in stale {
+        let absolute = project_root.join(rel);
+        if !paths.iter().any(|path| path == &absolute) {
+            paths.push(absolute);
+        }
+    }
+    paths
+}
+
+fn refresh_writable_dead_code_store(
+    store: &CallGraphStore,
+    callgraph_dir: &Path,
+    refresh_paths: &[PathBuf],
+) {
+    match store.refresh_files(refresh_paths) {
+        Ok(stats) => {
+            crate::slog_info!(
+                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={}",
+                callgraph_dir.display(),
+                refresh_paths.len(),
+                stats.changed_files.len(),
+                stats.deleted_files.len(),
+                stats.refreshed_own_files
+            );
+        }
+        Err(error) => {
+            crate::slog_warn!(
+                "tier2 dead_code: failed to refresh callgraph store at {} before projection: {}",
+                callgraph_dir.display(),
+                error
+            );
+            if let Err(mark_error) = store.mark_files_stale(refresh_paths) {
+                crate::slog_warn!(
+                    "tier2 dead_code: failed to mark callgraph store files stale at {} after refresh failure: {}",
+                    callgraph_dir.display(),
+                    mark_error
+                );
+            }
+        }
+    }
+}
+
+fn open_writable_dead_code_store(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+    allow_cold_build: bool,
+    build_if_missing: bool,
+    refresh_paths: &[PathBuf],
+) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
+    if build_if_missing {
+        open_or_build_blocking_callgraph_store(
+            callgraph_dir,
+            project_root,
+            allow_cold_build,
+            refresh_paths,
+        )
+    } else if allow_cold_build {
+        CallGraphStore::open_ready_repairing(callgraph_dir, project_root)
+    } else {
+        CallGraphStore::open_ready_no_rebuild(callgraph_dir, project_root)
+    }
+}
+
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
     allow_cold_build: bool,
@@ -2677,8 +2904,10 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     }
 
     for (index, callgraph_dir) in callgraph_dirs.iter().enumerate() {
-        // Paths without an explicit refresh stay read-only. Blocking inspect
-        // supplies root files when it must produce a cold callgraph snapshot.
+        // Paths without an explicit refresh stay read-only unless the published
+        // store still has stale backend rows. The background refresh worker is
+        // the usual writer for those rows; when it never runs for this root,
+        // dead_code refreshes them inline so projection is not stuck forever.
         let projection_store = if refresh_paths.is_empty() || !job.callgraph_writer {
             let store = match CallGraphStore::open_readonly(
                 callgraph_dir.clone(),
@@ -2703,26 +2932,54 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     continue;
                 }
             };
-            ProjectionStore::ReadOnly(store)
-        } else {
-            let store = match if build_if_missing {
-                open_or_build_blocking_callgraph_store(
+            let stale = job
+                .callgraph_writer
+                .then(|| store.stale_files().ok())
+                .flatten()
+                .unwrap_or_default();
+            if stale.is_empty() {
+                ProjectionStore::ReadOnly(store)
+            } else {
+                drop(store);
+                let refresh =
+                    merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
+                let store = match open_writable_dead_code_store(
                     callgraph_dir.clone(),
                     job.project_root.clone(),
                     allow_cold_build,
-                    refresh_paths,
-                )
-            } else if allow_cold_build {
-                CallGraphStore::open_ready_repairing(
-                    callgraph_dir.clone(),
-                    job.project_root.clone(),
-                )
-            } else {
-                CallGraphStore::open_ready_no_rebuild(
-                    callgraph_dir.clone(),
-                    job.project_root.clone(),
-                )
-            } {
+                    build_if_missing,
+                    &refresh,
+                ) {
+                    Ok(Some(store)) => store,
+                    Ok(None) => {
+                        crate::slog_info!(
+                            "tier2 dead_code: callgraph store unavailable at {} (cold/building/not ready); trying fallback={}",
+                            callgraph_dir.display(),
+                            index + 1 < callgraph_dirs.len()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
+                            callgraph_dir.display(),
+                            error,
+                            index + 1 < callgraph_dirs.len()
+                        );
+                        continue;
+                    }
+                };
+                refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
+                ProjectionStore::Writable(store)
+            }
+        } else {
+            let store = match open_writable_dead_code_store(
+                callgraph_dir.clone(),
+                job.project_root.clone(),
+                allow_cold_build,
+                build_if_missing,
+                refresh_paths,
+            ) {
                 Ok(Some(store)) => store,
                 Ok(None) => {
                     crate::slog_info!(
@@ -2742,32 +2999,9 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     continue;
                 }
             };
-            match store.refresh_files(refresh_paths) {
-                Ok(stats) => {
-                    crate::slog_info!(
-                        "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={}",
-                        callgraph_dir.display(),
-                        refresh_paths.len(),
-                        stats.changed_files.len(),
-                        stats.deleted_files.len(),
-                        stats.refreshed_own_files
-                    );
-                }
-                Err(error) => {
-                    crate::slog_warn!(
-                        "tier2 dead_code: failed to refresh callgraph store at {} before projection: {}",
-                        callgraph_dir.display(),
-                        error
-                    );
-                    if let Err(mark_error) = store.mark_files_stale(refresh_paths) {
-                        crate::slog_warn!(
-                            "tier2 dead_code: failed to mark callgraph store files stale at {} after refresh failure: {}",
-                            callgraph_dir.display(),
-                            mark_error
-                        );
-                    }
-                }
-            }
+            let stale = store.stale_files().unwrap_or_default();
+            let refresh = merge_callgraph_refresh_paths(&job.project_root, refresh_paths, stale);
+            refresh_writable_dead_code_store(&store, callgraph_dir, &refresh);
             ProjectionStore::Writable(store)
         };
 
@@ -5065,6 +5299,151 @@ export function bannerUnused() {}
 
         assert_eq!(snapshot.files.len(), 3);
         assert_eq!(snapshot.exported_symbols.len(), 3);
+    }
+
+    #[test]
+    fn stale_callgraph_store_refreshes_inline_when_refresh_worker_does_not_run() {
+        let dir = write_ts_project(2);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).expect("open store");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&files).expect("cold build store");
+        store
+            .mark_files_stale(&files)
+            .expect("mark published store stale");
+        drop(store);
+
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let manager = InspectManager::new();
+        assert!(
+            !manager.callgraph_ready_for_snapshot(&InspectSnapshot::new(
+                root.clone(),
+                inspect_dir.clone(),
+                Arc::clone(&job.config),
+                Arc::clone(&job.symbol_cache),
+            )),
+            "a store with leftover stale rows must not look callgraph-ready"
+        );
+
+        let snapshot = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("dead_code must refresh stale rows inline when the refresh worker never ran");
+        assert_eq!(snapshot.files.len(), 2);
+
+        let ready = InspectSnapshot::new(
+            root,
+            inspect_dir,
+            Arc::clone(&job.config),
+            Arc::clone(&job.symbol_cache),
+        );
+        assert!(
+            manager.callgraph_ready_for_snapshot(&ready),
+            "after the inline refresh, callgraph_ready must agree with a successful projection"
+        );
+    }
+
+    #[test]
+    fn callgraph_ready_and_builder_projection_agree_on_stale_rows() {
+        let dir = write_ts_project(1);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&files).expect("cold build store");
+        let sqlite_path = store.sqlite_path().to_path_buf();
+        drop(store);
+
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir.clone(),
+            Arc::clone(&job.config),
+            Arc::clone(&job.symbol_cache),
+        );
+        let manager = InspectManager::new();
+        assert!(
+            manager.callgraph_ready_for_snapshot(&snapshot),
+            "a fresh store must be ready for both the phase check and projection"
+        );
+        project_dead_code_snapshot(&sqlite_path).expect("fresh store should project");
+
+        let store = CallGraphStore::open_ready_no_rebuild(
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir"),
+            root.clone(),
+        )
+        .expect("reopen writer")
+        .expect("ready writer");
+        store.mark_files_stale(&files).expect("mark stale");
+        drop(store);
+
+        assert!(
+            !manager.callgraph_ready_for_snapshot(&snapshot),
+            "callgraph_ready must use the same stale-row predicate as dead_code projection"
+        );
+        let error =
+            project_dead_code_snapshot(&sqlite_path).expect_err("stale rows must block projection");
+        match error {
+            CallGraphStoreError::Unavailable(message) => {
+                assert_eq!(message, "callgraph has stale files pending refresh")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_builder_attempt_history_uses_locked_refusal_detail() {
+        let manager = InspectManager::new();
+        let unavailable = JobOutcome::Fresh {
+            payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+        };
+        manager
+            .record_tier2_attempt_outcome_for_test(InspectCategory::DeadCode, unavailable.clone());
+        let first = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
+        let first_at = first
+            .rsplit("first at ")
+            .next()
+            .and_then(|tail| tail.strip_suffix(')'))
+            .expect("first failure detail includes first-at unix time");
+        for _ in 1..7 {
+            manager.record_tier2_attempt_outcome_for_test(
+                InspectCategory::DeadCode,
+                unavailable.clone(),
+            );
+        }
+        assert_eq!(
+            manager.tier2_builder_state_detail(InspectCategory::DeadCode),
+            format!("last attempt failed: callgraph_unavailable (attempt 7, first at {first_at})")
+        );
+        assert_eq!(
+            manager.tier2_builder_state(InspectCategory::DeadCode),
+            InspectBuilderState::Absent,
+            "a finished failure must not keep the registry in an in-flight state"
+        );
+        assert_eq!(
+            manager.try_tier2_builder_busy(),
+            Some(false),
+            "failed-attempt history must not look like a live rebuild"
+        );
+
+        manager.record_tier2_attempt_outcome_for_test(
+            InspectCategory::DeadCode,
+            JobOutcome::Fresh {
+                payload: serde_json::json!({ "callgraph_available": true, "count": 0 }),
+            },
+        );
+        assert_eq!(
+            manager.tier2_builder_state_detail(InspectCategory::DeadCode),
+            InspectBuilderState::Absent.as_str()
+        );
     }
 
     #[test]

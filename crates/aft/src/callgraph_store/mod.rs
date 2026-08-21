@@ -3004,6 +3004,7 @@ impl CallGraphStore {
         let mut deleted = BTreeSet::new();
         let mut own_refresh = BTreeSet::new();
         let mut candidate_own_refresh = BTreeSet::new();
+        let mut confirmed_fresh = BTreeSet::new();
         let mut unchanged_extracts = 0usize;
         let mut selected_ref_ids = BTreeSet::new();
         let mut selected_refs_by_caller = BTreeMap::new();
@@ -3033,7 +3034,14 @@ impl CallGraphStore {
 
             if let Some(row) = &old_row {
                 match cache_freshness::verify_file(&abs_path, &row.freshness) {
-                    FreshnessVerdict::HotFresh => continue,
+                    FreshnessVerdict::HotFresh => {
+                        // Content still matches the stored graph. A prior failed
+                        // refresh may have left backend_file_state='stale' without
+                        // changing bytes; skip the extract but still clear that
+                        // leftover so dead-code projection can use this store.
+                        confirmed_fresh.insert(rel_path.clone());
+                        continue;
+                    }
                     FreshnessVerdict::ContentFresh {
                         new_mtime,
                         new_size,
@@ -3122,6 +3130,9 @@ impl CallGraphStore {
                 freshness.mtime,
                 freshness.size,
             )?;
+        }
+        for rel_path in &confirmed_fresh {
+            clear_stale_backend_status_for_file(&tx, &self.project_root, rel_path)?;
         }
         for rel_path in &deleted {
             let started = Instant::now();
@@ -3777,6 +3788,10 @@ impl ReadonlyCallGraphStore {
 
     pub fn sqlite_path(&self) -> &Path {
         self.inner.sqlite_path()
+    }
+
+    pub fn stale_files(&self) -> Result<Vec<String>> {
+        self.inner.stale_files()
     }
 
     pub(crate) fn projection_generation(&self) -> Option<&str> {
@@ -11083,6 +11098,29 @@ fn clear_backend_state_for_file(
             BACKEND_TREESITTER,
             project_root.display().to_string(),
             rel_path
+        ],
+    )?;
+    Ok(())
+}
+
+/// Mark a file whose graph bytes were just confirmed current as fresh.
+///
+/// `refresh_files` skips extracts for HotFresh inputs, so without this write a
+/// leftover `status='stale'` row from a failed refresh would keep blocking
+/// dead-code projection even though the graph still matches disk.
+fn clear_stale_backend_status_for_file(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE backend_file_state SET status = 'fresh', updated_at = ?4
+         WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3 AND status = 'stale'",
+        params![
+            BACKEND_TREESITTER,
+            project_root.display().to_string(),
+            rel_path,
+            unix_seconds_now(),
         ],
     )?;
     Ok(())

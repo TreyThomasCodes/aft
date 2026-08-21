@@ -311,16 +311,17 @@ fn handle_inspect_payload(
             if category != InspectCategory::DeadCode {
                 return None;
             }
-            let phase = phase_log.start(InspectPhaseEntry::category(
+            // Shared with dead_code projection (stale backend rows are not
+            // ready). Completion is owned by finish_tier2_phases from the
+            // builder aggregate so this check cannot mark callgraph_ready
+            // while the builder still reports callgraph_unavailable.
+            if !manager.callgraph_ready_for_snapshot(&snapshot) {
+                crate::slog_debug!("tier2 dead_code: callgraph store not ready at inspect start");
+            }
+            Some(phase_log.start(InspectPhaseEntry::category(
                 InspectPhaseId::CallgraphReady,
                 category,
-            ));
-            if manager.callgraph_ready_for_snapshot(&snapshot) {
-                phase.complete();
-                None
-            } else {
-                Some(phase)
-            }
+            )))
         });
         let tier2_phase = phase_log.map(|phase_log| {
             phase_log.start(InspectPhaseEntry::category(
@@ -3206,6 +3207,59 @@ mod deferred_terminal_tests {
                     && message.contains("builder_state=building since ")
                     && message.contains("age_s=")
         ));
+    }
+
+    #[test]
+    fn inspect_builder_state_refusal_uses_locked_failed_attempt_history() {
+        let manager = crate::inspect::InspectManager::new();
+        let unavailable = JobOutcome::Fresh {
+            payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+        };
+        manager
+            .record_tier2_attempt_outcome_for_test(InspectCategory::DeadCode, unavailable.clone());
+        let first = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
+        let first_at = first
+            .rsplit("first at ")
+            .next()
+            .and_then(|tail| tail.strip_suffix(')'))
+            .expect("failed-attempt detail includes first-at unix time");
+        for _ in 1..7 {
+            manager.record_tier2_attempt_outcome_for_test(
+                InspectCategory::DeadCode,
+                unavailable.clone(),
+            );
+        }
+        assert_eq!(
+            manager.tier2_builder_state_detail(InspectCategory::DeadCode),
+            format!("last attempt failed: callgraph_unavailable (attempt 7, first at {first_at})")
+        );
+    }
+
+    #[test]
+    fn callgraph_ready_phase_does_not_complete_when_builder_reports_unavailable() {
+        let log = InspectPhaseLog::for_request("inspect-callgraph-ready-honesty");
+        let callgraph_phase = log.start(InspectPhaseEntry::category(
+            InspectPhaseId::CallgraphReady,
+            InspectCategory::DeadCode,
+        ));
+        let tier2_phase = log.start(InspectPhaseEntry::category(
+            InspectPhaseId::Tier2Rescan,
+            InspectCategory::DeadCode,
+        ));
+        finish_tier2_phases(
+            &JobOutcome::Fresh {
+                payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+            },
+            Some(callgraph_phase),
+            Some(tier2_phase),
+        );
+        let (entries, _) = log.terminal_inputs();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.id != InspectPhaseId::CallgraphReady),
+            "callgraph_ready must not complete when the builder aggregate is callgraph_unavailable: {entries:?}"
+        );
     }
 
     #[test]
