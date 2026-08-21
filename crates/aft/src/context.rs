@@ -2223,8 +2223,12 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
-        let tier2_in_flight = match self.inspect_manager.try_tier2_any_in_flight() {
-            Some(in_flight) => in_flight,
+        // Read the inspect builder registry (the same map used to refuse inspect
+        // work while a rebuild is registered). Published status-bar counts are
+        // not a substitute: a complete snapshot with a rebuild still registered
+        // is still building.
+        let tier2_builder_busy = match self.inspect_manager.try_tier2_builder_busy() {
+            Some(busy) => busy,
             None => return RootHealthSummary::busy(),
         };
         let bash = match self.bash_background.try_health_counts() {
@@ -2286,12 +2290,13 @@ impl AppContext {
             || !heavy_root_work_allowed
             || !self.inspect_writer.load(Ordering::SeqCst)
             || !self.inspect_manager.automatic_tier2_refresh_enabled();
-        let tier2_status = if tier2_complete {
-            "ready"
-        } else if tier2_in_flight {
-            // A first scan has no aggregate to expose yet, but it is still warming.
-            // Keep the root in the health rollup until that worker publishes.
+        let tier2_status = if tier2_builder_busy {
+            // A registered rebuild is still in flight, including a first scan
+            // that has no aggregate yet. Keep the root warming until the
+            // registry entry is cleared.
             "building"
+        } else if tier2_complete {
+            "ready"
         } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
             // A partial snapshot can be "building" only when this root is
             // allowed to run the refresh that would complete it.
@@ -8618,6 +8623,33 @@ mod health_warming_honesty_tests {
             health_tier2_status(&ctx),
             "ready",
             "tier2 complete except dead_code-blocked-on-callgraph must not stay building"
+        );
+    }
+
+    #[test]
+    fn health_tier2_and_inspect_builder_state_read_the_same_registry() {
+        // Complete published counts must not make health report ready while the
+        // inspect builder registry still has a live registration for this root.
+        let ctx = ctx_with_config(Config::default());
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+
+        assert_eq!(health_tier2_status(&ctx), "building");
+        assert_eq!(
+            ctx.inspect_manager()
+                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+            crate::inspect::InspectBuilderState::Building
+        );
+
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+
+        assert_eq!(health_tier2_status(&ctx), "ready");
+        assert_eq!(
+            ctx.inspect_manager()
+                .tier2_builder_state(crate::inspect::InspectCategory::DeadCode),
+            crate::inspect::InspectBuilderState::Absent
         );
     }
 

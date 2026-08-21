@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{after, bounded, select, Receiver, Sender};
 use serde::Deserialize;
@@ -135,6 +135,63 @@ impl InspectBuilderState {
     }
 }
 
+/// One admission into the inspect builder registry. Health's `tier2` field and
+/// inspect refusals both read this map so a published aggregate cannot report
+/// ready while a rebuild is still registered.
+struct BuilderStateEntry {
+    state: InspectBuilderState,
+    started_at: Instant,
+    started_unix: u64,
+}
+
+impl BuilderStateEntry {
+    fn new(state: InspectBuilderState) -> Self {
+        Self {
+            state,
+            started_at: Instant::now(),
+            started_unix: unix_now_secs(),
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self.state {
+            InspectBuilderState::Building => format!(
+                "building since {} (age_s={})",
+                self.started_unix,
+                self.started_at.elapsed().as_secs()
+            ),
+            other => other.as_str().to_string(),
+        }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Drops the builder-registry entry (and any leftover waiters) if a reuse
+/// worker returns, panics, or is cancelled without going through the
+/// completion router. Admission and exit must be paired; a leftover
+/// registration reads as `building` with no running job.
+struct Tier2FlightExitGuard<'a> {
+    manager: &'a InspectManager,
+    key: JobKey,
+}
+
+impl Drop for Tier2FlightExitGuard<'_> {
+    fn drop(&mut self) {
+        self.manager.finish_tier2_flight(
+            &self.key,
+            JobOutcome::Failed {
+                message: "tier2 reuse worker exited without publishing a result".to_string(),
+            },
+        );
+    }
+}
+
 fn cached_tier2_aggregate_usable(
     category: InspectCategory,
     options: &Tier2ReuseOptions,
@@ -169,7 +226,11 @@ pub struct InspectManager {
     heavy_root_work_allowed: Arc<AtomicBool>,
     semantic_cold_seed_active: Arc<AtomicBool>,
     cold_build_limiter: Mutex<Arc<cold_build_limiter::ColdBuildLimiter>>,
-    builder_states: Mutex<HashMap<JobKey, InspectBuilderState>>,
+    /// Inspect refusals (`builder_state=...`) and health's `tier2` field both
+    /// read this registry. The waiter map (`in_flight`) fans out completions;
+    /// both surfaces treat a category as busy when it has an entry here, and
+    /// fall back to the waiter map if the registry is empty.
+    builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -278,7 +339,11 @@ impl InspectManager {
 
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
         if let Ok(mut states) = self.builder_states.lock() {
-            states.insert(key.clone(), state);
+            if let Some(entry) = states.get_mut(key) {
+                entry.state = state;
+            } else {
+                states.insert(key.clone(), BuilderStateEntry::new(state));
+            }
         }
     }
 
@@ -288,11 +353,37 @@ impl InspectManager {
         }
     }
 
+    fn record_flight_start(&self, key: &JobKey) {
+        self.set_builder_state(key, InspectBuilderState::Building);
+    }
+
+    fn tier2_flight_exit_guard(&self, key: JobKey) -> Tier2FlightExitGuard<'_> {
+        Tier2FlightExitGuard { manager: self, key }
+    }
+
+    /// Remove the registry entry and wake leftover waiters. Idempotent: a
+    /// second call after the completion router already ran is a no-op.
+    fn finish_tier2_flight(&self, key: &JobKey, outcome: JobOutcome) {
+        self.clear_builder_state(key);
+        let Some(waiters) = self
+            .in_flight
+            .lock()
+            .ok()
+            .and_then(|mut in_flight| in_flight.remove(key))
+        else {
+            return;
+        };
+        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
+        for waiter in waiters {
+            let _ = waiter.tx.send(outcome.clone());
+        }
+    }
+
     pub(crate) fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
         let key = JobKey::for_project_category(category);
         if let Ok(states) = self.builder_states.lock() {
-            if let Some(state) = states.get(&key) {
-                return *state;
+            if let Some(entry) = states.get(&key) {
+                return entry.state;
             }
         }
         if self
@@ -307,12 +398,34 @@ impl InspectManager {
         }
     }
 
-    fn builder_state_for_job(&self, job: &InspectJob) -> InspectBuilderState {
-        if !job.inspect_writer || !job.callgraph_writer {
-            InspectBuilderState::BuildDenied
-        } else {
-            self.tier2_builder_state(job.category)
+    pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
+        let key = JobKey::for_project_category(category);
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(entry) = states.get(&key) {
+                return entry.detail();
+            }
         }
+        self.tier2_builder_state(category).as_str().to_string()
+    }
+
+    fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
+        if !job.inspect_writer || !job.callgraph_writer {
+            InspectBuilderState::BuildDenied.as_str().to_string()
+        } else {
+            self.tier2_builder_state_detail(job.category)
+        }
+    }
+
+    /// Whether any Tier-2 category is registered in the builder registry.
+    /// Health uses this instead of published status-bar completeness so the
+    /// two surfaces cannot disagree about a live rebuild.
+    pub(crate) fn try_tier2_builder_busy(&self) -> Option<bool> {
+        let states = self.builder_states.try_lock().ok()?;
+        if states.keys().any(|key| key.category.is_tier2()) {
+            return Some(true);
+        }
+        drop(states);
+        self.try_tier2_any_in_flight()
     }
 
     pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
@@ -503,12 +616,15 @@ impl InspectManager {
         };
         in_flight.insert(key.clone(), Vec::new());
         drop(in_flight);
+        self.record_flight_start(&key);
 
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         pool.spawn_fifo(move || {
             let _permit = permit;
-            let result = manager.tier2_run_with_reuse_job_result(job);
+            let _flight = manager.tier2_flight_exit_guard(job.key.clone());
+            let result =
+                manager.tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
             manager.route_tier2_reuse_completion(result);
         });
 
@@ -572,16 +688,21 @@ impl InspectManager {
             }
         };
 
+        let mut started = Vec::new();
         for category in requested {
             let key = JobKey::for_project_category(category);
             submission.queued_categories.push(category);
             if in_flight.contains_key(&key) {
                 continue;
             }
-            in_flight.insert(key, Vec::new());
+            in_flight.insert(key.clone(), Vec::new());
+            started.push(key);
             submission.newly_queued_categories.push(category);
         }
         drop(in_flight);
+        for key in &started {
+            self.record_flight_start(key);
+        }
 
         if submission.newly_queued_categories.is_empty() {
             return submission;
@@ -601,6 +722,9 @@ impl InspectManager {
                     in_flight.remove(&JobKey::for_project_category(*category));
                 }
             }
+            for category in &deferred {
+                self.clear_builder_state(&JobKey::for_project_category(*category));
+            }
             submission
                 .queued_categories
                 .retain(|category| !deferred.contains(category));
@@ -615,7 +739,10 @@ impl InspectManager {
         pool.spawn_fifo(move || {
             let _permit = permit;
             for category in categories_for_worker {
-                let result = manager.tier2_run_with_reuse_result(snapshot.clone(), category, None);
+                let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
+                let _flight = manager.tier2_flight_exit_guard(job.key.clone());
+                let result = manager
+                    .tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
                 manager.route_tier2_reuse_completion(result);
             }
         });
@@ -645,9 +772,13 @@ impl InspectManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if in_flight {
-            jobs.entry(key).or_default();
+            jobs.entry(key.clone()).or_default();
+            drop(jobs);
+            self.record_flight_start(&key);
         } else {
             jobs.remove(&key);
+            drop(jobs);
+            self.clear_builder_state(&key);
         }
     }
 
@@ -967,8 +1098,9 @@ impl InspectManager {
         };
 
         if claimed {
-            let result = self
-                .tier2_run_with_reuse_job_result_with_options(job, Tier2ReuseOptions::default());
+            let _flight = self.tier2_flight_exit_guard(key.clone());
+            let result =
+                self.tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
             self.route_tier2_reuse_completion(result);
         }
 
@@ -1083,6 +1215,8 @@ impl InspectManager {
         }
 
         in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
+        drop(in_flight);
+        self.record_flight_start(key);
         Ok(true)
     }
 
@@ -1131,12 +1265,13 @@ impl InspectManager {
         // Rebinds retain the persisted contribution cache. Let quick reuse prove
         // that cache before joining the cold-build queue, so an unchanged root can
         // answer immediately even while unrelated background builds own the slots.
-        self.set_builder_state(&job.key, InspectBuilderState::Building);
+        self.record_flight_start(&job.key);
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         let cancellation = crate::executor::current_job_cancellation();
         pool.spawn_fifo(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+            let _flight = manager.tier2_flight_exit_guard(job.key.clone());
             let result = manager.tier2_run_with_reuse_job_result_catching(job, options);
             manager.route_tier2_reuse_completion(result);
         });
@@ -1885,7 +2020,7 @@ impl InspectManager {
         {
             return Err(format!(
                 "tier2 dead_code aggregate did not complete; builder_state={}",
-                self.builder_state_for_job(job).as_str()
+                self.builder_state_detail_for_job(job)
             ));
         }
         let rollup_started = Instant::now();
@@ -1924,6 +2059,7 @@ impl InspectManager {
 
         in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
         drop(in_flight);
+        self.record_flight_start(&key);
 
         if let Err(message) = self.enqueue_new_job(
             snapshot,
@@ -1935,6 +2071,7 @@ impl InspectManager {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 in_flight.remove(&key);
             }
+            self.clear_builder_state(&key);
             return Err(message);
         }
         Ok(())
@@ -1957,6 +2094,7 @@ impl InspectManager {
         }
         in_flight.insert(key.clone(), Vec::new());
         drop(in_flight);
+        self.record_flight_start(&key);
 
         if let Err(message) = self.enqueue_new_job(
             snapshot,
@@ -1968,6 +2106,7 @@ impl InspectManager {
             if let Ok(mut in_flight) = self.in_flight.lock() {
                 in_flight.remove(&key);
             }
+            self.clear_builder_state(&key);
             return Err(message);
         }
         Ok(())
@@ -2068,6 +2207,7 @@ impl InspectManager {
     }
 
     fn route_completion(&self, result: InspectResult) {
+        self.clear_builder_state(&result.key);
         let outcome = self.completion_outcome(result.clone());
         let waiters = self
             .in_flight
@@ -2081,25 +2221,16 @@ impl InspectManager {
     }
 
     fn route_tier2_reuse_completion(&self, result: InspectResult) {
-        self.clear_builder_state(&result.key);
         let outcome = match result.outcome.clone() {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
             },
             Err(message) => JobOutcome::Failed { message },
         };
-        let waiters = self
-            .in_flight
-            .lock()
-            .ok()
-            .and_then(|mut in_flight| in_flight.remove(&result.key))
-            .unwrap_or_default();
         // Publish completion before waking waiters so a direct-reuse caller sees all
-        // completion side effects when its result channel becomes ready.
-        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
-        for waiter in waiters {
-            let _ = waiter.tx.send(outcome.clone());
-        }
+        // completion side effects when its result channel becomes ready. The same
+        // finish path runs from the exit guard if this router is skipped.
+        self.finish_tier2_flight(&result.key, outcome);
         // The counter also signals the main-thread drain that a background
         // (watcher-driven) Tier-2 scan finished. This path bypasses
         // `result_rx`/`drain_completions`, so without this signal the bar's
@@ -4525,6 +4656,93 @@ mod guard_tests {
             "quick reuse must not request an interactive cold-build permit"
         );
         drop(maintenance);
+        assert_eq!(
+            manager.tier2_builder_state(InspectCategory::DeadCode),
+            InspectBuilderState::Absent,
+            "quick reuse must clear the builder registry on the way out"
+        );
+        assert!(!manager.tier2_any_in_flight());
+    }
+
+    #[test]
+    fn background_tier2_reuse_panic_clears_builder_registration() {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        std::fs::create_dir_all(root.join("src")).expect("create source directory");
+        std::fs::write(
+            root.join("src/dup.ts"),
+            "export function planted() { return 1; }\n",
+        )
+        .expect("write source fixture");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let snapshot = InspectSnapshot::new_with_capabilities(
+            root.clone(),
+            inspect_dir,
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            true,
+            true,
+        );
+
+        let previous_root = std::env::var_os("AFT_TEST_TIER2_REUSE_PANIC_ROOT");
+        let previous_category = std::env::var_os("AFT_TEST_TIER2_REUSE_PANIC_CATEGORY");
+        unsafe {
+            std::env::set_var("AFT_TEST_TIER2_REUSE_PANIC_ROOT", &root);
+            std::env::set_var("AFT_TEST_TIER2_REUSE_PANIC_CATEGORY", "duplicates");
+        }
+        struct RestorePanicEnv {
+            root: Option<std::ffi::OsString>,
+            category: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestorePanicEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.root.take() {
+                        Some(value) => std::env::set_var("AFT_TEST_TIER2_REUSE_PANIC_ROOT", value),
+                        None => std::env::remove_var("AFT_TEST_TIER2_REUSE_PANIC_ROOT"),
+                    }
+                    match self.category.take() {
+                        Some(value) => {
+                            std::env::set_var("AFT_TEST_TIER2_REUSE_PANIC_CATEGORY", value)
+                        }
+                        None => std::env::remove_var("AFT_TEST_TIER2_REUSE_PANIC_CATEGORY"),
+                    }
+                }
+            }
+        }
+        let _restore = RestorePanicEnv {
+            root: previous_root,
+            category: previous_category,
+        };
+
+        let manager = Arc::new(InspectManager::new());
+        manager
+            .submit_tier2_run_with_reuse_background(snapshot, InspectCategory::Duplicates)
+            .expect("queue background duplicates scan");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !manager.tier2_any_in_flight()
+                && manager.tier2_builder_state(InspectCategory::Duplicates)
+                    == InspectBuilderState::Absent
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a reuse worker that panics before the completion router must still clear the builder registry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn generated_unused_exports_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {

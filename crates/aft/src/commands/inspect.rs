@@ -1131,7 +1131,7 @@ fn receive_tier2_completion_until(
                     "inspect_phase_timeout: tier2 {} aggregate did not complete within {}s; builder_state={}",
                     category.as_str(),
                     BLOCKING_TIER2_PHASE_TIMEOUT.as_secs(),
-                    manager.tier2_builder_state(category).as_str(),
+                    manager.tier2_builder_state_detail(category),
                 ),
             });
         }
@@ -3184,6 +3184,27 @@ mod deferred_terminal_tests {
                 if message.contains("inspect_phase_timeout")
                     && message.contains("tier2 dead_code aggregate")
                     && message.contains("builder_state=absent")
+        ));
+    }
+
+    #[test]
+    fn inspect_builder_state_refusal_includes_start_timestamp() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let manager = crate::inspect::InspectManager::new();
+        manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            std::time::Instant::now() + Duration::from_millis(20),
+        )
+        .expect("deadline produces an honest failure");
+        assert!(matches!(
+            outcome,
+            JobOutcome::Failed { message }
+                if message.contains("inspect_phase_timeout")
+                    && message.contains("builder_state=building since ")
+                    && message.contains("age_s=")
         ));
     }
 

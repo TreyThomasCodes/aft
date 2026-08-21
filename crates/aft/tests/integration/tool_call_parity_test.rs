@@ -1035,6 +1035,16 @@ fn mask_memory_numbers(value: &mut Value) {
 }
 
 fn normalize_text(text: &str, project_root: &Path, cache_dir: &Path) -> String {
+    // The builder-state honesty detail carries a wall-clock start stamp
+    // ("building since <unix> (age_s=<n>)"). The direct and tool_call runs
+    // mint their registrations independently, so the stamps can straddle a
+    // one-second tick (same class as tier2_last_run above). Mask the values,
+    // keep the shape asserted.
+    let text = regex::Regex::new(r"building since \d+ \(age_s=\d+\)")
+        .expect("static regex")
+        .replace_all(text, "building since <ts> (age_s=<n>)")
+        .into_owned();
+    let text = text.as_str();
     // Base root forms: the raw path plus its canonicalized form (macOS /var ->
     // /private/var, Windows verbatim prefixes, etc.).
     let mut base_roots = vec![
