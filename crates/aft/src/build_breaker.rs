@@ -48,6 +48,16 @@ impl BuildDomain {
             Self::Tier2Scan => "tier2_scan",
         }
     }
+
+    fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "callgraph_cold" => Some(Self::CallgraphCold),
+            "search_cold" => Some(Self::SearchCold),
+            "semantic_seed" => Some(Self::SemanticSeed),
+            "tier2_scan" => Some(Self::Tier2Scan),
+            _ => None,
+        }
+    }
 }
 
 /// Durable namespace. Configure generations and cache keys do not appear here:
@@ -85,6 +95,16 @@ pub struct BuildSuspension {
     pub reason: String,
     pub death_count: u64,
     pub suspended_since_unix_ms: u64,
+}
+
+impl BuildSuspension {
+    pub fn age_millis_at(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.suspended_since_unix_ms)
+    }
+
+    pub fn age_seconds_at(&self, now_ms: u64) -> u64 {
+        self.age_millis_at(now_ms) / 1_000
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +367,60 @@ impl BuildDeathBreaker {
             let suspension = suspension_in_tx(&tx, key, now_ms)?;
             tx.commit()?;
             Ok(suspension)
+        })
+    }
+
+    pub fn active_suspensions_for_root(&self, root_id: &str) -> Result<Vec<BuildSuspension>> {
+        self.active_suspensions_for_root_at(root_id, unix_millis_now())
+    }
+
+    /// Read every still-active domain suspension for one root from the durable
+    /// breaker rows. Health and doctor snapshots use this instead of inferring a
+    /// suspension from transient worker state, so every surface reports the same
+    /// persisted reason and counters.
+    pub fn active_suspensions_for_root_at(
+        &self,
+        root_id: &str,
+        now_ms: u64,
+    ) -> Result<Vec<BuildSuspension>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT domain, zero_credit_deaths, credited_deaths, suspended_reason, suspended_since_ms
+                 FROM breaker_records
+                 WHERE root_id = ?1
+                   AND configuration_version = ?2
+                   AND suspended_reason IS NOT NULL
+                   AND suspended_since_ms IS NOT NULL
+                   AND suspended_until_ms > ?3
+                 ORDER BY domain",
+            )?;
+            let rows = statement.query_map(
+                params![root_id, BREAKER_CONFIGURATION_VERSION, now_ms.min(i64::MAX as u64) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            let mut suspensions = Vec::new();
+            for row in rows {
+                let (domain, zero_credit_deaths, credited_deaths, reason, since) = row?;
+                let Some(domain) = BuildDomain::from_persisted(&domain) else {
+                    continue;
+                };
+                suspensions.push(BuildSuspension {
+                    domain,
+                    reason,
+                    death_count: (zero_credit_deaths.max(0) as u64)
+                        .saturating_add(credited_deaths.max(0) as u64),
+                    suspended_since_unix_ms: since.max(0) as u64,
+                });
+            }
+            Ok(suspensions)
         })
     }
 
@@ -696,5 +770,98 @@ mod tests {
             .unwrap();
         assert_eq!(suspension.reason, "in_build_burn_limit");
         assert_eq!(suspension.domain, BuildDomain::Tier2Scan);
+    }
+
+    #[test]
+    fn durable_trip_agrees_across_navigation_inspect_and_health_snapshots() {
+        let storage = tempdir().unwrap();
+        let root = storage.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let breaker_path = storage
+            .path()
+            .join("callgraph")
+            .join(&project_key)
+            .join("build-breaker.sqlite");
+        let breaker = BuildDeathBreaker::open(&breaker_path).unwrap();
+        let key = BreakerKey::new(
+            root.display().to_string(),
+            BuildDomain::CallgraphCold,
+            "corpus-a",
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for _ in 0..3 {
+            let attempt = admitted(&breaker, &key, now);
+            breaker
+                .record_attributed_death_at(&key, &attempt.attempt_id, 10, 0, now)
+                .unwrap();
+        }
+        let snapshot_at = now + 5_000;
+        let suspension = breaker
+            .active_suspensions_for_root_at(&root.display().to_string(), snapshot_at)
+            .unwrap()
+            .pop()
+            .expect("tripped durable row");
+        assert_eq!(suspension.domain, BuildDomain::CallgraphCold);
+        assert_eq!(suspension.death_count, 3);
+        assert_eq!(suspension.age_seconds_at(snapshot_at), 5);
+
+        let navigation = crate::commands::callgraph_store_adapter::suspended_response_at(
+            "surface-agreement",
+            "callers",
+            &suspension,
+            snapshot_at,
+        );
+        assert_eq!(navigation.data["code"], "build_suspended");
+        assert_eq!(
+            navigation.data["message"],
+            "callers: build_suspended domain=callgraph_cold deaths=3 age_ms=5000 reason=zero_credit_death_limit; run doctor reset-build-breaker to resume"
+        );
+
+        let manager = crate::inspect::InspectManager::new();
+        manager.record_tier2_build_suspension_for_test(
+            crate::inspect::InspectCategory::DeadCode,
+            suspension.clone(),
+        );
+        let inspect_detail =
+            manager.tier2_builder_state_detail(crate::inspect::InspectCategory::DeadCode);
+        assert!(inspect_detail.starts_with("suspended domain=callgraph_cold deaths=3 age_s="));
+        assert!(inspect_detail.ends_with("reason=zero_credit_death_limit"));
+
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        // These tests use contexts without a bound project or root, so disable
+        // expensive root work before taking the non-blocking health snapshot.
+        context.set_heavy_root_work_allowed(false);
+        assert_eq!(context.storage_dir(), storage.path());
+        context.refresh_build_suspensions_for_health(&root, Some(&project_key));
+        let health = context.try_health_snapshot(&root);
+        assert_eq!(health.suspended_domains.len(), 1);
+        assert_eq!(health.suspended_domains[0].domain, "callgraph_cold");
+        assert_eq!(
+            health.suspended_domains[0].reason,
+            "zero_credit_death_limit"
+        );
+        assert_eq!(health.suspended_domains[0].death_count, 3);
+        assert!(health.suspended_domains[0].age_s <= 1);
+
+        assert!(breaker
+            .active_suspensions_for_root_at(&root.display().to_string(), now + TRIP_TTL_MS + 5)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            breaker.admit_at(&key, 10, now + TRIP_TTL_MS + 5).unwrap(),
+            BreakerAdmission::Admitted(_)
+        ));
     }
 }

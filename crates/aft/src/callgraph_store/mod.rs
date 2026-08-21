@@ -12394,6 +12394,14 @@ pub(crate) fn callgraph_corpus_fingerprint(
     Ok(hash_to_hex(hasher.finalize()))
 }
 
+#[cfg(test)]
+pub(crate) fn callgraph_corpus_fingerprint_for_test(
+    project_root: &Path,
+    files: &[PathBuf],
+) -> Result<String> {
+    callgraph_corpus_fingerprint(project_root, files)
+}
+
 fn hash_to_hex(hash: blake3::Hash) -> String {
     hash.to_hex().to_string()
 }

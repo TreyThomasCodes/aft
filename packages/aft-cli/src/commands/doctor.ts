@@ -18,6 +18,11 @@ import type { HarnessAdapter } from "../adapters/types.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import { probeAftBinary } from "../lib/binary-probe.js";
 import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
+import {
+  DOCTOR_BUILD_BREAKER_RESET_COMMAND,
+  formatBuildBreakerSuspension,
+  resetBuildBreakerSuspension,
+} from "../lib/build-breaker.js";
 import { CLI } from "../lib/cli.js";
 import {
   collectDiagnostics,
@@ -142,6 +147,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   log.info(
     `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
   );
+  logBuildBreakerSuspensions(report);
 
   const npmCount = report.lspCache.npm.entries.length;
   const ghCount = report.lspCache.github.entries.length;
@@ -244,7 +250,49 @@ export function hasDoctorProblems(report: DiagnosticReport): boolean {
   // good." outro. Reproducer: `rm -rf ~/.cache/aft/bin && bunx --bun
   // @cortexkit/aft doctor` previously printed "AFT binary unknown" + "Binary
   // cache: 0 versions" and then "Everything looks good." at the bottom.
-  return formatDiagnosticIssuesSection(report).length > 0;
+  return (
+    formatDiagnosticIssuesSection(report).length > 0 ||
+    (report.buildBreakerSuspensions?.length ?? 0) > 0
+  );
+}
+
+export function logBuildBreakerSuspensions(report: DiagnosticReport): void {
+  for (const suspension of report.buildBreakerSuspensions ?? []) {
+    log.warn(formatBuildBreakerSuspension(suspension));
+  }
+}
+
+export async function runDoctorBuildBreakerReset(argv: string[]): Promise<number> {
+  const optionValue = (name: string): string | undefined => {
+    const index = argv.indexOf(name);
+    return index >= 0 ? argv[index + 1] : undefined;
+  };
+  const root = optionValue("--root");
+  const domain = optionValue("--domain");
+  const fingerprint = optionValue("--fingerprint");
+  if (!root || !domain || !fingerprint) {
+    log.error(
+      `Usage: ${DOCTOR_BUILD_BREAKER_RESET_COMMAND} --root <root> --domain <domain> --fingerprint <fingerprint>`,
+    );
+    return 2;
+  }
+
+  const adapters = await resolveAdaptersForCommand(argv, {
+    allowMulti: false,
+    verb: "reset the build breaker for",
+  });
+  const storageRoot = adapters[0]?.getStorageDir();
+  if (!storageRoot) {
+    log.error("No AFT storage root was found for the selected harness.");
+    return 1;
+  }
+  const reset = resetBuildBreakerSuspension(storageRoot, { root, domain, fingerprint });
+  if (reset === 0) {
+    log.warn("No matching build-breaker suspension was found; no records were changed.");
+    return 1;
+  }
+  log.success(`Reset build breaker for root=${root} domain=${domain}.`);
+  return 0;
 }
 
 async function runClearFlow(argv: string[]): Promise<number> {

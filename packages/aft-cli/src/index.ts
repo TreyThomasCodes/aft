@@ -25,6 +25,9 @@ function printHelp(): void {
   console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
   console.log("    doctor --clear   Select caches to clear with an interactive prompt");
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
+  console.log(
+    "    doctor reset-build-breaker --root <root> --domain <domain> --fingerprint <fingerprint>",
+  );
   console.log("");
   console.log("  Harness selection:");
   console.log("    --harness opencode    Target OpenCode only");
@@ -37,6 +40,9 @@ function printHelp(): void {
   console.log(`    ${CLI} doctor lsp ./src/main.py`);
   console.log(`    ${CLI} doctor --clear`);
   console.log(`    ${CLI} doctor --issue`);
+  console.log(
+    `    ${CLI} doctor reset-build-breaker --root <root> --domain <domain> --fingerprint <fingerprint>`,
+  );
   console.log("");
 }
 
@@ -57,6 +63,10 @@ async function main(): Promise<number> {
     if (args[0] === "filters") {
       const { runDoctorFilters } = await import("./commands/doctor-filters.js");
       return runDoctorFilters({ argv: args.slice(1) });
+    }
+    if (args[0] === "reset-build-breaker") {
+      const { runDoctorBuildBreakerReset } = await import("./commands/doctor.js");
+      return runDoctorBuildBreakerReset(args.slice(1));
     }
     const { runDoctor } = await import("./commands/doctor.js");
     const force = args.includes("--force");

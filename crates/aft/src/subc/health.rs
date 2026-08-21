@@ -789,6 +789,9 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
         memory_roots.insert(root_label, memory);
 
         let project_key = crate::search_index::artifact_cache_key_memoized_only(root_id.as_path());
+        // Durable breaker state is loaded during the off-path rollup, then the
+        // cached health reply reads only the context snapshot.
+        ctx.refresh_build_suspensions_for_health(root_id.as_path(), project_key.as_deref());
         let repair_entries_60s = project_key.as_deref().and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)

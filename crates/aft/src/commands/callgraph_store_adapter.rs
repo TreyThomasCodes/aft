@@ -1769,8 +1769,21 @@ pub fn suspended_response(
     operation: &str,
     suspension: &crate::build_breaker::BuildSuspension,
 ) -> Response {
-    let age_ms = crate::callgraph_store::unix_millis_now()
-        .saturating_sub(suspension.suspended_since_unix_ms);
+    suspended_response_at(
+        req_id,
+        operation,
+        suspension,
+        crate::callgraph_store::unix_millis_now(),
+    )
+}
+
+pub(crate) fn suspended_response_at(
+    req_id: &str,
+    operation: &str,
+    suspension: &crate::build_breaker::BuildSuspension,
+    now_ms: u64,
+) -> Response {
+    let age_ms = suspension.age_millis_at(now_ms);
     Response::error(
         req_id,
         "build_suspended",

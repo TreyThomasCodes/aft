@@ -8,9 +8,11 @@ import {
   statSync,
 } from "node:fs";
 import { resolveCortexKitProjectConfigPath } from "@cortexkit/aft-bridge";
+
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
+import { type BuildBreakerSuspension, readBuildBreakerSuspensions } from "./build-breaker.js";
 import { CLI } from "./cli.js";
 import { readJsoncFile } from "./jsonc.js";
 import type { LegacyPartitionDuplicationSummary } from "./legacy-storage.js";
@@ -40,6 +42,8 @@ export interface DiagnosticReport {
   binaryCache: BinaryCacheInfo;
   /** LSP package and binary caches populated by plugin auto-install. */
   lspCache: LspCacheReport;
+  /** Active durable build-breaker suspensions, grouped by their stored project root. */
+  buildBreakerSuspensions?: BuildBreakerSuspension[];
 }
 
 export type DiagnosticIssueSeverity = "high" | "medium" | "low";
@@ -123,6 +127,9 @@ export async function collectDiagnostics(adapters: HarnessAdapter[]): Promise<Di
     harnesses,
     binaryCache: getBinaryCacheInfo(cliVersion),
     lspCache: getLspCacheReport(),
+    buildBreakerSuspensions: harnesses[0]
+      ? readBuildBreakerSuspensions(harnesses[0].storageDir.path)
+      : [],
   };
 }
 

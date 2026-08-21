@@ -3,7 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
@@ -360,6 +360,14 @@ pub struct Tier2HealthSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SuspendedDomainHealthSnapshot {
+    pub domain: String,
+    pub reason: String,
+    pub death_count: u64,
+    pub age_s: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootHealthSnapshot {
     pub project_root: String,
     pub actor_count: usize,
@@ -380,6 +388,8 @@ pub struct RootHealthSnapshot {
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash: Option<BgTaskHealthCounts>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,6 +400,7 @@ pub(crate) struct RootHealthSummary {
     callgraph_store_status: Option<&'static str>,
     tier2_status: Option<&'static str>,
     bash: Option<BgTaskHealthCounts>,
+    suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
 
 impl RootHealthSummary {
@@ -401,6 +412,7 @@ impl RootHealthSummary {
             callgraph_store_status: None,
             tier2_status: None,
             bash: None,
+            suspended_domains: Vec::new(),
         }
     }
 
@@ -463,6 +475,7 @@ impl RootHealthSummary {
                 .tier2_status
                 .map(|status| Tier2HealthSnapshot { status }),
             bash: self.bash,
+            suspended_domains: self.suspended_domains,
         }
     }
 }
@@ -481,6 +494,7 @@ impl RootHealthSnapshot {
             callgraph_pages_or_bytes_written_60s: None,
             tier2: None,
             bash: None,
+            suspended_domains: Vec::new(),
         }
     }
 
@@ -1586,6 +1600,10 @@ pub struct AppContext {
     callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
     callgraph_store_build_suspension:
         parking_lot::Mutex<Option<(u64, crate::build_breaker::BuildSuspension)>>,
+    /// Health probes run the durable query outside reply handling and copy its
+    /// results into this small snapshot. Reply handling uses only `try_read` on
+    /// this lock, avoiding SQLite and other blocking work.
+    health_build_suspensions: RwLock<Vec<SuspendedDomainHealthSnapshot>>,
     callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
@@ -2018,6 +2036,7 @@ impl AppContext {
             callgraph_store_rx_epoch: AtomicU64::new(0),
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
             callgraph_store_build_suspension: parking_lot::Mutex::new(None),
+            health_build_suspensions: RwLock::new(Vec::new()),
             callgraph_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -2251,6 +2270,10 @@ impl AppContext {
             Some(counts) => counts,
             None => return RootHealthSummary::busy(),
         };
+        let suspended_domains = match self.health_build_suspensions.try_read() {
+            Ok(snapshot) => snapshot.clone(),
+            Err(_) => return RootHealthSummary::busy(),
+        };
 
         // Borrow-only roots (mason worktrees, read-only siblings) never
         // materialize an in-RAM index or spawn a build: queries go through the
@@ -2328,6 +2351,7 @@ impl AppContext {
             callgraph_store_status: Some(callgraph_store_status),
             tier2_status: Some(tier2_status),
             bash: Some(bash),
+            suspended_domains,
         }
     }
 
@@ -3432,6 +3456,51 @@ impl AppContext {
 
     pub fn harness_dir(&self) -> PathBuf {
         self.storage_dir().join(self.harness().storage_segment())
+    }
+
+    /// Refresh the in-memory list of durable build suspensions during health
+    /// maintenance so reply handling can return the cached snapshot instead of
+    /// querying storage.
+    pub(crate) fn refresh_build_suspensions_for_health(
+        &self,
+        project_root: &Path,
+        project_key: Option<&str>,
+    ) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let suspended_domains = project_key
+            .and_then(|key| {
+                let path = self
+                    .storage_dir()
+                    .join("callgraph")
+                    .join(key)
+                    .join("build-breaker.sqlite");
+                path.is_file().then_some(path)
+            })
+            .and_then(|path| crate::build_breaker::BuildDeathBreaker::open(path).ok())
+            .and_then(|breaker| {
+                breaker
+                    .active_suspensions_for_root_at(&project_root.display().to_string(), now_ms)
+                    .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|suspension| {
+                let age_s = suspension.age_seconds_at(now_ms);
+                SuspendedDomainHealthSnapshot {
+                    domain: suspension.domain.as_str().to_string(),
+                    reason: suspension.reason,
+                    death_count: suspension.death_count,
+                    age_s,
+                }
+            })
+            .collect();
+        if let Ok(mut snapshot) = self.health_build_suspensions.write() {
+            *snapshot = suspended_domains;
+        }
     }
 
     pub fn inspect_dir(&self) -> PathBuf {

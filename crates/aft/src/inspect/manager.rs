@@ -119,6 +119,7 @@ pub(crate) enum InspectBuilderState {
     Building,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
+    Suspended,
     BuildDenied,
     Absent,
 }
@@ -129,6 +130,7 @@ impl InspectBuilderState {
             Self::Building => "building",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
+            Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
         }
@@ -150,6 +152,7 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
+    suspension: Option<crate::build_breaker::BuildSuspension>,
 }
 
 impl BuilderStateEntry {
@@ -162,6 +165,7 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
+            suspension: None,
         }
     }
 
@@ -178,6 +182,7 @@ impl BuilderStateEntry {
 
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
+        self.suspension = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -187,11 +192,32 @@ impl BuilderStateEntry {
 
     fn record_failure(&mut self, terminal: String) {
         self.state = None;
+        self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = Some(terminal);
     }
 
+    fn record_suspension(&mut self, suspension: crate::build_breaker::BuildSuspension) {
+        self.state = Some(InspectBuilderState::Suspended);
+        self.last_failure = None;
+        self.suspension = Some(suspension);
+    }
+
     fn detail(&self) -> String {
+        if let Some(suspension) = self.suspension.as_ref() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            return format!(
+                "suspended domain={} deaths={} age_s={} reason={}",
+                suspension.domain.as_str(),
+                suspension.death_count,
+                suspension.age_seconds_at(now_ms),
+                suspension.reason,
+            );
+        }
         if let Some(terminal) = self.last_failure.as_deref() {
             return format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
@@ -463,6 +489,12 @@ impl InspectManager {
         let Ok(mut states) = self.builder_states.lock() else {
             return;
         };
+        if states
+            .get(key)
+            .is_some_and(|entry| entry.suspension.is_some())
+        {
+            return;
+        }
         match builder_attempt_terminal(outcome) {
             BuilderAttemptTerminal::Succeeded => {
                 states.remove(key);
@@ -538,6 +570,31 @@ impl InspectManager {
             }
         }
         self.tier2_builder_state(category).as_str().to_string()
+    }
+
+    fn record_tier2_build_suspension(
+        &self,
+        key: &JobKey,
+        suspension: crate::build_breaker::BuildSuspension,
+    ) {
+        if let Ok(mut states) = self.builder_states.lock() {
+            if let Some(entry) = states.get_mut(key) {
+                entry.record_suspension(suspension);
+            } else {
+                let mut entry = BuilderStateEntry::new(InspectBuilderState::Suspended);
+                entry.record_suspension(suspension);
+                states.insert(key.clone(), entry);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_tier2_build_suspension_for_test(
+        &self,
+        category: InspectCategory,
+        suspension: crate::build_breaker::BuildSuspension,
+    ) {
+        self.record_tier2_build_suspension(&JobKey::for_project_category(category), suspension);
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
@@ -2856,6 +2913,32 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         );
         return None;
     };
+    for callgraph_dir in &callgraph_dirs {
+        match CallGraphStore::cold_build_suspension(callgraph_dir, &job.project_root) {
+            Ok(Some(suspension)) => {
+                // This is a durable admission refusal, not a failed scan attempt.
+                // Preserve it separately so blocking inspect reports the same
+                // breaker tuple that navigation and health expose.
+                if let Some(manager) = projection_cache {
+                    manager.record_tier2_build_suspension(&job.key, suspension.clone());
+                }
+                crate::slog_info!(
+                    "tier2 dead_code: callgraph build suspended for {} after {} deaths",
+                    suspension.domain.as_str(),
+                    suspension.death_count
+                );
+                return None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::slog_warn!(
+                    "tier2 dead_code: failed to read callgraph breaker at {}: {}",
+                    callgraph_dir.display(),
+                    error
+                );
+            }
+        }
+    }
 
     enum ProjectionStore {
         ReadOnly(ReadonlyCallGraphStore),
@@ -5171,6 +5254,53 @@ export function bannerUnused() {}
             snapshot.is_none(),
             "a cold/mid-build store must surface callgraph_unavailable instead of rebuilding inline"
         );
+    }
+
+    #[test]
+    fn suspended_callgraph_build_sets_distinct_builder_state() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let key = crate::build_breaker::BreakerKey::new(
+            root.display().to_string(),
+            crate::build_breaker::BuildDomain::CallgraphCold,
+            crate::callgraph_store::callgraph_corpus_fingerprint_for_test(&root, &files)
+                .expect("corpus fingerprint"),
+        );
+        let breaker = crate::build_breaker::BuildDeathBreaker::open(
+            callgraph_dir.join("build-breaker.sqlite"),
+        )
+        .expect("open breaker");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_millis() as u64;
+        for _ in 0..3 {
+            let crate::build_breaker::BreakerAdmission::Admitted(attempt) =
+                breaker.admit_at(&key, 0, now).expect("admit build")
+            else {
+                panic!("early suspension before the threshold");
+            };
+            breaker
+                .record_attributed_death_at(&key, &attempt.attempt_id, 0, 0, now)
+                .expect("record death");
+        }
+
+        let manager = InspectManager::new();
+        let job = snapshot_job(&root, &inspect_dir, true);
+        assert!(manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, true, true, &files)
+            .is_none());
+        assert_eq!(
+            manager.tier2_builder_state(InspectCategory::DeadCode),
+            InspectBuilderState::Suspended
+        );
+        let detail = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
+        assert!(detail.starts_with("suspended domain=callgraph_cold deaths=3 age_s="));
+        assert!(detail.ends_with("reason=zero_credit_death_limit"));
     }
 
     #[test]
