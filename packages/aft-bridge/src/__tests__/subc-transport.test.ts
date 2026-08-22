@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import {
   type BindIdentity,
   type RouteHandle,
@@ -88,8 +89,16 @@ class FakeClient implements SubcClientLike {
   routeOpenGate: Promise<void> | null = null;
   /** When set, the NEXT routeOpen rejects with this error then clears it. */
   routeOpenError: Error | null = null;
+  /** Returns an error while the mock daemon is refusing every route reopen. */
+  routeOpenFailure: (() => Error | null) | null = null;
+  /** Simulates subc-client's one ingress dispatcher shared by all subscriptions. */
+  private readonly ingress = new EventEmitter();
 
   constructor(private readonly onRequest: (channel: number, body: unknown) => Promise<unknown>) {}
+
+  get ingressListenerCount(): number {
+    return this.ingress.listenerCount("frame");
+  }
 
   async routeOpen(
     _target: RouteTarget,
@@ -98,6 +107,8 @@ class FakeClient implements SubcClientLike {
   ): Promise<RouteHandle> {
     this.routeOpens.push(identity);
     this.routeConsumerIdentities.push(opts?.consumerIdentity);
+    const daemonError = this.routeOpenFailure?.();
+    if (daemonError) throw daemonError;
     if (this.routeOpenError) {
       const err = this.routeOpenError;
       this.routeOpenError = null;
@@ -122,6 +133,14 @@ class FakeClient implements SubcClientLike {
     onEvent: (event: Uint8Array) => void,
   ): FakeSubscription {
     const sub = new FakeSubscription(route.channel, onEvent, this.subscriptionUnsubscribeGate);
+    const ingressListener = (event: Uint8Array): void => onEvent(event);
+    this.ingress.on("frame", ingressListener);
+    // The callback belongs to this subscription lifecycle. Settling `closed` on
+    // every StreamEnd/GOODBYE releases it before a reconnect can subscribe again.
+    void sub.closed.then(
+      () => this.ingress.off("frame", ingressListener),
+      () => this.ingress.off("frame", ingressListener),
+    );
     this.subscriptions.push(sub);
     return sub;
   }
@@ -138,6 +157,41 @@ class FakeClient implements SubcClientLike {
 /** Yield to the microtask/timer queue so the bg loop can advance. */
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function settleMicrotasks(turns = 32): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
+}
+
+/** Deterministic timer seam for asserting parked reconnect work without real waits. */
+class FakeClock {
+  private now = 0;
+  private nextTimerId = 0;
+  private readonly timers = new Map<number, { dueAt: number; resolve: () => void }>();
+  readonly scheduledDelays: number[] = [];
+
+  sleep = (ms: number): Promise<void> => {
+    this.scheduledDelays.push(ms);
+    return new Promise((resolve) => {
+      this.timers.set(this.nextTimerId++, { dueAt: this.now + ms, resolve });
+    });
+  };
+
+  get scheduledWorkCount(): number {
+    return this.timers.size;
+  }
+
+  async advance(ms: number): Promise<void> {
+    this.now += ms;
+    const ready = [...this.timers.entries()]
+      .filter(([, timer]) => timer.dueAt <= this.now)
+      .sort(([, left], [, right]) => left.dueAt - right.dueAt);
+    for (const [id, timer] of ready) {
+      this.timers.delete(id);
+      timer.resolve();
+    }
+    await settleMicrotasks();
+  }
 }
 
 function poolWith(
@@ -411,6 +465,41 @@ describe("SubcTransport Rd reconnect", () => {
     expect(client.requests[1]?.channel).toBe(2);
     expect(client.requests[1]?.body).toEqual(client.requests[0]?.body);
     expect(client.closedRoutes).toEqual([1]);
+  });
+
+  test("unknown_channel retries share a 100ms restart-burst delay", async () => {
+    let requestAttempts = 0;
+    const client = new FakeClient(async () => {
+      requestAttempts += 1;
+      if (requestAttempts <= 2) throw new SubcError("unknown channel", "unknown_channel");
+      return envelope({ id: "r", success: true, text: "recovered" });
+    });
+    const clock = new FakeClock();
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      routeRetrySleep: clock.sleep,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    const recovered = Promise.all([
+      transport.toolCall("restart-1", "read", {}),
+      transport.toolCall("restart-2", "read", {}),
+    ]);
+    await settleMicrotasks();
+
+    // Both route-closing replies arrived together, but they share one floor timer
+    // before either request is resent onto the restarted daemon.
+    expect(client.routeOpens).toHaveLength(2);
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(99);
+    expect(client.routeOpens).toHaveLength(2);
+    await clock.advance(1);
+
+    await expect(recovered).resolves.toHaveLength(2);
+    expect(client.routeOpens).toHaveLength(4);
+    expect(clock.scheduledDelays).toEqual([100]);
   });
 
   test("outcome-unknown request failures still surface without an in-place retry", async () => {
@@ -1451,6 +1540,74 @@ describe("SubcTransport bg_events subscription (S3)", () => {
       "subc bg_events: reconnect attempt=1",
       "subc bg_events: reconnect success attempt=1 channel=3@3",
     ]);
+  });
+
+  test("restart burst parks all bg reconnects without retaining shared ingress listeners", async () => {
+    const sessionCount = 8;
+    const clock = new FakeClock();
+    const clients: FakeClient[] = [];
+    let acceptingConnections = true;
+    let connectAttempts = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        connectAttempts += 1;
+        if (!acceptingConnections) throw new SocketClosedError("daemon is restarting");
+        const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+        clients.push(client);
+        return client;
+      },
+      onBgEventsNudge: () => undefined,
+      bgBackoffSleep: clock.sleep,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    await Promise.all(
+      Array.from({ length: sessionCount }, (_, index) =>
+        transport.toolCall(`restart-${index}`, "read", {}),
+      ),
+    );
+    await settleMicrotasks();
+
+    const firstClient = clients[0]!;
+    const initialRouteOpens = firstClient.routeOpens.length;
+    const baselineIngressListeners = firstClient.ingressListenerCount;
+    expect(baselineIngressListeners).toBe(sessionCount);
+
+    // A module restart ends every held route together. While it is unavailable,
+    // reopening routes reports a socket failure and later connects fail quickly.
+    acceptingConnections = false;
+    firstClient.routeOpenFailure = () => new SocketClosedError("daemon is restarting");
+    for (const subscription of firstClient.subscriptions.slice(0, sessionCount)) subscription.end();
+    await settleMicrotasks();
+
+    expect(firstClient.ingressListenerCount).toBe(0);
+    expect(clock.scheduledWorkCount).toBe(sessionCount);
+    await settleMicrotasks();
+    expect(clock.scheduledWorkCount).toBe(sessionCount);
+
+    // The first wave probes the retired client once per session. Later waves share
+    // ensureClient's single-flight connect and follow the 100ms-to-2s schedule.
+    for (const delay of [100, 200, 400, 800, 1_600, 2_000, 2_000]) {
+      await clock.advance(delay);
+      expect(clock.scheduledWorkCount).toBe(sessionCount);
+    }
+    expect(firstClient.routeOpens.length - initialRouteOpens).toBe(sessionCount);
+    expect(connectAttempts - 1).toBe(6);
+    expect([...new Set(clock.scheduledDelays)]).toEqual([100, 200, 400, 800, 1_600, 2_000]);
+
+    acceptingConnections = true;
+    await clock.advance(2_000);
+
+    const recoveredClient = clients[1]!;
+    expect(recoveredClient.subscriptions).toHaveLength(sessionCount);
+    expect(recoveredClient.ingressListenerCount).toBe(baselineIngressListeners);
+    expect(clock.scheduledWorkCount).toBe(0);
+
+    await pool.shutdown();
+    await settleMicrotasks();
+    expect(recoveredClient.ingressListenerCount).toBe(0);
   });
 
   test("closeSession stops the subscription and closes both routes", async () => {

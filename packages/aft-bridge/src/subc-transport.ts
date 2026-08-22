@@ -108,13 +108,21 @@ const AFT_MODULE_ID = "aft";
  */
 const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
 
+/** Every transport reconnect waits at least one event-loop turn and caps repeated failures. */
+const RECONNECT_RETRY_FLOOR_MS = 100;
+const RECONNECT_RETRY_CAP_MS = 2_000;
+
 /**
  * A bg subscription that stayed up at least this long before dropping is treated
  * as "stable", so its reconnect backoff resets to zero. A subscription that fails
  * faster than this is escalating-broken and must keep backing off toward the cap
- * (otherwise a permanently-failing route resubscribes in a 100ms hot loop). (B-#2.)
+ * instead of repeatedly resubscribing in a hot loop.
  */
 const BG_STABLE_MS = 5_000;
+
+function reconnectBackoffMs(attempt: number): number {
+  return Math.min(RECONNECT_RETRY_FLOOR_MS * 2 ** Math.min(attempt, 6), RECONNECT_RETRY_CAP_MS);
+}
 const BG_LIFECYCLE_LOG_INTERVAL_MS = 60_000;
 const BG_DISPATCH_PROBE_INTERVAL_MS = 60_000;
 
@@ -167,6 +175,8 @@ export interface SubcTransportPoolOptions {
   onBgEventsNudge?: (projectRoot: string, session: string) => void;
   /** Test seam: backoff sleeper for the bg resubscribe loop (default real timer). */
   bgBackoffSleep?: (ms: number) => Promise<void>;
+  /** Test seam for the pooled delay before reopening a route after an unknown-channel reply. */
+  routeRetrySleep?: (ms: number) => Promise<void>;
   /** Test-only polling interval for detecting frames silently discarded with a stale route epoch. */
   bgDispatchProbeIntervalMs?: number;
   /** Optional lifecycle registry used for root tracking; omit it to retain legacy behavior. */
@@ -308,6 +318,10 @@ function identityKey(identity: BindIdentity): IdentityKey {
  * the module emits StreamEnd when a route is replaced, so only `stop()` proves
  * that a clean end was requested by this consumer. Reopening the dedicated route
  * also forces an outbox drain, recovering completions queued while disconnected.
+ *
+ * Each subscribe call owns one route-scoped ingress listener in the shared client.
+ * A reconnect retires that route in `finally` before it opens the next one, so a
+ * restart cannot layer listeners from multiple subscription lifecycles.
  */
 class BgSubscription {
   private stopped = false;
@@ -543,6 +557,7 @@ class BgSubscription {
         }
         // Provider StreamEnd is also emitted for route replacement; without an
         // explicit local stop it must reopen rather than strand an idle session.
+        if (Date.now() - subscribedAt >= BG_STABLE_MS) backoffAttempt = 0;
         beginReconnect();
       } catch (err) {
         const routeId = this.routeId(route);
@@ -566,8 +581,7 @@ class BgSubscription {
   }
 
   private async backoff(attempt: number): Promise<void> {
-    const ms = Math.min(100 * 2 ** Math.min(attempt, 6), 2000);
-    await this.sleep(ms);
+    await this.sleep(reconnectBackoffMs(attempt));
   }
 }
 
@@ -855,6 +869,7 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
   private readonly onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
   private readonly bgBackoffSleep: (ms: number) => Promise<void>;
+  private readonly routeRetrySleep: (ms: number) => Promise<void>;
   private readonly bgDispatchProbeIntervalMs: number;
   private readonly lifecycleDemandCheck?: (
     root: CanonicalRootPath,
@@ -871,6 +886,10 @@ export class SubcTransportPool implements AftTransportPool {
   private client: SubcClientLike | null = null;
   /** Single-flight guard so concurrent first calls share one connect. */
   private connecting: Promise<SubcClientLike> | null = null;
+  /** The growing delay for a safe, once-only route resend after route closure. */
+  private routeReopenRetryDelayMs = RECONNECT_RETRY_FLOOR_MS;
+  /** Concurrent route closures wait for the same retry timer. */
+  private routeReopenRetry: Promise<void> | null = null;
   /** Per-session records keyed by the opaque identity key. */
   private readonly sessions = new Map<IdentityKey, SessionRecord>();
   /**
@@ -904,6 +923,8 @@ export class SubcTransportPool implements AftTransportPool {
     this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
     this.bgBackoffSleep =
       options.bgBackoffSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.routeRetrySleep =
+      options.routeRetrySleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.bgDispatchProbeIntervalMs =
       options.bgDispatchProbeIntervalMs ?? BG_DISPATCH_PROBE_INTERVAL_MS;
     const lifecycle = options.lifecycle;
@@ -1545,9 +1566,12 @@ export class SubcTransportPool implements AftTransportPool {
           this.client === client
         ) {
           clearRouteEntry(routeAndEntry.entry);
+          await this.waitForRouteReopenBackoff();
           routeAndEntry = await openRoute();
           try {
-            return await requestOnRoute(routeAndEntry.route);
+            const reply = await requestOnRoute(routeAndEntry.route);
+            this.resetRouteReopenBackoff();
+            return reply;
           } catch (retryError) {
             if (this.isReapInduced(record)) throw this.annotateReapError(retryError, record);
             handleRequestFailure(retryError, routeAndEntry.entry);
@@ -1564,6 +1588,31 @@ export class SubcTransportPool implements AftTransportPool {
       record.inflight -= 1;
       this.deleteSessionIfEmpty(key, record);
     }
+  }
+
+  /**
+   * Hold a restart burst behind one growing timer before reopening an unknown
+   * route. The resend remains bounded to one attempt, while a successful resend
+   * resets the next outage to the minimum delay.
+   */
+  private waitForRouteReopenBackoff(): Promise<void> {
+    const pending = this.routeReopenRetry;
+    if (pending) return pending;
+
+    const delay = this.routeReopenRetryDelayMs;
+    this.routeReopenRetryDelayMs = Math.min(delay * 2, RECONNECT_RETRY_CAP_MS);
+    let retry!: Promise<void>;
+    retry = Promise.resolve()
+      .then(() => this.routeRetrySleep(delay))
+      .finally(() => {
+        if (this.routeReopenRetry === retry) this.routeReopenRetry = null;
+      });
+    this.routeReopenRetry = retry;
+    return retry;
+  }
+
+  private resetRouteReopenBackoff(): void {
+    this.routeReopenRetryDelayMs = RECONNECT_RETRY_FLOOR_MS;
   }
 
   private async ensureClient(): Promise<SubcClientLike> {
