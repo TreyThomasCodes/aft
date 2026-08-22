@@ -3,8 +3,10 @@
 
 The harness builds an owner index for a synthetic Git repository, creates sibling
 worktrees with exactly 0, 250, and 1,000 same-size edits, then issues literal
-searches through the owner process's external-path lane. Output is NDJSON so raw
-samples and load observations remain machine-readable.
+searches through the owner process's external-path lane. The optional generation
+reload replay also deletes and rewrites 30% of a 0-drift worktree before forcing
+a new owner artifact generation. Output is NDJSON so raw samples and load
+observations remain machine-readable.
 """
 
 from __future__ import annotations
@@ -114,6 +116,8 @@ def initialize_owner(owner: Path, file_count: int, file_size: int) -> None:
             tokens.append("probe_0250")
         if index < 1_000:
             tokens.append("probe_1000")
+        if index >= file_count - 40:
+            tokens.append("probe_reload")
         prefix = (" ".join(tokens) + "\n").encode()
         line = (f"synthetic source file {index:04d} " + "x" * 96 + "\n").encode()
         repeats = (file_size - len(prefix)) // len(line) + 1
@@ -237,6 +241,100 @@ def measure(
     return row
 
 
+def cache_generation(storage: Path) -> tuple[int, int]:
+    cache_paths = list((storage / "index").glob("*/cache.bin"))
+    if len(cache_paths) != 1:
+        raise RuntimeError(f"expected one owner cache artifact, found {cache_paths}")
+    stat = cache_paths[0].stat()
+    return stat.st_mtime_ns, stat.st_size
+
+
+def rewrite_file_range(root: Path, first: int, count: int) -> None:
+    for index in range(first, first + count):
+        path = root / f"file_{index:04d}.txt"
+        content = path.read_bytes()
+        rewritten = content.replace(b"x", b"y", 1)
+        if rewritten == content:
+            raise RuntimeError(f"missing rewrite byte in {path}")
+        path.write_bytes(rewritten)
+
+
+def wait_for_owner_generation(
+    client: AftClient, owner: Path, storage: Path, previous_generation: tuple[int, int]
+) -> tuple[int, int]:
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        response = client.call(
+            "semantic_search",
+            query="probe_reload",
+            hint="literal",
+            top_k=20,
+            include_tests=True,
+            path=str(owner),
+        )
+        if not response.get("success"):
+            raise RuntimeError(f"owner search failed while waiting for reload: {response}")
+        generation = cache_generation(storage)
+        if generation != previous_generation:
+            return generation
+        time.sleep(0.2)
+    raise TimeoutError("owner index did not persist a new generation")
+
+
+def measure_generation_reload(
+    client: AftClient, owner: Path, borrower: Path, storage: Path, file_count: int
+) -> JsonObject:
+    delete_count = file_count * 30 // 100
+    rewrite_count = file_count * 30 // 100
+
+    before_started = time.perf_counter()
+    before = client.call(
+        "semantic_search",
+        query="probe_reload",
+        hint="literal",
+        top_k=20,
+        include_tests=True,
+        path=str(borrower),
+    )
+    before_ms = (time.perf_counter() - before_started) * 1_000
+    if not before.get("success"):
+        raise RuntimeError(f"borrowed warmup failed before reload: {before}")
+
+    previous_generation = cache_generation(storage)
+    for index in range(delete_count):
+        (borrower / f"file_{index:04d}.txt").unlink()
+    rewrite_file_range(borrower, delete_count, rewrite_count)
+    # Keep the owner corpus complete so the new artifact retains records for the
+    # borrower's deleted files, then wait until its watcher publishes that generation.
+    rewrite_file_range(owner, delete_count, rewrite_count)
+    wait_for_owner_generation(client, owner, storage, previous_generation)
+
+    after_started = time.perf_counter()
+    after = client.call(
+        "semantic_search",
+        query="probe_reload",
+        hint="literal",
+        top_k=20,
+        include_tests=True,
+        path=str(borrower),
+    )
+    after_ms = (time.perf_counter() - after_started) * 1_000
+    if not after.get("success"):
+        raise RuntimeError(f"borrowed reload failed after churn: {after}")
+
+    row = {
+        "event": "generation_reload",
+        "file_count": file_count,
+        "delete_count": delete_count,
+        "rewrite_count": rewrite_count,
+        "before_ms": round(before_ms, 3),
+        "after_ms": round(after_ms, 3),
+        "result_count": len(after.get("results") or []),
+    }
+    emit(row)
+    return row
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True, help="release AFT binary")
@@ -249,6 +347,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file-count", type=int, default=DEFAULT_FILE_COUNT)
     parser.add_argument("--file-size", type=int, default=DEFAULT_FILE_SIZE)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
+    parser.add_argument(
+        "--generation-reload",
+        action="store_true",
+        help="measure one reload after deleting and rewriting 30% of a borrowed worktree",
+    )
     return parser.parse_args()
 
 
@@ -311,6 +414,8 @@ def main() -> int:
                     "max_ms": sorted_values[-1],
                 }
             )
+        if args.generation_reload:
+            measure_generation_reload(client, owner, worktrees[0], storage, args.file_count)
         emit({"event": "complete", "work_dir": str(base), "kept": args.keep})
         return 0
     finally:

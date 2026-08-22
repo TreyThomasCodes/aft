@@ -981,7 +981,17 @@ impl SearchIndex {
     }
 
     pub fn remove_file(&mut self, path: &Path) {
-        let canonical_path = canonicalize_existing_or_deleted_path(path);
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
+        self.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
+    }
+
+    fn remove_file_with_canonicalization_memo(
+        &mut self,
+        path: &Path,
+        canonical_parents: &mut ParentCanonicalizationMemo,
+    ) {
+        let canonical_path =
+            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
         let file_id = {
             let path_to_id = Arc::make_mut(&mut self.path_to_id);
             if let Some(file_id) = path_to_id.remove(path) {
@@ -1033,7 +1043,16 @@ impl SearchIndex {
     }
 
     pub fn update_file(&mut self, path: &Path) {
-        self.remove_file(path);
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
+        self.update_file_with_canonicalization_memo(path, &mut canonical_parents);
+    }
+
+    fn update_file_with_canonicalization_memo(
+        &mut self,
+        path: &Path,
+        canonical_parents: &mut ParentCanonicalizationMemo,
+    ) {
+        self.remove_file_with_canonicalization_memo(path, canonical_parents);
 
         let metadata = match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -1272,6 +1291,7 @@ impl SearchIndex {
         let mut files = Vec::with_capacity(file_count);
         let mut path_to_id = HashMap::new();
         let mut unindexed_files = HashSet::new();
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
 
         for file_id in 0..file_count {
             if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint_at(file_id)) {
@@ -1298,7 +1318,11 @@ impl SearchIndex {
             let mut path_bytes = vec![0u8; path_len];
             reader.read_exact(&mut path_bytes).ok()?;
             let relative_path = PathBuf::from(String::from_utf8(path_bytes).ok()?);
-            let full_path = cached_path_under_root(&project_root, &relative_path)?;
+            let full_path = cached_path_under_root_with_memo(
+                &project_root,
+                &relative_path,
+                &mut canonical_parents,
+            )?;
             let file_id_u32 = u32::try_from(file_id).ok()?;
 
             files.push(FileEntry {
@@ -3897,25 +3921,121 @@ pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
     validate_cached_relative_path(relative)
 }
 
+/// Canonical parent directories recur throughout one artifact reload. Cache only
+/// that reload's results: a corpus commonly has many files per directory, while
+/// retaining results across loads would need filesystem-change invalidation.
+#[derive(Default)]
+struct ParentCanonicalizationMemo {
+    canonical_parents: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl ParentCanonicalizationMemo {
+    fn canonicalize_parent_with<F>(
+        &mut self,
+        parent: &Path,
+        canonicalize: &mut F,
+    ) -> Option<PathBuf>
+    where
+        F: FnMut(&Path) -> std::io::Result<PathBuf>,
+    {
+        self.canonical_parents
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| canonicalize(parent).ok())
+            .clone()
+    }
+}
+
 pub(crate) fn cached_path_under_root(root: &Path, relative_path: &Path) -> Option<PathBuf> {
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
+    cached_path_under_root_with_memo(root, relative_path, &mut canonical_parents)
+}
+
+fn cached_path_under_root_with_memo(
+    root: &Path,
+    relative_path: &Path,
+    canonical_parents: &mut ParentCanonicalizationMemo,
+) -> Option<PathBuf> {
+    let mut canonicalize = |path: &Path| fs::canonicalize(path);
+    cached_path_under_root_with_memo_and_canonicalizer(
+        root,
+        relative_path,
+        canonical_parents,
+        &mut canonicalize,
+    )
+}
+
+fn cached_path_under_root_with_memo_and_canonicalizer<F>(
+    root: &Path,
+    relative_path: &Path,
+    canonical_parents: &mut ParentCanonicalizationMemo,
+    canonicalize: &mut F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path) -> std::io::Result<PathBuf>,
+{
     let relative = validate_cached_relative_path(relative_path)?;
     let normalized_root = normalize_path(root);
     let full_path = normalize_path(&normalized_root.join(relative));
 
-    match fs::canonicalize(&full_path) {
-        Ok(canonical_path) => {
-            // Normalize only the containment operands. The returned path
-            // remains in the cache's established lexical form because
-            // path_to_id and semantic-cache consumers use that exact key.
-            if is_within_search_root(&normalized_root, &canonical_path) {
-                return Some(full_path);
-            }
-
-            let canonical_root = fs::canonicalize(&normalized_root).ok()?;
-            is_within_search_root(&canonical_root, &canonical_path).then_some(full_path)
+    match fs::symlink_metadata(&full_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => {
+            let parent = full_path.parent()?;
+            let file_name = full_path.file_name()?;
+            let canonical_path = canonical_parents
+                .canonicalize_parent_with(parent, canonicalize)?
+                .join(file_name);
+            cached_path_if_contained(
+                &normalized_root,
+                &full_path,
+                &canonical_path,
+                canonical_parents,
+                canonicalize,
+            )
         }
-        Err(_) => is_within_search_root(&normalized_root, &full_path).then_some(full_path),
+        Ok(_) => {
+            let canonical_path = canonicalize(&full_path).ok()?;
+            cached_path_if_contained(
+                &normalized_root,
+                &full_path,
+                &canonical_path,
+                canonical_parents,
+                canonicalize,
+            )
+        }
+        Err(_) => {
+            // If canonicalization fails, such as when an entry was deleted,
+            // preserve the normalized lexical path as the fallback. Still
+            // canonicalize its parent to seed the per-load memo so later sibling
+            // entries do not repeat the realpath call for that directory.
+            if let Some(parent) = full_path.parent() {
+                let _ = canonical_parents.canonicalize_parent_with(parent, canonicalize);
+            }
+            is_within_search_root(&normalized_root, &full_path).then_some(full_path)
+        }
     }
+}
+
+fn cached_path_if_contained<F>(
+    normalized_root: &Path,
+    full_path: &Path,
+    canonical_path: &Path,
+    canonical_parents: &mut ParentCanonicalizationMemo,
+    canonicalize: &mut F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&Path) -> std::io::Result<PathBuf>,
+{
+    // Normalize only the containment operands. The returned path remains in the
+    // cache's established lexical form because path_to_id and semantic-cache
+    // consumers use that exact key. The memo avoids canonicalization work only;
+    // every record still takes this containment check.
+    if is_within_search_root(normalized_root, canonical_path) {
+        return Some(full_path.to_path_buf());
+    }
+
+    let canonical_root =
+        canonical_parents.canonicalize_parent_with(normalized_root, canonicalize)?;
+    is_within_search_root(&canonical_root, canonical_path).then_some(full_path.to_path_buf())
 }
 
 pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
@@ -4898,11 +5018,26 @@ fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
-fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return canonical;
-    }
+fn canonicalize_existing_or_deleted_path_with_memo(
+    path: &Path,
+    canonical_parents: &mut ParentCanonicalizationMemo,
+) -> PathBuf {
+    let mut canonicalize = |path: &Path| fs::canonicalize(path);
+    canonicalize_existing_or_deleted_path_with_memo_and_canonicalizer(
+        path,
+        canonical_parents,
+        &mut canonicalize,
+    )
+}
 
+fn canonicalize_existing_or_deleted_path_with_memo_and_canonicalizer<F>(
+    path: &Path,
+    canonical_parents: &mut ParentCanonicalizationMemo,
+    canonicalize: &mut F,
+) -> PathBuf
+where
+    F: FnMut(&Path) -> std::io::Result<PathBuf>,
+{
     let Some(parent) = path.parent() else {
         return path.to_path_buf();
     };
@@ -4910,9 +5045,19 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
         return path.to_path_buf();
     };
 
-    fs::canonicalize(parent)
+    // A file symlink needs full resolution before it can be matched to a stored
+    // key. Ordinary files and known-missing entries are determined by their
+    // parent, which is shared by many records during a verification pass.
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if let Ok(canonical) = canonicalize(path) {
+            return canonical;
+        }
+    }
+
+    canonical_parents
+        .canonicalize_parent_with(parent, canonicalize)
         .map(|canonical_parent| canonical_parent.join(file_name))
-        .unwrap_or_else(|_| path.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
@@ -4927,6 +5072,7 @@ fn verify_file_mtimes(
     let mut stale_paths = Vec::new();
     let mut removed_paths = Vec::new();
     let mut changed = false;
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
 
     for entry in Arc::make_mut(&mut index.files).iter_mut() {
         if entry.path.as_os_str().is_empty() {
@@ -4966,7 +5112,7 @@ fn verify_file_mtimes(
     }
 
     for path in &removed_paths {
-        index.remove_file(path);
+        index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
         changed = true;
     }
 
@@ -4975,9 +5121,9 @@ fn verify_file_mtimes(
     // warm-cache verification from resurrecting now-ignored cached entries.
     for path in &stale_paths {
         if current_file_set.contains(path) {
-            index.update_file(path);
+            index.update_file_with_canonicalization_memo(path, &mut canonical_parents);
         } else {
-            index.remove_file(path);
+            index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
         }
         changed = true;
     }
@@ -4985,7 +5131,7 @@ fn verify_file_mtimes(
     // Detect new files not in the index
     for path in current_files {
         if !index.path_to_id.contains_key(&path) {
-            index.update_file(&path);
+            index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
             changed = true;
         }
     }
@@ -5264,6 +5410,7 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     let Ok(diff) = String::from_utf8(output.stdout) else {
         return false;
     };
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
 
     for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let mut fields = line.split('\t');
@@ -5272,33 +5419,30 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
         };
 
         if status.starts_with('R') {
-            let Some(old_path) = fields
-                .next()
-                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
-            else {
+            let Some(old_path) = fields.next().and_then(|path| {
+                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
+            }) else {
                 continue;
             };
-            let Some(new_path) = fields
-                .next()
-                .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
-            else {
+            let Some(new_path) = fields.next().and_then(|path| {
+                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
+            }) else {
                 continue;
             };
-            index.remove_file(&old_path);
-            index.update_file(&new_path);
+            index.remove_file_with_canonicalization_memo(&old_path, &mut canonical_parents);
+            index.update_file_with_canonicalization_memo(&new_path, &mut canonical_parents);
             continue;
         }
 
-        let Some(path) = fields
-            .next()
-            .and_then(|path| cached_path_under_root(root, &PathBuf::from(path)))
-        else {
+        let Some(path) = fields.next().and_then(|path| {
+            cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
+        }) else {
             continue;
         };
         if status.starts_with('D') || !path.exists() {
-            index.remove_file(&path);
+            index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
         } else {
-            index.update_file(&path);
+            index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
         }
     }
 
@@ -5475,6 +5619,103 @@ mod tests {
             .expect("missing child should fall back to lexical validation");
 
         assert_eq!(path, root.join("future/file.rs"));
+    }
+
+    #[test]
+    fn deleted_path_uses_one_parent_canonicalization() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let source = project.join("src");
+        fs::create_dir_all(&source).expect("create source dir");
+        let deleted = source.join("deleted.rs");
+        let expected = fs::canonicalize(&source)
+            .expect("canonicalize source dir")
+            .join("deleted.rs");
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
+        let mut canonicalize_calls = 0;
+        let mut canonicalize = |path: &Path| {
+            canonicalize_calls += 1;
+            fs::canonicalize(path)
+        };
+
+        let resolved = canonicalize_existing_or_deleted_path_with_memo_and_canonicalizer(
+            &deleted,
+            &mut canonical_parents,
+            &mut canonicalize,
+        );
+
+        assert_eq!(resolved, expected);
+        assert_eq!(canonicalize_calls, 1, "only the parent is canonicalized");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_path_memo_handles_mixed_entries_without_relaxing_symlink_checks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let source = project.join("src");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::create_dir_all(&outside).expect("create outside dir");
+        fs::write(source.join("present.rs"), "present").expect("write present file");
+        fs::write(outside.join("secret.rs"), "secret").expect("write outside file");
+        std::os::unix::fs::symlink(source.join("present.rs"), project.join("inside.rs"))
+            .expect("create in-root symlink");
+        std::os::unix::fs::symlink(outside.join("secret.rs"), project.join("outside.rs"))
+            .expect("create escaping symlink");
+        let root = fs::canonicalize(&project).expect("canonicalize project");
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
+        let mut canonicalized_paths = Vec::new();
+        let mut canonicalize = |path: &Path| {
+            canonicalized_paths.push(path.to_path_buf());
+            fs::canonicalize(path)
+        };
+
+        assert_eq!(
+            cached_path_under_root_with_memo_and_canonicalizer(
+                &root,
+                Path::new("src/present.rs"),
+                &mut canonical_parents,
+                &mut canonicalize,
+            ),
+            Some(root.join("src/present.rs"))
+        );
+        assert_eq!(
+            cached_path_under_root_with_memo_and_canonicalizer(
+                &root,
+                Path::new("src/deleted.rs"),
+                &mut canonical_parents,
+                &mut canonicalize,
+            ),
+            Some(root.join("src/deleted.rs"))
+        );
+        assert_eq!(
+            cached_path_under_root_with_memo_and_canonicalizer(
+                &root,
+                Path::new("inside.rs"),
+                &mut canonical_parents,
+                &mut canonicalize,
+            ),
+            Some(root.join("inside.rs"))
+        );
+        assert!(cached_path_under_root_with_memo_and_canonicalizer(
+            &root,
+            Path::new("outside.rs"),
+            &mut canonical_parents,
+            &mut canonicalize,
+        )
+        .is_none());
+
+        assert_eq!(
+            canonicalized_paths,
+            vec![
+                root.join("src"),
+                root.join("inside.rs"),
+                root.join("outside.rs"),
+                root.clone(),
+            ],
+            "siblings reuse their parent while symlinks still resolve individually"
+        );
     }
 
     #[cfg(unix)]

@@ -335,3 +335,41 @@ They are passed to candidate verification only after the borrowed index has
 finished opening, and the unindexed fallback is not selected when `cache.bin`
 exists. A generation reload therefore has to be bounded at the borrowed opener,
 not only in the later grep walk.
+
+
+## Parent-directory reload measurement
+
+A release-build replay measured artifact-generation reloads with 30,001 indexed
+entries (30,000 text files plus `.aftignore`). The borrowed worktree was warmed
+before churn, then deleted 9,000 files and rewrote the next 9,000 files. The
+owner rewrote that second range without deleting it and waited for its watcher
+to publish a new artifact generation, so the reloaded borrowed artifact still
+contained the deleted paths. The query targeted 40 unchanged files at the end
+of the corpus.
+
+The replay is available through the existing harness:
+
+```sh
+python3 benchmarks/borrowed-search-drift.py \
+  --binary target/release/aft \
+  --work-dir .borrowed-reload \
+  --file-count 30000 \
+  --file-size 256 \
+  --repeats 1 \
+  --generation-reload
+```
+
+The first row is the already-warm borrowed query before churn; the second is
+the query that misses the borrowed-artifact cache after the owner publishes its
+new generation.
+
+| Build | Warm before churn | Reload after 30% delete + 30% rewrite |
+|---|---:|---:|
+| Base `aef4a250` | 0.300 ms | 1,254.426 ms |
+| Parent-directory memo | 0.316 ms | 256.383 ms |
+
+Both runs were serial on the same host with the 30,001-entry artifact. The
+baseline run observed one/five/fifteen-minute load `8.85/10.08/11.14`; the
+memo run observed `16.75/9.68/10.29`, so these single samples are directional
+rather than an interleaved latency distribution. Even with the higher
+one-minute load, the deletion-shaped reload fell by 998.043 ms (79.6%, 4.89x).
