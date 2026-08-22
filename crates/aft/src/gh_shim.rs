@@ -235,12 +235,25 @@ fn run(args: &[OsString]) -> i32 {
 
     let determination = determine_rung(&paths, &cwd, now);
     if determination.rung != Rung::R3 {
-        if let Some(agent_binding) =
-            sticky_governance_binding(&paths, &cwd, now, &determination, args, current_platform())
-        {
-            return refuse_governance_unavailable(&paths, &agent_binding, now);
-        }
-        return delegate(args);
+        return match sticky_governance_disposition(
+            &paths,
+            &cwd,
+            now,
+            &determination,
+            args,
+            current_platform(),
+        ) {
+            Some(StickyGovernanceDisposition::Unavailable(agent_binding)) => {
+                refuse_governance_unavailable(&paths, &agent_binding, now)
+            }
+            Some(StickyGovernanceDisposition::Unclassified { manifest_version }) => refuse(
+                RefusalCode::Unclassified,
+                &format!(
+                    "no manifest declaration for this invocation (manifest {manifest_version})"
+                ),
+            ),
+            None => delegate(args),
+        };
     }
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
@@ -452,14 +465,19 @@ impl RungRecord {
     }
 }
 
-fn sticky_governance_binding(
+enum StickyGovernanceDisposition {
+    Unavailable(AgentBinding),
+    Unclassified { manifest_version: u64 },
+}
+
+fn sticky_governance_disposition(
     paths: &StatePaths,
     cwd: &Path,
     now: u64,
     determination: &RungRecord,
     args: &[OsString],
     platform: &str,
-) -> Option<AgentBinding> {
+) -> Option<StickyGovernanceDisposition> {
     if !determination.governance_infrastructure_unavailable() {
         return None;
     }
@@ -469,13 +487,19 @@ fn sticky_governance_binding(
     };
     let agent_binding = resolved_agent_binding(&manifest, cwd)?;
 
-    // A known binding makes declared writes sticky: a transient routing failure
-    // must not send an identity-governed action to upstream ambient credentials.
-    // Mechanical reads remain passthrough because they neither write nor assert
-    // the governed identity.
+    // Losing governance infrastructure must never make classification more
+    // permissive than when the daemon is reachable. Mechanical reads alone pass
+    // through because they neither write nor assert governed identity; known
+    // writes refuse when governance is unavailable, while unknown shapes remain
+    // fail-closed.
     match classify(args, &manifest, platform) {
-        Classification::Governed { .. } | Classification::Admin { .. } => Some(agent_binding),
-        Classification::Mechanical | Classification::Unclassified => None,
+        Classification::Governed { .. } | Classification::Admin { .. } => {
+            Some(StickyGovernanceDisposition::Unavailable(agent_binding))
+        }
+        Classification::Unclassified => Some(StickyGovernanceDisposition::Unclassified {
+            manifest_version: manifest.manifest_version,
+        }),
+        Classification::Mechanical => None,
     }
 }
 

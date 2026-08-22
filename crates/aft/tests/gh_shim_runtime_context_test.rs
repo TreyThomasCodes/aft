@@ -281,6 +281,28 @@ fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
         );
     }
 
+    let unclassified = shim_command(
+        &["alias", "set", "shortcut", "issue list"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn unclassified gh shim invocation");
+    assert_eq!(unclassified.status.code(), Some(86));
+    assert!(unclassified.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&unclassified.stderr),
+        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest 1)\n"
+    );
+    assert!(
+        !recorder.exists(),
+        "unclassified actions on a governed repository must not reach upstream gh"
+    );
+
     let status = shim_command(
         &["--status"],
         &project,
