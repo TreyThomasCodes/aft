@@ -3139,32 +3139,37 @@ impl SemanticIndex {
         // Query norms are shared by every entry; entry norms are cached because
         // remote embedding backends may return non-normalized vectors.
         let query_norm = vector_norm(query_vector);
-        let mut scored: Vec<(f32, usize)> = entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                let included = if self.shared_base.is_some() {
-                    include(&self.project_root.join(&entry.chunk.file))
-                } else {
-                    include(&entry.chunk.file)
-                };
-                if !included {
-                    return None;
-                }
+        let cancellation = crate::executor::current_job_cancellation();
+        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            if i % 64 == 0
+                && cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                break;
+            }
+            let included = if self.shared_base.is_some() {
+                include(&self.project_root.join(&entry.chunk.file))
+            } else {
+                include(&entry.chunk.file)
+            };
+            if !included {
+                continue;
+            }
 
-                let dot = if query_vector.len() == entry.vector.len() {
-                    dot_product(query_vector, &entry.vector)
-                } else {
-                    0.0
-                };
-                let denom = query_norm * entry.norm;
-                let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
-                if entry.chunk.exported {
-                    score *= 1.1;
-                }
-                Some((score, i))
-            })
-            .collect();
+            let dot = if query_vector.len() == entry.vector.len() {
+                dot_product(query_vector, &entry.vector)
+            } else {
+                0.0
+            };
+            let denom = query_norm * entry.norm;
+            let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
+            if entry.chunk.exported {
+                score *= 1.1;
+            }
+            scored.push((score, i));
+        }
 
         let keep = top_k.min(scored.len());
         if keep == 0 {

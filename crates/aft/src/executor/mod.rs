@@ -469,6 +469,10 @@ pub fn current_job_cancellation() -> Option<JobCancellation> {
     CURRENT_JOB_CANCELLATION.with(|slot| slot.borrow().clone())
 }
 
+pub fn current_job_cancelled() -> bool {
+    current_job_cancellation().is_some_and(|token| token.cancel_requested_before_commit())
+}
+
 pub struct JobCancellationContextGuard {
     previous: Option<JobCancellation>,
 }
@@ -505,6 +509,16 @@ struct RunningJob {
     job_class: JobClass,
     lane: Lane,
     started_at: Instant,
+    occupancy_reported: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LongRunningInteractiveJobSnapshot {
+    pub(crate) root_id: ProjectRootId,
+    pub(crate) request_id: String,
+    pub(crate) command: String,
+    pub(crate) lane: Lane,
+    pub(crate) age: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1073,6 +1087,45 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.bind_blocker_snapshot(root_id, request_id))
+    }
+
+    /// Return each over-age interactive occupant once. Marking happens under the
+    /// scheduler lock so repeated transport-loop censuses cannot flood logs while
+    /// the same job remains stuck.
+    pub(crate) fn try_take_long_running_interactive_jobs(
+        &self,
+        minimum_age: Duration,
+    ) -> Option<Vec<LongRunningInteractiveJobSnapshot>> {
+        let now = Instant::now();
+        let mut state = self.inner.state.try_lock()?;
+        let mut snapshots = state
+            .running_jobs
+            .values_mut()
+            .filter_map(|job| {
+                let age = now.saturating_duration_since(job.started_at);
+                if job.job_class != JobClass::Interactive
+                    || job.occupancy_reported
+                    || age < minimum_age
+                {
+                    return None;
+                }
+                job.occupancy_reported = true;
+                Some(LongRunningInteractiveJobSnapshot {
+                    root_id: job.root_id.clone(),
+                    request_id: job.request_id.clone(),
+                    command: job.command.clone(),
+                    lane: job.lane,
+                    age,
+                })
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.root_id
+                .as_path()
+                .cmp(right.root_id.as_path())
+                .then_with(|| left.request_id.cmp(&right.request_id))
+        });
+        Some(snapshots)
     }
 
     pub fn nonrunnable_dispatch_count(&self) -> usize {
@@ -2092,6 +2145,7 @@ fn dispatch_runnable_class(
                     job_class: run_job.job_class,
                     lane: run_job.lane,
                     started_at: Instant::now(),
+                    occupancy_reported: false,
                 },
             );
             state.idle_workers -= 1;

@@ -130,6 +130,7 @@ impl ReapMetrics {
 }
 
 const BG_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
+const INTERACTIVE_OCCUPANCY_WARN_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BgEventKind {
@@ -517,6 +518,39 @@ impl Drop for ResponseTaskGuard {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub(super) fn warn_slow_running_interactive_jobs(executor: &Executor) {
+    warn_slow_running_interactive_jobs_after(executor, INTERACTIVE_OCCUPANCY_WARN_AFTER);
+}
+
+fn warn_slow_running_interactive_jobs_after(executor: &Executor, minimum_age: Duration) {
+    let Some(jobs) = executor.try_take_long_running_interactive_jobs(minimum_age) else {
+        return;
+    };
+    for job in jobs {
+        let line = format!(
+            "executor occupancy census: class=Interactive job={} command={} lane={:?} age_ms={} root={}",
+            job.request_id,
+            job.command,
+            job.lane,
+            job.age.as_millis(),
+            job.root_id,
+        );
+        log::warn!("{line}");
+        #[cfg(test)]
+        INTERACTIVE_OCCUPANCY_TEST_LOGS.with(|logs| logs.borrow_mut().push(line));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERACTIVE_OCCUPANCY_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn take_interactive_occupancy_logs_for_test() -> Vec<String> {
+    INTERACTIVE_OCCUPANCY_TEST_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
 }
 
 pub(super) fn warn_slow_pending_binds(
@@ -1055,6 +1089,44 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn interactive_occupancy_census_names_job_lane_age_and_root_once() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("interactive-occupancy-census");
+        executor.register_actor(root.clone(), test_ctx());
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let response = executor.submit_async(
+            root.clone(),
+            Lane::PureRead,
+            "long-search".to_string(),
+            Box::new(move |_| {
+                started_tx.send(()).expect("signal long search");
+                release_rx.recv().expect("release long search");
+                Response::success("long-search", json!({}))
+            }),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("long search starts");
+        take_interactive_occupancy_logs_for_test();
+
+        warn_slow_running_interactive_jobs_after(&executor, Duration::ZERO);
+        warn_slow_running_interactive_jobs_after(&executor, Duration::ZERO);
+        let logs = take_interactive_occupancy_logs_for_test();
+        release_tx.send(()).expect("release long search");
+        assert!(response.blocking_recv().expect("search response").success);
+
+        assert_eq!(logs.len(), 1, "one running job emits one census line");
+        let line = &logs[0];
+        assert!(line.contains("class=Interactive"));
+        assert!(line.contains("job=long-search"));
+        assert!(line.contains("command="));
+        assert!(line.contains("lane=PureRead"));
+        assert!(line.contains("age_ms="));
+        assert!(line.contains(&format!("root={root}")));
     }
 
     #[test]

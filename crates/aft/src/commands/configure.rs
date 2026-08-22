@@ -2998,6 +2998,15 @@ fn schedule_artifact_loads(
                                 },
                             );
                         }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Degraded(degradation) => {
+                            slog_warn!(
+                                "search index is read-only but loading stopped at the interactive budget ({})",
+                                degradation.reason
+                            );
+                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
+                            slog_debug!("read-only search index load was cancelled");
+                        }
                         crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
                             slog_warn!(
                                 "search index is read-only but no shared artifact snapshot exists"
@@ -3212,6 +3221,17 @@ fn schedule_artifact_loads(
                             stale.drift_count
                         );
                         SemanticIndexEvent::Ready(stale.index)
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Degraded(degradation) => {
+                        SemanticIndexEvent::Failed(format!(
+                            "semantic index is read-only but loading stopped at the interactive budget ({})",
+                            degradation.reason
+                        ))
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
+                        SemanticIndexEvent::Failed(
+                            "read-only semantic index load was cancelled".to_string(),
+                        )
                     }
                     crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
                         SemanticIndexEvent::Failed(

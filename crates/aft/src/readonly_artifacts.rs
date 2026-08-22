@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // These openers borrow cache artifacts that may be owned by a different AFT
 // session. They therefore only read and verify the opened snapshot; any repair,
@@ -6,7 +7,8 @@ use std::path::{Path, PathBuf};
 // for that project.
 use crate::cache_freshness::{artifact_generation, ArtifactGeneration};
 use crate::search_index::{
-    artifact_cache_key_with_memo, resolve_cache_dir, resolve_cache_dir_with_key, SearchIndex,
+    artifact_cache_key_with_memo, resolve_cache_dir, resolve_cache_dir_with_key, BorrowedIndexLoad,
+    BorrowedIndexLoadStop, SearchIndex,
 };
 use crate::semantic_index::SemanticIndex;
 
@@ -14,7 +16,52 @@ use crate::semantic_index::SemanticIndex;
 pub(crate) enum ReadOnlyArtifact<T> {
     Fresh(T),
     Stale(ReadOnlyStale<T>),
+    Degraded(ReadOnlyDegradation),
+    Cancelled,
     Absent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadOnlyDegradation {
+    pub reason: &'static str,
+}
+
+pub(crate) const BORROWED_SEARCH_LOAD_DEGRADATION: ReadOnlyDegradation = ReadOnlyDegradation {
+    reason: "borrowed_search_index_load_budget",
+};
+pub(crate) const BORROWED_SEMANTIC_LOAD_DEGRADATION: ReadOnlyDegradation = ReadOnlyDegradation {
+    reason: "borrowed_semantic_index_load_budget",
+};
+const BORROWED_SEMANTIC_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST: std::cell::Cell<Option<(usize, Duration)>> = const { std::cell::Cell::new(None) };
+}
+
+fn borrowed_search_load_limits() -> (usize, Duration) {
+    #[cfg(test)]
+    if let Some(limits) = BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST.with(std::cell::Cell::get) {
+        return limits;
+    }
+    (
+        crate::search_index::BORROWED_INDEX_LOAD_MAX_RECORDS,
+        crate::search_index::BORROWED_INDEX_LOAD_BUDGET,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn with_borrowed_search_load_limits_for_test<R>(
+    max_records: usize,
+    duration: Duration,
+    run: impl FnOnce() -> R,
+) -> R {
+    BORROWED_SEARCH_LOAD_LIMITS_FOR_TEST.with(|slot| {
+        let previous = slot.replace(Some((max_records, duration)));
+        let result = run();
+        slot.set(previous);
+        result
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +80,8 @@ impl<T> ReadOnlyArtifact<T> {
                 drift_count: stale.drift_count,
                 ignore_rules_differ: stale.ignore_rules_differ,
             }),
+            Self::Degraded(degradation) => ReadOnlyArtifact::Degraded(degradation),
+            Self::Cancelled => ReadOnlyArtifact::Cancelled,
             Self::Absent => ReadOnlyArtifact::Absent,
         }
     }
@@ -137,15 +186,36 @@ fn open_search_index_from_cache_dir(
     project_root: &Path,
     cache_dir: PathBuf,
 ) -> ReadOnlyArtifact<SearchIndex> {
+    let (max_records, duration) = borrowed_search_load_limits();
+    open_search_index_from_cache_dir_with_budget(project_root, cache_dir, max_records, duration)
+}
+
+fn open_search_index_from_cache_dir_with_budget(
+    project_root: &Path,
+    cache_dir: PathBuf,
+    max_records: usize,
+    duration: Duration,
+) -> ReadOnlyArtifact<SearchIndex> {
     if !cache_dir.join("cache.bin").is_file() {
         return ReadOnlyArtifact::Absent;
     }
 
-    let Some((mut index, ignore_rules_differ)) =
-        SearchIndex::read_from_disk_borrow_tolerant(&cache_dir, project_root)
-    else {
-        return ReadOnlyArtifact::Absent;
-    };
+    let (mut index, ignore_rules_differ) =
+        match SearchIndex::read_from_disk_borrow_tolerant_with_budget(
+            &cache_dir,
+            project_root,
+            max_records,
+            duration,
+        ) {
+            BorrowedIndexLoad::Loaded(index, ignore_rules_differ) => (index, ignore_rules_differ),
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => {
+                return ReadOnlyArtifact::Degraded(BORROWED_SEARCH_LOAD_DEGRADATION);
+            }
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled) => {
+                return ReadOnlyArtifact::Cancelled;
+            }
+            BorrowedIndexLoad::Invalid => return ReadOnlyArtifact::Absent,
+        };
 
     index.set_ready(true);
     if ignore_rules_differ {
@@ -237,13 +307,29 @@ fn open_semantic_index_from_location(
     let Some(storage_dir) = storage_dir else {
         return ReadOnlyArtifact::Absent;
     };
-    if !data_path.is_file() {
+    let Ok(metadata) = data_path.metadata() else {
         return ReadOnlyArtifact::Absent;
+    };
+    if metadata.len() > BORROWED_SEMANTIC_MAX_BYTES {
+        return ReadOnlyArtifact::Degraded(BORROWED_SEMANTIC_LOAD_DEGRADATION);
+    }
+    if search_cancelled() {
+        return ReadOnlyArtifact::Cancelled;
     }
 
-    SemanticIndex::read_from_disk_borrow_tolerant(storage_dir, project_key, project_root)
-        .map(ReadOnlyArtifact::Fresh)
-        .unwrap_or(ReadOnlyArtifact::Absent)
+    let opened =
+        SemanticIndex::read_from_disk_borrow_tolerant(storage_dir, project_key, project_root)
+            .map(ReadOnlyArtifact::Fresh)
+            .unwrap_or(ReadOnlyArtifact::Absent);
+    if search_cancelled() {
+        ReadOnlyArtifact::Cancelled
+    } else {
+        opened
+    }
+}
+
+fn search_cancelled() -> bool {
+    crate::executor::current_job_cancelled()
 }
 
 fn semantic_index_location(
@@ -487,7 +573,7 @@ mod tests {
         match ctx.open_borrowed_search_index(root, Some(storage)) {
             ReadOnlyArtifact::Fresh(index)
             | ReadOnlyArtifact::Stale(ReadOnlyStale { index, .. }) => index,
-            ReadOnlyArtifact::Absent => panic!("expected borrowed search index"),
+            other => panic!("expected borrowed search index, got {other:?}"),
         }
     }
 
@@ -637,6 +723,99 @@ mod tests {
         assert!(result.files_searched <= 1);
         assert!(result.truncated);
         assert!(result.engine_capped);
+    }
+
+    #[test]
+    fn churned_borrowed_generation_stops_at_load_budget() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        for file_index in 0..64 {
+            fs::write(
+                root.join(format!("src/module_{file_index}.rs")),
+                format!("pub fn borrowed_budget_{file_index}() {{}}\n"),
+            )
+            .expect("write borrowed corpus file");
+        }
+        let storage = tempfile::tempdir().expect("storage");
+        let cache_dir = build_search_artifact(&root, storage.path());
+        assert!(matches!(
+            open_search_index_from_cache_dir_with_budget(
+                &root,
+                cache_dir.clone(),
+                10_000,
+                Duration::from_secs(5),
+            ),
+            ReadOnlyArtifact::Fresh(_)
+        ));
+
+        for file_index in 0..40 {
+            fs::write(
+                root.join(format!("src/module_{file_index}.rs")),
+                format!("pub fn churned_borrowed_budget_{file_index}() {{}}\n"),
+            )
+            .expect("churn borrowed corpus file");
+        }
+        build_search_artifact(&root, storage.path());
+
+        let started = std::time::Instant::now();
+        let opened = open_search_index_from_cache_dir_with_budget(
+            &root,
+            cache_dir,
+            10,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            started.elapsed() < Duration::from_secs(1),
+            true,
+            "record budget must stop before rerooting the churned corpus"
+        );
+        assert!(matches!(
+            opened,
+            ReadOnlyArtifact::Degraded(BORROWED_SEARCH_LOAD_DEGRADATION)
+        ));
+    }
+
+    #[test]
+    fn cancelled_borrowed_load_stops_at_checkpoint() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        let cache_dir = build_search_artifact(&root, storage.path());
+        let cancellation = crate::executor::JobCancellation::new();
+        cancellation.request_cancel();
+        let _installed = crate::executor::install_job_cancellation(cancellation);
+
+        assert!(matches!(
+            open_search_index_from_cache_dir_with_budget(
+                &root,
+                cache_dir,
+                10_000,
+                Duration::from_secs(5),
+            ),
+            ReadOnlyArtifact::Cancelled
+        ));
+    }
+
+    #[test]
+    fn oversized_borrowed_semantic_artifact_degrades_before_parse() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        let data_path = storage
+            .path()
+            .join("semantic")
+            .join(artifact_cache_key(&root))
+            .join("semantic.bin");
+        fs::create_dir_all(data_path.parent().expect("semantic parent"))
+            .expect("create semantic artifact directory");
+        let file = fs::File::create(&data_path).expect("create sparse semantic artifact");
+        file.set_len(BORROWED_SEMANTIC_MAX_BYTES + 1)
+            .expect("size sparse semantic artifact");
+
+        assert!(matches!(
+            open_semantic_index_read_only(&root, Some(storage.path())),
+            ReadOnlyArtifact::Degraded(BORROWED_SEMANTIC_LOAD_DEGRADATION)
+        ));
     }
 
     #[cfg(debug_assertions)]

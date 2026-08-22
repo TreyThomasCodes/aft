@@ -153,8 +153,9 @@ mod push;
 mod wire;
 
 use self::health::{
-    build_health_report, warn_slow_pending_binds, DispatchPathMetrics, HealthRollupCache,
-    ReapBlockerCensus, ResponseTaskGuard, HEALTH_ROLLUP_TTL,
+    build_health_report, warn_slow_pending_binds, warn_slow_running_interactive_jobs,
+    DispatchPathMetrics, HealthRollupCache, ReapBlockerCensus, ResponseTaskGuard,
+    HEALTH_ROLLUP_TTL,
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
@@ -377,11 +378,37 @@ impl PersistentCancelSignal {
     }
 }
 
-fn finish_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: u64) {
+fn submit_active_tool_call(
+    executor: &Executor,
+    active: &ActiveToolCalls,
+    route: RouteChannel,
+    corr: u64,
+    root_id: ProjectRootId,
+    lane: Lane,
+    request_id: String,
+    job: crate::executor::ExecutorJob,
+) -> oneshot::Receiver<Response> {
+    let (rx, cancellation) =
+        executor.submit_cancellable_async(root_id.clone(), lane, request_id, job);
     active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(route, corr));
+        .insert(
+            (route, corr),
+            ActiveToolCall {
+                root_id,
+                cancellation,
+            },
+        );
+    rx
+}
+
+fn finish_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: u64) -> bool {
+    active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(route, corr))
+        .is_some()
 }
 
 fn cancel_active_tool_call(
@@ -2725,6 +2752,7 @@ where
                 &mut bg_wake_pending,
             );
             warn_slow_pending_binds(&mut pending_binds, &executor);
+            warn_slow_running_interactive_jobs(&executor);
             if let Err(error) = expire_overdue_route_binds(
                 &writer_tx,
                 &executor,
@@ -4806,18 +4834,16 @@ async fn handle_tool_call(
             })
         });
         let inspect_setup_guard = PendingInspectSetupGuard::new(Arc::clone(pending_inspect_setups));
-        let (rx, cancellation) =
-            executor.submit_cancellable_async(identity.root.clone(), lane, request_id.clone(), job);
-        active_tool_calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                (route_id, frame.header.corr),
-                ActiveToolCall {
-                    root_id: identity.root.clone(),
-                    cancellation,
-                },
-            );
+        let rx = submit_active_tool_call(
+            executor.as_ref(),
+            active_tool_calls,
+            route_id,
+            frame.header.corr,
+            identity.root.clone(),
+            lane,
+            request_id.clone(),
+            job,
+        );
 
         let completion_tx = tx.clone();
         let completion_shutdown = Arc::clone(shutdown);
@@ -4861,7 +4887,9 @@ async fn handle_tool_call(
                     }
                 }
                 Ok(InspectSetupOutcome::Immediate { text, phase_trace }) => {
-                    finish_active_tool_call(&active_tool_calls, route, corr);
+                    if !finish_active_tool_call(&active_tool_calls, route, corr) {
+                        return;
+                    }
                     let result = ToolCallResult { text, response };
                     let fatal = response_is_fatal_panic(&result.response);
                     match build_tool_response_frame_with_limit(
@@ -4914,7 +4942,9 @@ async fn handle_tool_call(
                     }
                 }
                 Err(_) => {
-                    finish_active_tool_call(&active_tool_calls, route, corr);
+                    if !finish_active_tool_call(&active_tool_calls, route, corr) {
+                        return;
+                    }
                     let text = crate::subc_format::format_response_with_context(
                         "inspect",
                         &response,
@@ -4992,7 +5022,16 @@ async fn handle_tool_call(
             }
         })
     });
-    let rx = executor.submit_async(identity.root.clone(), lane, request_id.clone(), job);
+    let rx = submit_active_tool_call(
+        executor.as_ref(),
+        active_tool_calls,
+        route_id,
+        frame.header.corr,
+        identity.root.clone(),
+        lane,
+        request_id.clone(),
+        job,
+    );
     let completion_tx = tx.clone();
     let completion_shutdown = Arc::clone(shutdown);
     let route = route_id;
@@ -5000,6 +5039,7 @@ async fn handle_tool_call(
     let flags = frame.header.flags;
     let ver = frame.header.ver;
     let completion_metrics = Arc::clone(metrics);
+    let active_tool_calls = Arc::clone(active_tool_calls);
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id.clone()).await;
@@ -5014,6 +5054,9 @@ async fn handle_tool_call(
                 None,
             ),
         };
+        if !finish_active_tool_call(&active_tool_calls, route, corr) {
+            return;
+        }
         let result = ToolCallResult { text, response };
         let fatal = response_is_fatal_panic(&result.response);
         match build_tool_response_frame_with_limit(
@@ -5570,6 +5613,115 @@ pub(crate) mod test_support {
                 "detached force-restrict guard leaked"
             );
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn route_abandonment_cancels_long_running_interactive_search() {
+        let executor = Arc::new(Executor::new());
+        let (_dir, root) = test_root("cancelled-interactive-search");
+        executor.register_actor(root.clone(), test_ctx());
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        let route = RouteChannel {
+            channel: 9,
+            epoch: 1,
+        };
+
+        let disabled_iterations = Arc::new(AtomicUsize::new(0));
+        let disabled_probe = Arc::clone(&disabled_iterations);
+        let (disabled_started_tx, disabled_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (disabled_rx, disabled_cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::PureRead,
+            "untracked-search".to_string(),
+            Box::new(move |_| {
+                disabled_started_tx
+                    .send(())
+                    .expect("signal untracked search");
+                while !crate::commands::semantic_search::search_cancellation_requested() {
+                    disabled_probe.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+                Response::error(
+                    "untracked-search",
+                    "request_cancelled",
+                    "cancelled at search checkpoint",
+                )
+            }),
+        );
+        disabled_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("untracked search starts");
+        assert_eq!(
+            cancel_active_tool_calls_for_route(
+                &active,
+                executor.as_ref(),
+                route,
+                "disabled cancellation wiring",
+            ),
+            0
+        );
+        let iterations_before = disabled_iterations.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            disabled_iterations.load(Ordering::Relaxed) > iterations_before,
+            "without route registration the search keeps computing"
+        );
+        disabled_cancellation.request_cancel();
+        let disabled_response = disabled_rx
+            .blocking_recv()
+            .expect("untracked search settles after explicit cleanup");
+        assert_eq!(disabled_response.data["code"], "request_cancelled");
+
+        let tracked_iterations = Arc::new(AtomicUsize::new(0));
+        let tracked_probe = Arc::clone(&tracked_iterations);
+        let (tracked_started_tx, tracked_started_rx) = std::sync::mpsc::sync_channel(1);
+        let tracked_rx = submit_active_tool_call(
+            executor.as_ref(),
+            &active,
+            route,
+            42,
+            root.clone(),
+            Lane::PureRead,
+            "tracked-search".to_string(),
+            Box::new(move |_| {
+                tracked_started_tx.send(()).expect("signal tracked search");
+                while !crate::commands::semantic_search::search_cancellation_requested() {
+                    tracked_probe.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+                Response::error(
+                    "tracked-search",
+                    "request_cancelled",
+                    "cancelled at search checkpoint",
+                )
+            }),
+        );
+        tracked_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked search starts");
+        assert_eq!(
+            cancel_active_tool_calls_for_route(
+                &active,
+                executor.as_ref(),
+                route,
+                "test route abandonment",
+            ),
+            1
+        );
+        let tracked_response = tracked_rx
+            .blocking_recv()
+            .expect("tracked search stops at cancellation checkpoint");
+        assert_eq!(tracked_response.data["code"], "request_cancelled");
+        assert!(active.lock().expect("active tool calls").is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !executor.actor_is_idle(&root) {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled search must release the PureRead lane"
+            );
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

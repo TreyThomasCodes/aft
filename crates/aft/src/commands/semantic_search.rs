@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -19,7 +21,7 @@ use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
-use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact};
+use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, try_read_with_budget, GrepMatch, GrepPathExclusion,
     GrepResult, IndexStatus, SearchIndex, SearchIndexSnapshot, INTERACTIVE_ARTIFACT_READ_BUDGET,
@@ -41,7 +43,10 @@ const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
 const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
+const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
+const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
+const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 /// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
 /// virtually every real function/type so the agent doesn't re-read a file it
 /// already saw in search; a symbol exceeding it falls back to the line-budget
@@ -122,12 +127,14 @@ struct DegradedGrepFallbackResult {
     file_cap_reached: bool,
     file_limit: usize,
     candidate_files: usize,
+    walk_budget_reached: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ExternalBorrowMetadata {
     drift_count: usize,
     ignore_rules_differ: bool,
+    degraded_reason: Option<&'static str>,
 }
 
 impl ExternalBorrowMetadata {
@@ -135,6 +142,7 @@ impl ExternalBorrowMetadata {
         Self {
             drift_count: 0,
             ignore_rules_differ: false,
+            degraded_reason: None,
         }
     }
 
@@ -144,7 +152,26 @@ impl ExternalBorrowMetadata {
     }
 }
 
+pub(crate) fn search_cancellation_requested() -> bool {
+    crate::executor::current_job_cancelled()
+}
+
+fn cancelled_search_response(req: &RawRequest) -> Response {
+    cancelled_search_response_from_id(&req.id)
+}
+
+fn cancelled_search_response_from_id(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "request_cancelled",
+        "Search request cancelled because its route closed.",
+    )
+}
+
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    if search_cancellation_requested() {
+        return cancelled_search_response(req);
+    }
     let mut params = match serde_json::from_value::<SemanticSearchParams>(req.params.clone()) {
         Ok(params) => params,
         Err(error) => {
@@ -296,6 +323,18 @@ fn handle_external_search(
                 let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
                 (index, borrow_metadata)
             }
+            ReadOnlyArtifact::Degraded(degradation) => {
+                return handle_external_borrowed_degraded_fallback(
+                    req,
+                    ctx,
+                    &params,
+                    top_k,
+                    &shape,
+                    &external_root,
+                    degradation,
+                );
+            }
+            ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
             ReadOnlyArtifact::Absent => {
                 // No index exists for this foreign root. Rather than dead-ending
                 // with a not_indexed error (which reads to an agent as "this tool
@@ -369,6 +408,38 @@ fn handle_external_unindexed_fallback(
     shape: &QueryShape,
     external_root: &Path,
 ) -> Response {
+    handle_external_bounded_lexical_fallback(req, ctx, params, top_k, shape, external_root, None)
+}
+
+fn handle_external_borrowed_degraded_fallback(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: &SemanticSearchParams,
+    top_k: usize,
+    shape: &QueryShape,
+    external_root: &Path,
+    degradation: ReadOnlyDegradation,
+) -> Response {
+    handle_external_bounded_lexical_fallback(
+        req,
+        ctx,
+        params,
+        top_k,
+        shape,
+        external_root,
+        Some(degradation),
+    )
+}
+
+fn handle_external_bounded_lexical_fallback(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: &SemanticSearchParams,
+    top_k: usize,
+    shape: &QueryShape,
+    external_root: &Path,
+    degradation: Option<ReadOnlyDegradation>,
+) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
     let literal = true;
     let compiled = match pattern_compile::compile(
@@ -411,6 +482,9 @@ fn handle_external_unindexed_fallback(
         path_exclusion: grep_path_exclusion(params.include_tests),
     };
     let result = grep_executor::execute(ctx, &compiled, &scope, &grep_params);
+    if search_cancellation_requested() {
+        return cancelled_search_response(req);
+    }
 
     let result_source = if literal { "literal" } else { "regex" };
     let interpreted_as = if literal { "literal" } else { "regex" };
@@ -420,32 +494,50 @@ fn handle_external_unindexed_fallback(
         .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
     let display_root = absolute_display_root(external_root);
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+    let mut text = format_grep_search_text(&result, &display_root, interpreted_as);
+    if degradation.is_some() {
+        text.push_str("\n\n");
+        text.push_str(BORROWED_SEARCH_LOAD_FOOTER);
+    }
 
     let mut warnings = Vec::new();
-    warnings.push(format!(
-        "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
-        external_root.display()
-    ));
+    if degradation.is_some() {
+        warnings.push(BORROWED_SEARCH_LOAD_WARNING.to_string());
+    } else {
+        warnings.push(format!(
+            "No AFT index exists for {} — returning a bounded lexical scan (no semantic ranking). Open a session in that project for full indexed search.",
+            external_root.display()
+        ));
+    }
     if result.walk_truncated {
         warnings.push(
             "Lexical scan stopped early (file-count or time budget reached); results may be incomplete.".to_string(),
         );
     }
 
-    let extras = external_response_extras(external_root, &borrow_metadata)
+    let mut extras = external_response_extras(external_root, &borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
+    if let Some(degradation) = degradation {
+        extras.insert(
+            "borrowed_index_degraded_reason".to_string(),
+            serde_json::json!(degradation.reason),
+        );
+    }
     search_response(
         req,
         SearchResponseParts {
             query: &params.query,
             interpreted_as,
             query_kind: query_kind_label(shape.kind),
-            semantic_status: "external_unindexed",
+            semantic_status: if degradation.is_some() {
+                "external_borrowed_degraded"
+            } else {
+                "external_unindexed"
+            },
             status: "ready",
-            complete: !result.walk_truncated,
+            complete: degradation.is_none() && !result.walk_truncated,
             text,
             results: result_values,
             more_available: result.walk_truncated
@@ -683,6 +775,14 @@ fn handle_external_semantic_or_hybrid_search(
                 None
             }
         }
+        ReadOnlyArtifact::Degraded(degradation) => {
+            warnings.push(
+                "Borrowed semantic index loading stopped at the interactive budget; returning lexical-only results from the trigram index.".to_string(),
+            );
+            borrow_metadata.degraded_reason = Some(degradation.reason);
+            None
+        }
+        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
         ReadOnlyArtifact::Absent => {
             warnings.push(
                 "External semantic index is not available; returning lexical-only results from the trigram index.".to_string(),
@@ -926,13 +1026,21 @@ fn external_response_extras(
     external_root: &Path,
     borrow_metadata: &ExternalBorrowMetadata,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut extras = serde_json::json!({
         "external_root": external_root.display().to_string(),
         "borrowed": true,
         "drift_count": borrow_metadata.drift_count,
         "ignore_rules_differ": borrow_metadata.ignore_rules_differ,
         SUPPRESS_STATUS_BAR_FIELD: true,
-    })
+    });
+    if let (Some(reason), Some(object)) = (borrow_metadata.degraded_reason, extras.as_object_mut())
+    {
+        object.insert(
+            "borrowed_index_degraded_reason".to_string(),
+            serde_json::json!(reason),
+        );
+    }
+    extras
 }
 
 fn borrowed_drift_log_message(index_kind: &str, root: &Path, drift_count: usize) -> String {
@@ -1847,6 +1955,9 @@ fn zero_result_escalation_response(
 }
 
 fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response {
+    if search_cancellation_requested() {
+        return cancelled_search_response(req);
+    }
     let mut object = serde_json::Map::new();
     object.insert("status".to_string(), serde_json::json!(parts.status));
     object.insert("complete".to_string(), serde_json::json!(parts.complete));
@@ -2090,6 +2201,12 @@ fn semantic_unavailable_grep_fallback_response(
             fallback.file_limit
         ));
     }
+    if fallback.walk_budget_reached {
+        warnings.push(
+            "Degraded grep reached its 10-second walk budget; additional files were not scanned."
+                .to_string(),
+        );
+    }
     warnings
         .push("Semantic search unavailable; returning lexical-only fallback results.".to_string());
 
@@ -2100,13 +2217,16 @@ fn semantic_unavailable_grep_fallback_response(
         .collect::<Vec<_>>();
     let more_available = result.truncated
         || result.total_matches > result.matches.len()
-        || fallback.file_cap_reached;
+        || fallback.file_cap_reached
+        || fallback.walk_budget_reached;
     let mut extras = semantic_unavailable_extras(true);
-    if fallback.file_cap_reached {
+    if fallback.file_cap_reached || fallback.walk_budget_reached {
         extras.insert(
             "degraded_grep_walk_truncated".to_string(),
             serde_json::json!(true),
         );
+    }
+    if fallback.file_cap_reached {
         extras.insert(
             "degraded_grep_file_limit".to_string(),
             serde_json::json!(fallback.file_limit),
@@ -2181,28 +2301,51 @@ fn execute_degraded_grep_fallback(
     };
 
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
-    let (files, file_cap_reached) = collect_degraded_grep_files(project_root, include_tests);
+    let started = Instant::now();
+    let (files, file_cap_reached, walk_budget_reached) =
+        collect_degraded_grep_files(project_root, include_tests, started);
+    if search_cancellation_requested() {
+        return Err(cancelled_search_response_from_id(request_id));
+    }
     let candidate_files = files.len();
     let mut matches = Vec::new();
     let mut total_matches = 0usize;
     let mut files_searched = 0usize;
     let mut files_with_matches = 0usize;
     let mut truncated = false;
-    let mut engine_capped = file_cap_reached;
+    let mut engine_capped = file_cap_reached || walk_budget_reached;
 
+    let read_budget_reached = AtomicBool::new(walk_budget_reached);
+    let cancellation = crate::executor::current_job_cancellation();
     let mut readable_files = files
         .par_iter()
         .enumerate()
         .filter_map(|(index, file)| {
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                return None;
+            }
+            if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
+                read_budget_reached.store(true, Ordering::Relaxed);
+                return None;
+            }
             crate::search_index::read_searchable_text(file)
                 .map(|content| (index, file.clone(), content))
         })
         .collect::<Vec<_>>();
+    if search_cancellation_requested() {
+        return Err(cancelled_search_response_from_id(request_id));
+    }
     // Rayon collection order is not part of the response contract; restore the
     // original walker order before applying the existing result-cap semantics.
     readable_files.sort_by_key(|(index, _, _)| *index);
 
     for (_, file, content) in readable_files {
+        if search_cancellation_requested() {
+            return Err(cancelled_search_response_from_id(request_id));
+        }
         if truncated {
             engine_capped = true;
             break;
@@ -2228,6 +2371,7 @@ fn execute_degraded_grep_fallback(
     }
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
 
+    let walk_budget_reached = read_budget_reached.load(Ordering::Relaxed);
     Ok(DegradedGrepFallbackResult {
         grep: GrepResult {
             matches,
@@ -2238,15 +2382,20 @@ fn execute_degraded_grep_fallback(
             truncated,
             fully_degraded: true,
             engine_capped,
-            walk_truncated: false,
+            walk_truncated: walk_budget_reached,
         },
         file_cap_reached,
         file_limit: DEGRADED_GREP_FILE_LIMIT,
         candidate_files,
+        walk_budget_reached,
     })
 }
 
-fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec<PathBuf>, bool) {
+fn collect_degraded_grep_files(
+    project_root: &Path,
+    include_tests: bool,
+    started: Instant,
+) -> (Vec<PathBuf>, bool, bool) {
     let walker = ignore::WalkBuilder::new(project_root)
         .hidden(false)
         .git_ignore(true)
@@ -2257,7 +2406,7 @@ fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec
             let name = entry.file_name().to_string_lossy();
             if entry
                 .file_type()
-                .map_or(false, |file_type| file_type.is_dir())
+                .is_some_and(|file_type| file_type.is_dir())
             {
                 return !matches!(
                     name.as_ref(),
@@ -2277,10 +2426,16 @@ fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec
         .build();
 
     let mut files = Vec::new();
-    for entry in walker.filter_map(|entry| entry.ok()) {
+    for entry in walker.filter_map(Result::ok) {
+        if search_cancellation_requested() {
+            return (files, false, true);
+        }
+        if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
+            return (files, false, true);
+        }
         if !entry
             .file_type()
-            .map_or(false, |file_type| file_type.is_file())
+            .is_some_and(|file_type| file_type.is_file())
         {
             continue;
         }
@@ -2289,12 +2444,12 @@ fn collect_degraded_grep_files(project_root: &Path, include_tests: bool) -> (Vec
             continue;
         }
         if files.len() >= DEGRADED_GREP_FILE_LIMIT {
-            return (files, true);
+            return (files, true, false);
         }
         files.push(path);
     }
 
-    (files, false)
+    (files, false, false)
 }
 
 fn search_degraded_grep_file(
@@ -2322,6 +2477,9 @@ fn search_degraded_grep_file(
             };
 
             for (offset, matched) in haystack.match_indices(needle) {
+                if search_cancellation_requested() {
+                    break;
+                }
                 let match_text = content[offset..offset + matched.len()].to_string();
                 let (counted, should_continue) = record_degraded_grep_match(
                     file,
@@ -2343,6 +2501,9 @@ fn search_degraded_grep_file(
         }
         pattern_compile::CompiledPattern::Regex { compiled, .. } => {
             for matched in compiled.find_iter(content.as_bytes()) {
+                if search_cancellation_requested() {
+                    break;
+                }
                 let (counted, should_continue) = record_degraded_grep_match(
                     file,
                     content,
@@ -4982,6 +5143,161 @@ mod tests {
 
         assert!((candidates[0].rank_score - 0.012).abs() < 0.0001);
         assert!(!candidates[0].cap_protected);
+    }
+
+    #[test]
+    fn churned_borrowed_tree_query_completes_with_budget_degradation() {
+        let session = tempfile::tempdir().expect("session root");
+        let external = tempfile::tempdir().expect("external root");
+        let external_root =
+            std::fs::canonicalize(external.path()).expect("canonical external root");
+        let storage = tempfile::tempdir().expect("storage");
+        for file_index in 0..64 {
+            let file = external_root.join(format!(
+                "packages/pkg_{}/src/module_{file_index}.rs",
+                file_index % 8
+            ));
+            std::fs::create_dir_all(file.parent().expect("fixture parent"))
+                .expect("create nested fixture directory");
+            std::fs::write(
+                file,
+                format!("pub fn borrowed_tree_needle_{file_index}() {{}}\n"),
+            )
+            .expect("write borrowed fixture");
+        }
+        let cache_dir =
+            crate::search_index::resolve_cache_dir(&external_root, Some(storage.path()));
+        let mut index = SearchIndex::build(&external_root);
+        index.write_to_disk(&cache_dir, None);
+
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(session.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        let req = semantic_request("borrowed_tree_needle", 10);
+        let shape = query_shape::classify("borrowed_tree_needle");
+        let first = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
+            10_000,
+            Duration::from_secs(5),
+            || {
+                response_value(handle_external_search(
+                    &req,
+                    &ctx,
+                    SemanticSearchParams {
+                        query: "borrowed_tree_needle".to_string(),
+                        top_k: 10,
+                        include_tests: false,
+                        path: None,
+                    },
+                    10,
+                    shape.clone(),
+                    external_root.clone(),
+                ))
+            },
+        );
+        assert_eq!(first["success"], true, "initial borrow failed: {first:?}");
+
+        for file_index in 0..40 {
+            let file = external_root.join(format!(
+                "packages/pkg_{}/src/module_{file_index}.rs",
+                file_index % 8
+            ));
+            std::fs::write(
+                file,
+                format!("pub fn churned_borrowed_tree_{file_index}() {{}}\n"),
+            )
+            .expect("churn borrowed fixture");
+        }
+        let mut rebuilt = SearchIndex::build(&external_root);
+        rebuilt.write_to_disk(&cache_dir, None);
+
+        let started = Instant::now();
+        let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
+            10,
+            Duration::from_secs(5),
+            || {
+                response_value(handle_external_search(
+                    &req,
+                    &ctx,
+                    SemanticSearchParams {
+                        query: "borrowed_tree_needle".to_string(),
+                        top_k: 10,
+                        include_tests: false,
+                        path: None,
+                    },
+                    10,
+                    shape,
+                    external_root,
+                ))
+            },
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "churned generation must stop at the borrowed-load budget"
+        );
+        assert_eq!(degraded["success"], true);
+        assert_eq!(degraded["complete"], false);
+        assert_eq!(degraded["fully_degraded"], true);
+        assert_eq!(
+            degraded["borrowed_index_degraded_reason"],
+            "borrowed_search_index_load_budget"
+        );
+        assert!(degraded["text"]
+            .as_str()
+            .expect("degraded response text")
+            .ends_with(BORROWED_SEARCH_LOAD_FOOTER));
+    }
+
+    #[test]
+    fn borrowed_load_budget_degradation_has_locked_disclosure() {
+        let session = tempfile::tempdir().expect("session root");
+        let external = tempfile::tempdir().expect("external root");
+        std::fs::write(
+            external.path().join("fixture.rs"),
+            "pub fn budget_disclosure_needle() {}\n",
+        )
+        .expect("write external fixture");
+        let ctx = test_context(session.path());
+        let req = semantic_request("budget_disclosure_needle", 10);
+        let params = SemanticSearchParams {
+            query: "budget_disclosure_needle".to_string(),
+            top_k: 10,
+            include_tests: false,
+            path: Some(external.path().display().to_string()),
+        };
+        let shape = query_shape::classify(&params.query);
+
+        let response = response_value(handle_external_borrowed_degraded_fallback(
+            &req,
+            &ctx,
+            &params,
+            10,
+            &shape,
+            external.path(),
+            crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["fully_degraded"], true);
+        assert_eq!(
+            response["borrowed_index_degraded_reason"],
+            "borrowed_search_index_load_budget"
+        );
+        assert!(response["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning.as_str() == Some(BORROWED_SEARCH_LOAD_WARNING)));
+        assert!(response["text"]
+            .as_str()
+            .expect("text")
+            .ends_with(BORROWED_SEARCH_LOAD_FOOTER));
     }
 
     #[test]

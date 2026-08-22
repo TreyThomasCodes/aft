@@ -3175,19 +3175,29 @@ impl AppContext {
             canonical_root: canonical_root.clone(),
             artifact,
         };
-        let mut cache = self.borrowed_index_cache.lock();
-        if let Some(index) = cache.search(&key) {
-            return index;
+        {
+            let mut cache = self.borrowed_index_cache.lock();
+            if let Some(index) = cache.search(&key) {
+                return index;
+            }
         }
 
+        // Artifact parsing can touch many records. Keep this process-local cache
+        // mutex free so another read-only request is not blocked behind the load.
         let opened = crate::readonly_artifacts::open_search_index_read_only_with_key(
             &canonical_root,
             storage_dir,
             &project_key,
         )
         .map(Arc::new);
-        if !matches!(opened, crate::readonly_artifacts::ReadOnlyArtifact::Absent) {
-            cache.insert(key, BorrowedIndexCacheValue::Search(opened.clone()));
+        if !matches!(
+            opened,
+            crate::readonly_artifacts::ReadOnlyArtifact::Absent
+                | crate::readonly_artifacts::ReadOnlyArtifact::Cancelled
+        ) {
+            self.borrowed_index_cache
+                .lock()
+                .insert(key, BorrowedIndexCacheValue::Search(opened.clone()));
         }
         opened
     }
@@ -3210,19 +3220,29 @@ impl AppContext {
             canonical_root: canonical_root.clone(),
             artifact,
         };
-        let mut cache = self.borrowed_index_cache.lock();
-        if let Some(index) = cache.semantic(&key) {
-            return index;
+        {
+            let mut cache = self.borrowed_index_cache.lock();
+            if let Some(index) = cache.semantic(&key) {
+                return index;
+            }
         }
 
+        // Semantic snapshot parsing follows the same rule: bounded work runs
+        // without holding the cache's process-wide coordination mutex.
         let opened = crate::readonly_artifacts::open_semantic_index_read_only_with_key(
             &canonical_root,
             storage_dir,
             &project_key,
         )
         .map(Arc::new);
-        if !matches!(opened, crate::readonly_artifacts::ReadOnlyArtifact::Absent) {
-            cache.insert(key, BorrowedIndexCacheValue::Semantic(opened.clone()));
+        if !matches!(
+            opened,
+            crate::readonly_artifacts::ReadOnlyArtifact::Absent
+                | crate::readonly_artifacts::ReadOnlyArtifact::Cancelled
+        ) {
+            self.borrowed_index_cache
+                .lock()
+                .insert(key, BorrowedIndexCacheValue::Semantic(opened.clone()));
         }
         opened
     }

@@ -1,4 +1,3 @@
-#[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -85,6 +84,87 @@ struct ArtifactCacheKeyMemoState {
 }
 
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
+/// Borrowed snapshots are rerooted before grep's candidate/file-walk budgets
+/// begin. Cap that parse separately so per-record path containment checks cannot
+/// occupy an interactive lane for the size of an arbitrary foreign corpus.
+pub(crate) const BORROWED_INDEX_LOAD_BUDGET: Duration = Duration::from_secs(1);
+pub(crate) const BORROWED_INDEX_LOAD_MAX_RECORDS: usize = 100_000;
+const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BorrowedIndexLoadStop {
+    BudgetExceeded,
+    Cancelled,
+}
+
+#[derive(Debug)]
+pub(crate) enum BorrowedIndexLoad {
+    Loaded(SearchIndex, bool),
+    Stopped(BorrowedIndexLoadStop),
+    Invalid,
+}
+
+struct BorrowedIndexLoadBudget {
+    started_at: Instant,
+    duration: Duration,
+    max_records: usize,
+    stop: Cell<Option<BorrowedIndexLoadStop>>,
+}
+
+impl BorrowedIndexLoadBudget {
+    fn new(max_records: usize, duration: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            duration,
+            max_records,
+            stop: Cell::new(None),
+        }
+    }
+
+    fn preflight(&self, records: usize) -> bool {
+        if records > self.max_records {
+            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
+            return false;
+        }
+        self.checkpoint()
+    }
+
+    fn preflight_lookup_bytes(&self, bytes: u64, file_records: usize) -> bool {
+        let lookup_records = self.max_records.saturating_sub(file_records);
+        let max_bytes = 20u64.saturating_add(
+            u64::try_from(lookup_records)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(LOOKUP_ENTRY_BYTES as u64),
+        );
+        if bytes > max_bytes {
+            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
+            return false;
+        }
+        self.checkpoint()
+    }
+
+    fn checkpoint_at(&self, record: usize) -> bool {
+        if record % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0 {
+            self.checkpoint()
+        } else {
+            true
+        }
+    }
+
+    fn checkpoint(&self) -> bool {
+        if crate::executor::current_job_cancellation()
+            .is_some_and(|token| token.cancel_requested_before_commit())
+        {
+            self.stop.set(Some(BorrowedIndexLoadStop::Cancelled));
+            return false;
+        }
+        if self.started_at.elapsed() >= self.duration {
+            self.stop.set(Some(BorrowedIndexLoadStop::BudgetExceeded));
+            return false;
+        }
+        true
+    }
+}
 
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
@@ -1068,16 +1148,29 @@ impl SearchIndex {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 
-    pub(crate) fn read_from_disk_borrow_tolerant(
+    pub(crate) fn read_from_disk_borrow_tolerant_with_budget(
         cache_dir: &Path,
         current_canonical_root: &Path,
-    ) -> Option<(Self, bool)> {
-        Self::read_from_disk_with_policy(
+        max_records: usize,
+        duration: Duration,
+    ) -> BorrowedIndexLoad {
+        let budget = BorrowedIndexLoadBudget::new(max_records, duration);
+        match Self::read_from_disk_with_policy(
             cache_dir,
             current_canonical_root,
             false,
             IgnoreRulesLoadPolicy::BorrowTolerant,
-        )
+            Some(&budget),
+        ) {
+            Some((index, ignore_rules_differ)) => {
+                BorrowedIndexLoad::Loaded(index, ignore_rules_differ)
+            }
+            None => budget
+                .stop
+                .get()
+                .map(BorrowedIndexLoad::Stopped)
+                .unwrap_or(BorrowedIndexLoad::Invalid),
+        }
     }
 
     fn read_from_disk_with_options(
@@ -1090,6 +1183,7 @@ impl SearchIndex {
             current_canonical_root,
             allow_legacy_repair,
             IgnoreRulesLoadPolicy::Strict,
+            None,
         )
         .map(|(index, _)| index)
     }
@@ -1099,6 +1193,7 @@ impl SearchIndex {
         current_canonical_root: &Path,
         allow_legacy_repair: bool,
         ignore_rules_load_policy: IgnoreRulesLoadPolicy,
+        borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
     ) -> Option<(Self, bool)> {
         debug_assert!(current_canonical_root.is_absolute());
         let cache_path = cache_dir.join("cache.bin");
@@ -1140,6 +1235,9 @@ impl SearchIndex {
         if file_count > MAX_ENTRIES {
             return None;
         }
+        if borrowed_load_budget.is_some_and(|budget| !budget.preflight(file_count)) {
+            return None;
+        }
 
         if !reader_has_remaining(&mut reader, postings_body_end, head_len).ok()? {
             return None;
@@ -1176,6 +1274,9 @@ impl SearchIndex {
         let mut unindexed_files = HashSet::new();
 
         for file_id in 0..file_count {
+            if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint_at(file_id)) {
+                return None;
+            }
             if !reader_has_remaining(&mut reader, postings_body_end, MIN_FILE_ENTRY_BYTES).ok()? {
                 return None;
             }
@@ -1226,6 +1327,12 @@ impl SearchIndex {
         if lookup_section_start >= file_len {
             return None;
         }
+        let lookup_section_len = file_len.checked_sub(lookup_section_start)?;
+        if borrowed_load_budget
+            .is_some_and(|budget| !budget.preflight_lookup_bytes(lookup_section_len, file_count))
+        {
+            return None;
+        }
         let mut lookup_file = cache_file.try_clone().ok()?;
         lookup_file
             .seek(SeekFrom::Start(lookup_section_start))
@@ -1250,6 +1357,10 @@ impl SearchIndex {
         if entry_count > MAX_ENTRIES {
             return None;
         }
+        let total_records = file_count.checked_add(entry_count)?;
+        if borrowed_load_budget.is_some_and(|budget| !budget.preflight(total_records)) {
+            return None;
+        }
         let remaining_lookup = remaining_bytes(&mut lookup_reader, lookup_body_len)?;
         let minimum_lookup_bytes = entry_count.checked_mul(LOOKUP_ENTRY_BYTES)?;
         if minimum_lookup_bytes > remaining_lookup {
@@ -1258,7 +1369,12 @@ impl SearchIndex {
 
         let mut lookup = Vec::with_capacity(entry_count);
         let mut previous_trigram = None;
-        for _ in 0..entry_count {
+        for lookup_index in 0..entry_count {
+            if borrowed_load_budget.is_some_and(|budget| {
+                !budget.checkpoint_at(file_count.saturating_add(lookup_index))
+            }) {
+                return None;
+            }
             let trigram = read_u32(&mut lookup_reader).ok()?;
             let offset = read_u64(&mut lookup_reader).ok()?;
             let count = read_u32(&mut lookup_reader).ok()?;
@@ -1288,6 +1404,9 @@ impl SearchIndex {
             lookup: Arc::new(lookup),
         };
 
+        if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint()) {
+            return None;
+        }
         let (file_trigram_count, migrated_counts) = match read_file_trigram_count_extension(
             &base,
             postings_blob_end,
@@ -1296,7 +1415,8 @@ impl SearchIndex {
         ) {
             Ok(Some(counts)) => (counts, false),
             Ok(None) => (
-                compute_file_trigram_counts_from_base(&base, file_count).ok()?,
+                compute_file_trigram_counts_from_base(&base, file_count, borrowed_load_budget)
+                    .ok()?,
                 true,
             ),
             Err(_) => return None,
@@ -1571,15 +1691,17 @@ impl BasePostings {
     fn for_each_posting(
         &self,
         entry: LookupEntry,
-        mut visit: impl FnMut(u32, u8, u8),
+        mut visit: impl FnMut(u32, u8, u8) -> bool,
     ) -> std::io::Result<()> {
         let bytes = self.read_posting_bytes(entry)?;
         for chunk in bytes.chunks_exact(POSTING_BYTES) {
-            visit(
+            if !visit(
                 u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
                 chunk[4],
                 chunk[5],
-            );
+            ) {
+                break;
+            }
         }
         Ok(())
     }
@@ -1741,6 +1863,7 @@ impl SearchIndexSnapshot {
 
         let search_root = canonicalize_for_search_membership(search_root);
 
+        let job_cancellation = crate::executor::current_job_cancellation();
         let trigram_started = Instant::now();
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
         let candidate_ids = self.candidates(query);
@@ -1790,6 +1913,7 @@ impl SearchIndexSnapshot {
                         &truncated,
                         &total_matches,
                         stop_after,
+                        job_cancellation.as_ref(),
                     ) {
                         engine_capped.store(true, Ordering::Relaxed);
                         return Vec::new();
@@ -1812,6 +1936,7 @@ impl SearchIndexSnapshot {
                         &truncated,
                         &engine_capped,
                         Some(&stop_scan),
+                        job_cancellation.as_ref(),
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
@@ -1841,6 +1966,7 @@ impl SearchIndexSnapshot {
                     &truncated,
                     &engine_capped,
                     None,
+                    job_cancellation.as_ref(),
                 ));
 
                 if should_stop_search(&truncated, &total_matches, stop_after) {
@@ -2059,8 +2185,11 @@ impl SearchIndexSnapshot {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
                 let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
+                    if crate::executor::current_job_cancelled() {
+                        return false;
+                    }
                     if self.delta.superseded.contains(&file_id) {
-                        return;
+                        return true;
                     }
                     let posting = Posting {
                         file_id,
@@ -2068,18 +2197,24 @@ impl SearchIndexSnapshot {
                         loc_mask,
                     };
                     if !posting_matches_filter(&posting, filter) {
-                        return;
+                        return true;
                     }
                     if self.is_active_file(file_id) {
                         matches.push(file_id);
                     }
+                    true
                 });
             }
         }
 
         if let Some(postings) = self.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
-            for posting in postings {
+            for (posting_index, posting) in postings.iter().enumerate() {
+                if posting_index % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0
+                    && crate::executor::current_job_cancelled()
+                {
+                    break;
+                }
                 if !posting_matches_filter(posting, filter) {
                     continue;
                 }
@@ -2123,8 +2258,15 @@ fn search_candidate_file(
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
     stop_scan: Option<&Arc<AtomicBool>>,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
 ) -> Vec<SharedGrepMatch> {
-    if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
+    if grep_scan_should_stop(
+        stop_scan,
+        truncated,
+        total_matches,
+        stop_after,
+        job_cancellation,
+    ) {
         engine_capped.store(true, Ordering::Relaxed);
         return Vec::new();
     }
@@ -2158,7 +2300,13 @@ fn search_candidate_file(
             let mut start = 0;
 
             while let Some(position) = finder.find(&content[start..]) {
-                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(
+                    stop_scan,
+                    truncated,
+                    total_matches,
+                    stop_after,
+                    job_cancellation,
+                ) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -2197,7 +2345,13 @@ fn search_candidate_file(
             let mut start = 0;
 
             while let Some(position) = finder.find(&search_content[start..]) {
-                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(
+                    stop_scan,
+                    truncated,
+                    total_matches,
+                    stop_after,
+                    job_cancellation,
+                ) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -2231,7 +2385,13 @@ fn search_candidate_file(
         }
         SearchMatcher::Regex(regex) => {
             for matched in regex.find_iter(&content) {
-                if grep_scan_should_stop(stop_scan, truncated, total_matches, stop_after) {
+                if grep_scan_should_stop(
+                    stop_scan,
+                    truncated,
+                    total_matches,
+                    stop_after,
+                    job_cancellation,
+                ) {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -2282,8 +2442,10 @@ fn grep_scan_should_stop(
     truncated: &AtomicBool,
     total_matches: &AtomicUsize,
     stop_after: usize,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
 ) -> bool {
-    stop_scan.is_some_and(|flag| flag.load(Ordering::Relaxed))
+    job_cancellation.is_some_and(|token| token.cancel_requested_before_commit())
+        || stop_scan.is_some_and(|flag| flag.load(Ordering::Relaxed))
         || should_stop_search(truncated, total_matches, stop_after)
 }
 
@@ -3119,9 +3281,13 @@ fn read_file_trigram_count_extension(
 fn compute_file_trigram_counts_from_base(
     base: &BasePostings,
     file_count: usize,
+    borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
 ) -> std::io::Result<Vec<u32>> {
     let mut counts = vec![0u32; file_count];
-    for entry in base.lookup.iter().copied() {
+    for (entry_index, entry) in base.lookup.iter().copied().enumerate() {
+        if borrowed_load_budget.is_some_and(|budget| !budget.checkpoint_at(entry_index)) {
+            return Err(std::io::Error::other("borrowed index load stopped"));
+        }
         for posting in base.read_postings(entry)? {
             let Some(count) = counts.get_mut(posting.file_id as usize) else {
                 return Err(std::io::Error::other("posting references missing file"));
@@ -3262,6 +3428,11 @@ fn intersect_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     let mut right_index = 0;
 
     while left_index < left.len() && right_index < right.len() {
+        if (left_index + right_index) % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0
+            && crate::executor::current_job_cancelled()
+        {
+            break;
+        }
         match left[left_index].cmp(&right[right_index]) {
             std::cmp::Ordering::Less => left_index += 1,
             std::cmp::Ordering::Greater => right_index += 1,
@@ -3282,6 +3453,11 @@ fn union_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     let mut right_index = 0;
 
     while left_index < left.len() && right_index < right.len() {
+        if (left_index + right_index) % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0
+            && crate::executor::current_job_cancelled()
+        {
+            break;
+        }
         match left[left_index].cmp(&right[right_index]) {
             std::cmp::Ordering::Less => {
                 merged.push(left[left_index]);
@@ -3299,8 +3475,10 @@ fn union_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
         }
     }
 
-    merged.extend_from_slice(&left[left_index..]);
-    merged.extend_from_slice(&right[right_index..]);
+    if !crate::executor::current_job_cancelled() {
+        merged.extend_from_slice(&left[left_index..]);
+        merged.extend_from_slice(&right[right_index..]);
+    }
     merged
 }
 

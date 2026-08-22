@@ -427,6 +427,7 @@ fn grep_explicit_file(
     let truncated = AtomicBool::new(false);
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
+    let job_cancellation = crate::executor::current_job_cancellation();
 
     let matches = fallback_search_file(
         &file.to_path_buf(),
@@ -438,6 +439,8 @@ fn grep_explicit_file(
         &files_with_matches,
         &truncated,
         &engine_capped,
+        job_cancellation.as_ref(),
+        None,
     );
 
     GrepResult {
@@ -635,6 +638,9 @@ where
     let builder = fallback_project_walk_builder(search_root);
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
+        if crate::executor::current_job_cancelled() {
+            return true;
+        }
         if started.elapsed() >= budget {
             return true;
         }
@@ -709,6 +715,8 @@ fn fallback_grep(
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
     let stop_scan = Arc::new(AtomicBool::new(false));
+    let scan_deadline = Instant::now() + FALLBACK_WALK_BUDGET;
+    let job_cancellation = crate::executor::current_job_cancellation();
 
     let mut matches = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
@@ -721,7 +729,12 @@ fn fallback_grep(
         let partial: Vec<GrepMatch> = chunk
             .par_iter()
             .filter_map(|file| {
-                if stop_scan.load(Ordering::Relaxed) {
+                if stop_scan.load(Ordering::Relaxed)
+                    || Instant::now() >= scan_deadline
+                    || job_cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.cancel_requested_before_commit())
+                {
                     return None;
                 }
                 let file_matches = fallback_search_file(
@@ -734,6 +747,8 @@ fn fallback_grep(
                     &files_with_matches,
                     &truncated,
                     &engine_capped,
+                    job_cancellation.as_ref(),
+                    Some(scan_deadline),
                 );
                 if truncated.load(Ordering::Relaxed)
                     && total_matches.load(Ordering::Relaxed) >= stop_after
@@ -747,7 +762,7 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    let walk_truncated = for_each_bounded_fallback_walk_file(
+    let mut walk_truncated = for_each_bounded_fallback_walk_file(
         filter_root,
         search_root,
         filters,
@@ -764,6 +779,10 @@ fn fallback_grep(
         },
     );
     flush_batch(&mut batch, &mut matches);
+    if Instant::now() >= scan_deadline {
+        walk_truncated = true;
+        engine_capped.store(true, Ordering::Relaxed);
+    }
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
 
@@ -790,8 +809,12 @@ fn fallback_search_file(
     files_with_matches: &AtomicUsize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
 ) -> Vec<GrepMatch> {
-    if should_stop_fallback_search(truncated, total_matches, stop_after) {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
+    {
         engine_capped.store(true, Ordering::Relaxed);
         return Vec::new();
     }
@@ -820,10 +843,19 @@ fn fallback_search_file(
             engine_capped,
             &mut matched_this_file,
             &mut matches,
+            job_cancellation,
+            deadline,
         ),
         CompiledPattern::Regex { compiled, .. } => {
             for matched in compiled.find_iter(content.as_bytes()) {
-                if should_stop_fallback_search(truncated, total_matches, stop_after) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || should_stop_fallback_search(
+                        truncated,
+                        total_matches,
+                        stop_after,
+                        job_cancellation,
+                    )
+                {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -872,6 +904,8 @@ fn search_literal_in_text(
     engine_capped: &AtomicBool,
     matched_this_file: &mut bool,
     matches: &mut Vec<GrepMatch>,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
 ) {
     let content_bytes = content.as_bytes();
     let search_content;
@@ -885,7 +919,9 @@ fn search_literal_in_text(
     let mut start = 0usize;
 
     while let Some(position) = finder.find(&haystack[start..]) {
-        if should_stop_fallback_search(truncated, total_matches, stop_after) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
+        {
             engine_capped.store(true, Ordering::Relaxed);
             break;
         }
@@ -919,8 +955,11 @@ fn should_stop_fallback_search(
     truncated: &AtomicBool,
     total_matches: &AtomicUsize,
     stop_after: usize,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
 ) -> bool {
-    truncated.load(Ordering::Relaxed) && total_matches.load(Ordering::Relaxed) >= stop_after
+    job_cancellation.is_some_and(|token| token.cancel_requested_before_commit())
+        || (truncated.load(Ordering::Relaxed)
+            && total_matches.load(Ordering::Relaxed) >= stop_after)
 }
 
 pub(crate) fn ripgrep_glob(

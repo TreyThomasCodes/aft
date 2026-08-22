@@ -301,3 +301,37 @@ current-disk verification of the stale posting candidates selected by those
 queries, not from a corpus-wide drift census. The raw fixed-build output was
 retained on the M1 and copied locally as
 `/tmp/bg_282cadfb-final-benchmark.ndjson`.
+
+## Generation-reload follow-up
+
+A scaled debug-build replay used 30,001 indexed files, a session rooted in a
+sibling checkout, and an explicit external path into the artifact owner's
+checkout. A warm borrowed query took 3.965 ms. After rewriting 15,000 files and
+letting the artifact owner persist the new generation, the next borrowed query
+took 521.466 ms; the following query was warm again at 2.398 ms. The same first
+borrowed load reached 3,359.653 ms during a high-load run.
+
+A two-second macOS thread sample localized the reload cost before query mode
+selection:
+
+1. `handle_external_search` calls `AppContext::open_borrowed_search_index`.
+2. An artifact generation change misses `BorrowedIndexCache` and enters
+   `SearchIndex::read_from_disk_with_policy`.
+3. Its `for file_id in 0..file_count` loop rebuilds every file record. Each
+   record calls `cached_path_under_root`, which canonicalizes the existing
+   path to reject symlink escapes. In the sample, 96 of 122 on-CPU reload
+   samples were in that function's `fs::canonicalize`/`realpath` call.
+4. The same reader then rebuilds the complete path map and lookup table. Legacy
+   artifacts can additionally enter `compute_file_trigram_counts_from_base`,
+   which visits every posting in every lookup entry.
+
+These loops have no file-count, elapsed-time, or cancellation checkpoint. The
+borrow cache removed repeated parsing, but corpus churn can replace the owner
+artifact, change its generation key, and synchronously re-enter the full parse
+while the interactive executor still holds the PureRead gate.
+
+`MAX_FALLBACK_WALK_FILES` and `FALLBACK_WALK_BUDGET` do not constrain this work.
+They are passed to candidate verification only after the borrowed index has
+finished opening, and the unindexed fallback is not selected when `cache.bin`
+exists. A generation reload therefore has to be bounded at the borrowed opener,
+not only in the later grep walk.
