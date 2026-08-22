@@ -802,7 +802,8 @@ Check "no plugin crash" {
     }
     return $true
 }
-Check "plugin loaded" { LogContains $PluginLog "Resolved binary|Spawning binary|Copied npm binary" }
+# Every successful binary-resolution path records its source and final executable.
+Check "plugin loaded" { LogContains $PluginLog "Resolved binary from .+: " }
 Check "bridge spawned" { LogContains $PluginLog "started, pid" }
 WarnCheck "search index started" { LogContains $PluginLog "watcher started|search.*index|index.*build" }
 

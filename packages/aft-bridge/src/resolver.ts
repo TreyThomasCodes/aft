@@ -212,6 +212,22 @@ export function platformKey(
   return key;
 }
 
+type BinaryResolutionSource =
+  | "versioned cache"
+  | "npm platform package"
+  | "PATH"
+  | "cargo"
+  | "auto-download";
+
+type BinaryResolution = {
+  path: string;
+  source: BinaryResolutionSource;
+};
+
+function logBinaryResolution(resolution: BinaryResolution): void {
+  log(`Resolved binary from ${resolution.source}: ${resolution.path}`);
+}
+
 /**
  * Locate the `aft` binary synchronously by checking (in order):
  * 1. Cached binary from previous auto-download (~/.cache/aft/bin/)
@@ -226,14 +242,14 @@ export function platformKey(
  * @returns Absolute path to the first binary found, or null if none found.
  */
 export function findBinarySync(expectedVersion?: string): string | null {
-  const resolved = findBinarySyncInner(expectedVersion);
-  // Every resolution path funnels through this line: host log assertions and
-  // operators both key on it, so it must fire for sync and async callers alike.
-  if (resolved) log(`Resolved binary: ${resolved}`);
-  return resolved;
+  const resolution = findBinarySyncInner(expectedVersion);
+  // Keep one durable, source-labeled line after every successful binary-resolution
+  // path. Operators need to distinguish a stale cache hit from npm, PATH, cargo, or a download.
+  if (resolution) logBinaryResolution(resolution);
+  return resolution?.path ?? null;
 }
 
-function findBinarySyncInner(expectedVersion?: string): string | null {
+function findBinarySyncInner(expectedVersion?: string): BinaryResolution | null {
   const ext = process.platform === "win32" ? ".exe" : "";
   const env = { ...process.env };
 
@@ -253,7 +269,9 @@ function findBinarySyncInner(expectedVersion?: string): string | null {
   if (pluginVersion) {
     const tag = pluginVersion.startsWith("v") ? pluginVersion : `v${pluginVersion}`;
     const versionCached = cachedBinaryPathFromEnv(tag, env, ext);
-    if (versionCached && isExpectedCachedBinary(versionCached, pluginVersion)) return versionCached;
+    if (versionCached && isExpectedCachedBinary(versionCached, pluginVersion)) {
+      return { path: versionCached, source: "versioned cache" };
+    }
   }
 
   // 2. Check npm platform package — copy to versioned cache to avoid
@@ -282,7 +300,7 @@ function findBinarySyncInner(expectedVersion?: string): string | null {
         );
       } else {
         const copied = copyToVersionedCache(resolved, npmVersion);
-        return copied ?? resolved;
+        return { path: copied ?? resolved, source: "npm platform package" };
       }
     }
   } catch {
@@ -307,7 +325,7 @@ function findBinarySyncInner(expectedVersion?: string): string | null {
         continue;
       }
       const usable = probeBinaryCandidate(candidate, "PATH", expectedVersion);
-      if (usable) return usable;
+      if (usable) return { path: usable, source: "PATH" };
     }
   } catch {
     // not in PATH
@@ -317,7 +335,7 @@ function findBinarySyncInner(expectedVersion?: string): string | null {
   const cargoPath = join(homeDirFromEnv(env), ".cargo", "bin", `aft${ext}`);
   if (existsSync(cargoPath)) {
     const usable = probeBinaryCandidate(cargoPath, "cargo", expectedVersion);
-    if (usable) return usable;
+    if (usable) return { path: usable, source: "cargo" };
   }
 
   return null;
@@ -350,7 +368,10 @@ export async function findBinary(expectedVersion?: string): Promise<string> {
   // 5. Auto-download from GitHub releases
   log("Binary not found locally, attempting auto-download...");
   const downloaded = await ensureBinaryForResolver(expectedVersion);
-  if (downloaded) return downloaded;
+  if (downloaded) {
+    logBinaryResolution({ path: downloaded, source: "auto-download" });
+    return downloaded;
+  }
 
   // All sources exhausted
   throw new Error(

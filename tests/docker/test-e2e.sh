@@ -311,8 +311,9 @@ done
 check "unexpected mock fallback not used" "! grep -q 'unexpected-fallback' '$TURN_LOG' 2>/dev/null && ! grep -q 'UNEXPECTED_TURN_FALLBACK' '$RESULT_FILE' '$AIMOCK_LOG' 2>/dev/null"
 check "edit was undone (main.py restored)" "grep -q 'print(greet(\"world\"))' src/main.py && ! grep -q 'print(greet(\"docker\"))' src/main.py"
 
-# Plugin startup
-check "plugin loaded" "grep -q 'Resolved binary\|Copied npm binary' '$PLUGIN_LOG' 2>/dev/null"
+# Plugin startup. Binary resolution must emit one operator-facing contract line
+# for every successful path, naming both the source and final executable path.
+check "plugin loaded" "grep -q 'Resolved binary from .*: ' '$PLUGIN_LOG' 2>/dev/null"
 check "config loaded" "grep -q 'Config loaded' '$PLUGIN_LOG' 2>/dev/null"
 
 # Bridge spawned and survived

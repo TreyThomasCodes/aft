@@ -17,6 +17,7 @@
  * present, so this test focuses on the version-check helper directly.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,6 +127,35 @@ describe("findBinarySync versioned cache validation", () => {
     expect(readBinaryVersion(binaryPath)).toBe("1.2.3");
 
     expect(findBinarySync("1.2.3")).toBe(binaryPath);
+  });
+
+  test("logs the successful resolution path and source", () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    const packageRoot = join(import.meta.dir, "..", "..");
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        'import { findBinarySync } from "./src/resolver.ts"; console.log(findBinarySync("1.2.3"));',
+      ],
+      {
+        cwd: packageRoot,
+        env: {
+          ...process.env,
+          AFT_CACHE_DIR: join(tmpDir, "aft"),
+          HOME: tmpDir,
+          PATH: "",
+        },
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe(binaryPath);
+    expect(result.stderr).toContain(
+      `[aft-bridge] Resolved binary from versioned cache: ${binaryPath}`,
+    );
   });
 
   test("skips mislabeled newer cached binary instead of accepting directory name", () => {

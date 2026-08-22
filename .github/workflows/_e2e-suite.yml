@@ -132,7 +132,19 @@ jobs:
             -f tests/docker/Dockerfile.linux-x64 .
 
       - name: Run E2E test
-        run: docker run --rm --platform linux/amd64 aft-e2e-linux-x64
+        run: |
+          mkdir -p e2e-artifacts/linux
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD/e2e-artifacts/linux:/root/.local/share/cortexkit/aft/logs" \
+            aft-e2e-linux-x64
+
+      - name: Upload Linux plugin log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-linux-plugin-log-${{ github.run_attempt }}
+          path: e2e-artifacts/linux/aft-plugin.log
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Pi RPC e2e — exercises the real Pi runtime + AFT Pi plugin via RPC against
@@ -244,6 +256,25 @@ jobs:
           AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
 
+      - name: Collect Windows plugin log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $source = Join-Path $env:LOCALAPPDATA "cortexkit\aft\logs\aft-plugin.log"
+          $artifactDir = Join-Path $env:RUNNER_TEMP "aft-e2e-artifacts\windows"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+          if (Test-Path $source) {
+            Copy-Item $source (Join-Path $artifactDir "aft-plugin.log") -Force
+          }
+
+      - name: Upload Windows plugin log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-windows-plugin-log-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aft-e2e-artifacts/windows/aft-plugin.log
+          if-no-files-found: warn
+
       - name: Upload release-tested Windows x64 binary
         if: inputs.publish_release_artifacts == true
         uses: actions/upload-artifact@v4
@@ -333,6 +364,14 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
+
+      - name: Upload macOS plugin log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-macos-plugin-log-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log
+          if-no-files-found: warn
 
       # Package the split debug info (dSYM) as a sibling release asset. The
       # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed

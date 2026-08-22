@@ -56,10 +56,11 @@ RUN cd /test/project && git add -A && git commit -m "add source files"
 # Configure OpenCode
 RUN mkdir -p /root/.config/opencode
 
-# OpenCode global config — AFT plugin + aimock provider
+# OpenCode global config — load the packed plugin by file so OpenCode does not
+# resolve the bare package name through npm and replace the code under test.
 RUN echo '{ \
   "$schema": "https://opencode.ai/config.json", \
-  "plugin": ["@cortexkit/aft-opencode"], \
+  "plugin": ["file:///root/.cache/opencode/packages/node_modules/@cortexkit/aft-opencode/dist/index.js"], \
   "provider": { \
     "mock": { \
       "api": "openai", \
@@ -92,9 +93,11 @@ RUN echo '{ \
 }' > /root/.config/opencode/tui.json
 
 # Pre-install the locally packed AFT plugin + bridge so package metadata and
-# dependency resolution come from the code under test, not npm @latest. The
-# Linux platform package is still installed from npm for its package wrapper;
-# the executable payload is overwritten by the locally built fixture below.
+# dependency resolution come from the code under test. The config above points
+# directly at this dist entry; a bare package spec makes OpenCode run npm add
+# and can overwrite this tarball with the registry release. The Linux platform
+# package still comes from npm for its wrapper; the executable payload is
+# supplied by the locally built fixture below.
 COPY tests/docker/fixtures/npm-packs/*.tgz /tmp/aft-local-packs/
 RUN mkdir -p /root/.cache/opencode/packages && \
     cd /root/.cache/opencode/packages && \

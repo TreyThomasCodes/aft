@@ -17,6 +17,7 @@
  * empty and the npm platform package isn't installed.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,5 +56,37 @@ describe("findBinary async download", () => {
 
     await expect(findBinary("0.99.0-test")).resolves.toBe("/downloaded/aft");
     expect(seenVersions).toEqual(["0.99.0-test"]);
+  });
+
+  test("logs auto-download as the successful resolution source", () => {
+    const packageRoot = join(import.meta.dir, "..", "..");
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          'import { __setEnsureBinaryForTests, findBinary } from "./src/resolver.ts";',
+          '__setEnsureBinaryForTests(async () => "/downloaded/aft");',
+          'console.log(await findBinary("0.99.0-test"));',
+        ].join(" "),
+      ],
+      {
+        cwd: packageRoot,
+        env: {
+          ...process.env,
+          AFT_CACHE_DIR: cacheDir,
+          HOME: cacheDir,
+          PATH: "",
+        },
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("/downloaded/aft");
+    expect(result.stderr).toContain(
+      "[aft-bridge] Resolved binary from auto-download: /downloaded/aft",
+    );
   });
 });

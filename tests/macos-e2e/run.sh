@@ -129,16 +129,21 @@ echo '{"name":"test","version":"1.0.0"}' > "$TEST_PROJECT/package.json"
 echo "  Test project: $TEST_PROJECT"
 
 # ---- OpenCode + AFT config -------------------------------------------------
-# OpenCode uses XDG_CONFIG_HOME on macOS just like Linux.
+# OpenCode uses XDG_CONFIG_HOME on macOS just like Linux. Keep AFT's durable
+# data under RUNNER_TEMP too, giving the workflow a stable plugin-log artifact
+# path and preventing one local run from satisfying another run's assertions.
 export XDG_CONFIG_HOME="$RUNNER_TEMP/aft-e2e-xdg"
+export XDG_DATA_HOME="$RUNNER_TEMP/aft-e2e-data"
 OC_CONFIG_DIR="$XDG_CONFIG_HOME/opencode"
-mkdir -p "$OC_CONFIG_DIR"
+mkdir -p "$OC_CONFIG_DIR" "$XDG_DATA_HOME"
 
-# AFT plugin pointed at @latest from npm + aimock provider
+# The local dist entry is filled in after package installation below. Leaving
+# the list empty for now prevents a bare package spec from being fetched from
+# npm before the code-under-test path is known.
 cat > "$OC_CONFIG_DIR/opencode.json" <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
-  "plugin": ["@cortexkit/aft-opencode"],
+  "plugin": [],
   "provider": {
     "mock": {
       "api": "openai",
@@ -208,6 +213,20 @@ rm -rf "$PLUGIN_DIST_DEST"
 cp -R "$AFT_PLUGIN_DIST" "$PLUGIN_DIST_DEST"
 echo "  Injected local plugin dist into: $PLUGIN_DIST_DEST"
 
+# A bare `@cortexkit/aft-opencode` entry makes OpenCode run npm add at startup,
+# which can replace the local dist with the published release. Point directly
+# at index.js so every e2e assertion observes this checkout's plugin bundle.
+OPENCODE_CONFIG_FILE="$OC_CONFIG_DIR/opencode.json" \
+AFT_E2E_PLUGIN_ENTRY="$PLUGIN_DIST_DEST/index.js" \
+node <<'NODE'
+const fs = require("node:fs");
+const configPath = process.env.OPENCODE_CONFIG_FILE;
+const pluginEntry = process.env.AFT_E2E_PLUGIN_ENTRY;
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+config.plugin = [pluginEntry];
+fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+NODE
+
 # ---- Run shared harness ----------------------------------------------------
 # We don't use aimock's own server.js — the Linux harness drives aimock via
 # a custom mock-server.js fixture under tests/docker/. Reuse it directly so
@@ -229,8 +248,8 @@ fi
 cd "$TEST_PROJECT"
 
 export AFT_E2E_PLATFORM=macos
-# The shared harness creates a per-run TMPDIR/aimock-$$ root and points the
-# plugin log there so concurrent macOS/Linux E2E jobs do not collide.
+# The shared harness and plugin both derive the durable log from XDG_DATA_HOME,
+# so the content check and failure-artifact upload read the same file.
 unset AFT_E2E_PLUGIN_LOG
 
 bash "$REPO_ROOT/tests/docker/test-e2e.sh"
