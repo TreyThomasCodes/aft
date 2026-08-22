@@ -17,6 +17,10 @@ type StatusListener = (snapshot: Record<string, unknown>) => void;
 
 type PoolFactory = () => Promise<AftTransportPool>;
 
+/** After a failed terminal-pool revival, wait before retrying so repeated traffic cannot immediately start another connection attempt. */
+const REVIVAL_RETRY_FLOOR_MS = 100;
+const REVIVAL_RETRY_CAP_MS = 2_000;
+
 /**
  * Owns one terminal transport instance and replaces it when new demand arrives
  * after the host has shut it down. The replaced instance is never reused: its
@@ -25,6 +29,8 @@ type PoolFactory = () => Promise<AftTransportPool>;
 export class RevivableTransportPool implements AftTransportPool {
   private activePool: AftTransportPool;
   private revival: Promise<AftTransportPool> | null = null;
+  private revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
+  private revivalRetryNotBefore = 0;
   private readonly transports = new Map<string, RevivableProjectTransport>();
   private readonly configureOverrides = new Map<string, unknown>();
   private editSlotSurvivesCaptured = false;
@@ -135,25 +141,49 @@ export class RevivableTransportPool implements AftTransportPool {
     if (!this.activePool.isShutdown()) return this.activePool;
     if (this.revival) return this.revival;
 
+    const delay = Math.max(0, this.revivalRetryNotBefore - Date.now());
+    if (delay > 0) {
+      let scheduled!: Promise<AftTransportPool>;
+      scheduled = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+        if (this.revival === scheduled) this.revival = null;
+        return this.ensureActivePool();
+      });
+      this.revival = scheduled;
+      void scheduled.then(
+        () => undefined,
+        () => undefined,
+      );
+      return scheduled;
+    }
+
     warn(
       "transport was shut down but new demand arrived — reviving (host quit hook fired without process exit?)",
     );
-    const revival = this.createPool().then((pool) => {
-      for (const [key, value] of this.configureOverrides) {
-        pool.setConfigureOverride(key, value);
-      }
-      this.activePool = pool;
-      for (const [root, transport] of this.transports) {
-        transport.refreshStatusSubscription(pool.getActiveBridgeForRoot(root));
-      }
-      return pool;
-    });
+    const revival = Promise.resolve()
+      .then(() => this.createPool())
+      .then((pool) => {
+        for (const [key, value] of this.configureOverrides) {
+          pool.setConfigureOverride(key, value);
+        }
+        this.activePool = pool;
+        this.revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
+        this.revivalRetryNotBefore = 0;
+        for (const [root, transport] of this.transports) {
+          transport.refreshStatusSubscription(pool.getActiveBridgeForRoot(root));
+        }
+        return pool;
+      });
     this.revival = revival;
     revival.then(
       () => {
         if (this.revival === revival) this.revival = null;
       },
       () => {
+        // A terminal pool is parked after a failed revival. Concurrent and newly
+        // arriving calls share the one delayed retry instead of recursively
+        // starting connections or registering fresh listeners on every call.
+        this.revivalRetryNotBefore = Date.now() + this.revivalRetryDelayMs;
+        this.revivalRetryDelayMs = Math.min(this.revivalRetryDelayMs * 2, REVIVAL_RETRY_CAP_MS);
         if (this.revival === revival) this.revival = null;
       },
     );

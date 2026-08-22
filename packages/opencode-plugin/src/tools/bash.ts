@@ -289,6 +289,11 @@ export function createBashTool(
     ...ptyArgs,
   };
 
+  // This state is deliberately local to one registered tool. Every command still
+  // probes the module first; it only records whether the previous command used the
+  // host path so the first successful module call clears fallback mode immediately.
+  let hostFallbackActive = false;
+
   return {
     description: bashToolDescription(false, initialBashCfg.compress, initialBashCfg.background),
     args: args as ToolDefinition["args"],
@@ -448,6 +453,7 @@ export function createBashTool(
           env: shellEnv?.env,
         });
         usedHostFallback = true;
+        hostFallbackActive = true;
       } finally {
         removeAbortListener();
       }
@@ -455,6 +461,9 @@ export function createBashTool(
       if (data.success === false) {
         throw new Error((data.message as string) || "bash failed");
       }
+      // The normal dispatch above is the foreground recovery probe. A successful
+      // response means this command used the module, so do not retain its fallback banner.
+      if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const uiTitle = description ?? shortenCommand(command);
       if (data.status === "running" && typeof data.task_id === "string") {

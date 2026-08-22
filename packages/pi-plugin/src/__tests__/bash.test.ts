@@ -874,15 +874,18 @@ describe("bash tool adapter", () => {
     expect(confirmations).toHaveLength(0);
   });
 
-  test("transport-dead fallback confirms once then captures real host output", async () => {
+  test("transport-dead fallback recovers on the next successful module call", async () => {
     const tools = new Map<string, MockToolDef>();
     const command =
       process.platform === "win32"
         ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('pi-fallback')"`
         : "printf pi-fallback";
+    let attempts = 0;
     const bridge = {
       send: async () => {
-        throw new BridgeTransportUnavailableError("bridge spawn failed");
+        attempts += 1;
+        if (attempts === 1) throw new BridgeTransportUnavailableError("bridge spawn failed");
+        return { success: true, output: "module-recovered", exit_code: 0, truncated: false };
       },
     } as unknown as BinaryBridge;
     registerBashTool(
@@ -902,10 +905,21 @@ describe("bash tool adapter", () => {
       },
     });
     const output = toolText(result);
+    const recovered = toolText(
+      await tools
+        .get("bash")!
+        .execute("recovery-call", { command: "printf module-recovered" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+        }),
+    );
 
     expect(output).toStartWith(`${BASH_HOST_FALLBACK_BANNER}\n`);
     expect(output).toContain("pi-fallback");
     expect(output).toEndWith("[exit code: 0]");
+    expect(recovered).toBe("module-recovered");
+    expect(recovered).not.toContain(BASH_HOST_FALLBACK_BANNER);
+    expect(attempts).toBe(2);
     expect(confirmations).toEqual([
       {
         title: "AFT unavailable — run command on host?",

@@ -390,15 +390,18 @@ describe("OpenCode bash adapter", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
-  test("transport-dead fallback asks exactly once then captures real host output", async () => {
+  test("transport-dead fallback recovers on the next successful module call", async () => {
     const ask = mockAsk();
     const command =
       process.platform === "win32"
         ? `${JSON.stringify(process.execPath)} -e "process.stdout.write('opencode-fallback')"`
         : "printf opencode-fallback";
+    let attempts = 0;
     const { tool: bash } = createHarness(
       () => {
-        throw new BridgeTransportUnavailableError("bridge spawn failed");
+        attempts += 1;
+        if (attempts === 1) throw new BridgeTransportUnavailableError("bridge spawn failed");
+        return { success: true, output: "module-recovered", exit_code: 0, truncated: false };
       },
       undefined,
       false,
@@ -406,10 +409,16 @@ describe("OpenCode bash adapter", () => {
     );
 
     const output = bashText(await bash.execute({ command }, createMockSdkContext({ ask })));
+    const recovered = bashText(
+      await bash.execute({ command: "printf module-recovered" }, createMockSdkContext({ ask })),
+    );
 
     expect(output).toStartWith(`${BASH_HOST_FALLBACK_BANNER}\n`);
     expect(output).toContain("opencode-fallback");
     expect(output).toEndWith("[exit code: 0]");
+    expect(recovered).toBe("module-recovered");
+    expect(recovered).not.toContain(BASH_HOST_FALLBACK_BANNER);
+    expect(attempts).toBe(2);
     expect(ask).toHaveBeenCalledTimes(1);
     expect(ask.mock.calls[0][0]).toEqual({
       permission: "bash",

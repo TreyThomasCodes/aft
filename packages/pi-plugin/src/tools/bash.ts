@@ -432,6 +432,9 @@ export function registerBashTool(
     ? "use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead"
     : "use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead";
   const bashCfg = resolveBashConfig(ctx.config);
+  // Every command probes the module before fallback. Retain only enough state to
+  // clear fallback mode after the first successful module response.
+  let hostFallbackActive = false;
   const compressionSentence = bashCfg.compress
     ? " Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`."
     : "";
@@ -598,11 +601,16 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
           env: spawnContext.env,
         });
         usedHostFallback = true;
+        hostFallbackActive = true;
       }
 
       if (response.success === false) {
         throw new Error((response.message as string | undefined) ?? "bash failed");
       }
+
+      // The normal dispatch above is the foreground recovery probe. Once it
+      // succeeds, later results must render without the host-fallback banner.
+      if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {

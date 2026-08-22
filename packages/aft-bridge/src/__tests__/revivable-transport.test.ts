@@ -151,6 +151,34 @@ describe("RevivableTransportPool", () => {
     ]);
   });
 
+  test("parks failed revival attempts so concurrent terminal calls cannot hot-spin", async () => {
+    const initialClient = new FakeClient();
+    let attempts = 0;
+    const owner = new RevivableTransportPool(makeSubcPool(initialClient), () => {
+      attempts += 1;
+      throw new Error("subc unavailable");
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+
+    await owner.shutdown();
+    await Promise.all(
+      Array.from({ length: 20 }, () =>
+        transport.toolCall("session", "read", {}).catch(() => undefined),
+      ),
+    );
+    expect(attempts).toBe(1);
+
+    // The failed terminal pool has no immediate retry work. Many arrivals share
+    // one delayed retry instead of each recursively starting a fresh connection.
+    const queued = Array.from({ length: 20 }, () =>
+      transport.toolCall("session", "read", {}).catch(() => undefined),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(attempts).toBe(1);
+    await Promise.all(queued);
+    expect(attempts).toBe(2);
+  });
+
   test("logs the host-quit revival diagnosis", async () => {
     const messages: string[] = [];
     setActiveLogger({
