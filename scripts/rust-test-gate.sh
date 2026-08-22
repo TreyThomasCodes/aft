@@ -21,6 +21,7 @@ fi
 
 
 runner="${AFT_RUST_TEST_RUNNER:-nextest}"
+unit_runner="${AFT_UNIT_TEST_RUNNER:-cargo}"
 
 if [[ "$runner" == "cargo" ]]; then
   exec cargo test --workspace --quiet
@@ -28,6 +29,10 @@ fi
 
 if [[ "$runner" != "nextest" ]]; then
   echo "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')" >&2
+  exit 2
+fi
+if [[ "$unit_runner" != "cargo" && "$unit_runner" != "nextest" ]]; then
+  echo "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')" >&2
   exit 2
 fi
 
@@ -59,6 +64,10 @@ extract_nextest_archive_for_prewarm() {
 # `cargo test --workspace -- --list` currently reports zero doctests for both
 # workspace crates (`aft` and `aft_tokenizer`), so the split gate omits
 # `cargo test --workspace --doc` until doctests actually exist.
+#
+# A CI lane can set AFT_UNIT_TEST_RUNNER=nextest so a nonterminating unit test
+# is named and killed by the unit profile instead of leaving one silent libtest
+# process until the surrounding job times out.
 #
 # CI can split the independent execution phases after one job creates a nextest
 # archive. The default remains `all`, preserving the single-machine gate used
@@ -97,8 +106,15 @@ if phase_enabled lib; then
   run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
     cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
 
-  run_phase "cargo test --workspace --lib --bins --quiet" \
-    cargo test --workspace --lib --bins --quiet -- --skip platform_verifier_tls_client_subprocess
+  if [[ "$unit_runner" == "nextest" ]]; then
+    run_phase "cargo nextest run --workspace --lib --bins --profile unit" \
+      cargo nextest run --workspace --lib --bins --profile unit -- \
+        --skip platform_verifier_tls_client_subprocess
+  else
+    run_phase "cargo test --workspace --lib --bins --quiet" \
+      cargo test --workspace --lib --bins --quiet -- \
+        --skip platform_verifier_tls_client_subprocess
+  fi
 fi
 
 # macOS: the first exec of a freshly-linked binary is expensive, and it is NOT

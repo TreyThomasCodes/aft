@@ -62,6 +62,11 @@ on:
         description: "Git ref to test (branch name, tag, or commit SHA)"
         required: false
         type: string
+      macos_lib_hang_probe:
+        description: "Run only the fixed macOS Rust unit harness"
+        required: false
+        type: boolean
+        default: false
 
 # Cancel in-flight runs for the same PR/branch when a new commit arrives.
 # Saves CI minutes and surfaces the latest result faster.
@@ -70,6 +75,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  macos-lib-hang-probe:
+    if: ${{ inputs.macos_lib_hang_probe }}
+    name: macOS fixed Rust unit probe
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-macos
+          cache-bin: false
+          cache-on-failure: true
+      - name: Run timeout-aware unit targets
+        run: ./scripts/rust-test-gate.sh
+        env:
+          AFT_GATE_PHASES: lib
+          AFT_UNIT_TEST_RUNNER: nextest
+          NEXTEST_TEST_THREADS: num-cpus
+          AFT_TEST_DIAG: "1"
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+
   # ---------------------------------------------------------------------------
   # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
   # Defined as a reusable workflow so release.yml shares the exact same
@@ -77,6 +108,7 @@ jobs:
   # and macOS still block. See `_unit-suite.yml` for details.
   # ---------------------------------------------------------------------------
   unit:
+    if: ${{ !inputs.macos_lib_hang_probe }}
     name: Unit
     uses: ./.github/workflows/_unit-suite.yml
     # Called workflows do not see the caller's secrets by default; the
@@ -101,6 +133,7 @@ jobs:
   # fat-LTO binary shape is still e2e-tested before publishing.
   # ---------------------------------------------------------------------------
   e2e:
+    if: ${{ !inputs.macos_lib_hang_probe }}
     name: E2E
     uses: ./.github/workflows/_e2e-suite.yml
     with:

@@ -36,3 +36,10 @@ test-group = 'subc'
 [[profile.default.overrides]]
 filter = 'test(/^subc_storm_test::/)'
 test-group = 'storm'
+
+# Unit targets need a hard per-test bound because they previously ran as one
+# libtest process: one nonterminating worker hid the test name until CI killed
+# the entire job. Four status periods retain useful slow-test diagnostics while
+# capping any one test at two minutes.
+[profile.unit]
+slow-timeout = { period = "30s", terminate-after = 4 }
