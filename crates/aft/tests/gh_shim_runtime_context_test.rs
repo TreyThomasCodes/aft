@@ -112,13 +112,62 @@ fn write_project_repo(root: &Path) -> PathBuf {
 fn write_upstream_gh(bin: &Path) {
     let gh = bin.join("gh");
     fs::create_dir_all(bin).expect("create fake upstream bin directory");
-    fs::write(&gh, "#!/bin/sh\nprintf 'r2-passthrough\\n'\nexit 73\n")
-        .expect("write fake upstream gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nprintf 'r2-passthrough\\n'\nexit 73\n",
+    )
+    .expect("write fake upstream gh");
     let mut permissions = fs::metadata(&gh)
         .expect("read fake upstream gh metadata")
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&gh, permissions).expect("make fake upstream gh executable");
+}
+
+fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option<bool>) {
+    let config_dir = config_home.join("cortexkit");
+    fs::create_dir_all(&config_dir).expect("create user config directory");
+    let mut config = json!({
+        "subc": { "connection_file": connection_file },
+    });
+    if let Some(enabled) = enabled {
+        config["gh_shim"] = json!({ "enabled": enabled });
+    }
+    fs::write(
+        config_dir.join("aft.jsonc"),
+        serde_json::to_vec_pretty(&config).expect("serialize user config"),
+    )
+    .expect("write user config");
+}
+
+fn shim_command(
+    args: &[&str],
+    project: &Path,
+    config_home: &Path,
+    state_home: &Path,
+    home: &Path,
+    upstream_bin: &Path,
+    recorder: &Path,
+) -> Command {
+    let inherited_path = std::env::var_os("PATH").expect("test PATH");
+    let path = std::env::join_paths(
+        std::iter::once(upstream_bin.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("build test PATH");
+    let mut shim = Command::new(aft_binary());
+    shim.arg("gh-shim")
+        .args(args)
+        .current_dir(project)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", state_home)
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("GH_SHIM_TEST_RECORD", recorder)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GH_SHIM_BYPASS");
+    shim
 }
 
 #[test]
@@ -130,36 +179,22 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
     let project = write_project_repo(temp.path());
     let connection_file = write_dead_connection_file(temp.path());
     let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
     write_upstream_gh(&upstream_bin);
     write_fresh_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
 
-    let config_dir = config_home.join("cortexkit");
-    fs::create_dir_all(&config_dir).expect("create user config directory");
-    fs::write(
-        config_dir.join("aft.jsonc"),
-        format!(
-            "{{\n  \"subc\": {{ \"connection_file\": \"{}\" }}\n}}\n",
-            connection_file.display()
-        ),
+    let output = shim_command(
+        &["issue", "list"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
     )
-    .expect("write user config");
-
-    let inherited_path = std::env::var_os("PATH").expect("test PATH");
-    let path = std::env::join_paths(
-        std::iter::once(upstream_bin.clone()).chain(std::env::split_paths(&inherited_path)),
-    )
-    .expect("build test PATH");
-    let mut shim = Command::new(aft_binary());
-    shim.args(["gh-shim", "issue", "list"])
-        .current_dir(&project)
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_STATE_HOME", &state_home)
-        .env("HOME", &home)
-        .env("PATH", path)
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_ENTERPRISE_TOKEN");
-    let output = shim.output().expect("spawn gh shim");
+    .output()
+    .expect("spawn gh shim");
 
     assert_eq!(
         output.status.code(),
@@ -178,15 +213,22 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let status = Command::new(aft_binary())
-        .args(["gh-shim", "--status"])
-        .current_dir(&project)
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("XDG_STATE_HOME", &state_home)
-        .env("HOME", &home)
-        .env("PATH", &upstream_bin)
-        .output()
-        .expect("spawn gh shim status");
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read upstream invocation record"),
+        "issue list\n"
+    );
+
+    let status = shim_command(
+        &["--status"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim status");
     assert!(
         status.status.success(),
         "status should read the recorded rung: {}",
@@ -197,5 +239,151 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
     assert_eq!(
         report["last_rung"]["determination_inputs"]["daemon_unreachable"],
         "failed"
+    );
+}
+
+#[test]
+fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
+
+    let expected_stderr = "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n";
+    for args in [
+        &["issue", "comment", "42", "--body", "hello"][..],
+        &["pr", "merge", "42"][..],
+    ] {
+        let output = shim_command(
+            args,
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn governed gh shim invocation");
+        assert_eq!(output.status.code(), Some(86));
+        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&output.stderr), expected_stderr);
+        assert!(
+            !recorder.exists(),
+            "governed and admin actions must not reach upstream gh"
+        );
+    }
+
+    let status = shim_command(
+        &["--status"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim status");
+    assert!(status.status.success());
+    let report: Value = serde_json::from_slice(&status.stdout).expect("parse gh shim status JSON");
+    assert_eq!(
+        report["last_seam_refusal"]["code"],
+        "gh_shim_governance_unavailable"
+    );
+
+    let mechanical = shim_command(
+        &["issue", "view", "42"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn mechanical gh shim invocation");
+    assert_eq!(mechanical.status.code(), Some(73));
+    assert_eq!(
+        String::from_utf8_lossy(&mechanical.stdout),
+        "r2-passthrough\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read upstream invocation record"),
+        "issue view 42\n"
+    );
+}
+
+#[test]
+fn gh_shim_without_manifest_keeps_unreachable_daemon_passthrough() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_user_config(&config_home, &connection_file, None);
+
+    let output = shim_command(
+        &["issue", "comment", "42", "--body", "hello"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn dormant gh shim invocation");
+    assert_eq!(output.status.code(), Some(73));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read upstream invocation record"),
+        "issue comment 42 --body hello\n"
+    );
+}
+
+#[test]
+fn gh_shim_disabled_by_config_overrides_governance_stickiness() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, Some(false));
+
+    let output = shim_command(
+        &["issue", "comment", "42", "--body", "hello"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn disabled gh shim invocation");
+    assert_eq!(output.status.code(), Some(73));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read upstream invocation record"),
+        "issue comment 42 --body hello\n"
     );
 }

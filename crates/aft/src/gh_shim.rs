@@ -45,6 +45,7 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
+const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
 /// callers must parse these identifiers rather than human prose.
@@ -59,12 +60,13 @@ pub enum RefusalCode {
     UnboundIdentity,
     BypassAuditUnavailable,
     NoRealGh,
+    GovernanceUnavailable,
     SeamUnavailable,
     SeamRefusal,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestStale,
@@ -74,6 +76,7 @@ impl RefusalCode {
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
         Self::NoRealGh,
+        Self::GovernanceUnavailable,
         Self::SeamUnavailable,
         Self::SeamRefusal,
     ];
@@ -89,6 +92,7 @@ impl RefusalCode {
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
             Self::NoRealGh => "gh_shim_no_real_gh",
+            Self::GovernanceUnavailable => "gh_shim_governance_unavailable",
             Self::SeamUnavailable => "gh_shim_seam_unavailable",
             Self::SeamRefusal => "gh_shim_seam_refusal",
         }
@@ -231,6 +235,11 @@ fn run(args: &[OsString]) -> i32 {
 
     let determination = determine_rung(&paths, &cwd, now);
     if determination.rung != Rung::R3 {
+        if let Some(agent_binding) =
+            sticky_governance_binding(&paths, &cwd, now, &determination, args, current_platform())
+        {
+            return refuse_governance_unavailable(&paths, &agent_binding, now);
+        }
         return delegate(args);
     }
 
@@ -286,13 +295,8 @@ fn run(args: &[OsString]) -> i32 {
                         )
                     }
                 };
-            governed_outcome_status(route_governed(
-                &paths,
-                &determination,
-                &agent_binding,
-                request,
-                now,
-            ))
+            let outcome = route_governed(&paths, &determination, &agent_binding, request, now);
+            governed_outcome_status(&paths, &agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
@@ -304,7 +308,12 @@ fn run(args: &[OsString]) -> i32 {
     }
 }
 
-fn governed_outcome_status(outcome: RouteOutcome) -> i32 {
+fn governed_outcome_status(
+    paths: &StatePaths,
+    agent_binding: &AgentBinding,
+    now: u64,
+    outcome: RouteOutcome,
+) -> i32 {
     match outcome {
         RouteOutcome::Result(output) => {
             print!("{output}");
@@ -316,6 +325,9 @@ fn governed_outcome_status(outcome: RouteOutcome) -> i32 {
             "the project binding was unavailable at route time",
         ),
         RouteOutcome::SchemaMismatch(message) => refuse(RefusalCode::SeamSchemaMismatch, &message),
+        RouteOutcome::GovernanceUnavailable => {
+            refuse_governance_unavailable(paths, agent_binding, now)
+        }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
     }
 }
@@ -426,6 +438,45 @@ impl RungRecord {
     fn fresh_at(&self, now: u64) -> bool {
         now.saturating_sub(self.as_of_unix_secs) < DISCOVERY_CACHE_TTL.as_secs()
     }
+
+    fn governance_infrastructure_unavailable(&self) -> bool {
+        matches!(
+            self.inputs.get("connection_file").map(String::as_str),
+            Some("unreachable" | "discovery_budget_exhausted")
+        ) || self.inputs.get("daemon_unreachable").map(String::as_str) == Some("failed")
+            || self
+                .inputs
+                .get("catalog_gh_route_absent")
+                .map(String::as_str)
+                == Some("failed")
+    }
+}
+
+fn sticky_governance_binding(
+    paths: &StatePaths,
+    cwd: &Path,
+    now: u64,
+    determination: &RungRecord,
+    args: &[OsString],
+    platform: &str,
+) -> Option<AgentBinding> {
+    if !determination.governance_infrastructure_unavailable() {
+        return None;
+    }
+    let manifest = match resolve_manifest(paths, now) {
+        ManifestResolution::Active(manifest) | ManifestResolution::GraceCache(manifest) => manifest,
+        ManifestResolution::Regressed(_) | ManifestResolution::Dormant => return None,
+    };
+    let agent_binding = resolved_agent_binding(&manifest, cwd)?;
+
+    // A known binding makes declared writes sticky: a transient routing failure
+    // must not send an identity-governed action to upstream ambient credentials.
+    // Mechanical reads remain passthrough because they neither write nor assert
+    // the governed identity.
+    match classify(args, &manifest, platform) {
+        Classification::Governed { .. } | Classification::Admin { .. } => Some(agent_binding),
+        Classification::Mechanical | Classification::Unclassified => None,
+    }
 }
 
 fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
@@ -456,12 +507,13 @@ fn determine_rung_from_doc(
         return RungRecord::r1(now, "disabled_by_config");
     }
 
-    let Some(connection_file) =
-        connection_file_from_config_doc(config_doc.unwrap_or("")).filter(|path| path.is_file())
-    else {
+    let Some(connection_file) = connection_file_from_config_doc(config_doc.unwrap_or("")) else {
         // R1 has no daemon dial and no durable determination write.
         return RungRecord::r1(now, "absent_or_unparseable");
     };
+    if !connection_file.is_file() {
+        return RungRecord::r1(now, "unreachable");
+    }
 
     let cached = load_rung_record(paths);
     if std::time::Instant::now() >= deadline {
@@ -554,8 +606,8 @@ fn configured_connection_file_from(
     // The shim uses the same user-tier resolver as subc: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`,
     // then `~/.config/cortexkit/aft.jsonc`. XDG selects only the trusted user's
     // config location; it cannot select a project file or alter the configured
-    // connection. If that path is invalid, resolution falls back to the lower-priority
-    // R1 route instead of allowing a routing bypass.
+    // connection. An invalid path resolves to `None`; the caller decides whether
+    // that means structural passthrough or an unavailable governed route.
     let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
@@ -1815,6 +1867,7 @@ enum RouteOutcome {
     Refusal(String),
     UnboundIdentity,
     SchemaMismatch(String),
+    GovernanceUnavailable,
     Unavailable(String),
 }
 
@@ -1843,9 +1896,7 @@ fn route_governed(
     }
 
     let Some(connection_file) = configured_connection_file() else {
-        return RouteOutcome::Unavailable(
-            "the governance connection file is no longer available".to_string(),
-        );
+        return RouteOutcome::GovernanceUnavailable;
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_root = project_root_for(&cwd);
@@ -1867,16 +1918,16 @@ fn route_governed(
             };
             let consumer = SubcConsumer::connect(&connection_file, options)
                 .await
-                .map_err(|error| RouteOutcome::Unavailable(error.to_string()))?;
+                .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
             let catalog = consumer
                 .catalog_list()
                 .await
-                .map_err(|error| RouteOutcome::Unavailable(error.to_string()))?;
+                .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
             let holder = route_holder(&catalog.modules);
             record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
-            let module_id = holder.module_id.ok_or_else(|| {
-                RouteOutcome::Unavailable("no holder advertises gh.route".to_string())
-            })?;
+            let module_id = holder
+                .module_id
+                .ok_or(RouteOutcome::GovernanceUnavailable)?;
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface {
@@ -1936,6 +1987,31 @@ fn route_governed(
             Ok(outcome)
         })
         .unwrap_or_else(|outcome| outcome)
+}
+
+fn refuse_governance_unavailable(
+    paths: &StatePaths,
+    agent_binding: &AgentBinding,
+    now: u64,
+) -> i32 {
+    let state = SeamState {
+        bound_holder: None,
+        agent_binding: Some(agent_binding.clone()),
+        last_seam_refusal: Some(LastSeamRefusal {
+            code: RefusalCode::GovernanceUnavailable.as_str().to_string(),
+            at_unix_secs: now,
+        }),
+    };
+    if let Err(error) = write_seam_state(paths, state) {
+        return refuse(
+            RefusalCode::SeamUnavailable,
+            &format!("governed self-report update failed: {error}"),
+        );
+    }
+    refuse(
+        RefusalCode::GovernanceUnavailable,
+        GOVERNANCE_UNAVAILABLE_TEXT,
+    )
 }
 
 fn governed_seam_state(
@@ -2746,6 +2822,29 @@ mod tests {
     }
 
     #[test]
+    fn configured_but_unreachable_connection_file_is_distinct_from_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let connection_file = directory.path().join("missing-connection.json");
+        let doc = serde_json::json!({
+            "subc": { "connection_file": connection_file }
+        })
+        .to_string();
+        let record = determine_rung_from_doc(
+            &paths,
+            Path::new("/cwd"),
+            1,
+            std::time::Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(
+            record.inputs.get("connection_file").map(String::as_str),
+            Some("unreachable")
+        );
+    }
+
+    #[test]
     fn enabled_default_keeps_structural_rungs() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
@@ -3084,6 +3183,22 @@ mod tests {
         assert!(!paths.root.join("r1-cache.json").exists());
     }
 
+    #[test]
+    fn governance_unavailable_is_per_determination_and_does_not_latch_r3() {
+        assert!(RungRecord::r1(1, "unreachable").governance_infrastructure_unavailable());
+        assert!(
+            RungRecord::r1(1, "discovery_budget_exhausted").governance_infrastructure_unavailable()
+        );
+        assert!(
+            RungRecord::r2(1, "daemon_unreachable", None).governance_infrastructure_unavailable()
+        );
+        assert!(RungRecord::r2(1, "catalog_gh_route_absent", None)
+            .governance_infrastructure_unavailable());
+        assert!(!RungRecord::r2(1, "agent_credentials_present", Some(1))
+            .governance_infrastructure_unavailable());
+        assert!(!RungRecord::r3(2, 1).governance_infrastructure_unavailable());
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolved_image_identity_skips_a_shim_reached_through_a_symlinked_parent() {
@@ -3115,10 +3230,18 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 11);
+        assert_eq!(RefusalCode::ALL.len(), 12);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
+        assert_eq!(
+            RefusalCode::GovernanceUnavailable.as_str(),
+            "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            GOVERNANCE_UNAVAILABLE_TEXT,
+            "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns"
+        );
         assert_eq!(SelfReportDiagnostic::ALL.len(), 7);
         assert!(SelfReportDiagnostic::ALL
             .iter()
