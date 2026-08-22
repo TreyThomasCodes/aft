@@ -420,6 +420,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       backups: dirSize(join(storage, "backups")),
       url_cache: dirSize(join(storage, "url_cache")),
       onnxruntime: dirSize(join(storage, "onnxruntime")),
+      logs: dirSize(join(storage, "logs")),
     };
   }
 }

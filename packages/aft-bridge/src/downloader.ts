@@ -339,35 +339,57 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   }
 }
 
+/** In-process single-flight for plugin startup and first-tool-call resolution. */
+const ensureBinaryInFlight = new Map<string, Promise<string | null>>();
+
+function ensureBinaryKey(version?: string): string {
+  if (!version) return "latest";
+  return version.startsWith("v") ? version : `v${version}`;
+}
+
 /**
  * Ensure the AFT binary is available: check cache, then download if needed.
- * This is the main entry point called by the resolver.
+ * This is the main entry point called by the resolver and by plugin startup
+ * warmups. Sharing the promise keeps those two paths on one download while the
+ * filesystem lock still coordinates separate host processes.
  *
  * @param version - Git tag (e.g. `"v0.25.1"` or `"0.25.1"` — both accepted).
  *   Normalized to a `v`-prefixed tag internally so the on-disk cache layout
  *   stays consistent regardless of caller convention.
  */
 export async function ensureBinary(version?: string): Promise<string | null> {
-  if (version) {
-    // Normalize tag for cache lookup so a caller passing the bare version
-    // (e.g. `"0.25.1"`) finds the same cache entry that `downloadBinary`
-    // and `findBinarySync` write to (`~/.cache/aft/bin/v0.25.1/aft`).
-    const tag = version.startsWith("v") ? version : `v${version}`;
+  const key = ensureBinaryKey(version);
+  const existing = ensureBinaryInFlight.get(key);
+  if (existing) return existing;
 
-    // When a specific version is requested, ONLY check the versioned cache.
-    // Do NOT fall back to legacy flat cache — it may contain a different version,
-    // causing an infinite spawn-check-replace loop.
-    const versionCached = getCachedBinaryPath(tag);
-    if (versionCached && isExpectedCachedBinary(versionCached, tag)) {
-      log(`Found cached binary for ${tag}: ${versionCached}`);
-      return versionCached;
+  const task = (async () => {
+    if (version) {
+      // Normalize tag for cache lookup so a caller passing the bare version
+      // (e.g. "0.25.1") finds the same cache entry that `downloadBinary`
+      // and `findBinarySync` write to (`~/.cache/aft/bin/v0.25.1/aft`).
+      const tag = ensureBinaryKey(version);
+
+      // When a specific version is requested, ONLY check the versioned cache.
+      // Do NOT fall back to legacy flat cache — it may contain a different version,
+      // causing an infinite spawn-check-replace loop.
+      const versionCached = getCachedBinaryPath(tag);
+      if (versionCached && isExpectedCachedBinary(versionCached, tag)) {
+        log(`Found cached binary for ${tag}: ${versionCached}`);
+        return versionCached;
+      }
+      log(`No cached binary for ${tag}, downloading...`);
+      return downloadBinary(tag);
     }
-    log(`No cached binary for ${tag}, downloading...`);
-    return downloadBinary(tag);
+    // No version requested — download latest.
+    log("No cached binary found, downloading latest...");
+    return downloadBinary();
+  })();
+  ensureBinaryInFlight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (ensureBinaryInFlight.get(key) === task) ensureBinaryInFlight.delete(key);
   }
-  // No version requested — download latest.
-  log("No cached binary found, downloading latest...");
-  return downloadBinary();
 }
 
 type DownloadLockTiming = {

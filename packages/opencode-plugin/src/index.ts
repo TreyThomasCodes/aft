@@ -5,6 +5,7 @@ import {
   ensureOnnxRuntime,
   ensureStorageMigrated,
   findBinary,
+  findBinarySync,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
   markAnnouncementSeen,
@@ -273,7 +274,24 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     return { tool: {} };
   }
 
-  const binaryPath = await findBinary(PLUGIN_VERSION);
+  // Probe synchronously so a missing or mismatched cache entry can start its
+  // download before the rest of plugin startup does any work. The resolver and
+  // first-tool-call path share ensureBinary's in-process promise; its filesystem
+  // lock also coordinates a second OpenCode process without duplicate fetches.
+  const cachedBinaryPath = findBinarySync(PLUGIN_VERSION);
+  if (!cachedBinaryPath) {
+    void ensureBinary(PLUGIN_VERSION).then(
+      (path) => {
+        if (path) log(`Background binary warmup ready at ${path}`);
+      },
+      (err) => {
+        warn(
+          `Background binary warmup failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      },
+    );
+  }
+  const binaryPath = cachedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
 
   await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
   const autoUpdateAbort = new AbortController();

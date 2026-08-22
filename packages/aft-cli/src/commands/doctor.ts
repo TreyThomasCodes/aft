@@ -25,6 +25,7 @@ import {
 } from "../lib/build-breaker.js";
 import { CLI } from "../lib/cli.js";
 import {
+  collectDiagnosticIssues,
   collectDiagnostics,
   type DiagnosticReport,
   findPluginCliVersionSkews,
@@ -131,9 +132,16 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       (h) => h.pluginRegistered && h.aftConfig.enabled,
     );
     const hasRegisteredHarness = report.harnesses.some((h) => h.pluginRegistered);
-    if (hasEnabledRegisteredHarness) {
+    const binaryIssue = collectDiagnosticIssues(report).find(
+      (issue) => issue.code === "binary_missing",
+    );
+    if (hasEnabledRegisteredHarness && binaryIssue?.severity === "info") {
+      log.info(
+        `  no matching aft binary detected — it will self-install when the next AFT-enabled session starts (or run \`${CLI} doctor --fix\`)`,
+      );
+    } else if (hasEnabledRegisteredHarness) {
       log.warn(
-        `  no matching aft binary detected — run \`${CLI} doctor --fix\` to download, or it will install automatically when an AFT-enabled session makes its first tool call`,
+        `  no matching aft binary detected — run \`${CLI} doctor --fix\` to download, or start an AFT-enabled session to trigger plugin-side install`,
       );
     } else if (hasRegisteredHarness) {
       log.info(
@@ -251,7 +259,7 @@ export function hasDoctorProblems(report: DiagnosticReport): boolean {
   // @cortexkit/aft doctor` previously printed "AFT binary unknown" + "Binary
   // cache: 0 versions" and then "Everything looks good." at the bottom.
   return (
-    formatDiagnosticIssuesSection(report).length > 0 ||
+    collectDiagnosticIssues(report).some((issue) => issue.severity !== "info") ||
     (report.buildBreakerSuspensions?.length ?? 0) > 0
   );
 }
@@ -854,6 +862,8 @@ function logDoctorIssues(report: DiagnosticReport): void {
     const remediation = lines[i + 1];
     if (issue.startsWith("[HIGH]")) {
       log.error(issue);
+    } else if (issue.startsWith("[INFO]")) {
+      log.info(issue);
     } else {
       log.warn(issue);
     }
@@ -1007,10 +1017,14 @@ function describeAdapterInstallHint(kind: string): string {
 }
 
 function formatStorageSizes(sizes: Record<string, number>): string {
-  const parts = Object.entries(sizes)
-    .filter(([, size]) => size > 0)
+  const projectParts = Object.entries(sizes)
+    .filter(([key, size]) => key !== "logs" && size > 0)
     .map(([key, size]) => `${key}: ${formatBytes(size)}`);
-  return parts.length > 0 ? parts.join(", ") : "empty";
+  const logsSize = sizes.logs ?? 0;
+  const parts = [...projectParts];
+  if (logsSize > 0) parts.push(`logs: ${formatBytes(logsSize)}`);
+  if (projectParts.length > 0) return parts.join(", ");
+  return logsSize > 0 ? `${parts[0]}; no project data yet` : "empty";
 }
 
 function formatLegacyDuplication(

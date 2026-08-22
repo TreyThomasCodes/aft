@@ -37,6 +37,7 @@ import {
   ensureOnnxRuntime,
   ensureStorageMigrated,
   findBinary,
+  findBinarySync,
   formatDroppedKeyWarnings,
   getManualInstallHint,
   isHomeDirectoryRoot,
@@ -374,11 +375,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
 
+  // Probe synchronously so a missing or mismatched cache entry can start its
+  // download before the rest of plugin startup does any work. The resolver and
+  // first-tool-call path share ensureBinary's in-process promise; its filesystem
+  // lock also coordinates a second Pi/OpenCode process without duplicate fetches.
+  const cachedBinaryPath = findBinarySync(PLUGIN_VERSION);
+  if (!cachedBinaryPath) {
+    void ensureBinary(PLUGIN_VERSION).then(
+      (path) => {
+        if (path) log(`Background binary warmup ready at ${path}`);
+      },
+      (err) => {
+        warn(
+          `Background binary warmup failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      },
+    );
+  }
+
   // Resolve the AFT binary. On first run this downloads the platform binary to
   // ~/.cache/aft/bin/vX.Y.Z/aft; failures are reported through Pi's plugin loader.
   let binaryPath: string;
   try {
-    binaryPath = await findBinary(PLUGIN_VERSION);
+    binaryPath = cachedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
   } catch (err) {
     warn(
       `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +

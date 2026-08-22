@@ -356,6 +356,25 @@ describe("doctor problem assessment", () => {
     expect(hasDoctorProblems(report)).toBe(true);
   });
 
+  test("matching registered plugin makes a missing binary informational", () => {
+    const report = {
+      ...makeReport(
+        makeHarness({
+          pluginRegistered: true,
+          pluginCache: {
+            path: "/tmp/aft-test/plugin-cache/package.json",
+            exists: true,
+            cached: "0.0.0-test",
+          },
+        }),
+      ),
+      binaryVersion: null,
+    };
+
+    expect(hasDoctorProblems(report)).toBe(false);
+    expect(formatDiagnosticIssuesSection(report).join("\n")).toContain("[INFO] AFT binary");
+  });
+
   test("disabled registered harness is surfaced without treating the missing binary as broken", () => {
     const report = {
       ...makeReport(

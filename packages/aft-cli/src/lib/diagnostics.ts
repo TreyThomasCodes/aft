@@ -46,7 +46,7 @@ export interface DiagnosticReport {
   buildBreakerSuspensions?: BuildBreakerSuspension[];
 }
 
-export type DiagnosticIssueSeverity = "high" | "medium" | "low";
+export type DiagnosticIssueSeverity = "high" | "medium" | "low" | "info";
 
 export interface DiagnosticIssue {
   code:
@@ -371,16 +371,25 @@ function pluginVersionSkewIssue(
 export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = [];
 
-  const hasEnabledRegisteredHarness = report.harnesses.some(
-    (h) => h.pluginRegistered && h.aftConfig.enabled,
+  const hasEnabledHarness = report.harnesses.some((h) => h.hostInstalled && h.aftConfig.enabled);
+  const hasMatchingEnabledPlugin = report.harnesses.some(
+    (h) =>
+      h.pluginRegistered &&
+      h.aftConfig.enabled &&
+      h.pluginCache.cached &&
+      normalizeVersion(h.pluginCache.cached) === normalizeVersion(report.cliVersion),
   );
-  if (!report.binaryVersion && hasEnabledRegisteredHarness) {
+  if (!report.binaryVersion && hasEnabledHarness) {
     issues.push({
       code: "binary_missing",
-      severity: "high",
+      severity: hasMatchingEnabledPlugin ? "info" : "high",
       scope: "AFT binary",
-      message: `No aft binary matching CLI ${report.cliVersion} was detected.`,
-      remediation: `Run \`${CLI} doctor --fix\` to download the matching binary, or start an AFT-enabled session to trigger plugin-side install.`,
+      message: hasMatchingEnabledPlugin
+        ? `No aft binary matching CLI ${report.cliVersion} was detected; it will self-install when the next AFT-enabled session starts.`
+        : `No aft binary matching CLI ${report.cliVersion} was detected.`,
+      remediation: hasMatchingEnabledPlugin
+        ? `Start an AFT-enabled session to install the matching binary automatically, or run \`${CLI} doctor --fix\`.`
+        : `Run \`${CLI} doctor --fix\` to download the matching binary, or start an AFT-enabled session to trigger plugin-side install.`,
     });
   }
 

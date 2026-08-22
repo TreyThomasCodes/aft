@@ -266,4 +266,21 @@ describe("doctor storage wording", () => {
     expect(text).toContain("not created");
     expect(text).not.toContain("lazy");
   });
+
+  test("reports logs without calling storage empty when no project data exists", () => {
+    const text = formatDoctorStorageStatus(
+      makeHarness({
+        storageDir: {
+          path: "/tmp/aft-test/storage",
+          exists: true,
+          accessible: true,
+          sizesByKey: { logs: 5.7 * 1024 * 1024 },
+        },
+        logFile: { path: "/tmp/aft-test/storage/logs/aft-plugin.log", exists: true, sizeKb: 5800 },
+      }),
+    );
+
+    expect(text).toBe("/tmp/aft-test/storage (logs: 5.7 MB; no project data yet)");
+    expect(text).not.toContain("empty");
+  });
 });

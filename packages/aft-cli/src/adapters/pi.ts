@@ -1,7 +1,7 @@
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { resolveAftLogPath, resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
@@ -18,10 +18,11 @@ const PLUGIN_NAME = "@cortexkit/aft-pi";
 const PLUGIN_ENTRY = `npm:${PLUGIN_NAME}`;
 
 function getPiAgentDir(): string {
-  // Prefer $HOME / %USERPROFILE% so tests can override. Falls back to
-  // os.homedir() which reads from getpwuid()/SHGetKnownFolderPath. Matches
-  // the convention OpenCode and Pi themselves use (settings-manager.js
-  // reads $HOME via getAgentDir()).
+  // Pi supports an explicit agent-dir override for isolated installations.
+  // Otherwise follow its $HOME / %USERPROFILE% convention so the CLI probes
+  // the same settings and managed npm tree as the host.
+  const configuredDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (configuredDir) return resolve(configuredDir);
   const envHome = process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME;
   const home = envHome && envHome.length > 0 ? envHome : homedir();
   return join(home, ".pi", "agent");
@@ -34,7 +35,8 @@ function getPiAgentDir(): string {
  *
  * As of Pi v0.74.0, installed package sources are recorded in
  * `~/.pi/agent/settings.json` under the `packages` array. Each entry is a
- * string in one of these forms (Pi's package-manager.js → parseSource):
+ * source string (or an object with a `source` field) in one of these forms
+ * (Pi's package-manager.js → parseSource):
  *
  *   - `npm:<spec>`         e.g. `npm:@cortexkit/aft-pi` or `npm:@cortexkit/aft-pi@1.2.3`
  *   - `file:<path>`        local file: URL
@@ -56,7 +58,17 @@ function readPiExtensionIndex(): { installed: string[]; path: string | null } {
       const value = JSON.parse(trimmed) as Record<string, unknown>;
       const packages = value.packages;
       if (Array.isArray(packages)) {
-        const installed = packages.filter((p): p is string => typeof p === "string");
+        const installed = packages.flatMap((p): string[] => {
+          if (typeof p === "string") return [p];
+          if (
+            typeof p === "object" &&
+            p !== null &&
+            typeof (p as { source?: unknown }).source === "string"
+          ) {
+            return [(p as { source: string }).source];
+          }
+          return [];
+        });
         return { installed, path: settingsPath };
       }
     } catch {
@@ -243,10 +255,12 @@ export class PiAdapter implements HarnessAdapter {
   }
 
   getPluginCacheInfo(): PluginCacheInfo {
-    // Pi manages its own extension cache location; doctor reports whether the
-    // extension is registered, not an on-disk cache path. Best-effort: look
-    // for a node_modules install under Pi's agent dir.
+    // Pi manages user-scoped npm packages below its agent directory rather than
+    // the project or the process-wide npm root. Read the installed manifest so
+    // doctor reports the version that the registered extension actually loads.
     const candidates = [
+      join(getPiAgentDir(), "npm", "node_modules", "@cortexkit", "aft-pi", "package.json"),
+      // Keep older layouts readable for users upgrading from pre-managed installs.
       join(getPiAgentDir(), "node_modules", "@cortexkit", "aft-pi", "package.json"),
       join(getPiAgentDir(), "extensions", "node_modules", "@cortexkit", "aft-pi", "package.json"),
     ];
@@ -266,7 +280,7 @@ export class PiAdapter implements HarnessAdapter {
       }
     }
     return {
-      path: join(getPiAgentDir(), "extensions"),
+      path: join(getPiAgentDir(), "npm", "node_modules", "@cortexkit", "aft-pi", "package.json"),
       exists: false,
     };
   }
@@ -307,6 +321,7 @@ export class PiAdapter implements HarnessAdapter {
       backups: dirSize(join(storage, "backups")),
       url_cache: dirSize(join(storage, "url_cache")),
       onnxruntime: dirSize(join(storage, "onnxruntime")),
+      logs: dirSize(join(storage, "logs")),
     };
   }
 }

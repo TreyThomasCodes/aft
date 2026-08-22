@@ -120,6 +120,36 @@ describe("diagnostic issue summaries", () => {
     expect(findPluginCliVersionSkews(report)).toHaveLength(0);
   });
 
+  test("downgrades a missing binary to INFO when a matching plugin can install it", () => {
+    const report = makeReport(
+      makeHarness({
+        pluginCache: {
+          path: "/tmp/pi/npm/node_modules/@cortexkit/aft-pi/package.json",
+          exists: true,
+          cached: "0.30.3",
+        },
+      }),
+    );
+    report.binaryVersion = null;
+
+    const issue = collectDiagnosticIssues(report).find((entry) => entry.code === "binary_missing");
+
+    expect(issue).toMatchObject({
+      severity: "info",
+      message:
+        "No aft binary matching CLI 0.30.3 was detected; it will self-install when the next AFT-enabled session starts.",
+    });
+  });
+
+  test("keeps a missing binary HIGH when no plugin session can install it", () => {
+    const report = makeReport(makeHarness({ pluginRegistered: false }));
+    report.binaryVersion = null;
+
+    expect(collectDiagnosticIssues(report)).toContainEqual(
+      expect.objectContaining({ code: "binary_missing", severity: "high" }),
+    );
+  });
+
   test("doctor --issue markdown includes the issue summary and plugin version", () => {
     const report = makeReport(
       makeHarness({

@@ -236,6 +236,31 @@ describe("PiAdapter configuration", () => {
     expect(adapter.hasPluginEntry()).toBe(true);
   });
 
+  test("getPluginCacheInfo reads the Pi-managed npm install root", () => {
+    const packageDir = join(agentDir, "npm", "node_modules", "@cortexkit", "aft-pi");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      join(packageDir, "package.json"),
+      JSON.stringify({
+        name: "@cortexkit/aft-pi",
+        version: "0.51.3",
+      }),
+    );
+    writeFileSync(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ packages: [{ source: "npm:@cortexkit/aft-pi" }] }),
+    );
+
+    const info = new PiAdapter().getPluginCacheInfo();
+
+    expect(info).toEqual({
+      path: join(packageDir, "package.json"),
+      cached: "0.51.3",
+      latest: undefined,
+      exists: true,
+    });
+  });
+
   // Local dev mode: `pi install file:/path` writes a relative path to
   // the agentDir under `packages` (see Pi's normalizePackageSourceForSettings).
   test("hasPluginEntry returns true for relative path to local plugin checkout", () => {
