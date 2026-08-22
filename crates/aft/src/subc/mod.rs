@@ -186,10 +186,17 @@ struct ToolCallCompletion {
     phase_trace: PhaseTrace,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteDetachPolicy {
+    RetainForReplay,
+    CancelOnDetach,
+}
+
 #[derive(Clone)]
 struct ActiveToolCall {
     root_id: ProjectRootId,
     cancellation: JobCancellation,
+    detach_policy: RouteDetachPolicy,
 }
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
@@ -386,6 +393,7 @@ fn submit_active_tool_call(
     root_id: ProjectRootId,
     lane: Lane,
     request_id: String,
+    detach_policy: RouteDetachPolicy,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let (rx, cancellation) =
@@ -398,6 +406,7 @@ fn submit_active_tool_call(
             ActiveToolCall {
                 root_id,
                 cancellation,
+                detach_policy,
             },
         );
     rx
@@ -432,12 +441,53 @@ fn cancel_active_tool_call(
     true
 }
 
-fn cancel_active_tool_calls_for_route(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteWorkDisposition {
+    RetainForReplay,
+    Abandon,
+}
+
+fn apply_route_work_disposition(
     active: &ActiveToolCalls,
     executor: &Executor,
     route: RouteChannel,
+    disposition: RouteWorkDisposition,
     reason: &str,
 ) -> usize {
+    if disposition == RouteWorkDisposition::RetainForReplay {
+        let (retained, cancelled) = {
+            let mut calls = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut retained = 0usize;
+            let mut cancelled = Vec::new();
+            calls.retain(|(call_route, _), call| {
+                if *call_route != route {
+                    return true;
+                }
+                match call.detach_policy {
+                    RouteDetachPolicy::RetainForReplay => {
+                        retained += 1;
+                        true
+                    }
+                    RouteDetachPolicy::CancelOnDetach => {
+                        cancelled.push(call.clone());
+                        false
+                    }
+                }
+            });
+            (retained, cancelled)
+        };
+        let cancelled_count = cancelled.len();
+        for call in cancelled {
+            executor.cancel_job(&call.root_id, &call.cancellation);
+        }
+        log::debug!(
+            "subc attach: retained {retained} replayable active tool call(s) and cancelled {cancelled_count} teardown-terminal call(s) route={route} reason={reason}"
+        );
+        return retained;
+    }
+
     let cancelled = {
         let mut calls = active
             .lock()
@@ -1288,7 +1338,13 @@ fn purge_deleted_root_residents(
         if let Some(cancel) = route_bash_cancels.remove(&route) {
             cancel.token.cancel();
         }
-        cancel_active_tool_calls_for_route(active_tool_calls, executor, route, "root reclaim");
+        apply_route_work_disposition(
+            active_tool_calls,
+            executor,
+            route,
+            RouteWorkDisposition::Abandon,
+            "root reclaim",
+        );
         retry_buffer.remove(&route);
         if let Some(sub) = bg_subs.remove(&route) {
             metrics.record_bg_subscription_ended(&sub.root, &sub.session, route, "root-reclaim");
@@ -2004,7 +2060,16 @@ async fn teardown_installed_route(
         )
         .await?;
     }
-    cancel_active_tool_calls_for_route(active_tool_calls, executor, channel, cancellation_reason);
+    // Closing a route does not abandon its session: reliable responses are
+    // retained for detach/rebind replay. Cancellation belongs to explicit
+    // Cancel frames, whole-connection teardown, or root reclamation.
+    apply_route_work_disposition(
+        active_tool_calls,
+        executor,
+        channel,
+        RouteWorkDisposition::RetainForReplay,
+        cancellation_reason,
+    );
     if let Some(pending) = pending_binds.get_mut(&channel) {
         pending.cancelled = true;
         let outcome = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
@@ -4842,6 +4907,7 @@ async fn handle_tool_call(
             identity.root.clone(),
             lane,
             request_id.clone(),
+            RouteDetachPolicy::CancelOnDetach,
             job,
         );
 
@@ -5030,6 +5096,7 @@ async fn handle_tool_call(
         identity.root.clone(),
         lane,
         request_id.clone(),
+        RouteDetachPolicy::RetainForReplay,
         job,
     );
     let completion_tx = tx.clone();
@@ -5584,6 +5651,7 @@ pub(crate) mod test_support {
             ActiveToolCall {
                 root_id: root.clone(),
                 cancellation,
+                detach_policy: RouteDetachPolicy::CancelOnDetach,
             },
         );
         started_rx
@@ -5617,7 +5685,7 @@ pub(crate) mod test_support {
     }
 
     #[test]
-    fn route_abandonment_cancels_long_running_interactive_search() {
+    fn true_abandonment_cancels_but_route_detach_retains_interactive_search() {
         let executor = Arc::new(Executor::new());
         let (_dir, root) = test_root("cancelled-interactive-search");
         executor.register_actor(root.clone(), test_ctx());
@@ -5653,10 +5721,11 @@ pub(crate) mod test_support {
             .recv_timeout(Duration::from_secs(1))
             .expect("untracked search starts");
         assert_eq!(
-            cancel_active_tool_calls_for_route(
+            apply_route_work_disposition(
                 &active,
                 executor.as_ref(),
                 route,
+                RouteWorkDisposition::Abandon,
                 "disabled cancellation wiring",
             ),
             0
@@ -5684,6 +5753,7 @@ pub(crate) mod test_support {
             root.clone(),
             Lane::PureRead,
             "tracked-search".to_string(),
+            RouteDetachPolicy::RetainForReplay,
             Box::new(move |_| {
                 tracked_started_tx.send(()).expect("signal tracked search");
                 while !crate::commands::semantic_search::search_cancellation_requested() {
@@ -5700,12 +5770,62 @@ pub(crate) mod test_support {
         tracked_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("tracked search starts");
+
+        let (terminal_started_tx, terminal_started_rx) = std::sync::mpsc::sync_channel(1);
+        let terminal_rx = submit_active_tool_call(
+            executor.as_ref(),
+            &active,
+            route,
+            43,
+            root.clone(),
+            Lane::PureRead,
+            "teardown-terminal".to_string(),
+            RouteDetachPolicy::CancelOnDetach,
+            Box::new(move |_| {
+                terminal_started_tx
+                    .send(())
+                    .expect("signal teardown-terminal call");
+                while !crate::executor::current_job_cancelled() {
+                    std::thread::yield_now();
+                }
+                Response::error(
+                    "teardown-terminal",
+                    "request_cancelled",
+                    "cancelled for terminal-emitting teardown",
+                )
+            }),
+        );
+        terminal_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("teardown-terminal call starts");
         assert_eq!(
-            cancel_active_tool_calls_for_route(
+            apply_route_work_disposition(
                 &active,
                 executor.as_ref(),
                 route,
-                "test route abandonment",
+                RouteWorkDisposition::RetainForReplay,
+                "test route detach",
+            ),
+            1,
+            "only the replayable search remains active after route detach"
+        );
+        let terminal_response = terminal_rx
+            .blocking_recv()
+            .expect("teardown-terminal call stops at cancellation checkpoint");
+        assert_eq!(terminal_response.data["code"], "request_cancelled");
+        let iterations_before_detach = tracked_iterations.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            tracked_iterations.load(Ordering::Relaxed) > iterations_before_detach,
+            "route detach must retain work whose response can replay after rebind"
+        );
+        assert_eq!(
+            apply_route_work_disposition(
+                &active,
+                executor.as_ref(),
+                route,
+                RouteWorkDisposition::Abandon,
+                "test session purge",
             ),
             1
         );
@@ -5767,6 +5887,7 @@ pub(crate) mod test_support {
             ActiveToolCall {
                 root_id: root.clone(),
                 cancellation,
+                detach_policy: RouteDetachPolicy::CancelOnDetach,
             },
         )])));
 
