@@ -39,7 +39,7 @@ const PREVIOUS_VERSION = "0.48.1";
 // minor line must be added here BEFORE its first tag: the npm publish job
 // runs this gate from the TAGGED commit, so a missing line fails the
 // release only after crates.io has already published (v0.51.0 incident).
-const GOVERNED_VERSION_LINES = ["0.49.", "0.50.", "0.51."];
+const GOVERNED_VERSION_LINES = ["0.49.", "0.50.", "0.51.", "0.52."];
 const RELEASE_VERSION = (() => {
   const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
   const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
