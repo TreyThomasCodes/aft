@@ -226,6 +226,14 @@ export function platformKey(
  * @returns Absolute path to the first binary found, or null if none found.
  */
 export function findBinarySync(expectedVersion?: string): string | null {
+  const resolved = findBinarySyncInner(expectedVersion);
+  // Every resolution path funnels through this line: host log assertions and
+  // operators both key on it, so it must fire for sync and async callers alike.
+  if (resolved) log(`Resolved binary: ${resolved}`);
+  return resolved;
+}
+
+function findBinarySyncInner(expectedVersion?: string): string | null {
   const ext = process.platform === "win32" ? ".exe" : "";
   const env = { ...process.env };
 
@@ -336,7 +344,6 @@ export async function findBinary(expectedVersion?: string): Promise<string> {
   // Try synchronous resolution first (fast path)
   const syncResult = findBinarySync(expectedVersion);
   if (syncResult) {
-    log(`Resolved binary: ${syncResult}`);
     return syncResult;
   }
 
