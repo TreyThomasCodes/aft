@@ -364,7 +364,8 @@ jobs:
   # minutes in the explicit debug build. Its 1,683-test nextest slice alone ran
   # for 4.8-5.0 minutes, so it uses the same exact-inventory archive sharding as
   # Linux. Extracted binaries are signed and prewarmed before timed execution;
-  # the keychain-sensitive libtest and serialized watcher stay together.
+  # the keychain probe stays isolated, unit targets use per-test nextest
+  # timeouts, and the watcher remains serialized on libtest.
   #
   # Catches macOS-specific code paths: FSEvents watcher behavior (different
   # coalescing latency from inotify), /var vs /private/var symlink
@@ -474,15 +475,16 @@ jobs:
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
 
-      - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
+      - name: Rust test gate (unit and integration on nextest, watcher isolated)
         run: ./scripts/rust-test-gate.sh
         env:
           AFT_TEST_DIAG: "1"
           # See the Linux job: full core count on otherwise-idle CI runners.
           NEXTEST_TEST_THREADS: "num-cpus"
           # Archive shards own the integration inventory. These phases preserve
-          # the keychain-sensitive libtest and serialized watcher behavior.
+          # the isolated keychain probe and serialized watcher behavior.
           AFT_GATE_PHASES: lib,watcher
+          AFT_UNIT_TEST_RUNNER: nextest
           # The storm tests exercise no macOS-specific paths; the dedicated
           # unit-linux-storm job is the release-storm arbiter.
           AFT_GATE_SKIP_RELEASE_STORM: "1"

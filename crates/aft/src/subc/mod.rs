@@ -5686,7 +5686,17 @@ pub(crate) mod test_support {
 
     #[test]
     fn true_abandonment_cancels_but_route_detach_retains_interactive_search() {
-        let executor = Arc::new(Executor::new());
+        // This scenario requires the replayable and terminal calls to run at the
+        // same time. Pin two read slots instead of deriving the topology from
+        // the host, where a small runner can queue the terminal call forever
+        // behind the intentionally retained call.
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 3,
+            read_cap: 2,
+            actor_cap: 2,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
         let (_dir, root) = test_root("cancelled-interactive-search");
         executor.register_actor(root.clone(), test_ctx());
         let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
@@ -5706,7 +5716,15 @@ pub(crate) mod test_support {
                 disabled_started_tx
                     .send(())
                     .expect("signal untracked search");
+                let deadline = Instant::now() + Duration::from_secs(5);
                 while !crate::commands::semantic_search::search_cancellation_requested() {
+                    if Instant::now() >= deadline {
+                        return Response::error(
+                            "untracked-search",
+                            "test_timeout",
+                            "untracked search did not receive cancellation",
+                        );
+                    }
                     disabled_probe.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                 }
@@ -5756,7 +5774,15 @@ pub(crate) mod test_support {
             RouteDetachPolicy::RetainForReplay,
             Box::new(move |_| {
                 tracked_started_tx.send(()).expect("signal tracked search");
+                let deadline = Instant::now() + Duration::from_secs(5);
                 while !crate::commands::semantic_search::search_cancellation_requested() {
+                    if Instant::now() >= deadline {
+                        return Response::error(
+                            "tracked-search",
+                            "test_timeout",
+                            "tracked search did not receive cancellation",
+                        );
+                    }
                     tracked_probe.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                 }
@@ -5785,7 +5811,15 @@ pub(crate) mod test_support {
                 terminal_started_tx
                     .send(())
                     .expect("signal teardown-terminal call");
+                let deadline = Instant::now() + Duration::from_secs(5);
                 while !crate::executor::current_job_cancelled() {
+                    if Instant::now() >= deadline {
+                        return Response::error(
+                            "teardown-terminal",
+                            "test_timeout",
+                            "terminal call did not receive cancellation",
+                        );
+                    }
                     std::thread::yield_now();
                 }
                 Response::error(

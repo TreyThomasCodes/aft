@@ -5,7 +5,7 @@ This script captures the current workspace inventory from `cargo test --workspac
 -- --list`, then compares it against the split buckets used by
 `scripts/rust-test-gate.sh`:
 
-* `cargo test --workspace --lib --bins`
+* `cargo nextest list --workspace --lib --bins`
 * `cargo nextest list --workspace -E 'kind(test) - binary(=watcher_integration)'`
 * `cargo test -p agent-file-tools --test watcher_integration`
 
@@ -40,19 +40,20 @@ class CargoEntry:
 
     @property
     def key(self) -> str:
-        if self.kind == "test":
-            return f"test|{self.suite}|{self.name}"
+        if self.kind in {"lib", "bin", "test"}:
+            return f"{self.kind}|{self.suite}|{self.name}"
         return f"{self.kind}|{self.suite}|{self.source}|{self.name}"
 
 
 @dataclass(frozen=True)
 class NextestEntry:
+    kind: str
     suite: str
     name: str
 
     @property
     def key(self) -> str:
-        return f"test|{self.suite}|{self.name}"
+        return f"{self.kind}|{self.suite}|{self.name}"
 
 
 def run_command(command: list[str]) -> str:
@@ -137,17 +138,21 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
     return entries
 
 
-def parse_nextest_list(output: str) -> list[NextestEntry]:
+def parse_nextest_list(
+    output: str, allowed_suite_kinds: set[str] | None = None
+) -> list[NextestEntry]:
+    allowed_suite_kinds = allowed_suite_kinds or {"test"}
     payload = json.loads(output)
     entries: list[NextestEntry] = []
     for suite_data in payload.get("rust-suites", {}).values():
-        if suite_data.get("kind") != "test":
+        suite_kind = suite_data.get("kind")
+        if suite_kind not in allowed_suite_kinds:
             continue
         suite = suite_data["binary-name"]
         for name, testcase in suite_data.get("testcases", {}).items():
             if testcase.get("kind") != "test":
                 continue
-            entries.append(NextestEntry(suite=suite, name=name))
+            entries.append(NextestEntry(kind=suite_kind, suite=suite, name=name))
     return entries
 
 
@@ -160,16 +165,16 @@ baseline_entries = parse_cargo_list(baseline_output)
 
 unit_bin_output = run_command([
     "cargo",
-    "test",
+    "nextest",
+    "list",
     "--workspace",
     "--lib",
     "--bins",
-    "--",
-    "--list",
+    "-T",
+    "json",
+    "--cargo-quiet",
 ])
-unit_bin_entries = [
-    entry for entry in parse_cargo_list(unit_bin_output) if entry.kind in {"lib", "bin"}
-]
+unit_bin_entries = parse_nextest_list(unit_bin_output, {"lib", "bin"})
 
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
@@ -206,7 +211,7 @@ baseline_by_bucket = Counter(entry.kind for entry in baseline_entries)
 coverage: dict[str, list[str]] = {}
 
 for entry in unit_bin_entries:
-    coverage.setdefault(entry.key, []).append("cargo-lib-bin")
+    coverage.setdefault(entry.key, []).append("nextest-lib-bin")
 for entry in doc_entries:
     coverage.setdefault(entry.key, []).append("cargo-doc")
 for entry in nextest_entries:
@@ -230,7 +235,7 @@ print(
     "Split counts:",
     ", ".join(
         [
-            f"cargo-lib-bin={len(unit_bin_entries)}",
+            f"nextest-lib-bin={len(unit_bin_entries)}",
             f"cargo-doc={len(doc_entries)}",
             f"nextest-integration={len(nextest_entries)}",
             f"cargo-watcher={len(watcher_entries)}",

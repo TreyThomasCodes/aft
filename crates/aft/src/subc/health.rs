@@ -1113,9 +1113,24 @@ mod tests {
             .expect("long search starts");
         take_interactive_occupancy_logs_for_test();
 
+        // The production census deliberately uses try_lock, so a scheduler turn
+        // may make one observation a no-op. Retry until the nonblocking snapshot
+        // succeeds, then prove later observations do not report the same job.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let logs = loop {
+            warn_slow_running_interactive_jobs_after(&executor, Duration::ZERO);
+            let logs = take_interactive_occupancy_logs_for_test();
+            if !logs.is_empty() {
+                break logs;
+            }
+            assert!(Instant::now() < deadline, "occupancy census stayed busy");
+            std::thread::yield_now();
+        };
         warn_slow_running_interactive_jobs_after(&executor, Duration::ZERO);
-        warn_slow_running_interactive_jobs_after(&executor, Duration::ZERO);
-        let logs = take_interactive_occupancy_logs_for_test();
+        assert!(
+            take_interactive_occupancy_logs_for_test().is_empty(),
+            "a reported running job must not emit a second census line"
+        );
         release_tx.send(()).expect("release long search");
         assert!(response.blocking_recv().expect("search response").success);
 
