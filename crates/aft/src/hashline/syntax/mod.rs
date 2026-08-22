@@ -463,10 +463,17 @@ pub fn parse_hashline_patch(patch: &str) -> Result<Patch, HashlineRejection> {
     let mut sections = Vec::new();
     let mut envelope_started = false;
     let mut envelope_ended = false;
-    for (index, raw_line) in patch.split('\n').enumerate() {
+    let mut lines = patch.split('\n').enumerate().peekable();
+    while let Some((index, raw_line)) = lines.next() {
         let line_number = index + 1;
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let trimmed = line.trim();
+
+        // `split('\n')` yields one final empty item for a terminal newline. It
+        // is not a text-body row, while a deliberate blank body row remains `+`.
+        if raw_line.is_empty() && lines.peek().is_none() {
+            continue;
+        }
 
         if trimmed == "*** Begin Patch" {
             if envelope_started || !sections.is_empty() {
@@ -531,9 +538,28 @@ pub fn parse_hashline_patch(patch: &str) -> Result<Patch, HashlineRejection> {
             )));
         };
         if !operation.append_body_line(line) {
-            return Err(HashlineRejection::parse(format!(
-                "PUT body rows must begin with +; unexpected content at line {line_number}"
-            )));
+            let message = match operation {
+                Operation::Put(PutOperation {
+                    source: PutSource::Register(_),
+                    line: operation_line,
+                    ..
+                }) => format!(
+                    "PUT at line {operation_line} copies a register and accepts no body; \
+                     use `PUT <address>:` followed by `+` rows for text (unexpected content at line {line_number})"
+                ),
+                Operation::Put(PutOperation {
+                    source: PutSource::Text(_),
+                    ..
+                }) => format!(
+                    "text PUT body rows must begin with `+` (`+` alone is a blank row); \
+                     unexpected content at line {line_number}"
+                ),
+                _ => format!(
+                    "only `PUT <address>:` accepts body rows beginning with `+`; \
+                     unexpected content at line {line_number}"
+                ),
+            };
+            return Err(HashlineRejection::parse(message));
         }
     }
 
@@ -1411,10 +1437,23 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_body_rows_without_plus_and_noncanonical_file_operations() {
+    fn parser_guides_text_put_bodies_and_accepts_a_terminal_newline() {
+        let register_put = parse_hashline_patch("[a.rs#CAFE]\nPUT 1\n+replacement")
+            .expect_err("register PUT cannot accept a text body");
+        assert_eq!(register_put.stage, RejectionStage::Parse);
+        assert!(register_put.message.contains("PUT <address>:"));
+        assert!(register_put.message.contains("accepts no body"));
+
         let body = parse_hashline_patch("[a.rs#CAFE]\nPUT 1:\nreplacement")
             .expect_err("body rows require the + marker");
-        assert_eq!(body.stage, RejectionStage::Parse);
+        assert!(body.message.contains("`+`"));
+        assert!(body.message.contains("blank row"));
+
+        assert!(parse_hashline_patch("[a.rs#CAFE]\nPUT 1:\n+replacement\n").is_ok());
+    }
+
+    #[test]
+    fn parser_rejects_noncanonical_file_operations() {
         assert!(parse_hashline_patch("[a.rs#CAFE]\nREM 1").is_err());
         assert!(parse_hashline_patch("[a.rs#CAFE]\nMV 1 -> b.rs").is_err());
         assert!(parse_hashline_patch("[a.rs#CAFE]\nREM\nPUT 1:\n+x").is_err());

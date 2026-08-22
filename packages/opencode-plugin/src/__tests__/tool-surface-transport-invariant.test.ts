@@ -81,6 +81,30 @@ function buildSurface(pool: PluginContext["pool"]): Record<string, unknown> {
 }
 
 describe("tool surface transport invariance", () => {
+  test("hashline edit description provides the patch grammar", () => {
+    const ctx = {
+      pool: fakePool("hashline-description"),
+      client: {} as PluginContext["client"],
+      config: { edit_mode: "hashline" },
+      storageDir: "/tmp/aft-hashline-surface-test",
+      hashlineEffective: true,
+    } as PluginContext;
+    const description = hoistedTools(ctx).edit?.description ?? "";
+
+    for (const fragment of [
+      "[path#TAG]",
+      "current tagged read",
+      "`N.=M`",
+      "plain `N` PUT replaces",
+      "`PUT <address>:`",
+      "`+` alone is blank",
+      "REM: bare `REM` only",
+      "MV: `MV <destination>`",
+    ]) {
+      expect(description).toContain(fragment);
+    }
+  });
+
   test("tool names, descriptions, and schemas are independent of the pool", () => {
     const standalone = buildSurface(fakePool("standalone-ndjson"));
     const subc = buildSurface(fakePool("subc-daemon"));

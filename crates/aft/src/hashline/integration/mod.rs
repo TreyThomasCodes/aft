@@ -130,6 +130,38 @@ mod tests {
     }
 
     #[test]
+    fn hashline_description_is_a_complete_agent_quick_reference() {
+        for fragment in [
+            "[path#TAG]",
+            "four hexadecimal digits",
+            "current tagged read",
+            "REM and MV require a whole-file tagged read",
+            "`0` (BOF)",
+            "`N.=M`",
+            "`<N`/`>N`",
+            "`N*`/`<N*`/`>N*`",
+            "`$`/`$-K`",
+            "plain `N` PUT replaces",
+            "`PUT <address>:`",
+            "`+` alone is blank",
+            "PUT without `:` copies",
+            "CUT: `CUT <address> [@name]`",
+            "REM: bare `REM` only",
+            "MV: `MV <destination>`",
+            "`*** Begin Patch`/`*** End Patch`",
+        ] {
+            assert!(
+                HASHLINE_EDIT_DESCRIPTION.contains(fragment),
+                "quick reference is missing {fragment:?}"
+            );
+        }
+        assert_eq!(
+            LEGACY_EDIT_DESCRIPTION,
+            "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone."
+        );
+    }
+
+    #[test]
     fn a7_session_never_exposes_both_edit_schemas() {
         let artifacts = regenerate_governed_edit_artifacts();
         assert_eq!(artifacts["dual_mode"], json!(true));

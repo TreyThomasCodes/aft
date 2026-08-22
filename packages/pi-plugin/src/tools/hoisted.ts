@@ -313,6 +313,16 @@ const EditParams = Type.Object({
   ),
 });
 
+const HASHLINE_EDIT_DESCRIPTION = [
+  "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string. Server-owned preview control is outside this schema.",
+  "",
+  "Quick reference:",
+  "- Header: `[path#TAG]`; TAG is exactly four hexadecimal digits from a current tagged read. Read every addressed row and gap boundary; REM and MV require a whole-file tagged read. Re-read after an edit before chaining: an edit-response tag can retain only changed context.",
+  "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), `<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). A plain `N` PUT replaces; use `<N` or `>N` to insert.",
+  "- PUT text: `PUT <address>:` followed by one or more `+` body rows (`+` alone is blank). A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.",
+  "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. `*** Begin Patch`/`*** End Patch` is an optional envelope.",
+].join("\n");
+
 const HashlineEditParams = Type.Object(
   {
     patch: Type.String({
@@ -623,8 +633,7 @@ export function registerHoistedTools(
     pi.registerTool<typeof HashlineEditParams, FileMutationDetails>({
       name: "edit",
       label: "edit",
-      description:
-        "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string of one or more `[path#TAG]` sections with PUT/CUT/REM/MV operations. Paths and tags come from section headers; obtain tags from tagged reads. Server-owned preview control is outside this schema.",
+      description: HASHLINE_EDIT_DESCRIPTION,
       promptSnippet: "Apply a tagged hashline patch through the edit tool",
       promptGuidelines: [
         "Read a file to obtain its current hashline tag before editing it.",

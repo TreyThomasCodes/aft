@@ -159,6 +159,19 @@ describe("hoisted tool adapters", () => {
     };
     expect(Object.keys(editSchema.properties ?? {})).toEqual(["patch"]);
     expect(editSchema.required).toEqual(["patch"]);
+    const description = tools.get("edit")!.description;
+    for (const fragment of [
+      "[path#TAG]",
+      "current tagged read",
+      "`N.=M`",
+      "plain `N` PUT replaces",
+      "`PUT <address>:`",
+      "`+` alone is blank",
+      "REM: bare `REM` only",
+      "MV: `MV <destination>`",
+    ]) {
+      expect(description).toContain(fragment);
+    }
     const result = (await executeTool(
       tools.get("edit")!,
       { patch: "*** Begin Patch\n[src.ts#ABCD]\nPUT 1:\n+after\n*** End Patch" },

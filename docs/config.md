@@ -259,6 +259,8 @@ if auto-detection picks the wrong tool or you want to pin a specific formatter.
 
 Set `edit_mode` to `"hashline"` to make `edit` accept exactly `{ "patch": "..." }` and to render text reads with snapshot tags used by those patches. Other tools, including `write` and `apply_patch`, keep their existing schemas and behavior. The setting defaults to `"default"`; it is accepted in both user and project config, with ordinary project-over-user precedence. An unknown value emits a configure warning and falls back to `"default"`.
 
+See the [Hashline patch grammar](hashline.md) for section headers, addresses, operations, and tag freshness rules.
+
 A hashline mutation starts only after every affected path has a backup record. If backup registration cannot complete, the edit fails before any file is changed.
 
 Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
