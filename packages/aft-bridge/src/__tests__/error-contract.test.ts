@@ -19,6 +19,7 @@ import {
   BASH_TRANSPORT_DISPOSITION,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   isBashTransportDeadError,
+  isRouteOpenReloadWindowError,
   SUBC_MODULE_RESTART_DISPOSITION,
 } from "../error-contract.js";
 import {
@@ -126,6 +127,41 @@ describe("isBashTransportDeadError", () => {
       expect(isBashTransportDeadError(error)).toBe(false);
     });
   }
+});
+
+describe("isRouteOpenReloadWindowError", () => {
+  test.each([
+    [
+      "fast module reload refusal",
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+    ],
+    [
+      "warming supervisor refusal",
+      Object.assign(new SubcError("module supervised but not available", "module_warming"), {
+        state: "running",
+        enabled: true,
+        live: false,
+      }),
+    ],
+    [
+      "legacy not-live supervisor refusal",
+      Object.assign(new SubcError("module supervised but not available", "target_unavailable"), {
+        state: "running",
+        enabled: true,
+        live: false,
+      }),
+    ],
+    [
+      "bind relay closed before acknowledgement",
+      new SubcError("connection closed during route.bind relay", "target_unavailable"),
+    ],
+  ])("accepts pre-send route.open reload shape: %s", (_name, error) => {
+    expect(isRouteOpenReloadWindowError(error)).toBe(true);
+  });
+
+  test("rejects a route GOODBYE because its request outcome is unknown", () => {
+    expect(isRouteOpenReloadWindowError(routeGoodbyeError())).toBe(false);
+  });
 });
 
 describe("adaptToolError", () => {

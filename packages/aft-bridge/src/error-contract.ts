@@ -105,6 +105,23 @@ function isRouteGoodbyeError(error: unknown): boolean {
   return error.code === "route_closed" && error.message.includes("route closed by subc");
 }
 
+/**
+ * True for the daemon's temporary route.open refusals while an AFT module is
+ * restarting. `module_reloading` is the fast refusal; `module_warming` is the
+ * newer supervision-state response; `target_unavailable` covers the legacy
+ * `live=false` response and a bind relay that closes before its acknowledgement.
+ *
+ * This classifier is only used for route.open rejections: route.open rejections
+ * are provably pre-send AS A CLASS (the daemon refuses-or-assigns atomically;
+ * forwarding requires the channel the rejection withholds). The stable code is
+ * therefore sufficient here and no message prose participates in the match.
+ */
+export function isRouteOpenReloadWindowError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "module_reloading" || code === "module_warming" || code === "target_unavailable";
+}
+
 function hasEngineResponse(error: Error): boolean {
   const response = (error as Error & { response?: unknown }).response;
   if (response !== null && typeof response === "object") return true;

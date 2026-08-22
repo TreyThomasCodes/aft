@@ -35,6 +35,7 @@ import {
 
 import { log } from "./active-logger.js";
 import type { StatusSnapshot } from "./bridge.js";
+import { isRouteOpenReloadWindowError } from "./error-contract.js";
 import {
   asCanonicalRootPath,
   asRootGeneration,
@@ -111,6 +112,10 @@ const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
 /** Every transport reconnect waits at least one event-loop turn and caps repeated failures. */
 const RECONNECT_RETRY_FLOOR_MS = 100;
 const RECONNECT_RETRY_CAP_MS = 2_000;
+/** Maximum total restart-burst delay a fresh route.open may absorb. */
+const ROUTE_OPEN_RELOAD_WAIT_CAP_MS = 15_000;
+const ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX =
+  " The AFT daemon module did not return within the 15s reload window.";
 
 /**
  * A bg subscription that stayed up at least this long before dropping is treated
@@ -617,6 +622,19 @@ function absentRootError(root: CanonicalRootPath): SubcError {
   );
 }
 
+/** Preserve the daemon's final refusal while making the reload timeout actionable. */
+function reloadWindowExhaustedError(error: unknown): unknown {
+  if (error instanceof Error) {
+    try {
+      error.message += ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX;
+      return error;
+    } catch {
+      // A frozen SDK error cannot carry the suffix; retain its message in a wrapper.
+    }
+  }
+  return new Error(`${String(error)}${ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX}`);
+}
+
 /**
  * Fire-and-forget route close that can never throw — neither synchronously (a
  * client that rejects/throws when closing a route on an already-dead socket) nor
@@ -888,8 +906,10 @@ export class SubcTransportPool implements AftTransportPool {
   private connecting: Promise<SubcClientLike> | null = null;
   /** The growing delay for a safe, once-only route resend after route closure. */
   private routeReopenRetryDelayMs = RECONNECT_RETRY_FLOOR_MS;
-  /** Concurrent route closures wait for the same retry timer. */
+  /** Concurrent route closures and route.open refusals wait for the same retry timer. */
   private routeReopenRetry: Promise<void> | null = null;
+  /** Delay assigned to the shared retry timer while it is pending. */
+  private routeReopenRetryMs: number | null = null;
   /** Per-session records keyed by the opaque identity key. */
   private readonly sessions = new Map<IdentityKey, SessionRecord>();
   /**
@@ -1511,6 +1531,26 @@ export class SubcTransportPool implements AftTransportPool {
         }
       };
 
+      const openRouteAfterReloadWindow = async (): Promise<{
+        route: RouteHandle;
+        entry: RouteEntry;
+      }> => {
+        let reloadWaitedMs = 0;
+        while (true) {
+          try {
+            return await openRoute();
+          } catch (error) {
+            if (!isRouteOpenReloadWindowError(error)) throw error;
+            const { delayMs, wait } = this.waitForRouteReopenBackoff();
+            if (reloadWaitedMs + delayMs > ROUTE_OPEN_RELOAD_WAIT_CAP_MS) {
+              throw reloadWindowExhaustedError(error);
+            }
+            reloadWaitedMs += delayMs;
+            await wait;
+          }
+        }
+      };
+
       const clearRouteEntry = (entry: RouteEntry): void => {
         if (record.routeEntry !== entry) return;
         entry.closed = true;
@@ -1555,7 +1595,7 @@ export class SubcTransportPool implements AftTransportPool {
         return reply;
       };
 
-      let routeAndEntry = await openRoute();
+      let routeAndEntry = await openRouteAfterReloadWindow();
       try {
         return await requestOnRoute(routeAndEntry.route);
       } catch (error) {
@@ -1566,8 +1606,8 @@ export class SubcTransportPool implements AftTransportPool {
           this.client === client
         ) {
           clearRouteEntry(routeAndEntry.entry);
-          await this.waitForRouteReopenBackoff();
-          routeAndEntry = await openRoute();
+          await this.waitForRouteReopenBackoff().wait;
+          routeAndEntry = await openRouteAfterReloadWindow();
           try {
             const reply = await requestOnRoute(routeAndEntry.route);
             this.resetRouteReopenBackoff();
@@ -1595,20 +1635,25 @@ export class SubcTransportPool implements AftTransportPool {
    * route. The resend remains bounded to one attempt, while a successful resend
    * resets the next outage to the minimum delay.
    */
-  private waitForRouteReopenBackoff(): Promise<void> {
+  private waitForRouteReopenBackoff(): { delayMs: number; wait: Promise<void> } {
     const pending = this.routeReopenRetry;
-    if (pending) return pending;
+    const pendingDelay = this.routeReopenRetryMs;
+    if (pending && pendingDelay !== null) return { delayMs: pendingDelay, wait: pending };
 
-    const delay = this.routeReopenRetryDelayMs;
-    this.routeReopenRetryDelayMs = Math.min(delay * 2, RECONNECT_RETRY_CAP_MS);
+    const delayMs = this.routeReopenRetryDelayMs;
+    this.routeReopenRetryDelayMs = Math.min(delayMs * 2, RECONNECT_RETRY_CAP_MS);
     let retry!: Promise<void>;
     retry = Promise.resolve()
-      .then(() => this.routeRetrySleep(delay))
+      .then(() => this.routeRetrySleep(delayMs))
       .finally(() => {
-        if (this.routeReopenRetry === retry) this.routeReopenRetry = null;
+        if (this.routeReopenRetry === retry) {
+          this.routeReopenRetry = null;
+          this.routeReopenRetryMs = null;
+        }
       });
     this.routeReopenRetry = retry;
-    return retry;
+    this.routeReopenRetryMs = delayMs;
+    return { delayMs, wait: retry };
   }
 
   private resetRouteReopenBackoff(): void {

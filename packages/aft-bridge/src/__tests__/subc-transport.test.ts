@@ -502,6 +502,158 @@ describe("SubcTransport Rd reconnect", () => {
     expect(clock.scheduledDelays).toEqual([100]);
   });
 
+  test("reload-window route.open refusals share the restart-burst floor and stay invisible", async () => {
+    const reloadErrors: Error[] = [
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      Object.assign(new SubcError("module supervised but not available", "module_warming"), {
+        state: "running",
+        enabled: true,
+        live: false,
+      }),
+      new SubcError("connection closed during route.bind relay", "target_unavailable"),
+    ];
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "live" }));
+    client.routeOpenFailure = () => reloadErrors.shift() ?? null;
+    const clock = new FakeClock();
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      routeRetrySleep: clock.sleep,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    const calls = Promise.all([
+      transport.toolCall("reload-1", "read", {}),
+      transport.toolCall("reload-2", "read", {}),
+    ]);
+    await settleMicrotasks();
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(100);
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(200);
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(400);
+
+    await expect(calls).resolves.toHaveLength(2);
+    expect(client.requests).toHaveLength(2);
+    expect(clock.scheduledDelays).toEqual([100, 200, 400]);
+  });
+
+  test("reload-window exhaustion surfaces the final route.open error with a locked suffix", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "never" }));
+    client.routeOpenFailure = () =>
+      new SubcError("module_id 'aft' is reloading", "module_reloading");
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      routeRetrySleep: async () => undefined,
+    });
+
+    let surfaced: unknown;
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("reload-exhausted", "read", {});
+    } catch (error) {
+      surfaced = error;
+    }
+    expect((surfaced as Error).message).toBe(
+      "module_id 'aft' is reloading The AFT daemon module did not return within the 15s reload window.",
+    );
+  });
+
+  test("a dying-route GOODBYE surfaces while a fresh reload-window dispatch is absorbed", async () => {
+    let releaseDying!: () => void;
+    const dyingGate = new Promise<void>((resolve) => {
+      releaseDying = resolve;
+    });
+    let markDyingRequestStarted!: () => void;
+    const dyingRequestStarted = new Promise<void>((resolve) => {
+      markDyingRequestStarted = resolve;
+    });
+    const goodbye = new SubcError("route closed by subc (GOODBYE)", "route_closed");
+    let requestCalls = 0;
+    const client = new FakeClient(async () => {
+      requestCalls += 1;
+      if (requestCalls === 1) {
+        markDyingRequestStarted();
+        await dyingGate;
+        throw goodbye;
+      }
+      return envelope({ id: "fresh", success: true, text: "live" });
+    });
+    const reloadErrors: Error[] = [
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      Object.assign(new SubcError("module supervised but not available", "target_unavailable"), {
+        state: "running",
+        enabled: true,
+        live: false,
+      }),
+    ];
+    const clock = new FakeClock();
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      routeRetrySleep: clock.sleep,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    const dying = transport.toolCall("dying-route", "write", { filePath: "a", content: "old" });
+    await dyingRequestStarted;
+    client.routeOpenFailure = () => reloadErrors.shift() ?? null;
+    const fresh = transport.toolCall("fresh-route", "write", { filePath: "a", content: "new" });
+    await settleMicrotasks();
+    expect(clock.scheduledWorkCount).toBe(1);
+
+    releaseDying();
+    await expect(dying).rejects.toBe(goodbye);
+    expect(client.requests).toHaveLength(1);
+
+    await clock.advance(100);
+    await clock.advance(200);
+    await expect(fresh).resolves.toMatchObject({ text: "live" });
+    expect(client.requests).toHaveLength(2);
+  });
+
+  test("unknown-channel resends and reload-window opens share one restart-burst timer", async () => {
+    let requestAttempts = 0;
+    const client = new FakeClient(async () => {
+      requestAttempts += 1;
+      if (requestAttempts <= 2) throw new SubcError("unknown channel", "unknown_channel");
+      return envelope({ id: "r", success: true, text: "recovered" });
+    });
+    const reloadErrors: Error[] = [
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+      new SubcError("module_id 'aft' is reloading", "module_reloading"),
+    ];
+    const clock = new FakeClock();
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => client,
+      routeRetrySleep: clock.sleep,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    const calls = Promise.all([
+      transport.toolCall("interleaved-1", "read", {}),
+      transport.toolCall("interleaved-2", "read", {}),
+    ]);
+    await settleMicrotasks();
+    client.routeOpenFailure = () => reloadErrors.shift() ?? null;
+
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(100);
+    expect(clock.scheduledWorkCount).toBe(1);
+    await clock.advance(200);
+
+    await expect(calls).resolves.toHaveLength(2);
+    expect(client.requests).toHaveLength(4);
+    expect(clock.scheduledDelays).toEqual([100, 200]);
+  });
+
   test("outcome-unknown request failures still surface without an in-place retry", async () => {
     const outcomeUnknown = new SubcCallError(
       "outcome_unknown",
