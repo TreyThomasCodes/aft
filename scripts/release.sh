@@ -243,6 +243,31 @@ if [[ -f "$gate_script" ]]; then
     echo "    manifest's source_commit must match the surface manifest's"
     exit 1
   }
+
+  # Validate the SAME gate shape the publish job runs. The flagless gate above
+  # skips activation-evidence validation, so a stale evidence file used to
+  # sail through preflight and refuse at npm publish (v0.52.1's first tag).
+  # Evidence goes stale whenever governed manifests are refreshed without
+  # restaging it; restage deterministically, then validate like the workflow.
+  evidence_file="docs/${line_slug}-release-evidence.json"
+  if [[ -f "$evidence_file" ]]; then
+    echo "  activation evidence (restage + candidate gate)..."
+    node "$gate_script" --stage --evidence-output "$evidence_file" >/dev/null 2>&1 || {
+      echo "Error: activation evidence restage failed"
+      echo "  ↳ run: node $gate_script --stage --evidence-output $evidence_file"
+      exit 1
+    }
+    if ! git diff --quiet -- "$evidence_file"; then
+      git add "$evidence_file"
+      git commit -q -m "docs: restage ${line_slug} activation evidence for v${VERSION}"
+      echo "  ↳ evidence was stale; restaged and committed"
+    fi
+    node "$gate_script" --candidate --evidence "$evidence_file" >/dev/null 2>&1 || {
+      echo "Error: candidate gate with evidence failed (the publish job runs this exact shape)"
+      echo "  ↳ run: node $gate_script --candidate --evidence $evidence_file"
+      exit 1
+    }
+  fi
 fi
 
 # Slow checks AFTER the fast ones pass.
