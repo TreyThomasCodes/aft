@@ -1,3 +1,9 @@
+> **SUPERSEDED — do not implement from this file.** The document review
+> consult (NO-GO as written) found the v1 body contradicts the v2 amendments
+> and shipped machinery in load-bearing ways (artifact-key collision for
+> mid-repo entries, lease-join insufficiency, watcher-gap contradiction).
+> The governing design is `index-roots-v3.md`; this file is history.
+
 # Standing indexed roots (`index.roots`) — design v1
 
 Community demand (Discord 2026-08-20): agents/users want folders indexed that no
