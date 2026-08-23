@@ -136,6 +136,7 @@ mod tests {
             "four hexadecimal digits",
             "current tagged read",
             "REM and MV require a whole-file tagged read",
+            "multiple sections compose in patch order against pre-request coordinates",
             "`0` (BOF)",
             "`N.=M`",
             "`<N`/`>N`",

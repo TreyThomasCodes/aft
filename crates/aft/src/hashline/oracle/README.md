@@ -35,9 +35,16 @@ The only registered deviation categories are exactly:
 1. `block-resolver-span` — native BlockResolver spans may differ for JSX.
 2. `strict-exact-byte-verification` — AFT rejects addressed raw-byte drift
    even when normalized oracle text would remain accepted.
+3. `same-path-section-composition` — AFT composes sections resolving to one
+   canonical path in patch order against tag-anchored pre-request coordinates,
+   while the pinned oracle's `assertUniqueCanonicalPaths` rejects that input.
+   The owner approved this model-ergonomics deviation on 2026-08-23.
 
-The manifest's deviation-control rows are required to fail if either
-registered deviation silently disappears.  No third category is permitted.
+The manifest's deviation-control rows are required to fail if either row-level
+registered deviation silently disappears.  The third category uses the named
+pinned-oracle rejection and AFT end-to-end patch controls because JSONL rows are
+single-operation, single-address fixtures.  A fourth category requires the same
+explicit owner-decision, written-justification, and two-sided-control process.
 
 ## xxHash32 parity
 

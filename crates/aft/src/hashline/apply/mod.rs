@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use crate::hashline::scan::{RawLineRecord, Snapshot};
 use crate::hashline::snapshot::AffectedRegion;
 use crate::hashline::syntax::{
-    verify_exact, Baseline, CutOperation, HashlineRejection, HashlineRejectionCode, Operation,
-    PutOperation, PutSource, RegisterRef, RejectionStage, RemOperation, ResolvedAddress,
+    verify_exact, Baseline, CutOperation, HashlineRejection, HashlineRejectionCode, LineSpan,
+    Operation, PutOperation, PutSource, RegisterRef, RejectionStage, RemOperation, ResolvedAddress,
     ResolvedOperation, VerificationOutcome,
 };
 
@@ -169,71 +169,484 @@ pub struct SectionPlanInput<'a> {
     pub resolved: &'a [ResolvedOperation],
 }
 
-/// Plan every section without mutating the session register store or disk.
+/// Plan every canonical path without mutating the session register store or disk.
 ///
-/// Any verification, eligibility, or register-bound failure rejects the whole
-/// plan. Staged register captures remain local until
+/// Every section is verified against its path's single pre-request baseline before
+/// byte planning begins. Repeated canonical paths then compose in patch order, but
+/// produce one final file plan and therefore one transaction write. This deliberately
+/// differs from the pinned oracle's duplicate-path refusal: retained tags make the
+/// pre-request coordinates unambiguous and avoid requiring agents to hand-merge
+/// sections. Any verification, eligibility, composition, or register-bound failure
+/// rejects the whole plan. Staged register captures remain local until
 /// [`commit_registers_if_complete`].
 pub fn plan_apply(
     sections: &[SectionPlanInput<'_>],
     session_registers: &RegisterStore,
 ) -> Result<ApplyPlan, HashlineRejection> {
+    let mut section_counts = BTreeMap::<PathBuf, usize>::new();
+    let mut common_baselines = BTreeMap::<PathBuf, Vec<u8>>::new();
+
+    // Verification deliberately precedes all register staging and byte planning.
+    // A stale address in any repeated section rejects the entire request before a
+    // composed unit can acquire a backup or write its first intermediate result.
+    for section in sections {
+        let path = section.canonical_path.to_path_buf();
+        *section_counts.entry(path.clone()).or_default() += 1;
+        if let Some(existing) = common_baselines.get(&path) {
+            if existing != &section.baseline.bytes {
+                return Err(HashlineRejection::new(
+                    HashlineRejectionCode::StaleTag,
+                    RejectionStage::Baseline,
+                    "sections for one canonical path did not retain one Phase-1 baseline",
+                ));
+            }
+        } else {
+            common_baselines.insert(path, section.baseline.bytes.clone());
+        }
+        verify_section_against_pre_request_baseline(section)?;
+    }
+
     let mut staged = session_registers.stage();
-    let mut files = Vec::with_capacity(sections.len());
-    // One working baseline per canonical path so multi-section same-path edits
-    // compose in patch order against pre-request coordinates that the syntax
-    // layer already resolved. Intra-path renumbering is applied by replaying
-    // prior planned bytes when the same path appears again.
-    let mut working_bytes: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    let mut slots = Vec::<ApplyPlanSlot>::new();
+    let mut slot_by_path = BTreeMap::<PathBuf, usize>::new();
 
     for section in sections {
         let path = section.canonical_path.to_path_buf();
-        let baseline_bytes = working_bytes
-            .get(&path)
-            .cloned()
-            .unwrap_or_else(|| section.baseline.bytes.clone());
-        let baseline = Baseline::from_bytes(baseline_bytes.clone());
-
-        // Verify each resolved address against the common baseline before any
-        // mutation is planned. Anchor mismatches reject; span mismatches are
-        // reported as recovery-required and refuse silent apply here.
-        for resolved in section.resolved {
-            match verify_exact(section.snapshot, &baseline, resolved.address) {
-                VerificationOutcome::Exact => {}
-                VerificationOutcome::RecoveryRequired(_) => {
-                    return Err(HashlineRejection::new(
-                        HashlineRejectionCode::StaleTag,
-                        RejectionStage::Recovery,
-                        "addressed content no longer matches the Phase-1 baseline",
-                    ));
-                }
-                VerificationOutcome::Rejected(rejection) => return Err(rejection),
-                VerificationOutcome::BlockNeedsResolution { .. } => {
-                    return Err(HashlineRejection::new(
-                        HashlineRejectionCode::BoundaryIneligible,
-                        RejectionStage::Eligibility,
-                        "block address was not expanded before apply planning",
-                    ));
-                }
-            }
+        if section_counts.get(&path).copied().unwrap_or_default() == 1 {
+            let planned = apply_section_ops(
+                section.requested_path,
+                section.canonical_path,
+                section.baseline,
+                section.operations,
+                section.resolved,
+                &mut staged,
+            )?;
+            slot_by_path.insert(path, slots.len());
+            slots.push(ApplyPlanSlot::Complete(planned));
+            continue;
         }
 
-        let planned = apply_section_ops(
-            section.requested_path,
-            section.canonical_path,
-            &baseline,
-            section.operations,
-            section.resolved,
-            &mut staged,
-        )?;
-        working_bytes.insert(path, planned.final_bytes.clone());
-        files.push(planned);
+        let slot = if let Some(slot) = slot_by_path.get(&path).copied() {
+            slot
+        } else {
+            let slot = slots.len();
+            slots.push(ApplyPlanSlot::Composing(CompositionState::new(section)));
+            slot_by_path.insert(path, slot);
+            slot
+        };
+        let ApplyPlanSlot::Composing(state) = &mut slots[slot] else {
+            unreachable!("repeated canonical path always owns a composition state")
+        };
+        state.apply_section(section, &mut staged)?;
     }
+
+    let files = slots
+        .into_iter()
+        .map(|slot| match slot {
+            ApplyPlanSlot::Complete(file) => Ok(file),
+            ApplyPlanSlot::Composing(state) => state.finish(),
+        })
+        .collect::<Result<Vec<_>, HashlineRejection>>()?;
 
     Ok(ApplyPlan {
         files,
         staged_registers: staged,
     })
+}
+
+fn verify_section_against_pre_request_baseline(
+    section: &SectionPlanInput<'_>,
+) -> Result<(), HashlineRejection> {
+    for resolved in section.resolved {
+        match verify_exact(section.snapshot, section.baseline, resolved.address) {
+            VerificationOutcome::Exact => {}
+            VerificationOutcome::RecoveryRequired(_) => {
+                return Err(HashlineRejection::new(
+                    HashlineRejectionCode::StaleTag,
+                    RejectionStage::Recovery,
+                    "addressed content no longer matches the Phase-1 baseline",
+                ));
+            }
+            VerificationOutcome::Rejected(rejection) => return Err(rejection),
+            VerificationOutcome::BlockNeedsResolution { .. } => {
+                return Err(HashlineRejection::new(
+                    HashlineRejectionCode::BoundaryIneligible,
+                    RejectionStage::Eligibility,
+                    "block address was not expanded before apply planning",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+enum ApplyPlanSlot {
+    Complete(PlannedFile),
+    Composing(CompositionState),
+}
+
+#[derive(Clone, Debug)]
+struct CompositionState {
+    canonical_path: PathBuf,
+    requested_path: String,
+    original: Baseline,
+    current: Baseline,
+    origins: Vec<LineOrigin>,
+    deleted_by: BTreeMap<usize, String>,
+    removed_by: Option<String>,
+    warnings: Vec<String>,
+    repair_layers: Vec<&'static str>,
+    remove_file: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LineOrigin {
+    Original(usize),
+    Replacement { source: LineSpan, operation: String },
+    Inserted { gap: OriginalGap },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OriginalGap {
+    before: Option<usize>,
+    after: Option<usize>,
+}
+
+impl CompositionState {
+    fn new(section: &SectionPlanInput<'_>) -> Self {
+        Self {
+            canonical_path: section.canonical_path.to_path_buf(),
+            requested_path: section.requested_path.to_string(),
+            original: section.baseline.clone(),
+            current: section.baseline.clone(),
+            origins: (1..=section.baseline.snapshot.total_lines)
+                .map(LineOrigin::Original)
+                .collect(),
+            deleted_by: BTreeMap::new(),
+            removed_by: None,
+            warnings: Vec::new(),
+            repair_layers: Vec::new(),
+            remove_file: false,
+        }
+    }
+
+    fn apply_section(
+        &mut self,
+        section: &SectionPlanInput<'_>,
+        registers: &mut StagedRegisters,
+    ) -> Result<(), HashlineRejection> {
+        if section.operations.len() != section.resolved.len() {
+            return Err(HashlineRejection::parse(
+                "resolved operation count does not match the parsed section",
+            ));
+        }
+        for (operation, resolved) in section.operations.iter().zip(section.resolved.iter()) {
+            self.apply_operation(operation, resolved, registers)?;
+        }
+        Ok(())
+    }
+
+    fn apply_operation(
+        &mut self,
+        operation: &Operation,
+        resolved: &ResolvedOperation,
+        registers: &mut StagedRegisters,
+    ) -> Result<(), HashlineRejection> {
+        let current_operation = operation_label(operation);
+        if let Some(previous) = &self.removed_by {
+            return Err(composition_conflict(
+                &current_operation,
+                previous,
+                "the earlier operation removed the whole pre-request file",
+            ));
+        }
+
+        let original_address = resolved.address;
+        let current_address = self.remap_address(original_address, &current_operation)?;
+        let current_resolved = ResolvedOperation {
+            operation_index: resolved.operation_index,
+            address: current_address,
+        };
+        let before_lines = self.current.snapshot.total_lines;
+        let planned = apply_section_ops(
+            &self.requested_path,
+            &self.canonical_path,
+            &self.current,
+            std::slice::from_ref(operation),
+            std::slice::from_ref(&current_resolved),
+            registers,
+        )?;
+        let after = Baseline::from_bytes(planned.final_bytes.clone());
+        let after_lines = after.snapshot.total_lines;
+        self.update_origins(
+            operation,
+            original_address,
+            current_address,
+            &current_operation,
+            before_lines,
+            after_lines,
+        )?;
+        self.current = after;
+        self.remove_file = planned.remove_file;
+        self.warnings.extend(planned.warnings);
+        for layer in planned.repair_layers {
+            if !self.repair_layers.contains(&layer) {
+                self.repair_layers.push(layer);
+            }
+        }
+        Ok(())
+    }
+
+    fn remap_address(
+        &self,
+        address: ResolvedAddress,
+        current_operation: &str,
+    ) -> Result<ResolvedAddress, HashlineRejection> {
+        match address {
+            ResolvedAddress::Span(span) => self
+                .remap_span(span, current_operation)
+                .map(ResolvedAddress::Span),
+            ResolvedAddress::Gap(gap) => self
+                .remap_gap(
+                    OriginalGap {
+                        before: gap.before,
+                        after: gap.after,
+                    },
+                    current_operation,
+                )
+                .map(ResolvedAddress::Gap),
+            ResolvedAddress::WholeFile
+            | ResolvedAddress::BlockAnchor(_)
+            | ResolvedAddress::BlockGapAnchor { .. } => Ok(address),
+        }
+    }
+
+    fn remap_span(
+        &self,
+        span: LineSpan,
+        current_operation: &str,
+    ) -> Result<LineSpan, HashlineRejection> {
+        for line in span.lines() {
+            if let Some(previous) = self.deleted_by.get(&line) {
+                return Err(composition_conflict(
+                    current_operation,
+                    previous,
+                    &format!("pre-request line {line} was deleted earlier"),
+                ));
+            }
+        }
+
+        let mut selected = Vec::new();
+        for (index, origin) in self.origins.iter().enumerate() {
+            match origin {
+                LineOrigin::Original(line) if span.start <= *line && *line <= span.end => {
+                    selected.push(index + 1);
+                }
+                LineOrigin::Replacement { source, operation } if spans_overlap(*source, span) => {
+                    if !span_contains(span, *source) {
+                        return Err(composition_conflict(
+                            current_operation,
+                            operation,
+                            "the later pre-request span only partially overlaps an earlier replacement",
+                        ));
+                    }
+                    selected.push(index + 1);
+                }
+                LineOrigin::Original(_)
+                | LineOrigin::Replacement { .. }
+                | LineOrigin::Inserted { .. } => {}
+            }
+        }
+
+        let Some(start) = selected.first().copied() else {
+            return Err(HashlineRejection::eligibility(
+                HashlineRejectionCode::BoundaryIneligible,
+                format!(
+                    "{current_operation} cannot resolve its pre-request span after earlier same-path operations"
+                ),
+            ));
+        };
+        let end = selected.last().copied().unwrap_or(start);
+        Ok(LineSpan { start, end })
+    }
+
+    fn remap_gap(
+        &self,
+        gap: OriginalGap,
+        current_operation: &str,
+    ) -> Result<crate::hashline::syntax::ResolvedGap, HashlineRejection> {
+        for line in [gap.before, gap.after].into_iter().flatten() {
+            if let Some(previous) = self.deleted_by.get(&line) {
+                return Err(composition_conflict(
+                    current_operation,
+                    previous,
+                    &format!("required pre-request gap anchor line {line} was deleted earlier"),
+                ));
+            }
+        }
+
+        let before = self.last_index_for_original(gap.before);
+        let after = self.first_index_for_original(gap.after);
+        let last_inserted = self
+            .origins
+            .iter()
+            .enumerate()
+            .filter_map(|(index, origin)| match origin {
+                LineOrigin::Inserted { gap: inserted } if *inserted == gap => Some(index + 1),
+                _ => None,
+            })
+            .last();
+
+        Ok(crate::hashline::syntax::ResolvedGap {
+            before: last_inserted.or(before),
+            after,
+        })
+    }
+
+    fn first_index_for_original(&self, line: Option<usize>) -> Option<usize> {
+        let line = line?;
+        self.origins
+            .iter()
+            .position(|origin| origin_covers_line(origin, line))
+            .map(|index| index + 1)
+    }
+
+    fn last_index_for_original(&self, line: Option<usize>) -> Option<usize> {
+        let line = line?;
+        self.origins
+            .iter()
+            .rposition(|origin| origin_covers_line(origin, line))
+            .map(|index| index + 1)
+    }
+
+    fn update_origins(
+        &mut self,
+        operation: &Operation,
+        original_address: ResolvedAddress,
+        current_address: ResolvedAddress,
+        operation_name: &str,
+        before_lines: usize,
+        after_lines: usize,
+    ) -> Result<(), HashlineRejection> {
+        match operation {
+            Operation::Put(_) => match (original_address, current_address) {
+                (ResolvedAddress::Span(original), ResolvedAddress::Span(current)) => {
+                    let replaced = current.end - current.start + 1;
+                    let inserted = after_lines
+                        .checked_add(replaced)
+                        .and_then(|count| count.checked_sub(before_lines))
+                        .ok_or_else(|| {
+                            HashlineRejection::parse(
+                                "same-path replacement produced inconsistent line accounting",
+                            )
+                        })?;
+                    let replacement = (0..inserted).map(|_| LineOrigin::Replacement {
+                        source: original,
+                        operation: operation_name.to_string(),
+                    });
+                    self.origins
+                        .splice(current.start - 1..current.end, replacement);
+                }
+                (ResolvedAddress::Gap(original), ResolvedAddress::Gap(current)) => {
+                    let inserted = after_lines.checked_sub(before_lines).ok_or_else(|| {
+                        HashlineRejection::parse(
+                            "same-path gap insertion produced inconsistent line accounting",
+                        )
+                    })?;
+                    let index = current.before.unwrap_or(0);
+                    let gap = OriginalGap {
+                        before: original.before,
+                        after: original.after,
+                    };
+                    self.origins.splice(
+                        index..index,
+                        (0..inserted).map(|_| LineOrigin::Inserted { gap }),
+                    );
+                }
+                _ => {}
+            },
+            Operation::Cut(_) => {
+                let ResolvedAddress::Span(original) = original_address else {
+                    return Ok(());
+                };
+                let ResolvedAddress::Span(current) = current_address else {
+                    return Ok(());
+                };
+                self.origins.drain(current.start - 1..current.end);
+                for line in original.lines() {
+                    self.deleted_by.insert(line, operation_name.to_string());
+                }
+            }
+            Operation::Rem(_) => {
+                for line in 1..=self.original.snapshot.total_lines {
+                    self.deleted_by.insert(line, operation_name.to_string());
+                }
+                self.origins.clear();
+                self.removed_by = Some(operation_name.to_string());
+            }
+            Operation::Mv(_) => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<PlannedFile, HashlineRejection> {
+        let affected = if self.remove_file {
+            AffectedRegion::default()
+        } else {
+            let original_lines = baseline_lines(&self.original)?;
+            let final_lines = baseline_lines(&self.current)?;
+            affected_from_line_diff(&original_lines, &final_lines)
+        };
+        Ok(PlannedFile {
+            canonical_path: self.canonical_path,
+            requested_path: self.requested_path,
+            baseline_bytes: self.original.bytes,
+            final_bytes: self.current.bytes,
+            affected,
+            remove_file: self.remove_file,
+            warnings: self.warnings,
+            repair_layers: self.repair_layers,
+        })
+    }
+}
+
+fn operation_label(operation: &Operation) -> String {
+    match operation {
+        Operation::Put(operation) => format!("PUT at patch line {}", operation.line),
+        Operation::Cut(operation) => format!("CUT at patch line {}", operation.line),
+        Operation::Rem(operation) => format!("REM at patch line {}", operation.line),
+        Operation::Mv(operation) => format!("MV at patch line {}", operation.line),
+    }
+}
+
+fn composition_conflict(
+    current_operation: &str,
+    previous_operation: &str,
+    reason: &str,
+) -> HashlineRejection {
+    HashlineRejection::eligibility(
+        HashlineRejectionCode::BoundaryIneligible,
+        format!(
+            "same-path composition conflict: {current_operation} conflicts with {previous_operation}: {reason}"
+        ),
+    )
+}
+
+fn origin_covers_line(origin: &LineOrigin, line: usize) -> bool {
+    match origin {
+        LineOrigin::Original(original) => *original == line,
+        LineOrigin::Replacement { source, .. } => source.start <= line && line <= source.end,
+        LineOrigin::Inserted { .. } => false,
+    }
+}
+
+fn spans_overlap(left: LineSpan, right: LineSpan) -> bool {
+    left.start <= right.end && right.start <= left.end
+}
+
+fn span_contains(outer: LineSpan, inner: LineSpan) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
 }
 
 /// Apply PUT/CUT/REM operations for one section against one baseline.

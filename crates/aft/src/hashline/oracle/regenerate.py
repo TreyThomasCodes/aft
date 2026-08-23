@@ -27,10 +27,17 @@ P4 = 0x27D4EB2F
 P5 = 0x165667B1
 MASK32 = 0xFFFFFFFF
 
-DEVIATION_CATEGORIES = (
+ROW_DEVIATION_CATEGORIES = (
     "block-resolver-span",
     "strict-exact-byte-verification",
 )
+PATCH_LEVEL_DEVIATION_CONTROLS = {
+    "same-path-section-composition": (
+        "commands::hashline::tests::same_path_section_composition_pinned_oracle_rejection_control",
+        "commands::hashline::tests::same_path_section_composition_aft_outcome_control",
+    ),
+}
+DEVIATION_CATEGORIES = ROW_DEVIATION_CATEGORIES + tuple(PATCH_LEVEL_DEVIATION_CONTROLS)
 
 
 def rotl32(value: int, count: int) -> int:
@@ -466,17 +473,23 @@ def validate_fixtures(fixtures: list[dict[str, Any]]) -> None:
         ):
             raise AssertionError(f"repair {repair} has no mutation-checked negative control")
 
-    observed_deviations = {
+    row_deviations = {
         fixture["deviation_category"]
         for fixture in fixtures
         if fixture["deviation_category"] is not None
     }
+    if row_deviations != set(ROW_DEVIATION_CATEGORIES):
+        raise AssertionError(
+            f"row deviation categories must be exactly {ROW_DEVIATION_CATEGORIES}, "
+            f"got {sorted(row_deviations)}"
+        )
+    observed_deviations = row_deviations | set(PATCH_LEVEL_DEVIATION_CONTROLS)
     if observed_deviations != set(DEVIATION_CATEGORIES):
         raise AssertionError(
-            f"deviation categories must be exactly {DEVIATION_CATEGORIES}, "
+            f"registered deviation categories must be exactly {DEVIATION_CATEGORIES}, "
             f"got {sorted(observed_deviations)}"
         )
-    for deviation in DEVIATION_CATEGORIES:
+    for deviation in ROW_DEVIATION_CATEGORIES:
         controls = [
             fixture
             for fixture in fixtures
@@ -484,6 +497,9 @@ def validate_fixtures(fixtures: list[dict[str, Any]]) -> None:
         ]
         if len(controls) < 2 or any(not fixture.get("control_failure_if_equal") for fixture in controls):
             raise AssertionError(f"deviation {deviation} lacks two-way controls")
+    for deviation, controls in PATCH_LEVEL_DEVIATION_CONTROLS.items():
+        if len(controls) < 2 or len(set(controls)) != len(controls):
+            raise AssertionError(f"patch-level deviation {deviation} lacks two distinct controls")
 
 
 def render_json(value: Any) -> bytes:
@@ -596,19 +612,30 @@ def make_outputs() -> dict[str, bytes]:
                 "justification": "AFT exact-compares raw addressed bytes and terminators even where the oracle accepts normalized text.",
                 "control_rule": "A deviation-control fixture must fail if trailing-byte drift is accepted by the native verifier.",
             },
+            {
+                "id": "same-path-section-composition",
+                "justification": "AFT composes same-canonical-path sections although the pinned oracle's assertUniqueCanonicalPaths rejects them. The owner decided on 2026-08-23 that requiring agents to hand-merge sections is model-hostile and tag-anchored pre-request coordinates make composition deterministic.",
+                "control_rule": "The pinned-oracle rejection control and AFT end-to-end composition control must fail if either side of the deliberate deviation changes without review.",
+            },
         ],
         "coverage": coverage,
         "deviation_control": {
             "registered_category_count": len(DEVIATION_CATEGORIES),
             "observed_category_count": len(
                 {fixture["deviation_category"] for fixture in fixtures if fixture["deviation_category"]}
+                | set(PATCH_LEVEL_DEVIATION_CONTROLS)
             ),
             "control_rows": [
                 fixture["id"]
                 for fixture in fixtures
                 if fixture["deviation_control"]
             ],
-            "requires_exactly_two_categories": True,
+            "control_tests": [
+                {"deviation_category": deviation, "test": test}
+                for deviation, tests in PATCH_LEVEL_DEVIATION_CONTROLS.items()
+                for test in tests
+            ],
+            "requires_exactly_three_categories": True,
         },
     }
     manifest_bytes = render_json(manifest)

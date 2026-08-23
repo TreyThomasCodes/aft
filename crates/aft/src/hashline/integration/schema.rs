@@ -57,6 +57,7 @@ pub const HASHLINE_EDIT_DESCRIPTION: &str = concat!(
     "- Header: `[path#TAG]`; TAG is exactly four hexadecimal digits from a current tagged read. ",
     "Read every addressed row and gap boundary; REM and MV require a whole-file tagged read. ",
     "Re-read after an edit before chaining: an edit-response tag can retain only changed context.\n",
+    "- Same canonical path: multiple sections compose in patch order against pre-request coordinates.\n",
     "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), ",
     "`<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). ",
     "A plain `N` PUT replaces; use `<N` or `>N` to insert.\n",

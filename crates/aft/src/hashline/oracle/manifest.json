@@ -44,6 +44,11 @@
       "id": "strict-exact-byte-verification",
       "justification": "AFT exact-compares raw addressed bytes and terminators even where the oracle accepts normalized text.",
       "control_rule": "A deviation-control fixture must fail if trailing-byte drift is accepted by the native verifier."
+    },
+    {
+      "id": "same-path-section-composition",
+      "justification": "AFT composes same-canonical-path sections although the pinned oracle's assertUniqueCanonicalPaths rejects them. The owner decided on 2026-08-23 that requiring agents to hand-merge sections is model-hostile and tag-anchored pre-request coordinates make composition deterministic.",
+      "control_rule": "The pinned-oracle rejection control and AFT end-to-end composition control must fail if either side of the deliberate deviation changes without review."
     }
   ],
   "coverage": {
@@ -111,14 +116,24 @@
     ]
   },
   "deviation_control": {
-    "registered_category_count": 2,
-    "observed_category_count": 2,
+    "registered_category_count": 3,
+    "observed_category_count": 3,
     "control_rows": [
       "oracle-121",
       "oracle-122",
       "oracle-123",
       "oracle-124"
     ],
-    "requires_exactly_two_categories": true
+    "control_tests": [
+      {
+        "deviation_category": "same-path-section-composition",
+        "test": "commands::hashline::tests::same_path_section_composition_pinned_oracle_rejection_control"
+      },
+      {
+        "deviation_category": "same-path-section-composition",
+        "test": "commands::hashline::tests::same_path_section_composition_aft_outcome_control"
+      }
+    ],
+    "requires_exactly_three_categories": true
   }
 }

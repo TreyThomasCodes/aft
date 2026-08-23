@@ -6,14 +6,15 @@
 //! checks, ordered execution, destination-before-source MV reporting, final-byte
 //! observation, register commit gating, and `op_id` emission.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::backup::{new_op_id, BackupStore};
 use crate::hashline::apply::{
-    apply_section_ops, commit_registers_if_complete, FileClassification, FileResult, MutationState,
-    PlannedFile, RegisterStore, SectionPlanInput, StagedRegisters,
+    commit_registers_if_complete, plan_apply, ApplyPlan, FileClassification, FileResult,
+    MutationState, PlannedFile, RegisterStore, SectionPlanInput, StagedRegisters,
 };
 use crate::hashline::scan::Snapshot;
 use crate::hashline::snapshot::{
@@ -190,10 +191,30 @@ pub fn plan_transaction(
     session_registers: &RegisterStore,
     backups_enabled: bool,
 ) -> Result<TransactionPlan, HashlineRejection> {
-    let mut staged = session_registers.stage();
-    let mut steps = Vec::with_capacity(sections.len());
+    if sections.is_empty() {
+        return Err(HashlineRejection::parse(
+            "transaction plan requires at least one section",
+        ));
+    }
+
+    // Phase 1 lowers every section through the apply planner first. That planner
+    // collapses repeated canonical paths into one final byte image, so Phase 2
+    // can journal, baseline-check, write, tag, and count the path exactly once.
+    let mut line_sections = Vec::with_capacity(sections.len());
+    let mut source_paths = BTreeSet::<PathBuf>::new();
+    let mut moves = BTreeMap::<PathBuf, MergedMove<'_>>::new();
+    let mut rem_paths = BTreeSet::<PathBuf>::new();
 
     for section in sections {
+        let path = section.canonical_path.to_path_buf();
+        source_paths.insert(path.clone());
+        if let Some(previous) = moves.get(&path) {
+            return Err(HashlineRejection::parse(format!(
+                "{} is followed by another section for the same canonical source; MV must be the final same-path operation",
+                previous.operation_label
+            )));
+        }
+
         let (line_ops, line_resolved, mv_op) = split_mv(section.operations, section.resolved)?;
         if mv_op.is_some() && section.mv_destination.is_none() {
             return Err(HashlineRejection::parse(
@@ -205,45 +226,70 @@ pub fn plan_transaction(
                 "destination coordinates supplied without an MV operation",
             ));
         }
+        if line_ops
+            .iter()
+            .any(|operation| matches!(operation, Operation::Rem(_)))
+        {
+            rem_paths.insert(path.clone());
+        }
 
-        let planned_source = if line_ops.is_empty() {
-            // Pure MV or empty line body: carry baseline bytes forward.
-            PlannedFile {
-                canonical_path: section.canonical_path.to_path_buf(),
-                requested_path: section.requested_path.to_string(),
-                baseline_bytes: section.baseline.bytes.clone(),
-                final_bytes: section.baseline.bytes.clone(),
-                affected: AffectedRegion::default(),
-                remove_file: false,
-                warnings: Vec::new(),
-                repair_layers: Vec::new(),
-            }
-        } else {
-            // Verify then plan line ops against the section baseline. Multi-section
-            // same-path composition is owned by the apply planner; transaction
-            // sections are already one logical unit per call site.
-            let input = SectionPlanInput {
-                canonical_path: section.canonical_path,
-                requested_path: section.requested_path,
-                baseline: section.baseline,
-                snapshot: section.snapshot,
-                operations: line_ops,
-                resolved: line_resolved,
-            };
-            let plan = plan_line_section(&input, &mut staged)?;
-            plan
-        };
+        if let (Some(mv), Some(destination)) = (mv_op, section.mv_destination.as_ref()) {
+            moves.insert(
+                path.clone(),
+                MergedMove {
+                    destination: destination.clone(),
+                    operation_label: format!("MV at patch line {}", mv.line),
+                },
+            );
+        }
+        line_sections.push(SectionPlanInput {
+            canonical_path: section.canonical_path,
+            requested_path: section.requested_path,
+            baseline: section.baseline,
+            snapshot: section.snapshot,
+            operations: line_ops,
+            resolved: line_resolved,
+        });
+    }
 
-        let step = if let Some(dest) = section.mv_destination.as_ref() {
-            let dest_existed = dest.baseline_bytes.is_some();
+    for (source, mv) in &moves {
+        if rem_paths.contains(source) {
+            return Err(HashlineRejection::parse(format!(
+                "{} cannot follow REM sections for the same canonical source",
+                mv.operation_label
+            )));
+        }
+        if mv.destination.canonical_path == source {
+            return Err(HashlineRejection::parse(format!(
+                "{} resolves its destination to the same canonical path as its source",
+                mv.operation_label
+            )));
+        }
+        if source_paths.contains(mv.destination.canonical_path) {
+            return Err(HashlineRejection::parse(format!(
+                "{} targets a canonical path that is also edited by another patch section; split the move and destination edit into separate requests",
+                mv.operation_label
+            )));
+        }
+    }
+
+    let ApplyPlan {
+        files,
+        staged_registers,
+    } = plan_apply(&line_sections, session_registers)?;
+    let mut steps = Vec::with_capacity(files.len());
+    for planned_source in files {
+        let step = if let Some(mv) = moves.remove(&planned_source.canonical_path) {
+            let destination = mv.destination;
+            let dest_existed = destination.baseline_bytes.is_some();
             PlannedStep::Mv(PlannedMv {
                 source_canonical: planned_source.canonical_path,
                 source_requested: planned_source.requested_path,
                 source_baseline_bytes: planned_source.baseline_bytes,
-                dest_canonical: dest.canonical_path.to_path_buf(),
-                dest_requested: dest.requested_path.to_string(),
+                dest_canonical: destination.canonical_path.to_path_buf(),
+                dest_requested: destination.requested_path.to_string(),
                 dest_existed,
-                dest_baseline_bytes: dest.baseline_bytes.map(|bytes| bytes.to_vec()),
+                dest_baseline_bytes: destination.baseline_bytes.map(|bytes| bytes.to_vec()),
                 final_bytes: planned_source.final_bytes,
                 affected: planned_source.affected,
                 warnings: planned_source.warnings,
@@ -252,21 +298,20 @@ pub fn plan_transaction(
         } else {
             PlannedStep::Mutate(planned_source)
         };
-
         assert_rollback_available(backups_enabled, &step)?;
         steps.push(step);
     }
 
-    if steps.is_empty() {
-        return Err(HashlineRejection::parse(
-            "transaction plan requires at least one section",
-        ));
-    }
-
     Ok(TransactionPlan {
         steps,
-        staged_registers: staged,
+        staged_registers,
     })
+}
+
+#[derive(Clone, Debug)]
+struct MergedMove<'a> {
+    destination: MvDestinationInput<'a>,
+    operation_label: String,
 }
 
 /// Preview reuses Phase 1 and renders the planned envelope without any mutation.
@@ -417,47 +462,6 @@ fn split_mv<'a>(
         ));
     }
     Ok((operations, resolved, None))
-}
-
-fn plan_line_section(
-    section: &SectionPlanInput<'_>,
-    staged: &mut StagedRegisters,
-) -> Result<PlannedFile, HashlineRejection> {
-    // Exact verification against the common baseline before any byte planning.
-    for resolved in section.resolved {
-        match crate::hashline::syntax::verify_exact(
-            section.snapshot,
-            section.baseline,
-            resolved.address,
-        ) {
-            crate::hashline::syntax::VerificationOutcome::Exact => {}
-            crate::hashline::syntax::VerificationOutcome::RecoveryRequired(_) => {
-                return Err(HashlineRejection::new(
-                    crate::hashline::syntax::HashlineRejectionCode::StaleTag,
-                    crate::hashline::syntax::RejectionStage::Recovery,
-                    "addressed content no longer matches the Phase-1 baseline",
-                ));
-            }
-            crate::hashline::syntax::VerificationOutcome::Rejected(rejection) => {
-                return Err(rejection)
-            }
-            crate::hashline::syntax::VerificationOutcome::BlockNeedsResolution { .. } => {
-                return Err(HashlineRejection::new(
-                    crate::hashline::syntax::HashlineRejectionCode::BoundaryIneligible,
-                    crate::hashline::syntax::RejectionStage::Eligibility,
-                    "block address was not expanded before transaction planning",
-                ));
-            }
-        }
-    }
-    apply_section_ops(
-        section.requested_path,
-        section.canonical_path,
-        section.baseline,
-        section.operations,
-        section.resolved,
-        staged,
-    )
 }
 
 fn assert_rollback_available(
@@ -1258,8 +1262,8 @@ mod tests {
     use crate::hashline::scan::scan_bytes;
     use crate::hashline::snapshot::{capture_taggable_read, ReadPublication, ReadSelection};
     use crate::hashline::syntax::{
-        parse_address, resolve_address, resolve_snapshot, PutOperation, PutSource, RegisterRef,
-        ResolvedAddress,
+        parse_address, resolve_address, resolve_snapshot, CutOperation, PutOperation, PutSource,
+        RegisterRef, ResolvedAddress,
     };
 
     const SESSION: &str = "hashline-tx-test";
@@ -1921,6 +1925,91 @@ mod tests {
             .files
             .iter()
             .all(|f| f.mutation_state == MutationState::Unmutated));
+    }
+
+    #[test]
+    fn mixed_patch_keeps_distinct_file_independent_and_same_path_pair_atomic() {
+        let temp = tempfile::tempdir().unwrap();
+        let distinct = temp.path().join("distinct.txt");
+        let composed = temp.path().join("composed.txt");
+        write_file(&distinct, b"distinct\n");
+        write_file(&composed, b"one\ntwo\nthree\n");
+        let distinct_bytes = fs::read(&distinct).unwrap();
+        let composed_bytes = fs::read(&composed).unwrap();
+        let distinct_snapshot = whole_snapshot(&distinct_bytes);
+        let composed_snapshot = whole_snapshot(&composed_bytes);
+        let distinct_baseline = Baseline::from_bytes(distinct_bytes);
+        let composed_baseline = Baseline::from_bytes(composed_bytes);
+        let distinct_ops = vec![put_text("1", &["changed"])];
+        let first_cut = vec![Operation::Cut(CutOperation {
+            address: parse_address("1").unwrap(),
+            register: None,
+            line: 2,
+        })];
+        let last_cut = vec![Operation::Cut(CutOperation {
+            address: parse_address("3").unwrap(),
+            register: None,
+            line: 4,
+        })];
+        let distinct_resolved = vec![resolve_one(&distinct_snapshot, &distinct_ops[0])];
+        let first_resolved = vec![resolve_one(&composed_snapshot, &first_cut[0])];
+        let last_resolved = vec![resolve_one(&composed_snapshot, &last_cut[0])];
+        let sections = [
+            section_put(
+                &distinct,
+                "distinct.txt",
+                &distinct_baseline,
+                &distinct_snapshot,
+                &distinct_ops,
+                &distinct_resolved,
+            ),
+            section_put(
+                &composed,
+                "composed.txt",
+                &composed_baseline,
+                &composed_snapshot,
+                &first_cut,
+                &first_resolved,
+            ),
+            section_put(
+                &composed,
+                "composed.txt",
+                &composed_baseline,
+                &composed_snapshot,
+                &last_cut,
+                &last_resolved,
+            ),
+        ];
+        let registers = RegisterStore::new();
+        let plan = plan_transaction(&sections, &registers, true).unwrap();
+        assert_eq!(plan.steps.len(), 2);
+
+        let mut backups = backup_store(&temp.path().join("backups"));
+        let mut snapshots = SnapshotStore::new();
+        let mut session_regs = RegisterStore::new();
+        let mut exec = ctx(
+            &mut backups,
+            &mut snapshots,
+            &mut session_regs,
+            true,
+            Some(ExecuteFault::BaselineDrift { step: 1 }),
+        );
+        let envelope = execute_transaction(plan, &mut exec);
+
+        assert!(envelope.success);
+        assert!(!envelope.complete);
+        assert_eq!(envelope.summary_text, "1 of 2 files applied");
+        assert_eq!(envelope.files.len(), 2);
+        assert_eq!(
+            envelope.files[0].classification,
+            FileClassification::Applied
+        );
+        assert_eq!(
+            envelope.files[1].classification,
+            FileClassification::FailedBaselineDrift
+        );
+        assert_eq!(fs::read(&distinct).unwrap(), b"changed\n");
+        assert_eq!(fs::read(&composed).unwrap(), b"one\ntwo\nthree\n");
     }
 
     /// A12: external writer between Phase 1 and Phase 2 write → baseline drift.

@@ -204,15 +204,27 @@ fn resolve_write_path(
     requested: &str,
 ) -> Result<PathBuf, HashlineRejection> {
     let path = crate::subc_translate::resolve_path_from_project_root(project_root, requested);
-    ctx.validate_write_location(&req.id, &path)
-        .map_err(|response| {
-            let message = response
-                .data
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("path is not write-eligible");
-            HashlineRejection::untaggable_path(message)
-        })
+    // Hashline handles are keyed by the symlink-resolved file identity. Following
+    // the final component here keeps two requested spellings of one existing file
+    // in the same verification and transaction unit while still validating the
+    // resolved target against the project boundary.
+    let validated = ctx.validate_path(&req.id, &path).map_err(|response| {
+        let message = response
+            .data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("path is not write-eligible");
+        HashlineRejection::untaggable_path(message)
+    })?;
+    let canonical = std::fs::canonicalize(&validated).unwrap_or(validated);
+    ctx.validate_path(&req.id, &canonical).map_err(|response| {
+        let message = response
+            .data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("path is not write-eligible");
+        HashlineRejection::untaggable_path(message)
+    })
 }
 
 fn transport_kind(ctx: &AppContext) -> TransportKind {
@@ -267,6 +279,39 @@ mod tests {
         }
     }
 
+    fn registered_fixture(
+        contents: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, AppContext, String) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let path = root.join("sample.txt");
+        std::fs::write(&path, contents).expect("fixture write");
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let registration = ctx.hashline_bindings().register(
+            &root,
+            DEFAULT_SESSION_ID.to_string(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+            },
+        );
+        assert!(registration.effective);
+        let mut read = request("read", json!({ "file": path }));
+        read.params["_hashline_requested_path"] = Value::String("sample.txt".to_string());
+        let response = crate::commands::read::handle_read(&read, &ctx);
+        let tag = response.data["hashline_tag"]
+            .as_str()
+            .expect("tagged read")
+            .to_string();
+        (temp, root, path, ctx, tag)
+    }
+
     #[test]
     fn preflight_then_apply_mutates_bytes_and_records_undo() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -310,6 +355,177 @@ mod tests {
         assert!(response.success, "{}", response.data);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "omega\nbeta\n");
         assert!(response.data["op_id"].as_str().is_some());
+        assert_eq!(
+            ctx.backup().lock().history(DEFAULT_SESSION_ID, &path).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_path_section_composition_pinned_oracle_rejection_control() {
+        // The pinned oracle runs assertUniqueCanonicalPaths before apply. Lock its
+        // rejection for the exact duplicate-canonical-path class AFT composes.
+        let canonical_paths = [PathBuf::from("/same-file"), PathBuf::from("/same-file")];
+        let mut unique = std::collections::BTreeSet::new();
+        let outcome = canonical_paths
+            .iter()
+            .find(|path| !unique.insert((*path).clone()))
+            .map(|path| {
+                format!(
+                    "assertUniqueCanonicalPaths rejected duplicate canonical path {}",
+                    path.display()
+                )
+            });
+
+        assert_eq!(
+            outcome.as_deref(),
+            Some("assertUniqueCanonicalPaths rejected duplicate canonical path /same-file")
+        );
+    }
+
+    #[test]
+    fn same_path_section_composition_aft_outcome_control() {
+        let (_temp, _root, path, ctx, tag) =
+            registered_fixture("alpha\nbeta\ngamma\ndelta\nepsilon\n");
+        let original = std::fs::read(&path).unwrap();
+        let patch = format!("[sample.txt#{tag}]\nCUT 1\n[sample.txt#{tag}]\nCUT 5");
+
+        let response = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(response.success, "{}", response.data);
+        assert_eq!(std::fs::read(&path).unwrap(), b"beta\ngamma\ndelta\n");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("1 of 1 files applied"));
+        assert_eq!(
+            response.data["classifications"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(response.data["final_tags"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ctx.backup().lock().history(DEFAULT_SESSION_ID, &path).len(),
+            1
+        );
+
+        let undo = crate::commands::undo::handle_undo(&request("undo", json!({})), &ctx);
+        assert!(undo.success, "{}", undo.data);
+        assert_eq!(undo.data["restored_count"], json!(1));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn stale_address_in_one_same_path_section_rejects_the_whole_unit() {
+        let (_temp, _root, path, ctx, tag) =
+            registered_fixture("alpha\nbeta\ngamma\ndelta\nepsilon\n");
+        std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\nexternal\n").unwrap();
+        let patch = format!("[sample.txt#{tag}]\nCUT 1\n[sample.txt#{tag}]\nCUT 5");
+
+        let rejection = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(!rejection.success, "{}", rejection.data);
+        assert_eq!(rejection.data["code"], json!("hashline_stale_tag"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"alpha\nbeta\ngamma\ndelta\nexternal\n"
+        );
+        assert!(ctx
+            .backup()
+            .lock()
+            .history(DEFAULT_SESSION_ID, &path)
+            .is_empty());
+    }
+
+    #[test]
+    fn same_path_overlaps_compose_in_order_but_deleted_addresses_reject_both_ops() {
+        let (_temp, _root, path, ctx, tag) = registered_fixture("alpha\nbeta\ngamma\n");
+        let replacement_patch =
+            format!("[sample.txt#{tag}]\nPUT 1:\n+first\n[sample.txt#{tag}]\nPUT 1:\n+second");
+        let replacement = handle_edit(
+            &request("hashline_edit", json!({ "patch": replacement_patch })),
+            &ctx,
+        );
+        assert!(replacement.success, "{}", replacement.data);
+        assert_eq!(std::fs::read(&path).unwrap(), b"second\nbeta\ngamma\n");
+
+        let undo = crate::commands::undo::handle_undo(&request("undo", json!({})), &ctx);
+        assert!(undo.success, "{}", undo.data);
+        let cut_then_put =
+            format!("[sample.txt#{tag}]\nCUT 1\n[sample.txt#{tag}]\nPUT 1:\n+forbidden");
+        let rejection = handle_edit(
+            &request("hashline_edit", json!({ "patch": cut_then_put })),
+            &ctx,
+        );
+        assert!(!rejection.success, "{}", rejection.data);
+        let message = rejection.data["message"].as_str().unwrap_or_default();
+        assert!(message.contains("PUT at patch line 4"), "{message}");
+        assert!(message.contains("CUT at patch line 2"), "{message}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn mv_can_finish_a_same_source_composition_and_undo_as_one_operation() {
+        let (_temp, root, source, ctx, tag) = registered_fixture("alpha\nbeta\n");
+        let destination = root.join("moved.txt");
+        let patch = format!("[sample.txt#{tag}]\nPUT 1:\n+omega\n[sample.txt#{tag}]\nMV moved.txt");
+
+        let response = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(response.success, "{}", response.data);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"omega\nbeta\n");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("1 of 1 files applied"));
+
+        let undo = crate::commands::undo::handle_undo(&request("undo", json!({})), &ctx);
+        assert!(undo.success, "{}", undo.data);
+        assert_eq!(std::fs::read(&source).unwrap(), b"alpha\nbeta\n");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn mv_destination_edited_by_another_section_rejects_before_mutation() {
+        let (_temp, root, source, ctx, source_tag) = registered_fixture("source\n");
+        let destination = root.join("destination.txt");
+        std::fs::write(&destination, "destination\n").unwrap();
+        let mut read = request("read", json!({ "file": destination }));
+        read.params["_hashline_requested_path"] = Value::String("destination.txt".to_string());
+        let destination_read = crate::commands::read::handle_read(&read, &ctx);
+        let destination_tag = destination_read.data["hashline_tag"].as_str().unwrap();
+        let patch = format!(
+            "[destination.txt#{destination_tag}]\nPUT 1:\n+changed\n[sample.txt#{source_tag}]\nMV destination.txt"
+        );
+
+        let rejection = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(!rejection.success, "{}", rejection.data);
+        assert!(rejection.data["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("also edited by another patch section"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"source\n");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_real_path_sections_share_one_canonical_transaction_unit() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, root, path, ctx, tag) = registered_fixture("one\ntwo\nthree\n");
+        symlink(&path, root.join("alias.txt")).unwrap();
+        let edit_request = request("hashline_edit", json!({}));
+        assert_eq!(
+            resolve_write_path(&edit_request, &ctx, &root, "sample.txt").unwrap(),
+            resolve_write_path(&edit_request, &ctx, &root, "alias.txt").unwrap()
+        );
+        let patch = format!("[sample.txt#{tag}]\nCUT 1\n[alias.txt#{tag}]\nCUT 3");
+
+        let response = handle_edit(&request("hashline_edit", json!({ "patch": patch })), &ctx);
+        assert!(response.success, "{}", response.data);
+        assert_eq!(std::fs::read(&path).unwrap(), b"two\n", "{}", response.data);
+        assert_eq!(
+            response.data["classifications"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(
             ctx.backup().lock().history(DEFAULT_SESSION_ID, &path).len(),
             1
