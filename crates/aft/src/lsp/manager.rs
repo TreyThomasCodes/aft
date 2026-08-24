@@ -663,6 +663,33 @@ impl LspManager {
             .collect()
     }
 
+    /// Return whether a navigation request would need to initialize an applicable
+    /// server. Missing binaries, inapplicable root markers, and cached spawn
+    /// failures stay on the synchronous path because they cannot incur a
+    /// handshake wait.
+    pub fn navigation_requires_deferred_execution(
+        &self,
+        file_path: &Path,
+        config: &Config,
+    ) -> bool {
+        let Ok(canonical_path) = canonicalize_for_lsp(file_path) else {
+            return false;
+        };
+        servers_for_file(&canonical_path, config)
+            .into_iter()
+            .filter_map(|definition| {
+                let key = server_key_for_definition(&definition, &canonical_path, config)?;
+                Some((definition, key))
+            })
+            .any(|(definition, key)| {
+                if let Some(client) = self.clients.get(&key) {
+                    return client.state() != ServerState::Ready;
+                }
+                !self.failed_spawns.contains_key(&key)
+                    && self.resolve_binary(&definition, config).is_ok()
+            })
+    }
+
     /// Detailed version of [`ensure_server_for_file`] that records every
     /// matching server's outcome (`Ok` / `NoRootMarker` / `BinaryNotInstalled`
     /// / `SpawnFailed`).

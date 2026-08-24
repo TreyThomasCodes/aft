@@ -40,6 +40,7 @@ pub mod lsp_find_references;
 pub mod lsp_goto_definition;
 pub mod lsp_hover;
 pub mod lsp_inspect;
+pub mod lsp_navigation;
 pub mod lsp_prepare_rename;
 pub mod lsp_rename;
 pub mod move_file;

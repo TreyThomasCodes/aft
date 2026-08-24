@@ -1,15 +1,21 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use aft::commands::lsp_find_references::handle_lsp_find_references;
 use aft::commands::lsp_goto_definition::handle_lsp_goto_definition;
 use aft::commands::lsp_hover::handle_lsp_hover;
+use aft::commands::lsp_navigation::handle_lsp_navigation_deferred;
 use aft::config::Config;
 use aft::context::AppContext;
 use aft::lsp::registry::ServerKind;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
+use aft::response_finalize::DispatchOutcome;
 use tempfile::tempdir;
+
+use super::helpers::{warm_executable, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
@@ -236,4 +242,82 @@ fn test_lsp_find_references_defaults_include_declaration_true() {
         "default should include declaration: {json:#}"
     );
     assert_eq!(json["total"], 2);
+}
+
+#[test]
+fn warm_navigation_stays_synchronous_and_preserves_response_bytes() {
+    let (_temp_dir, main_rs) = rust_workspace_with_file();
+    let ctx = Arc::new(app_context_with_fake_lsp());
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "warm-hover",
+        "command": "lsp_hover",
+        "file": main_rs.display().to_string(),
+        "line": 1,
+        "character": 1,
+    }))
+    .expect("request parses");
+
+    let initial = handle_lsp_hover(&request, &ctx);
+    assert!(initial.success, "fixture server should warm successfully");
+    let expected = handle_lsp_hover(&request, &ctx);
+    let actual = match handle_lsp_navigation_deferred(&request, Arc::clone(&ctx)) {
+        DispatchOutcome::Immediate(response) => response,
+        DispatchOutcome::Deferred(_) => panic!("warm navigation must remain synchronous"),
+    };
+
+    assert_eq!(
+        serde_json::to_vec(&actual).expect("serialize actual response"),
+        serde_json::to_vec(&expected).expect("serialize expected response")
+    );
+}
+
+#[test]
+fn standalone_ndjson_polls_cold_navigation_off_the_input_loop() {
+    let (temp_dir, main_rs) = rust_workspace_with_file();
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let installed = bin_dir.join(if cfg!(windows) {
+        "rust-analyzer.exe"
+    } else {
+        "rust-analyzer"
+    });
+    fs::copy(fake_server_path(), &installed).expect("install fake rust analyzer");
+    warm_executable(&installed, &[]);
+
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let joined_path = std::env::join_paths(paths).expect("join fixture PATH");
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("PATH", joined_path.as_os_str()),
+        ("AFT_FAKE_LSP_INIT_DELAY_MS", std::ffi::OsStr::new("1500")),
+    ]);
+    let ready = aft.send(r#"{"id":"input-loop-ready","command":"ping"}"#);
+    assert_eq!(ready["id"], "input-loop-ready");
+
+    aft.send_silent(
+        &serde_json::json!({
+            "id": "cold-hover",
+            "command": "lsp_hover",
+            "file": main_rs.display().to_string(),
+            "line": 1,
+            "character": 1,
+        })
+        .to_string(),
+    );
+    aft.send_silent(r#"{"id":"input-loop-probe","command":"ping"}"#);
+
+    let first = aft
+        .try_read_next_timeout(Duration::from_secs(1))
+        .expect("input loop should answer while the cold server initializes");
+    assert_eq!(
+        first["id"], "input-loop-probe",
+        "cold navigation must not serialize the next NDJSON request: {first:#}"
+    );
+
+    let navigation = aft.read_next();
+    assert_eq!(navigation["id"], "cold-hover", "response: {navigation:#}");
+    assert_eq!(navigation["success"], true, "response: {navigation:#}");
+    assert!(aft.shutdown().success());
 }

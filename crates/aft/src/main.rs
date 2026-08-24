@@ -843,6 +843,12 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.command == "inspect" {
         return aft::commands::inspect::handle_inspect_deferred(&req, Arc::clone(ctx));
     }
+    if aft::commands::lsp_navigation::is_lsp_navigation_command(&req.command) {
+        return aft::commands::lsp_navigation::handle_lsp_navigation_deferred(
+            &req,
+            Arc::clone(ctx),
+        );
+    }
     if req.command == "bash"
         && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
     {

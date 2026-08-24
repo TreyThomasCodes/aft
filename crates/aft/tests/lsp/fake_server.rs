@@ -247,6 +247,15 @@ fn main() -> io::Result<()> {
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
+                    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_INIT_DELAY_SIGNAL") {
+                        let _ = std::fs::write(signal_path, b"waiting");
+                    }
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_INIT_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
                     if let Some(target_root_uri) =
                         std::env::var("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI").ok()
                     {

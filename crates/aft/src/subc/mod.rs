@@ -201,22 +201,22 @@ struct ActiveToolCall {
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
 
-struct PendingInspectSetupGuard(Arc<AtomicUsize>);
+struct PendingDeferredSetupGuard(Arc<AtomicUsize>);
 
-impl PendingInspectSetupGuard {
+impl PendingDeferredSetupGuard {
     fn new(count: Arc<AtomicUsize>) -> Self {
         count.fetch_add(1, Ordering::SeqCst);
         Self(count)
     }
 }
 
-impl Drop for PendingInspectSetupGuard {
+impl Drop for PendingDeferredSetupGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-enum InspectSetupOutcome {
+enum DeferredSetupOutcome {
     Immediate {
         text: String,
         phase_trace: PhaseTrace,
@@ -228,13 +228,14 @@ enum InspectSetupOutcome {
     },
 }
 
-struct PendingSubcInspect {
+struct PendingSubcResponse {
     route: RouteChannel,
     corr: u64,
     flags: Flags,
     ver: u8,
     root: ProjectRootId,
     session_id: String,
+    bare_name: String,
     format_context: crate::subc_format::FormatContext,
     bind_trust: BindTrust,
     pending: PendingResponse,
@@ -242,18 +243,18 @@ struct PendingSubcInspect {
     phase_trace: PhaseTrace,
 }
 
-struct ResolvedSubcInspect {
-    entry: PendingSubcInspect,
+struct ResolvedSubcResponse {
+    entry: PendingSubcResponse,
     response: Response,
 }
 
 #[derive(Default)]
-struct PendingSubcInspects {
-    entries: Vec<PendingSubcInspect>,
+struct PendingSubcResponses {
+    entries: Vec<PendingSubcResponse>,
 }
 
-impl PendingSubcInspects {
-    fn register(&mut self, pending: PendingSubcInspect) {
+impl PendingSubcResponses {
+    fn register(&mut self, pending: PendingSubcResponse) {
         self.entries.retain(|entry| {
             let keep = entry.route != pending.route || entry.corr != pending.corr;
             if !keep {
@@ -266,7 +267,7 @@ impl PendingSubcInspects {
         self.entries.push(pending);
     }
 
-    fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcInspect> {
+    fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
         let mut ready = Vec::new();
         let mut waiting = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
@@ -274,7 +275,7 @@ impl PendingSubcInspects {
                 .actor_context(&entry.root)
                 .and_then(|ctx| (entry.pending.poll)(&ctx));
             if let Some(response) = response {
-                ready.push(ResolvedSubcInspect { entry, response });
+                ready.push(ResolvedSubcResponse { entry, response });
             } else {
                 waiting.push(entry);
             }
@@ -283,23 +284,38 @@ impl PendingSubcInspects {
         ready
     }
 
+    fn cancel_request(&mut self, route: RouteChannel, corr: u64) -> bool {
+        let mut cancelled = false;
+        self.entries.retain(|entry| {
+            let keep = entry.route != route || entry.corr != corr;
+            if !keep {
+                cancelled = true;
+                if let Some(cancellation) = &entry.pending.cancellation {
+                    cancellation.request_cancel();
+                }
+            }
+            keep
+        });
+        cancelled
+    }
+
     fn drain_route(
         &mut self,
         route: RouteChannel,
         executor: &Executor,
-    ) -> Vec<ResolvedSubcInspect> {
+    ) -> Vec<ResolvedSubcResponse> {
         self.drain_matching(executor, |entry| entry.route == route)
     }
 
-    fn drain_on_shutdown(&mut self, executor: &Executor) -> Vec<ResolvedSubcInspect> {
+    fn drain_on_shutdown(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
         self.drain_matching(executor, |_| true)
     }
 
     fn drain_matching(
         &mut self,
         executor: &Executor,
-        matches: impl Fn(&PendingSubcInspect) -> bool,
-    ) -> Vec<ResolvedSubcInspect> {
+        matches: impl Fn(&PendingSubcResponse) -> bool,
+    ) -> Vec<ResolvedSubcResponse> {
         let mut resolved = Vec::new();
         let mut waiting = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
@@ -313,7 +329,7 @@ impl PendingSubcInspects {
             if let Some(ctx) = executor.actor_context(&entry.root) {
                 if let Some(on_shutdown) = entry.pending.on_shutdown.as_mut() {
                     let response = on_shutdown(&ctx);
-                    resolved.push(ResolvedSubcInspect { entry, response });
+                    resolved.push(ResolvedSubcResponse { entry, response });
                 }
             }
         }
@@ -418,6 +434,17 @@ fn finish_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&(route, corr))
         .is_some()
+}
+
+fn active_tool_call_is_registered(
+    active: &ActiveToolCalls,
+    route: RouteChannel,
+    corr: u64,
+) -> bool {
+    active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&(route, corr))
 }
 
 fn cancel_active_tool_call(
@@ -2008,7 +2035,7 @@ async fn teardown_installed_route(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
-    pending_inspects: &mut PendingSubcInspects,
+    pending_responses: &mut PendingSubcResponses,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
@@ -2046,8 +2073,8 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
-    for resolved in pending_inspects.drain_route(channel, executor) {
-        deliver_resolved_subc_inspect(
+    for resolved in pending_responses.drain_route(channel, executor) {
+        deliver_resolved_subc_response(
             tx,
             resolved,
             routes,
@@ -2696,8 +2723,8 @@ where
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
-    let (inspect_deferred_tx, mut inspect_deferred_rx) =
-        mpsc::unbounded_channel::<PendingSubcInspect>();
+    let (deferred_response_tx, mut deferred_response_rx) =
+        mpsc::unbounded_channel::<PendingSubcResponse>();
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<RouteBindCompletion>(256);
@@ -2734,8 +2761,8 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
-    let pending_inspect_setups = Arc::new(AtomicUsize::new(0));
-    let mut pending_inspects = PendingSubcInspects::default();
+    let pending_deferred_setups = Arc::new(AtomicUsize::new(0));
+    let mut pending_responses = PendingSubcResponses::default();
     let health_rollup_cache = HealthRollupCache::new();
     health_rollup_cache.refresh(&executor, &shared_app);
     let mut next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
@@ -2748,9 +2775,9 @@ where
         }
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
-        let ready_inspects = pending_inspects.poll_ready(executor.as_ref());
+        let ready_inspects = pending_responses.poll_ready(executor.as_ref());
         for resolved in ready_inspects {
-            if let Err(error) = deliver_resolved_subc_inspect(
+            if let Err(error) = deliver_resolved_subc_response(
                 &writer_tx,
                 resolved,
                 &routes,
@@ -2981,7 +3008,7 @@ where
                             &mut live_roots,
                             &mut route_bash_cancels,
                             &active_tool_calls,
-                            &mut pending_inspects,
+                            &mut pending_responses,
                             &mut pending_binds,
                             &mut retry_buffer,
                             &mut push_buffer,
@@ -3030,7 +3057,7 @@ where
                             &mut pending_bash_asks,
                             &mut route_bash_cancels,
                             &active_tool_calls,
-                            &mut pending_inspects,
+                            &mut pending_responses,
                             &mut retry_buffer,
                             &mut push_buffer,
                             &shutdown,
@@ -3057,7 +3084,7 @@ where
                             &mut live_roots,
                             &executor,
                             &active_tool_calls,
-                            &pending_inspect_setups,
+                            &pending_deferred_setups,
                             &shutdown,
                             &connection_cancel,
                             &bash_deferred_tx,
@@ -3071,7 +3098,7 @@ where
                             &mut bg_wake_pending,
                             &mut bg_wake_epoch,
                             dispatch,
-                            &inspect_deferred_tx,
+                            &deferred_response_tx,
                             allow_native_passthrough,
                             tool_response_body_limit,
                         )
@@ -3089,6 +3116,7 @@ where
                             frame.header.corr,
                             "Cancel frame",
                         );
+                        pending_responses.cancel_request(channel, frame.header.corr);
                         if bg_subs.contains_key(&channel) {
                             if let Err(error) = end_bg_subscription(
                                 &writer_tx,
@@ -3122,14 +3150,20 @@ where
                         }
                     }
                     // Incoming push messages are ignored here. Cancel frames are
-                    // handled above for both active inspect jobs and pending bash
-                    // elicitation requests.
+                    // handled above for active and deferred tool calls plus pending
+                    // bash elicitation requests.
                     _ => {}
                 }
             }
-            Some(pending) = inspect_deferred_rx.recv() => {
-                if routes.contains_key(&pending.route) {
-                    pending_inspects.register(pending);
+            Some(pending) = deferred_response_rx.recv() => {
+                if routes.contains_key(&pending.route)
+                    && active_tool_call_is_registered(
+                        &active_tool_calls,
+                        pending.route,
+                        pending.corr,
+                    )
+                {
+                    pending_responses.register(pending);
                 } else {
                     if let Some(cancellation) = &pending.pending.cancellation {
                         cancellation.request_cancel();
@@ -3264,7 +3298,7 @@ where
                     );
                 }
             }
-            _ = tokio::time::sleep(PENDING_POLL_INTERVAL), if !pending_inspects.is_empty() => {
+            _ = tokio::time::sleep(PENDING_POLL_INTERVAL), if !pending_responses.is_empty() => {
                 // The next loop turn polls detached inspect completions. Keeping
                 // the timer here lets already-ready control frames run first.
             }
@@ -3354,25 +3388,25 @@ where
     connection_cancel.cancel();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
     let setup_drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while pending_inspect_setups.load(Ordering::SeqCst) != 0
+    while pending_deferred_setups.load(Ordering::SeqCst) != 0
         && tokio::time::Instant::now() < setup_drain_deadline
     {
         tokio::select! {
             biased;
-            Some(pending) = inspect_deferred_rx.recv() => pending_inspects.register(pending),
+            Some(pending) = deferred_response_rx.recv() => pending_responses.register(pending),
             _ = tokio::time::sleep(Duration::from_millis(5)) => {}
         }
     }
-    if pending_inspect_setups.load(Ordering::SeqCst) != 0 {
+    if pending_deferred_setups.load(Ordering::SeqCst) != 0 {
         log::warn!(
-            "subc attach: timed out waiting for deferred inspect setup registration during shutdown"
+            "subc attach: timed out waiting for deferred response setup registration during shutdown"
         );
     }
-    while let Ok(pending) = inspect_deferred_rx.try_recv() {
-        pending_inspects.register(pending);
+    while let Ok(pending) = deferred_response_rx.try_recv() {
+        pending_responses.register(pending);
     }
-    for resolved in pending_inspects.drain_on_shutdown(executor.as_ref()) {
-        if let Err(error) = deliver_resolved_subc_inspect(
+    for resolved in pending_responses.drain_on_shutdown(executor.as_ref()) {
+        if let Err(error) = deliver_resolved_subc_response(
             &writer_tx,
             resolved,
             &routes,
@@ -3385,7 +3419,7 @@ where
         )
         .await
         {
-            log::warn!("subc attach: failed to emit inspect shutdown terminal: {error}");
+            log::warn!("subc attach: failed to emit deferred shutdown terminal: {error}");
         }
     }
     // Channel-0 Goodbye, EOF, and fatal exits bypass per-route Goodbye. Settle
@@ -3990,7 +4024,7 @@ async fn handle_control_request(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
-    pending_inspects: &mut PendingSubcInspects,
+    pending_responses: &mut PendingSubcResponses,
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     shutdown: &Arc<Notify>,
@@ -4068,7 +4102,7 @@ async fn handle_control_request(
                     live_roots,
                     route_bash_cancels,
                     active_tool_calls,
-                    pending_inspects,
+                    pending_responses,
                     pending_binds,
                     retry_buffer,
                     push_buffer,
@@ -4442,7 +4476,7 @@ async fn handle_tool_call(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     active_tool_calls: &ActiveToolCalls,
-    pending_inspect_setups: &Arc<AtomicUsize>,
+    pending_deferred_setups: &Arc<AtomicUsize>,
     shutdown: &Arc<Notify>,
     connection_cancel: &PersistentCancelSignal,
     bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
@@ -4456,7 +4490,7 @@ async fn handle_tool_call(
     bg_wake_pending: &mut HashSet<RouteChannel>,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
-    inspect_deferred_tx: &mpsc::UnboundedSender<PendingSubcInspect>,
+    deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
@@ -4822,15 +4856,17 @@ async fn handle_tool_call(
         report_registration_downgrade: true,
     };
 
-    if bare_name == "inspect" {
-        let Some(inspect_ctx) = executor.actor_context(&identity.root) else {
+    let uses_deferred_response_seam = bare_name == "inspect"
+        || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
+    if uses_deferred_response_seam {
+        let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
             let response = Response::error(
                 &request_id,
                 "actor_not_registered",
                 "executor actor is not registered",
             );
             let text = crate::subc_format::format_response_with_context(
-                "inspect",
+                &bare_name,
                 &response,
                 &format_context,
             );
@@ -4849,13 +4885,14 @@ async fn handle_tool_call(
         let identity_for_run = identity.clone();
         let request_id_for_force = request_id.clone();
         let format_context_for_run = format_context.clone();
-        let (setup_tx, setup_rx) = oneshot::channel::<InspectSetupOutcome>();
+        let bare_name_for_run = bare_name.clone();
+        let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || match prepare_tool_call(
-                    "inspect",
+                    &bare_name_for_run,
                     arguments,
                     &format_context_for_run,
                     &tool_call_context,
@@ -4864,31 +4901,65 @@ async fn handle_tool_call(
                 ) {
                     Err(result) => {
                         let response = result.response;
-                        let _ = setup_tx.send(InspectSetupOutcome::Immediate {
+                        let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
                             text: result.text,
                             phase_trace,
                         });
                         response
                     }
                     Ok(prepared) => {
-                        let DispatchOutcome::Deferred(pending) =
+                        let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_restriction(
                                 &prepared.request,
-                                Arc::clone(&inspect_ctx),
+                                Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
-                        else {
-                            unreachable!("inspect deferred setup returned an immediate response")
+                        } else {
+                            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
+                                matches!(bind_trust, BindTrust::Untrusted),
+                            )
                         };
-                        let _ = setup_tx.send(InspectSetupOutcome::Deferred {
-                            pending,
-                            surface_downgraded: prepared.surface_downgraded,
-                            phase_trace,
-                        });
-                        Response::success(
-                            request_id_for_force.clone(),
-                            json!({ "inspect_deferred": true }),
-                        )
+                        match outcome {
+                            DispatchOutcome::Deferred(pending) => {
+                                let _ = setup_tx.send(DeferredSetupOutcome::Deferred {
+                                    pending,
+                                    surface_downgraded: prepared.surface_downgraded,
+                                    phase_trace,
+                                });
+                                Response::success(
+                                    request_id_for_force.clone(),
+                                    json!({ "response_deferred": true }),
+                                )
+                            }
+                            DispatchOutcome::Immediate(response) => {
+                                phase_trace.mark_execute_done();
+                                let finalizer = |response: &mut Response| {
+                                    crate::response_finalize::finalize_response_with_bg_completions(
+                                        response,
+                                        ctx,
+                                        &identity_for_run.session,
+                                        &bare_name_for_run,
+                                        bind_trust.allows_bash_observation(),
+                                    );
+                                };
+                                let result = finish_tool_call_response(
+                                    &bare_name_for_run,
+                                    &format_context_for_run,
+                                    response,
+                                    prepared.surface_downgraded,
+                                    Some(&finalizer),
+                                    Some(&mut phase_trace),
+                                );
+                                let response = result.response;
+                                let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
+                                    text: result.text,
+                                    phase_trace,
+                                });
+                                response
+                            }
+                        }
                     }
                 };
                 if matches!(bind_trust, BindTrust::Untrusted) {
@@ -4898,7 +4969,8 @@ async fn handle_tool_call(
                 }
             })
         });
-        let inspect_setup_guard = PendingInspectSetupGuard::new(Arc::clone(pending_inspect_setups));
+        let deferred_setup_guard =
+            PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
         let rx = submit_active_tool_call(
             executor.as_ref(),
             active_tool_calls,
@@ -4915,7 +4987,7 @@ async fn handle_tool_call(
         let completion_shutdown = Arc::clone(shutdown);
         let completion_metrics = Arc::clone(metrics);
         let active_tool_calls = Arc::clone(active_tool_calls);
-        let inspect_deferred_tx = inspect_deferred_tx.clone();
+        let deferred_response_tx = deferred_response_tx.clone();
         let route = route_id;
         let corr = frame.header.corr;
         let flags = frame.header.flags;
@@ -4924,35 +4996,36 @@ async fn handle_tool_call(
         let session_id = identity.session.clone();
         tokio::spawn(async move {
             let _response_task = ResponseTaskGuard::new(&completion_metrics);
-            let _inspect_setup = inspect_setup_guard;
+            let _deferred_setup = deferred_setup_guard;
             let response = await_executor_response(rx, request_id.clone()).await;
             match setup_rx.await {
-                Ok(InspectSetupOutcome::Deferred {
+                Ok(DeferredSetupOutcome::Deferred {
                     pending,
                     surface_downgraded,
                     phase_trace,
                 }) => {
-                    let pending = PendingSubcInspect {
+                    let pending = PendingSubcResponse {
                         route,
                         corr,
                         flags,
                         ver,
                         root,
                         session_id,
+                        bare_name,
                         format_context,
                         bind_trust,
                         pending,
                         surface_downgraded,
                         phase_trace,
                     };
-                    if let Err(error) = inspect_deferred_tx.send(pending) {
+                    if let Err(error) = deferred_response_tx.send(pending) {
                         if let Some(cancellation) = &error.0.pending.cancellation {
                             cancellation.request_cancel();
                         }
                         finish_active_tool_call(&active_tool_calls, route, corr);
                     }
                 }
-                Ok(InspectSetupOutcome::Immediate { text, phase_trace }) => {
+                Ok(DeferredSetupOutcome::Immediate { text, phase_trace }) => {
                     if !finish_active_tool_call(&active_tool_calls, route, corr) {
                         return;
                     }
@@ -4970,7 +5043,7 @@ async fn handle_tool_call(
                         Ok(response_frame) => {
                             let trace = ToolResponseWriteTrace::new(
                                 phase_trace,
-                                "inspect".to_string(),
+                                bare_name.clone(),
                                 identity.project_root.clone(),
                                 identity.session.clone(),
                                 route.channel,
@@ -4985,13 +5058,13 @@ async fn handle_tool_call(
                             .await
                             {
                                 log::warn!(
-                                    "subc attach: failed to queue inspect setup response: {error}"
+                                    "subc attach: failed to queue deferred-seam setup response: {error}"
                                 );
                             }
                         }
                         Err(error) => {
                             log::error!(
-                                "subc attach: failed to build inspect setup response: {error}"
+                                "subc attach: failed to build deferred-seam setup response: {error}"
                             );
                         }
                     }
@@ -5012,7 +5085,7 @@ async fn handle_tool_call(
                         return;
                     }
                     let text = crate::subc_format::format_response_with_context(
-                        "inspect",
+                        &bare_name,
                         &response,
                         &format_context,
                     );
@@ -5030,7 +5103,7 @@ async fn handle_tool_call(
                             &completion_tx,
                             &completion_metrics,
                             response_frame,
-                            "inspect setup failure",
+                            "deferred setup failure",
                         )
                         .await;
                     }
@@ -5312,9 +5385,9 @@ async fn await_executor_response(rx: oneshot::Receiver<Response>, request_id: St
         .unwrap_or_else(|_| Response::error(request_id, "internal_error", "executor dropped"))
 }
 
-async fn deliver_resolved_subc_inspect(
+async fn deliver_resolved_subc_response(
     tx: &WriterSender,
-    mut resolved: ResolvedSubcInspect,
+    mut resolved: ResolvedSubcResponse,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Executor,
@@ -5331,7 +5404,8 @@ async fn deliver_resolved_subc_inspect(
 
     let Some(identity) = routes.get(&entry.route) else {
         log::debug!(
-            "subc attach: dropping deferred inspect response {} for unbound route {}",
+            "subc attach: dropping deferred {} response {} for unbound route {}",
+            entry.bare_name,
             entry.pending.request_id,
             entry.route
         );
@@ -5346,12 +5420,12 @@ async fn deliver_resolved_subc_inspect(
             response,
             &ctx,
             &entry.session_id,
-            "inspect",
+            &entry.bare_name,
             entry.bind_trust.allows_bash_observation(),
         );
     };
     let result = finish_tool_call_response(
-        "inspect",
+        &entry.bare_name,
         &entry.format_context,
         resolved.response,
         entry.surface_downgraded,
@@ -5370,7 +5444,7 @@ async fn deliver_resolved_subc_inspect(
     )?;
     let trace = ToolResponseWriteTrace::new(
         std::mem::replace(&mut entry.phase_trace, PhaseTrace::new(Instant::now())),
-        "inspect".to_string(),
+        entry.bare_name.clone(),
         identity.project_root.clone(),
         entry.session_id.clone(),
         entry.route.channel,
@@ -5542,6 +5616,86 @@ pub(crate) mod test_support {
         }
     }
 
+    fn cold_navigation_context(root: &Path) -> (Arc<AppContext>, PathBuf) {
+        let source_dir = root.join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n")
+            .expect("write Cargo manifest");
+        let source = source_dir.join("main.rs");
+        std::fs::write(&source, "fn main() {}\n").expect("write source");
+        let binary = root.join("cold-navigation-server");
+        std::fs::write(&binary, b"fixture").expect("write server placeholder");
+
+        let ctx = inspect_context(root);
+        ctx.lsp()
+            .override_binary(crate::lsp::registry::ServerKind::Rust, binary);
+        (ctx, source)
+    }
+
+    fn navigation_request(id: &str, source: &Path) -> RawRequest {
+        serde_json::from_value(json!({
+            "id": id,
+            "command": "lsp_hover",
+            "file": source.display().to_string(),
+            "line": 1,
+            "character": 1,
+        }))
+        .expect("navigation request")
+    }
+
+    fn submit_deferred_navigation_setup(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        ctx: &Arc<AppContext>,
+        source: &Path,
+        request_id: &str,
+    ) -> (PendingResponse, JobCancellation) {
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let request = navigation_request(request_id, source);
+        let navigation_ctx = Arc::clone(ctx);
+        let (_rx, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            request_id.to_string(),
+            Box::new(move |_| {
+                let DispatchOutcome::Deferred(pending) = crate::commands::lsp_navigation::
+                    handle_lsp_navigation_deferred_with_restriction(
+                        &request,
+                        navigation_ctx,
+                        true,
+                    )
+                else {
+                    panic!("cold navigation setup must defer")
+                };
+                pending_tx.send(pending).expect("send pending navigation");
+                Response::success("navigation-setup", json!({}))
+            }),
+        );
+        let pending = pending_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("navigation setup leaves the executor lane");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !executor.actor_is_idle(root) {
+            assert!(
+                Instant::now() < deadline,
+                "navigation setup kept lane counters live"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (pending, cancellation)
+    }
+
+    fn wait_for_navigation_terminal(pending: &mut PendingResponse, ctx: &AppContext) -> Response {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(response) = (pending.poll)(ctx) {
+                return response;
+            }
+            assert!(Instant::now() < deadline, "navigation terminal timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn deferred_inspect_releases_lane_for_bind_and_mutation() {
         let _serial = crate::commands::inspect::deferred_inspect_test_lock();
@@ -5584,6 +5738,123 @@ pub(crate) mod test_support {
             terminal.data.get("inspect_terminal").is_some(),
             "inspect must still produce its terminal: {:?}",
             terminal.data
+        );
+    }
+
+    #[test]
+    fn deferred_cold_navigation_releases_lsp_lane_for_reads_and_mutation() {
+        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("deferred-cold-navigation");
+        let (ctx, source) = cold_navigation_context(dir.path());
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started_rx, _release_tx) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let (mut pending, cancellation) = submit_deferred_navigation_setup(
+            &executor,
+            &root,
+            &ctx,
+            &source,
+            "subc-cold-navigation",
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached navigation reaches its cold-start gate");
+
+        for (lane, request_id) in [
+            (Lane::PureRead, "subc-navigation-read"),
+            (Lane::Mutating, "subc-navigation-write"),
+        ] {
+            let response = executor.submit(
+                root.clone(),
+                lane,
+                request_id.to_string(),
+                Box::new(move |_| Response::success(request_id, json!({ "admitted": true }))),
+            );
+            assert!(
+                response
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("unrelated work admits while navigation remains deferred")
+                    .success
+            );
+        }
+        assert_eq!(
+            crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test(),
+            1,
+            "lane admissions must not finish the detached navigation"
+        );
+
+        cancellation.request_cancel();
+        let terminal = wait_for_navigation_terminal(&mut pending, &ctx);
+        assert!(!terminal.success);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled navigation worker did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(executor.actor_is_idle(&root));
+    }
+
+    #[test]
+    fn cancelling_pending_navigation_removes_entry_without_reply() {
+        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("cancelled-pending-navigation");
+        let (ctx, source) = cold_navigation_context(dir.path());
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started_rx, _release_tx) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let (pending, _cancellation) = submit_deferred_navigation_setup(
+            &executor,
+            &root,
+            &ctx,
+            &source,
+            "subc-cancel-navigation",
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached navigation reaches its cancellation gate");
+
+        let route = RouteChannel {
+            channel: 17,
+            epoch: 1,
+        };
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            route,
+            corr: 71,
+            flags: Flags::new(false, Priority::Passive, false),
+            ver: PROTOCOL_VERSION,
+            root: root.clone(),
+            session_id: "navigation-cancel-session".to_string(),
+            bare_name: "lsp_hover".to_string(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "lsp_hover",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+        });
+
+        assert!(registry.cancel_request(route, 71));
+        assert!(registry.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "pending cancellation did not settle the detached worker"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            registry.poll_ready(executor.as_ref()).is_empty(),
+            "a cancelled navigation must not leak a reply"
         );
     }
 
@@ -5898,14 +6169,15 @@ pub(crate) mod test_support {
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("detached inspect reaches shutdown gate");
-        let mut registry = PendingSubcInspects::default();
-        registry.register(PendingSubcInspect {
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
             route,
             corr: 42,
             flags: Flags::new(false, Priority::Passive, false),
             ver: PROTOCOL_VERSION,
             root: root.clone(),
             session_id: "shutdown-session".to_string(),
+            bare_name: "inspect".to_string(),
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "inspect",
                 &json!({}),
