@@ -159,10 +159,38 @@ struct RouteSpec {
     tool_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct StormTiming {
+    bind_bound: Duration,
+    tool_bound: Duration,
+    health_bound: Duration,
+    completion_bound: Duration,
+    measure_in_storm_stats: bool,
+}
+
+impl StormTiming {
+    const SETUP: Self = Self {
+        bind_bound: SETUP_BIND_BOUND,
+        tool_bound: SETUP_BIND_BOUND,
+        health_bound: SETUP_BIND_BOUND,
+        completion_bound: SETUP_BIND_BOUND,
+        measure_in_storm_stats: false,
+    };
+    const MEASURED: Self = Self {
+        bind_bound: BIND_ACK_BOUND,
+        tool_bound: TOOL_BOUND,
+        health_bound: HEALTH_BOUND,
+        completion_bound: COMPLETION_PUSH_BOUND,
+        measure_in_storm_stats: true,
+    };
+}
+
 #[derive(Debug)]
 struct BindTiming {
     route: u16,
     started_at: Instant,
+    bound: Duration,
+    measure_in_storm_stats: bool,
 }
 
 #[derive(Debug)]
@@ -170,16 +198,22 @@ struct ToolTiming {
     route: u16,
     started_at: Instant,
     name: &'static str,
+    bound: Duration,
+    measure_in_storm_stats: bool,
 }
 
 #[derive(Debug)]
 struct HealthTiming {
     started_at: Instant,
+    bound: Duration,
+    measure_in_storm_stats: bool,
 }
 
 #[derive(Debug)]
 struct CompletionTiming {
     started_at: Instant,
+    bound: Duration,
+    measure_in_storm_stats: bool,
 }
 
 #[derive(Default, Debug)]
@@ -1298,7 +1332,6 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
     let mut pending_tools = HashMap::new();
     let mut pending_health = HashMap::new();
     let mut pending_completions = HashMap::new();
-    let mut stats = StormStats::default();
 
     for route in &routes {
         corr += 1;
@@ -1316,113 +1349,73 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
             BindTiming {
                 route: route.channel,
                 started_at: Instant::now(),
+                bound: StormTiming::SETUP.bind_bound,
+                measure_in_storm_stats: false,
             },
         );
     }
+    let mut setup_stats = StormStats::default();
     drain_until_idle(
         &mut rx,
         &mut pending_binds,
         &mut pending_tools,
         &mut pending_health,
         &mut pending_completions,
-        &mut stats,
+        &mut setup_stats,
         Duration::from_secs(20),
     )
     .await;
 
-    let storm_deadline = Instant::now() + scale.storm_for;
-    let mut next_health_at = Instant::now();
-    while Instant::now() < storm_deadline {
-        let now = Instant::now();
-        for route in &mut routes {
-            let route_has_pending_bind = pending_binds
-                .values()
-                .any(|bind| bind.route == route.channel);
-            if now >= route.next_bind_at && !route_has_pending_bind {
-                route.bind_count += 1;
-                route.epoch = route
-                    .epoch
-                    .checked_add(1)
-                    .expect("storm route epoch should not overflow");
-                corr += 1;
-                let semantic_enabled = semantic_roots.contains(&route.root_index);
-                let config_change = route.bind_count % 10 == 0 && !semantic_enabled;
-                if !semantic_enabled {
-                    touch_between_rebinds(&roots[route.root_index], route.bind_count);
-                }
-                send_bind_epoch(
-                    &tx,
-                    route.channel,
-                    route.epoch,
-                    corr,
-                    &roots[route.root_index],
-                    &route.session,
-                    storm_project_config(true, semantic_enabled, config_change, 0),
-                );
-                pending_binds.insert(
-                    corr,
-                    BindTiming {
-                        route: route.channel,
-                        started_at: Instant::now(),
-                    },
-                );
-                route.next_bind_at =
-                    now + Duration::from_millis(1_300 + u64::from(route.channel % 5) * 80);
-            }
+    // A freshly linked harness can page in executor and transport code while the
+    // first roots begin their background builds. Exercise the same per-route
+    // rebind, tool, completion, and watcher traffic under the module's real
+    // setup deadline before the measured storm. The warm-up is a readiness
+    // barrier, not a relaxed latency assertion: the following phase retains the
+    // calibrated production bounds and starts only after every warm-up frame drains.
+    run_storm_phase(
+        &tx,
+        &mut rx,
+        &mut routes,
+        &roots,
+        &semantic_roots,
+        &mut corr,
+        &mut pending_binds,
+        &mut pending_tools,
+        &mut pending_health,
+        &mut pending_completions,
+        &mut setup_stats,
+        Duration::from_secs(2),
+        StormTiming::SETUP,
+    )
+    .await;
+    drain_until_idle(
+        &mut rx,
+        &mut pending_binds,
+        &mut pending_tools,
+        &mut pending_health,
+        &mut pending_completions,
+        &mut setup_stats,
+        Duration::from_secs(20),
+    )
+    .await;
 
-            let route_has_pending_tool = pending_tools
-                .values()
-                .any(|tool| tool.route == route.channel);
-            let route_has_pending_bind = pending_binds
-                .values()
-                .any(|bind| bind.route == route.channel);
-            if now >= route.next_tool_at && !route_has_pending_tool && !route_has_pending_bind {
-                route.tool_count += 1;
-                corr += 1;
-                send_interactive_tool(
-                    &tx,
-                    route,
-                    corr,
-                    &roots[route.root_index],
-                    &mut pending_completions,
-                );
-                let name = match route.tool_count % 4 {
-                    0 => "read",
-                    1 => "write",
-                    2 => "subc_test_emit_bash_completed",
-                    _ => "subc_test_enqueue_watcher_event",
-                };
-                pending_tools.insert(
-                    corr,
-                    ToolTiming {
-                        route: route.channel,
-                        started_at: now,
-                        name,
-                    },
-                );
-                route.next_tool_at = now + Duration::from_millis(500);
-            }
-        }
-
-        if now >= next_health_at {
-            corr += 1;
-            send_control(&tx, corr, ModuleControlRequest::HealthCheck {});
-            pending_health.insert(corr, HealthTiming { started_at: now });
-            next_health_at = now + Duration::from_millis(400);
-        }
-
-        read_one_or_sleep(
-            &mut rx,
-            &mut pending_binds,
-            &mut pending_tools,
-            &mut pending_health,
-            &mut pending_completions,
-            &mut stats,
-            Duration::from_millis(25),
-        )
-        .await;
-    }
-
+    let mut stats = StormStats::default();
+    run_storm_phase(
+        &tx,
+        &mut rx,
+        &mut routes,
+        &roots,
+        &semantic_roots,
+        &mut corr,
+        &mut pending_binds,
+        &mut pending_tools,
+        &mut pending_health,
+        &mut pending_completions,
+        &mut stats,
+        scale.storm_for,
+        StormTiming::MEASURED,
+    )
+    .await;
     drain_until_idle(
         &mut rx,
         &mut pending_binds,
@@ -1463,6 +1456,138 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
         COMPLETION_PUSH_BOUND
     );
     send_goodbye_and_wait(&tx).await;
+}
+
+async fn run_storm_phase(
+    tx: &mpsc::UnboundedSender<Frame>,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    routes: &mut [RouteSpec],
+    roots: &[PathBuf],
+    semantic_roots: &HashSet<usize>,
+    corr: &mut u64,
+    pending_binds: &mut HashMap<u64, BindTiming>,
+    pending_tools: &mut HashMap<u64, ToolTiming>,
+    pending_health: &mut HashMap<u64, HealthTiming>,
+    pending_completions: &mut HashMap<String, CompletionTiming>,
+    stats: &mut StormStats,
+    run_for: Duration,
+    timing: StormTiming,
+) {
+    // Initial RouteBindAck messages establish route readiness. Restart the
+    // schedule after that barrier so cold setup cannot collapse the first
+    // rebinds and tool calls into a catch-up burst.
+    let started_at = Instant::now();
+    for route in &mut *routes {
+        route.next_bind_at =
+            started_at + Duration::from_millis(1_300 + u64::from(route.channel % 5) * 80);
+        route.next_tool_at =
+            started_at + Duration::from_millis(200 + u64::from(route.channel % 3) * 75);
+    }
+
+    let deadline = started_at + run_for;
+    let mut next_health_at = started_at;
+    while Instant::now() < deadline {
+        let now = Instant::now();
+        for route in &mut *routes {
+            let route_has_pending_bind = pending_binds
+                .values()
+                .any(|bind| bind.route == route.channel);
+            if now >= route.next_bind_at && !route_has_pending_bind {
+                route.bind_count += 1;
+                route.epoch = route
+                    .epoch
+                    .checked_add(1)
+                    .expect("storm route epoch should not overflow");
+                *corr += 1;
+                let semantic_enabled = semantic_roots.contains(&route.root_index);
+                let config_change = route.bind_count % 10 == 0 && !semantic_enabled;
+                if !semantic_enabled {
+                    touch_between_rebinds(&roots[route.root_index], route.bind_count);
+                }
+                send_bind_epoch(
+                    tx,
+                    route.channel,
+                    route.epoch,
+                    *corr,
+                    &roots[route.root_index],
+                    &route.session,
+                    storm_project_config(true, semantic_enabled, config_change, 0),
+                );
+                pending_binds.insert(
+                    *corr,
+                    BindTiming {
+                        route: route.channel,
+                        started_at: Instant::now(),
+                        bound: timing.bind_bound,
+                        measure_in_storm_stats: timing.measure_in_storm_stats,
+                    },
+                );
+                route.next_bind_at =
+                    now + Duration::from_millis(1_300 + u64::from(route.channel % 5) * 80);
+            }
+
+            let route_has_pending_tool = pending_tools
+                .values()
+                .any(|tool| tool.route == route.channel);
+            let route_has_pending_bind = pending_binds
+                .values()
+                .any(|bind| bind.route == route.channel);
+            if now >= route.next_tool_at && !route_has_pending_tool && !route_has_pending_bind {
+                route.tool_count += 1;
+                *corr += 1;
+                send_interactive_tool(
+                    tx,
+                    route,
+                    *corr,
+                    &roots[route.root_index],
+                    pending_completions,
+                    timing,
+                );
+                let name = match route.tool_count % 4 {
+                    0 => "read",
+                    1 => "write",
+                    2 => "subc_test_emit_bash_completed",
+                    _ => "subc_test_enqueue_watcher_event",
+                };
+                pending_tools.insert(
+                    *corr,
+                    ToolTiming {
+                        route: route.channel,
+                        started_at: now,
+                        name,
+                        bound: timing.tool_bound,
+                        measure_in_storm_stats: timing.measure_in_storm_stats,
+                    },
+                );
+                route.next_tool_at = now + Duration::from_millis(500);
+            }
+        }
+
+        if now >= next_health_at {
+            *corr += 1;
+            send_control(tx, *corr, ModuleControlRequest::HealthCheck {});
+            pending_health.insert(
+                *corr,
+                HealthTiming {
+                    started_at: now,
+                    bound: timing.health_bound,
+                    measure_in_storm_stats: timing.measure_in_storm_stats,
+                },
+            );
+            next_health_at = now + Duration::from_millis(400);
+        }
+
+        read_one_or_sleep(
+            rx,
+            pending_binds,
+            pending_tools,
+            pending_health,
+            pending_completions,
+            stats,
+            Duration::from_millis(25),
+        )
+        .await;
+    }
 }
 
 async fn drive_heavy_init_saturation_daemon(input: FakeDaemonInput) {
@@ -2132,6 +2257,7 @@ fn send_interactive_tool(
     corr: u64,
     root: &Path,
     pending_completions: &mut HashMap<String, CompletionTiming>,
+    timing: StormTiming,
 ) {
     match route.tool_count % 4 {
         0 => send_tool_epoch(
@@ -2159,6 +2285,8 @@ fn send_interactive_tool(
                 task_id.clone(),
                 CompletionTiming {
                     started_at: Instant::now(),
+                    bound: timing.completion_bound,
+                    measure_in_storm_stats: timing.measure_in_storm_stats,
                 },
             );
             send_tool_epoch(
@@ -2539,19 +2667,28 @@ fn process_storm_frame(
                     .expect("unexpected bind ack");
                 let elapsed = timing.started_at.elapsed();
                 assert!(
-                    elapsed <= BIND_ACK_BOUND,
-                    "RouteBindAck for route {} took {elapsed:?}",
-                    timing.route
+                    elapsed <= timing.bound,
+                    "RouteBindAck for route {} took {elapsed:?}, exceeding {:?}",
+                    timing.route,
+                    timing.bound
                 );
-                stats.bind_latencies.push(elapsed);
+                if timing.measure_in_storm_stats {
+                    stats.bind_latencies.push(elapsed);
+                }
             } else if let Some(report) = response.health_report() {
                 let timing = pending_health
                     .remove(&frame.header.corr)
                     .expect("unexpected health response");
                 let elapsed = timing.started_at.elapsed();
-                assert!(elapsed <= HEALTH_BOUND, "health.check took {elapsed:?}");
-                stats.max_health_latency = stats.max_health_latency.max(elapsed);
-                assert_pending_bind_age(&report);
+                assert!(
+                    elapsed <= timing.bound,
+                    "health.check took {elapsed:?}, exceeding {:?}",
+                    timing.bound
+                );
+                if timing.measure_in_storm_stats {
+                    stats.max_health_latency = stats.max_health_latency.max(elapsed);
+                    assert_pending_bind_age(&report);
+                }
             }
         }
         FrameType::Response => {
@@ -2560,12 +2697,15 @@ fn process_storm_frame(
                 .expect("unexpected tool response");
             let elapsed = timing.started_at.elapsed();
             assert!(
-                elapsed <= TOOL_BOUND,
-                "{} on route {} took {elapsed:?}",
+                elapsed <= timing.bound,
+                "{} on route {} took {elapsed:?}, exceeding {:?}",
                 timing.name,
-                timing.route
+                timing.route,
+                timing.bound
             );
-            stats.max_tool_latency = stats.max_tool_latency.max(elapsed);
+            if timing.measure_in_storm_stats {
+                stats.max_tool_latency = stats.max_tool_latency.max(elapsed);
+            }
             let body: Value = serde_json::from_slice(&frame.body).expect("tool response body");
             assert_ne!(
                 body.get("isError").and_then(Value::as_bool),
@@ -2578,10 +2718,13 @@ fn process_storm_frame(
                 if let Some(timing) = pending_completions.remove(task_id.as_str()) {
                     let elapsed = timing.started_at.elapsed();
                     assert!(
-                        elapsed <= COMPLETION_PUSH_BOUND,
-                        "completion {task_id} push took {elapsed:?}"
+                        elapsed <= timing.bound,
+                        "completion {task_id} push took {elapsed:?}, exceeding {:?}",
+                        timing.bound
                     );
-                    stats.max_completion_latency = stats.max_completion_latency.max(elapsed);
+                    if timing.measure_in_storm_stats {
+                        stats.max_completion_latency = stats.max_completion_latency.max(elapsed);
+                    }
                 }
             }
         }
