@@ -31,9 +31,46 @@ impl From<CompressionAggregate> for CompressionAggregateSerde {
 }
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
-    Response::success(
-        &req.id,
-        ctx.build_status_snapshot_for_session(req.session()),
+    let mut snapshot = ctx.build_status_snapshot_for_session(req.session());
+    if let Some(removal) = removal_health_for_status(req) {
+        snapshot["removal"] = removal;
+    }
+    Response::success(&req.id, snapshot)
+}
+
+/// Add removal-time state only when the management caller names a storage root.
+///
+/// Normal status refreshes are frequent and must stay independent from a global
+/// SQLite aggregation. `aft doctor` supplies this parameter while the user is
+/// deciding whether to remove AFT, and the read-only helper never creates or
+/// migrates their database.
+fn removal_health_for_status(req: &RawRequest) -> Option<serde_json::Value> {
+    let storage_root = req.params.get("removal_storage_dir")?;
+    let Some(storage_root) = storage_root.as_str() else {
+        return Some(serde_json::json!({
+            "available": false,
+            "message": "removal_storage_dir must be a string",
+        }));
+    };
+
+    Some(
+        match crate::db::removal::removal_health_from_storage_root(std::path::Path::new(
+            storage_root,
+        )) {
+            Ok(health) => serde_json::json!({
+                "available": true,
+                "usage_window_days": health.usage_window_days,
+                "project_roots_served": health.project_roots_served,
+                "sessions_served": health.sessions_served,
+                "project_roots_source": health.project_roots_source,
+                "running_background_tasks": health.running_background_tasks,
+                "undo_history_sessions": health.undo_history_sessions,
+            }),
+            Err(message) => serde_json::json!({
+                "available": false,
+                "message": message,
+            }),
+        },
     )
 }
 
@@ -400,6 +437,24 @@ mod tests {
             session_id: None,
             params: json!({}),
         }
+    }
+
+    #[test]
+    fn removal_status_reports_an_empty_storage_root_as_zero_state() {
+        let storage = tempfile::tempdir().expect("create storage root");
+        let request = RawRequest {
+            params: json!({ "removal_storage_dir": storage.path() }),
+            ..request()
+        };
+
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let response = handle_status(&request, &ctx);
+
+        assert_eq!(response.data["removal"]["available"], true);
+        assert_eq!(response.data["removal"]["project_roots_served"], 0);
+        assert_eq!(response.data["removal"]["sessions_served"], 0);
+        assert_eq!(response.data["removal"]["running_background_tasks"], 0);
+        assert_eq!(response.data["removal"]["undo_history_sessions"], 0);
     }
 
     #[test]

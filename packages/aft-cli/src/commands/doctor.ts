@@ -15,8 +15,9 @@ import { join } from "node:path";
 import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
+import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
-import { probeAftBinary } from "../lib/binary-probe.js";
+import { findAftBinary, probeAftBinary } from "../lib/binary-probe.js";
 import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
 import {
   DOCTOR_BUILD_BREAKER_RESET_COMMAND,
@@ -79,6 +80,21 @@ export interface DoctorOptions {
   force: boolean;
   issue: boolean;
   argv: string[];
+  /** Test seams keep command rendering covered without spawning a binary. */
+  resolveAdapters?: typeof resolveAdaptersForCommand;
+  collectDiagnostics?: typeof collectDiagnostics;
+  collectRemovalHealth?: typeof collectRemovalHealth;
+}
+
+export interface RemovalHealth {
+  available: boolean;
+  usageWindowDays?: number;
+  projectRootsServed?: number;
+  sessionsServed?: number;
+  projectRootsSource?: string;
+  runningBackgroundTasks?: number;
+  undoHistorySessions?: number;
+  message?: string;
 }
 
 export interface CacheClearSummary {
@@ -119,12 +135,14 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     return runClearFlow(options.argv);
   }
 
-  const adapters = await resolveAdaptersForCommand(options.argv, {
+  const resolveAdapters = options.resolveAdapters ?? resolveAdaptersForCommand;
+  const adapters = await resolveAdapters(options.argv, {
     allowMulti: false,
     verb: "diagnose",
   });
 
-  const report = await collectDiagnostics(adapters);
+  const report = await (options.collectDiagnostics ?? collectDiagnostics)(adapters);
+  const removalHealth = await (options.collectRemovalHealth ?? collectRemovalHealth)(adapters);
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
@@ -156,6 +174,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
   );
   logBuildBreakerSuspensions(report);
+
+  log.step("If you remove AFT");
+  for (const line of renderRemovalSection(removalHealth)) {
+    log.info(`  ${line}`);
+  }
 
   const npmCount = report.lspCache.npm.entries.length;
   const ghCount = report.lspCache.github.entries.length;
@@ -250,6 +273,110 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
   outro("Everything looks good.");
   return 0;
+}
+
+async function collectRemovalHealth(adapters: HarnessAdapter[]): Promise<RemovalHealth> {
+  const adapter = adapters[0];
+  if (!adapter) {
+    return { available: false, message: "no harness storage root was selected" };
+  }
+
+  const binary = findAftBinary(getSelfVersion());
+  if (!binary) {
+    return { available: false, message: "the aft binary could not be found" };
+  }
+
+  try {
+    const response = await sendAftRequest(binary, {
+      id: "doctor-removal-status",
+      command: "status",
+      // The Rust status handler opens this exact database read-only. Doctor must
+      // not configure a bridge just to inspect what removal would leave behind.
+      removal_storage_dir: adapter.getStorageDir(),
+    });
+    return coerceRemovalHealth(response);
+  } catch (error) {
+    return {
+      available: false,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function coerceRemovalHealth(response: AftResponse): RemovalHealth {
+  if (!response.success) {
+    return { available: false, message: response.message ?? response.code ?? "status failed" };
+  }
+  const raw = response.removal;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { available: false, message: "the aft binary did not return removal state" };
+  }
+  const removal = raw as Record<string, unknown>;
+  if (removal.available !== true) {
+    return {
+      available: false,
+      message:
+        typeof removal.message === "string" ? removal.message : "removal state is unavailable",
+    };
+  }
+
+  const usageWindowDays = nonNegativeInteger(removal.usage_window_days);
+  const projectRootsServed = nonNegativeInteger(removal.project_roots_served);
+  const sessionsServed = nonNegativeInteger(removal.sessions_served);
+  const runningBackgroundTasks = nonNegativeInteger(removal.running_background_tasks);
+  const undoHistorySessions = nonNegativeInteger(removal.undo_history_sessions);
+  if (
+    usageWindowDays === null ||
+    projectRootsServed === null ||
+    sessionsServed === null ||
+    runningBackgroundTasks === null ||
+    undoHistorySessions === null ||
+    typeof removal.project_roots_source !== "string"
+  ) {
+    return { available: false, message: "the aft binary returned incomplete removal state" };
+  }
+
+  return {
+    available: true,
+    usageWindowDays,
+    projectRootsServed,
+    sessionsServed,
+    projectRootsSource: removal.project_roots_source,
+    runningBackgroundTasks,
+    undoHistorySessions,
+  };
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** Render AFT's durable removal costs; the section is shown even when state is unavailable. */
+export function renderRemovalSection(health: RemovalHealth): string[] {
+  if (!health.available) {
+    return [`usage and deferred work: unavailable (${health.message ?? "unknown error"})`];
+  }
+
+  const usageWindowDays = health.usageWindowDays ?? 7;
+  const projectRootsServed = health.projectRootsServed ?? 0;
+  const sessionsServed = health.sessionsServed ?? 0;
+  const runningBackgroundTasks = health.runningBackgroundTasks ?? 0;
+  const undoHistorySessions = health.undoHistorySessions ?? 0;
+
+  return [
+    `last ${usageWindowDays} days: ${projectRootsServed} ${plural(projectRootsServed, "project root")} served (approx. from durable task/backup project keys; root paths are not retained)`,
+    `last ${usageWindowDays} days: ${sessionsServed} ${plural(sessionsServed, "session")} served (durable task/backup activity)`,
+    runningBackgroundTasks === 0
+      ? "no running tasks"
+      : `${runningBackgroundTasks} running background ${plural(runningBackgroundTasks, "task")} would orphan`,
+    undoHistorySessions === 0
+      ? "no undo history recorded"
+      : `undo history for ${undoHistorySessions} ${plural(undoHistorySessions, "session")} becomes unreachable (files themselves are untouched)`,
+  ];
+}
+
+function plural(count: number, singular: string): string {
+  return count === 1 ? singular : `${singular}s`;
 }
 
 export function hasDoctorProblems(report: DiagnosticReport): boolean {

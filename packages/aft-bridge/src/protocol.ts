@@ -52,8 +52,21 @@ export interface StatusCompression {
   session: StatusCompressionAggregate;
 }
 
+export interface StatusRemovalHealth {
+  available: boolean;
+  usage_window_days?: number;
+  project_roots_served?: number;
+  sessions_served?: number;
+  project_roots_source?: "durable_project_keys_approximation" | string;
+  running_background_tasks?: number;
+  undo_history_sessions?: number;
+  message?: string;
+}
+
 export interface StatusResponse extends AftSuccessResponse {
   compression?: StatusCompression;
+  /** Present only for the read-only removal-time status request used by doctor. */
+  removal?: StatusRemovalHealth;
 }
 
 /**

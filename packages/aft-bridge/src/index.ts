@@ -182,6 +182,7 @@ export type {
   ProgressFrame,
   StatusCompression,
   StatusCompressionAggregate,
+  StatusRemovalHealth,
   StatusResponse,
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";

@@ -1,15 +1,17 @@
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 pub mod backups;
 pub mod bash_tasks;
 pub mod bash_watches;
 pub mod compression_events;
+pub mod removal;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -159,6 +161,18 @@ CREATE INDEX IF NOT EXISTS idx_bash_pattern_watches_task
   ON bash_pattern_watches (harness, session_id, task_id);
 "#;
 
+// Removal-time health reads the existing task and backup tables. These indexes
+// keep its seven-day aggregation and non-terminal task lookup off full history.
+const MIGRATION_V6: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_started_activity
+  ON bash_tasks (started_at, project_key, harness, session_id);
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_non_terminal_pid
+  ON bash_tasks (pid)
+  WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out');
+CREATE INDEX IF NOT EXISTS idx_backups_created_activity
+  ON backups (created_at, project_key, harness, session_id);
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(std::io::Error),
@@ -225,6 +239,16 @@ pub fn open(path: &Path) -> Result<Connection, OpenError> {
     Ok(conn)
 }
 
+/// Open an existing AFT database without creating, migrating, or mutating it.
+///
+/// Doctor uses this path for removal-time reporting, so checking state cannot
+/// itself create an AFT database or race a running bridge's write transaction.
+pub fn open_readonly(path: &Path) -> Result<Connection, OpenError> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
 pub fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -282,6 +306,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         3 => tx.execute_batch(MIGRATION_V3),
         4 => apply_migration_v4(&tx),
         5 => tx.execute_batch(MIGRATION_V5),
+        6 => tx.execute_batch(MIGRATION_V6),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -336,6 +361,9 @@ mod tests {
         "idx_bash_tasks_project_lookup",
         "idx_bash_pattern_watches_session",
         "idx_bash_pattern_watches_task",
+        "idx_bash_tasks_started_activity",
+        "idx_bash_tasks_non_terminal_pid",
+        "idx_backups_created_activity",
         "idx_compression_session",
         "idx_compression_session_created",
         "idx_compression_project_key",
@@ -623,6 +651,45 @@ mod tests {
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert!(sqlite_names(&conn, "table").contains(&"bash_pattern_watches".to_string()));
         assert!(sqlite_names(&conn, "index").contains(&"idx_bash_pattern_watches_task".to_string()));
+    }
+
+    #[test]
+    fn migration_v6_adds_removal_health_indexes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V3).unwrap();
+        conn.execute_batch(MIGRATION_V4).unwrap();
+        conn.execute_batch(MIGRATION_V5).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (5)", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+
+        let indexes = sqlite_names(&conn, "index");
+        for index in [
+            "idx_bash_tasks_started_activity",
+            "idx_bash_tasks_non_terminal_pid",
+            "idx_backups_created_activity",
+        ] {
+            assert!(
+                indexes.contains(&index.to_string()),
+                "missing v6 index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_readonly_does_not_create_a_missing_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-aft.db");
+
+        assert!(open_readonly(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

@@ -12,6 +12,7 @@ import {
   type DoctorFixPlanItem,
   doctorSkewBinaryDownloadDecision,
   formatDoctorStorageStatus,
+  renderRemovalSection,
   shouldSkipDoctorFixConfirmation,
 } from "./doctor.js";
 
@@ -250,6 +251,44 @@ describe("doctor skew download prompt decision", () => {
     expect(doctorSkewBinaryDownloadDecision([])).toBe("skip");
     expect(doctorSkewBinaryDownloadDecision(["--ci"])).toBe("skip");
     expect(doctorSkewBinaryDownloadDecision(["--yes"])).toBe("proceed");
+  });
+});
+
+describe("doctor removal section", () => {
+  test("renders populated durable removal state", () => {
+    expect(
+      renderRemovalSection({
+        available: true,
+        usageWindowDays: 7,
+        projectRootsServed: 2,
+        sessionsServed: 3,
+        projectRootsSource: "durable_project_keys_approximation",
+        runningBackgroundTasks: 1,
+        undoHistorySessions: 4,
+      }),
+    ).toEqual([
+      "last 7 days: 2 project roots served (approx. from durable task/backup project keys; root paths are not retained)",
+      "last 7 days: 3 sessions served (durable task/backup activity)",
+      "1 running background task would orphan",
+      "undo history for 4 sessions becomes unreachable (files themselves are untouched)",
+    ]);
+  });
+
+  test("renders zero state and the durable project-key gap honestly", () => {
+    const section = renderRemovalSection({
+      available: true,
+      usageWindowDays: 7,
+      projectRootsServed: 0,
+      sessionsServed: 0,
+      projectRootsSource: "durable_project_keys_approximation",
+      runningBackgroundTasks: 0,
+      undoHistorySessions: 0,
+    });
+
+    expect(section).toContain("no running tasks");
+    expect(section).toContain("no undo history recorded");
+    expect(section[0]).toContain("approx. from durable task/backup project keys");
+    expect(section[0]).toContain("root paths are not retained");
   });
 });
 
