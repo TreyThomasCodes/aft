@@ -34,8 +34,6 @@ pub const ENVELOPE_VERSION: u64 = 2;
 pub const REFUSAL_EXIT_STATUS: i32 = 86;
 const DISCOVERY_BUDGET: Duration = Duration::from_millis(150);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
-const MANIFEST_TTL: Duration = Duration::from_secs(15 * 60);
-const MANIFEST_STALE_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Clock skew tolerated before a manifest's signed issue time counts as being
 /// in the future and therefore invalid.
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
@@ -53,7 +51,6 @@ const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable 
 pub enum RefusalCode {
     Unclassified,
     AdminTier,
-    ManifestStale,
     ManifestBelowFloor,
     ManifestRegressed,
     SeamSchemaMismatch,
@@ -66,10 +63,9 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::Unclassified,
         Self::AdminTier,
-        Self::ManifestStale,
         Self::ManifestBelowFloor,
         Self::ManifestRegressed,
         Self::SeamSchemaMismatch,
@@ -85,7 +81,6 @@ impl RefusalCode {
         match self {
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
-            Self::ManifestStale => "gh_shim_manifest_stale",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
             Self::ManifestRegressed => "gh_shim_manifest_regressed",
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
@@ -107,18 +102,16 @@ pub enum SelfReportDiagnostic {
     ManifestUnavailable,
     ManifestInvalid,
     ManifestBelowFloor,
-    ManifestStale,
     ManifestRegressed,
     ManifestRollback,
     RungUnavailable,
 }
 
 impl SelfReportDiagnostic {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::ManifestUnavailable,
         Self::ManifestInvalid,
         Self::ManifestBelowFloor,
-        Self::ManifestStale,
         Self::ManifestRegressed,
         Self::ManifestRollback,
         Self::RungUnavailable,
@@ -129,7 +122,6 @@ impl SelfReportDiagnostic {
             Self::ManifestUnavailable => "gh_shim_status_manifest_unavailable",
             Self::ManifestInvalid => "gh_shim_status_manifest_invalid",
             Self::ManifestBelowFloor => "gh_shim_status_manifest_below_floor",
-            Self::ManifestStale => "gh_shim_status_manifest_stale",
             Self::ManifestRegressed => "gh_shim_status_manifest_regressed",
             Self::ManifestRollback => "gh_shim_status_manifest_rollback",
             Self::RungUnavailable => "gh_shim_status_rung_unavailable",
@@ -221,11 +213,10 @@ fn run(args: &[OsString]) -> i32 {
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Presence-based regressed-manifest arm. Decided from the installed
-    // artifact BEFORE any rung probe so a governed refusal never depends on
-    // daemon reachability: past the last-valid grace window, governed/admin
-    // tuples refuse and mechanical operations pass through whatever the rung
-    // cache says.
+    // Presence-based regressed-manifest arm. Decide from the installed artifact
+    // BEFORE any rung probe so a governed refusal never depends on daemon
+    // reachability: a validation failure after a prior valid manifest makes
+    // governed/admin tuples refuse while mechanical operations pass through.
     if let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) {
         return match regressed_disposition(args, &manifest, current_platform()) {
             RegressedDisposition::Passthrough => delegate(args),
@@ -257,11 +248,11 @@ fn run(args: &[OsString]) -> i32 {
     }
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
-    // R3 determination is reused. If it disappears or expires between those
-    // two moments, the whole invocation falls back to R2 passthrough instead
-    // of a classification-shaped refusal.
+    // R3 determination is reused. If it disappears or fails validation between
+    // those two moments, the whole invocation falls back to R2 passthrough
+    // instead of a classification-shaped refusal.
     let manifest = match resolve_manifest(&paths, now) {
-        ManifestResolution::Active(manifest) | ManifestResolution::GraceCache(manifest) => manifest,
+        ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed(manifest) => {
             return match regressed_disposition(args, &manifest, current_platform()) {
                 RegressedDisposition::Passthrough => delegate(args),
@@ -482,7 +473,7 @@ fn sticky_governance_disposition(
         return None;
     }
     let manifest = match resolve_manifest(paths, now) {
-        ManifestResolution::Active(manifest) | ManifestResolution::GraceCache(manifest) => manifest,
+        ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed(_) | ManifestResolution::Dormant => return None,
     };
     let agent_binding = resolved_agent_binding(&manifest, cwd)?;
@@ -558,9 +549,8 @@ fn determine_rung_from_doc(
 
     // The signed manifest supplies the binding before the probe opens a route, so
     // rate accounting and audit records use the same agent session on every run.
-    // A failing artifact inside the last-valid grace window still supplies the
-    // cached manifest; the regressed arm itself is decided in `run` before any
-    // probe.
+    // A failed validation does not supply a manifest here because the regressed
+    // arm itself is decided in `run` before any probe.
     let Some(manifest) = resolve_manifest(paths, now).into_manifest() else {
         let record = RungRecord::r2(now, "manifest_unavailable", None);
         write_rung_record_silently(paths, &record);
@@ -1013,9 +1003,9 @@ struct Manifest {
     artifact_id: String,
     manifest_version: u64,
     schema_floor: u64,
-    /// When the signer issued this manifest. Lives inside the signed bytes so
-    /// freshness cannot be re-stamped locally; the verifier keys TTL/grace off
-    /// this field and never off the envelope-side fetch time.
+    /// When the signer issued this manifest. This signed provenance metadata is
+    /// displayed in status but does not expire a human-approved sign-once
+    /// artifact; only an implausibly future issue time is malformed.
     issued_at_unix_secs: u64,
     #[serde(default)]
     detectors: Detectors,
@@ -1185,9 +1175,8 @@ struct SignedManifest {
     envelope_version: u64,
     key_id: String,
     /// Advisory local metadata only: when this machine stored the artifact.
-    /// Freshness is keyed off the signed `issued_at_unix_secs` inside
-    /// `manifest_bytes`; this field is never consulted for staleness, so
-    /// re-stamping it locally buys nothing.
+    /// It is not a validity input and re-stamping it cannot alter the signed
+    /// manifest provenance.
     fetched_at_unix_secs: u64,
     signature: String,
     manifest_bytes: String,
@@ -1199,9 +1188,6 @@ enum ManifestProblem {
     Invalid(String),
     BelowFloor {
         manifest_floor: u64,
-    },
-    Stale {
-        manifest_version: u64,
     },
     /// The manifest is validly signed but its version is below the newest
     /// version ever accepted on this machine: a rollback incident, never an
@@ -1218,7 +1204,6 @@ impl ManifestProblem {
             Self::Missing => SelfReportDiagnostic::ManifestUnavailable,
             Self::Invalid(_) => SelfReportDiagnostic::ManifestInvalid,
             Self::BelowFloor { .. } => SelfReportDiagnostic::ManifestBelowFloor,
-            Self::Stale { .. } => SelfReportDiagnostic::ManifestStale,
             Self::RolledBack { .. } => SelfReportDiagnostic::ManifestRollback,
         }
     }
@@ -1230,10 +1215,6 @@ impl ManifestProblem {
             Self::BelowFloor { manifest_floor } => format!(
                 "{} (manifest floor {manifest_floor}, shim floor {SCHEMA_FLOOR})",
                 RefusalCode::ManifestBelowFloor.as_str()
-            ),
-            Self::Stale { manifest_version } => format!(
-                "{} (manifest version {manifest_version})",
-                RefusalCode::ManifestStale.as_str()
             ),
             Self::RolledBack {
                 manifest_version,
@@ -1257,11 +1238,13 @@ impl ManifestProblem {
 /// re-serialized struct instead would make every serializer a party to the
 /// signature.
 ///
-/// SIGNED FRESHNESS. Freshness is keyed off `issued_at_unix_secs`, which lives
-/// inside the signed bytes. The envelope-side fetch time is advisory local
-/// metadata only: an envelope-side timestamp can be re-stamped locally, which
-/// would let an old signed manifest replay forever and dodge exactly the
-/// governed-set additions shipped in a newer manifest.
+/// VERSION-MONOTONIC VALIDITY. Manifest approval is a human ceremony performed
+/// once per signature, not a periodic lease. Expiring a sign-once artifact
+/// converts approval cadence into a scheduled outage. A verified manifest stays
+/// valid regardless of age; the local version high-water mark refuses a
+/// validly-signed version below the newest accepted version, which is the honest
+/// replay defense. `issued_at_unix_secs` remains signed provenance metadata and
+/// rejects only an implausibly future timestamp.
 ///
 /// TWO-SIDED BOUND (the custody bar stays at config integrity). The governed
 /// EXECUTION vocabulary is compiled into the route holder (vendored
@@ -1318,10 +1301,8 @@ fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProbl
         });
     }
     // Monotonic version high-water mark: a manifest older than the newest ever
-    // accepted here is refused as a rollback incident. Checked before the
-    // issue-time rules so a rollback is never masked by staleness: any past
-    // manifest that once carried a wider vocabulary still verifies inside the
-    // staleness window, so replaying it must fail on version, not time.
+    // accepted here is refused as a rollback incident. Version, not artifact age,
+    // prevents replay of a past manifest that may carry a wider vocabulary.
     let newest_accepted = version_high_water(paths);
     if manifest.manifest_version < newest_accepted {
         return Err(ManifestProblem::RolledBack {
@@ -1336,20 +1317,13 @@ fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProbl
             ISSUED_AT_FUTURE_SKEW.as_secs()
         )));
     }
-    if now.saturating_sub(manifest.issued_at_unix_secs)
-        > MANIFEST_TTL.as_secs() + MANIFEST_STALE_GRACE.as_secs()
-    {
-        return Err(ManifestProblem::Stale {
-            manifest_version: manifest.manifest_version,
-        });
-    }
     // Accepted: advance the high-water mark and refresh the last-valid cache
     // that the regressed-manifest arm classifies from. Both are local state
     // under the dormancy-valve argument documented above.
     if manifest.manifest_version > newest_accepted {
         write_version_high_water(paths, manifest.manifest_version);
     }
-    write_last_valid_manifest(paths, now, &manifest);
+    write_last_valid_manifest(paths, &manifest);
     Ok(manifest)
 }
 
@@ -1464,12 +1438,9 @@ fn compiled_manifest_trust_set() -> &'static [Option<ManifestTrustKey>] {
 enum ManifestResolution {
     /// The installed artifact verified: normal classification.
     Active(Manifest),
-    /// The installed artifact FAILED verification, but the last-valid manifest
-    /// cache is inside its grace window: classify from that cache.
-    GraceCache(Manifest),
-    /// The installed artifact FAILED verification and the grace window of the
-    /// last-valid cache has expired: governed/admin tuples the cache
-    /// classifies are refused; mechanical operations pass through.
+    /// The installed artifact failed validation after a prior valid manifest:
+    /// governed/admin tuples the cache classifies are refused, while mechanical
+    /// operations pass through.
     Regressed(Manifest),
     /// No manifest artifact on disk (dormant), or a failing artifact on a
     /// machine that never validated one: whole-invocation R2 passthrough.
@@ -1479,18 +1450,14 @@ enum ManifestResolution {
 impl ManifestResolution {
     fn manifest(&self) -> Option<&Manifest> {
         match self {
-            Self::Active(manifest) | Self::GraceCache(manifest) | Self::Regressed(manifest) => {
-                Some(manifest)
-            }
+            Self::Active(manifest) | Self::Regressed(manifest) => Some(manifest),
             Self::Dormant => None,
         }
     }
 
     fn into_manifest(self) -> Option<Manifest> {
         match self {
-            Self::Active(manifest) | Self::GraceCache(manifest) | Self::Regressed(manifest) => {
-                Some(manifest)
-            }
+            Self::Active(manifest) | Self::Regressed(manifest) => Some(manifest),
             Self::Dormant => None,
         }
     }
@@ -1502,14 +1469,12 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
         Err(ManifestProblem::Missing) => return ManifestResolution::Dormant,
         Err(_) => {}
     }
-    // Artifact present but failing. Classify from the last-valid cache while
-    // inside its grace window; past grace the refusal arm takes over. No cache
-    // at all means this machine never validated a manifest, so there is
-    // nothing to regress from and the shim stays dormant.
+    // Artifact present but failing. The last-valid cache immediately enters the
+    // regressed arm because validation failures, rather than time passage, are
+    // what make its classification unsafe. No cache means this machine never
+    // validated a manifest, so there is nothing to regress from and the shim
+    // stays dormant.
     match read_last_valid_manifest(paths) {
-        Some(cache) if cache_within_grace(&cache, now) => {
-            ManifestResolution::GraceCache(cache.manifest)
-        }
         Some(cache) => ManifestResolution::Regressed(cache.manifest),
         None => ManifestResolution::Dormant,
     }
@@ -1533,7 +1498,7 @@ fn regressed_disposition(
             RegressedDisposition::Refuse {
                 code: RefusalCode::ManifestRegressed,
                 text: format!(
-                    "the manifest artifact fails validation past the last-valid grace window; {tuple} is refused until the manifest is repaired"
+                    "the manifest artifact fails validation; {tuple} is refused until the manifest is repaired"
                 ),
             }
         }
@@ -1551,27 +1516,21 @@ enum RegressedDisposition {
     Refuse { code: RefusalCode, text: String },
 }
 
-/// Last manifest that fully verified on this machine, plus when it was last
-/// accepted. Local state under the dormancy-valve argument at the verifier
-/// site: it lets the regressed-manifest arm keep classifying while a broken
-/// artifact is repaired, and it is not a security boundary.
+/// Last manifest that fully verified on this machine. Local state under the
+/// dormancy-valve argument at the verifier site: it lets the regressed-manifest
+/// arm keep classifying while a broken artifact is repaired, and it is not a
+/// security boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LastValidManifest {
-    accepted_at_unix_secs: u64,
     manifest: Manifest,
-}
-
-fn cache_within_grace(cache: &LastValidManifest, now: u64) -> bool {
-    now.saturating_sub(cache.accepted_at_unix_secs) <= MANIFEST_STALE_GRACE.as_secs()
 }
 
 fn read_last_valid_manifest(paths: &StatePaths) -> Option<LastValidManifest> {
     serde_json::from_slice(&fs::read(&paths.last_valid_manifest).ok()?).ok()
 }
 
-fn write_last_valid_manifest(paths: &StatePaths, accepted_at_unix_secs: u64, manifest: &Manifest) {
+fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
     let record = LastValidManifest {
-        accepted_at_unix_secs,
         manifest: manifest.clone(),
     };
     let Ok(bytes) = serde_json::to_vec(&record) else {
@@ -2256,6 +2215,9 @@ struct SelfReport {
 #[derive(Serialize)]
 struct CachedManifestReport {
     version: Option<u64>,
+    /// Signed provenance metadata for the manifest used by this report; it does
+    /// not control artifact validity after signature verification.
+    issued_at_unix_secs: Option<u64>,
     version_error: Option<String>,
     state: Option<&'static str>,
     state_error: Option<String>,
@@ -2354,6 +2316,7 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
 fn disabled_manifest_report() -> CachedManifestReport {
     CachedManifestReport {
         version: None,
+        issued_at_unix_secs: None,
         version_error: None,
         state: Some("disabled"),
         state_error: None,
@@ -2385,6 +2348,7 @@ fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestRepo
     match load_manifest(paths, now) {
         Ok(manifest) => CachedManifestReport {
             version: Some(manifest.manifest_version),
+            issued_at_unix_secs: Some(manifest.issued_at_unix_secs),
             version_error: None,
             state: Some("valid"),
             state_error: None,
@@ -2394,6 +2358,7 @@ fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestRepo
             let error = ManifestProblem::Missing.status_label();
             CachedManifestReport {
                 version: None,
+                issued_at_unix_secs: None,
                 version_error: Some(error.clone()),
                 state: None,
                 state_error: Some(error),
@@ -2405,18 +2370,9 @@ fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestRepo
             // in self-report: name the arm state first, then the artifact
             // fault that triggered it.
             match read_last_valid_manifest(paths) {
-                Some(cache) if cache_within_grace(&cache, now) => CachedManifestReport {
-                    version: Some(cache.manifest.manifest_version),
-                    version_error: None,
-                    state: Some("regressed_grace"),
-                    state_error: None,
-                    diagnostics: vec![
-                        SelfReportDiagnostic::ManifestRegressed.as_str(),
-                        problem.diagnostic().as_str(),
-                    ],
-                },
                 Some(cache) => CachedManifestReport {
                     version: Some(cache.manifest.manifest_version),
+                    issued_at_unix_secs: Some(cache.manifest.issued_at_unix_secs),
                     version_error: None,
                     state: Some("regressed"),
                     state_error: None,
@@ -2429,6 +2385,7 @@ fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestRepo
                     let error = problem.status_label();
                     CachedManifestReport {
                         version: None,
+                        issued_at_unix_secs: None,
                         version_error: Some(error.clone()),
                         state: None,
                         state_error: Some(error),
@@ -2652,9 +2609,8 @@ mod tests {
     /// can be exercised against an injected set.
     const STANDBY_TEST_SEED: [u8; 32] = *b"gh-shim-standby-fixture-seed-001";
     const DEV_STANDBY_MANIFEST_KEY_ID: &str = "gh-routing-dev-standby-key-v1";
-    /// Issue time baked into the canonical manifest fixture; every test clock
-    /// is expressed relative to it because freshness is keyed off the signed
-    /// `issued_at_unix_secs`.
+    /// Issue time baked into the canonical manifest fixture; test clocks and
+    /// signed provenance variants are expressed relative to this metadata.
     const FIXTURE_ISSUED_AT: u64 = 1_787_184_000;
     const TEST_NOW: u64 = FIXTURE_ISSUED_AT + 60;
     const FIXTURE_ACCEPTED_SEAM_REFUSAL_CODES: &[&str] = &[
@@ -3029,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_cache_rejects_tampering_staleness_and_old_schema_floor() {
+    fn signed_cache_rejects_tampering_and_old_schema_floor() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
         let now = TEST_NOW;
@@ -3050,10 +3006,10 @@ mod tests {
             load_manifest(&paths, now),
             Err(ManifestProblem::Invalid(_))
         ));
-        // The accepted copy is still inside its grace window, so the self
-        // report names the regressed arm first and the artifact fault second.
+        // A validation failure immediately enters the regressed arm, so status
+        // names that state first and the artifact fault second.
         assert_eq!(
-            cached_manifest_report(&paths).diagnostics,
+            cached_manifest_report_at(&paths, now).diagnostics,
             vec![
                 SelfReportDiagnostic::ManifestRegressed.as_str(),
                 SelfReportDiagnostic::ManifestInvalid.as_str(),
@@ -3066,31 +3022,6 @@ mod tests {
         assert!(matches!(
             load_manifest(&paths, now),
             Err(ManifestProblem::BelowFloor { manifest_floor: 0 })
-        ));
-
-        // Freshness keys off the signed issued_at, not the envelope fetch time.
-        let mut stale = fixture_manifest();
-        stale.issued_at_unix_secs =
-            now - MANIFEST_TTL.as_secs() - MANIFEST_STALE_GRACE.as_secs() - 1;
-        write_signed_manifest(&paths, stale, now);
-        assert!(matches!(
-            load_manifest(&paths, now),
-            Err(ManifestProblem::Stale { .. })
-        ));
-
-        // An issue time inside the small future skew stays acceptable; beyond
-        // it the manifest is invalid.
-        let mut skewed = fixture_manifest();
-        skewed.issued_at_unix_secs = now + ISSUED_AT_FUTURE_SKEW.as_secs();
-        write_signed_manifest(&paths, skewed, now);
-        assert!(load_manifest(&paths, now).is_ok());
-
-        let mut future = fixture_manifest();
-        future.issued_at_unix_secs = now + ISSUED_AT_FUTURE_SKEW.as_secs() + 1;
-        write_signed_manifest(&paths, future, now);
-        assert!(matches!(
-            load_manifest(&paths, now),
-            Err(ManifestProblem::Invalid(_))
         ));
     }
 
@@ -3254,7 +3185,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 12);
+        assert_eq!(RefusalCode::ALL.len(), 11);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
@@ -3266,10 +3197,13 @@ mod tests {
             GOVERNANCE_UNAVAILABLE_TEXT,
             "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns"
         );
-        assert_eq!(SelfReportDiagnostic::ALL.len(), 7);
+        assert_eq!(SelfReportDiagnostic::ALL.len(), 6);
         assert!(SelfReportDiagnostic::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_status_")));
+        assert!(SelfReportDiagnostic::ALL
+            .iter()
+            .all(|code| !code.as_str().contains("stale")));
         assert_eq!(REFUSAL_EXIT_STATUS, 86);
     }
 
@@ -3502,7 +3436,7 @@ mod tests {
     }
 
     #[test]
-    fn future_and_stale_issued_at_fixtures_are_refused() {
+    fn future_issued_at_fixture_is_refused_and_aged_fixture_serves_governed_classification() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
 
@@ -3517,16 +3451,39 @@ mod tests {
             other => panic!("expected future issued_at refusal, got {other:?}"),
         }
 
+        // This signature is valid, but its provenance timestamp is 2,000,000
+        // seconds old. A ceremony-once manifest remains active, so it still
+        // classifies governed commands instead of scheduling an outage.
         write_envelope_fixture(
             &paths,
             include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-stale-issued-at.json"),
         );
+        let ManifestResolution::Active(manifest) = resolve_manifest(&paths, TEST_NOW) else {
+            panic!("expected the aged signed manifest to remain active");
+        };
+        assert_eq!(manifest.issued_at_unix_secs, FIXTURE_ISSUED_AT - 2_000_000);
         assert!(matches!(
-            load_manifest(&paths, TEST_NOW),
-            Err(ManifestProblem::Stale {
-                manifest_version: 1
-            })
+            classify(
+                &[
+                    OsString::from("issue"),
+                    OsString::from("comment"),
+                    OsString::from("42"),
+                    OsString::from("--body"),
+                    OsString::from("hello"),
+                ],
+                &manifest,
+                "macos"
+            ),
+            Classification::Governed { tuple, .. } if tuple == "issue comment"
         ));
+
+        let report: Value =
+            serde_json::from_str(&render_self_report(&paths).expect("self report serialization"))
+                .expect("self report JSON");
+        assert_eq!(
+            report["cached_manifest"]["issued_at_unix_secs"],
+            FIXTURE_ISSUED_AT - 2_000_000
+        );
     }
 
     #[test]
@@ -3651,14 +3608,14 @@ mod tests {
     }
 
     #[test]
-    fn regressed_past_grace_refuses_governed_and_admin_and_passes_mechanical() {
+    fn regressed_invalid_artifact_refuses_governed_and_admin_and_passes_mechanical() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let accepted_at = TEST_NOW;
+        let now = TEST_NOW;
 
         // Accept the canonical manifest; this writes the last-valid cache.
-        write_signed_manifest(&paths, fixture_manifest(), accepted_at);
-        load_manifest(&paths, accepted_at).expect("canonical manifest verifies");
+        write_signed_manifest(&paths, fixture_manifest(), now);
+        load_manifest(&paths, now).expect("canonical manifest verifies");
 
         // Break the installed artifact: signed bytes tampered after signing.
         write_envelope_fixture(
@@ -3666,14 +3623,8 @@ mod tests {
             include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"),
         );
 
-        // Inside the last-valid grace window the cache still classifies.
-        assert!(matches!(
-            resolve_manifest(&paths, accepted_at + MANIFEST_STALE_GRACE.as_secs()),
-            ManifestResolution::GraceCache(_)
-        ));
-
-        // Past grace the regressed arm takes over.
-        let now = accepted_at + MANIFEST_STALE_GRACE.as_secs() + 1;
+        // A failed validation immediately enters the regressed arm; time passing
+        // does not participate in manifest validity.
         let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) else {
             panic!("expected the regressed arm");
         };
@@ -3717,10 +3668,11 @@ mod tests {
             }
         ));
 
-        // The self report is loud about the regressed state.
+        // The self report is loud about the regressed validation failure.
         let report = cached_manifest_report_at(&paths, now);
         assert_eq!(report.state, Some("regressed"));
         assert_eq!(report.version, Some(1));
+        assert_eq!(report.issued_at_unix_secs, Some(FIXTURE_ISSUED_AT));
         assert_eq!(
             report.diagnostics,
             vec![
@@ -3731,7 +3683,7 @@ mod tests {
     }
 
     #[test]
-    fn version_high_water_refuses_rollbacks_and_the_incident_is_visible_in_self_report() {
+    fn version_high_water_refuses_rollbacks_and_status_reports_them() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
 

@@ -27,8 +27,8 @@ exact bytes of the manifest file the signer publishes. The verifier verifies
 the received bytes FIRST and parses them SECOND. There is no canonicalization
 rule: re-formatting, re-ordering, or re-encoding a signed manifest changes the
 bytes and breaks the signature. `fetched_at_unix_secs` is advisory local
-metadata only; freshness is keyed off `issued_at_unix_secs`, which lives
-inside the signed manifest bytes.
+metadata only. `issued_at_unix_secs` lives inside the signed manifest bytes
+and is displayed as provenance in `--status`; it does not expire the artifact.
 
 `initial-manifest-v1.json` is the authoritative signed byte source for the
 canonical fixtures: its file contents, byte for byte, are what the canonical
@@ -78,17 +78,17 @@ IwrC9VYvTyUjPSAGrw13+2beSZ3E0ECTcJtJDOBQgZGUP51NWvC4CfmfUDXwdcFddTqvN6D40KLdm/Hg
 | `signed-envelope-v2.json` | raw-bytes round-trip golden: bytes -> verify -> parse | signature verifies over the exact `initial-manifest-v1.json` bytes; parse yields the fixture manifest |
 | `signed-envelope-v2-tampered.json` | tampered single byte | same signature as canonical, one substituted byte inside `manifest_bytes` (`issue view` -> `issue View`): verification fails |
 | `signed-envelope-v2-future-issued-at.json` | future `issued_at_unix_secs` (issue time + 3600s, beyond the 300s skew) | refused as invalid |
-| `signed-envelope-v2-stale-issued-at.json` | stale `issued_at_unix_secs` (issue time - 2,000,000s, beyond TTL + grace) | refused as stale |
+| `signed-envelope-v2-stale-issued-at.json` | aged `issued_at_unix_secs` (issue time - 2,000,000s) | accepted and continues to classify governed commands; its timestamp remains visible as provenance in `--status` |
 | `signed-envelope-v2-version-2.json` | newer `manifest_version` (2), same body | accepted; sets the version high-water mark. After it is accepted, `signed-envelope-v2.json` (version 1, validly signed) is refused as a rollback incident, visible in `--status` as `gh_shim_status_manifest_rollback` |
 | `signed-envelope-v2-standby-key.json` | standby-key signature over the canonical bytes | accepted under a two-slot trust set containing the standby key; a third unknown key id is refused |
 
-The regressed-past-grace oracle is composed from the fixtures above: accept
-the canonical envelope, replace the artifact with the tampered envelope, and
-advance the clock past the last-valid grace window. Governed and admin tuples
-classified by the last-valid manifest are refused with
-`gh_shim_manifest_regressed`; mechanical operations pass through. See
-`regressed_past_grace_refuses_governed_and_admin_and_passes_mechanical` in
-`crates/aft/src/gh_shim.rs`.
+The regressed-invalid-artifact oracle is composed from the fixtures above:
+accept the canonical envelope, then replace the artifact with the tampered
+envelope. The validation failure immediately makes governed and admin tuples
+classified by the last-valid manifest refuse with `gh_shim_manifest_regressed`;
+mechanical operations pass through. Time passage does not participate. See
+`regressed_invalid_artifact_refuses_governed_and_admin_and_passes_mechanical`
+in `crates/aft/src/gh_shim.rs`.
 
 ## Untouched wire fixtures
 
