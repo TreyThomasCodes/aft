@@ -49,7 +49,7 @@ opencode-aft/
 
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
-- Contains: ~60 command-specific request parsing and response generation modules
+- Contains: ~66 command-specific request parsing and response generation modules
 - Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/hashline.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`, `crates/aft/src/commands/health_digest.rs`
 
 **`crates/aft/src/compress/`:**
@@ -99,7 +99,7 @@ opencode-aft/
 
 **`crates/aft/src/hashline/`:**
 - Purpose: Provide byte scanning, line-tag snapshot stores, parser verification, apply repair, two-phase transactions, remap recovery, session registration, release performance gates, and seed-zero xxHash32 oracle calculation for hashline editing.
-- Contains: Byte scanner (`scan/`), snapshot rendering store (`snapshot/`), syntax parser and address verifier (`syntax/`), PUT/CUT/REM apply, boundary/indent repair, and register store (`apply/`), Phase 1/2 transaction engine with rollback protection (`transaction/`), exact-verbatim remap recovery (`recovery/`), session binding and transport integration (`integration/`), release gates and performance ceilings (`release/`), and pure-Rust xxHash32 digest calculator and oracle parity fixtures (`oracle/`).
+- Contains: Byte scanner (`scan/`), snapshot rendering store (`snapshot/`), syntax parser and address verifier (`syntax/`), PUT/CUT/REM apply, same-path section composition, boundary/indent repair, and register store (`apply/`), Phase 1/2 transaction engine with rollback protection (`transaction/`), exact-verbatim remap recovery (`recovery/`), session binding and transport integration (`integration/`), release gates and performance ceilings (`release/`), and pure-Rust xxHash32 digest calculator and oracle parity fixtures (`oracle/`).
 - Key files: `crates/aft/src/hashline/mod.rs`, `crates/aft/src/hashline/scan/mod.rs`, `crates/aft/src/hashline/snapshot/mod.rs`, `crates/aft/src/hashline/syntax/mod.rs`, `crates/aft/src/hashline/apply/mod.rs`, `crates/aft/src/hashline/transaction/mod.rs`, `crates/aft/src/hashline/recovery/mod.rs`, `crates/aft/src/hashline/integration/mod.rs`, `crates/aft/src/hashline/release/mod.rs`, `crates/aft/src/hashline/oracle/mod.rs`
 
 **`crates/aft/src/subc/`:**
