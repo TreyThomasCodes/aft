@@ -413,7 +413,7 @@
 
 **GitHub CLI routing shim entry point:**
 - Location: `crates/aft/src/gh_shim.rs`, `crates/aft/src/main.rs`
-- Triggers: Invocation as `gh` (argv[0]), `AFT_GH_SHIM`, or `AFT_DISPATCH_AS=gh`
+- Triggers: Invocation as `gh` (argv[0]) or with `gh-shim` as the first argument (for example, `aft gh-shim`)
 - Responsibilities: Validate signed routing manifest, route governed commands via `prefrontal-core` subc `gh.route` seam or exec upstream `gh`, handle `--status` and `--shim-version` self-reports
 
 **Rust binary CLI subcommands:**
