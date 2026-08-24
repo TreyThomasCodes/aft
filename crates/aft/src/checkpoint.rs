@@ -133,6 +133,28 @@ pub struct CheckpointStore {
     lock_timeout: Duration,
 }
 
+/// Owns a checkpoint mutation lock and removes its project scope directory after
+/// the filesystem lock has released. The directory exists only to scope the
+/// lockfile to one project because named checkpoints themselves live in memory.
+struct CheckpointLockGuard {
+    guard: Option<fs_lock::LockGuard>,
+    scope_dir: Option<PathBuf>,
+}
+
+impl Drop for CheckpointLockGuard {
+    fn drop(&mut self) {
+        // LockGuard::drop must join the heartbeat before removing the lockfile.
+        // Drop it first, then make the best-effort directory cleanup so a new
+        // owner can keep the scope directory when it races this release.
+        if let Some(guard) = self.guard.take() {
+            drop(guard);
+        }
+        if let Some(scope_dir) = &self.scope_dir {
+            remove_empty_scope_dir(scope_dir);
+        }
+    }
+}
+
 impl CheckpointStore {
     pub fn new() -> Self {
         let project_root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
@@ -160,23 +182,32 @@ impl CheckpointStore {
         }
     }
 
-    fn acquire_mutation_lock(&self) -> Result<fs_lock::LockGuard, AftError> {
-        if let Some(parent) = self.lock_path.parent() {
+    fn acquire_mutation_lock(&self) -> Result<CheckpointLockGuard, AftError> {
+        let scope_dir = self.lock_path.parent().map(Path::to_path_buf);
+        if let Some(parent) = scope_dir.as_deref() {
             fs::create_dir_all(parent).map_err(|error| AftError::IoError {
                 path: parent.display().to_string(),
                 message: format!("failed to create checkpoint lock directory: {error}"),
             })?;
         }
 
-        fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(|error| match error {
-            fs_lock::AcquireError::Timeout => AftError::IoError {
-                path: self.lock_path.display().to_string(),
-                message: "timed out acquiring checkpoint mutation lock".to_string(),
-            },
-            fs_lock::AcquireError::Io(error) => AftError::IoError {
-                path: self.lock_path.display().to_string(),
-                message: format!("failed to acquire checkpoint mutation lock: {error}"),
-            },
+        let guard =
+            fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(
+                |error| match error {
+                    fs_lock::AcquireError::Timeout => AftError::IoError {
+                        path: self.lock_path.display().to_string(),
+                        message: "timed out acquiring checkpoint mutation lock".to_string(),
+                    },
+                    fs_lock::AcquireError::Io(error) => AftError::IoError {
+                        path: self.lock_path.display().to_string(),
+                        message: format!("failed to acquire checkpoint mutation lock: {error}"),
+                    },
+                },
+            )?;
+
+        Ok(CheckpointLockGuard {
+            guard: Some(guard),
+            scope_dir,
         })
     }
 
@@ -409,7 +440,8 @@ impl CheckpointStore {
     }
 
     /// Remove checkpoints older than `ttl_hours` across all sessions.
-    /// Empty session entries are pruned after cleanup.
+    /// Empty session entries are pruned after cleanup. The filesystem sweep
+    /// removes empty project scope directories left behind by released locks.
     pub fn cleanup(&mut self, ttl_hours: u32) {
         let now = current_timestamp();
         let ttl_secs = ttl_hours as u64 * 3600;
@@ -417,6 +449,10 @@ impl CheckpointStore {
             session_cps.retain(|_, cp| now.saturating_sub(cp.created_at) < ttl_secs);
             !session_cps.is_empty()
         });
+
+        if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
+            sweep_empty_scope_dirs(checkpoints_root);
+        }
     }
 
     fn get(&self, session: &str, name: &str) -> Result<&Checkpoint, AftError> {
@@ -649,6 +685,32 @@ fn rollback_created_dirs(dirs: &[PathBuf]) -> bool {
     ok
 }
 
+/// Remove one project scope directory without ever deleting its contents.
+/// Another process may acquire the lock or create a file between inspection and
+/// removal, so every failure is intentionally ignored.
+fn remove_empty_scope_dir(scope_dir: &Path) {
+    let _ = fs::remove_dir(scope_dir);
+}
+
+/// Sweep only the direct children of the checkpoints root. Scope directories
+/// contain lockfiles, not durable checkpoint data, so an empty one is safe to
+/// remove while a non-empty one is left untouched by `remove_dir`.
+fn sweep_empty_scope_dirs(checkpoints_root: &Path) {
+    let entries = match fs::read_dir(checkpoints_root) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            remove_empty_scope_dir(&entry.path());
+        }
+    }
+}
+
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -674,7 +736,11 @@ mod tests {
 
     fn checkpoint_store() -> (CheckpointStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("checkpoint.lock");
+        let lock_path = dir
+            .path()
+            .join("checkpoints")
+            .join("test-project")
+            .join("checkpoint.lock");
         (
             CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT),
             dir,
@@ -796,6 +862,23 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_lock_scope_is_removed_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_dir = dir.path().join("checkpoints").join("project-scope");
+        let lock_path = scope_dir.join("checkpoint.lock");
+        let path = dir.path().join("checkpoint.txt");
+        fs::write(&path, "data").unwrap();
+        let backup_store = BackupStore::new();
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+
+        store
+            .create(DEFAULT_SESSION_ID, "released", vec![path], &backup_store)
+            .unwrap();
+
+        assert!(!scope_dir.exists(), "released lock scope should be removed");
+    }
+
+    #[test]
     fn cleanup_removes_expired_across_sessions() {
         let (path, _dir) = temp_file("cp_cleanup.txt", "data");
         let backup_store = BackupStore::new();
@@ -829,6 +912,50 @@ mod tests {
         assert_eq!(store.total_count(), 1);
         assert_eq!(store.list(DEFAULT_SESSION_ID)[0].name, "recent");
         assert!(store.list("other").is_empty());
+    }
+
+    #[test]
+    fn cleanup_sweeps_empty_scope_dirs_but_keeps_live_lock_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoints_root = dir.path().join("checkpoints");
+        let empty_a = checkpoints_root.join("empty-a");
+        let empty_b = checkpoints_root.join("empty-b");
+        let live_scope = checkpoints_root.join("live-scope");
+        fs::create_dir_all(&empty_a).unwrap();
+        fs::create_dir_all(&empty_b).unwrap();
+        fs::create_dir_all(&live_scope).unwrap();
+        fs::write(live_scope.join("checkpoint.lock"), "live lock").unwrap();
+
+        let lock_path = checkpoints_root
+            .join("current-scope")
+            .join("checkpoint.lock");
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.cleanup(24);
+
+        assert!(!empty_a.exists());
+        assert!(!empty_b.exists());
+        assert!(live_scope.is_dir());
+        assert!(live_scope.join("checkpoint.lock").is_file());
+    }
+
+    #[test]
+    fn cleanup_ignores_non_empty_scope_dir_removal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoints_root = dir.path().join("checkpoints");
+        let scope_dir = checkpoints_root.join("racing-scope");
+        fs::create_dir_all(&scope_dir).unwrap();
+        // Model the post-race state where a concurrent lock acquisition adds
+        // this file after the root readdir but before remove_dir.
+        fs::write(scope_dir.join("checkpoint.lock"), "lock appeared").unwrap();
+
+        let lock_path = checkpoints_root
+            .join("current-scope")
+            .join("checkpoint.lock");
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.cleanup(24);
+
+        assert!(scope_dir.is_dir());
+        assert!(scope_dir.join("checkpoint.lock").is_file());
     }
 
     #[test]
@@ -1056,6 +1183,7 @@ mod tests {
             .unwrap();
         fs::write(&path, "changed").unwrap();
 
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         let held_lock =
             fs_lock::try_acquire(&lock_path, Duration::from_secs(1)).expect("hold checkpoint lock");
         let restore_result = store.restore(DEFAULT_SESSION_ID, "locked");
