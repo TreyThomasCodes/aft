@@ -58,6 +58,20 @@ fn write_fresh_manifest(state_home: &Path, now: u64) {
     .expect("write manifest envelope");
 }
 
+fn write_invalid_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest(state_home, now);
+    let manifest_path = state_home.join("cortexkit/aft/gh-shim/gh-routing-manifest.json");
+    let mut envelope: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest envelope"))
+            .expect("parse manifest envelope");
+    envelope["key_id"] = json!("gh-routing-untrusted-test-key");
+    fs::write(
+        manifest_path,
+        serde_json::to_vec(&envelope).expect("serialize invalid manifest envelope"),
+    )
+    .expect("write invalid manifest envelope");
+}
+
 fn write_dead_connection_file(root: &Path) -> PathBuf {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
     let port = listener
@@ -370,6 +384,44 @@ fn gh_shim_without_manifest_keeps_unreachable_daemon_passthrough() {
     assert_eq!(output.status.code(), Some(73));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
     assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read upstream invocation record"),
+        "issue comment 42 --body hello\n"
+    );
+}
+
+#[test]
+fn gh_shim_invalid_manifest_announces_ambient_credential_fallback() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_invalid_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
+
+    let output = shim_command(
+        &["issue", "comment", "42", "--body", "hello"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn invalid-manifest gh shim invocation");
+
+    assert_eq!(output.status.code(), Some(73));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
+    assert_eq!(
+        output.stderr,
+        b"gh-shim: manifest invalid (untrusted manifest key id gh-routing-untrusted-test-key); executing with ambient gh credentials\n"
+    );
     assert_eq!(
         fs::read_to_string(&recorder).expect("read upstream invocation record"),
         "issue comment 42 --body hello\n"

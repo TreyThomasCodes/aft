@@ -217,9 +217,13 @@ fn run(args: &[OsString]) -> i32 {
     // BEFORE any rung probe so a governed refusal never depends on daemon
     // reachability: a validation failure after a prior valid manifest makes
     // governed/admin tuples refuse while mechanical operations pass through.
-    if let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) {
+    let initial_manifest = resolve_manifest(&paths, now);
+    let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
+    if let ManifestResolution::Regressed { manifest, problem } = initial_manifest {
         return match regressed_disposition(args, &manifest, current_platform()) {
-            RegressedDisposition::Passthrough => delegate(args),
+            RegressedDisposition::Passthrough => {
+                delegate_after_invalid_manifest_notice(args, &problem)
+            }
             RegressedDisposition::Refuse { code, text } => refuse(code, &text),
         };
     }
@@ -243,7 +247,10 @@ fn run(args: &[OsString]) -> i32 {
                     "no manifest declaration for this invocation (manifest {manifest_version})"
                 ),
             ),
-            None => delegate(args),
+            None => match invalid_manifest_problem.as_ref() {
+                Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
+                None => delegate(args),
+            },
         };
     }
 
@@ -253,11 +260,16 @@ fn run(args: &[OsString]) -> i32 {
     // instead of a classification-shaped refusal.
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
-        ManifestResolution::Regressed(manifest) => {
+        ManifestResolution::Regressed { manifest, problem } => {
             return match regressed_disposition(args, &manifest, current_platform()) {
-                RegressedDisposition::Passthrough => delegate(args),
+                RegressedDisposition::Passthrough => {
+                    delegate_after_invalid_manifest_notice(args, &problem)
+                }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
             }
+        }
+        ManifestResolution::Invalid(problem) => {
+            return delegate_after_invalid_manifest_notice(args, &problem)
         }
         ManifestResolution::Dormant => return delegate(args),
     };
@@ -289,15 +301,7 @@ fn run(args: &[OsString]) -> i32 {
             let request =
                 match canonicalize_governed(args, &tuple, &canonical, manifest.manifest_version) {
                     Ok(request) => request,
-                    Err(_) => {
-                        return refuse(
-                            RefusalCode::Unclassified,
-                            &format!(
-                                "undeclared shape for {tuple} in manifest {}",
-                                manifest.manifest_version
-                            ),
-                        )
-                    }
+                    Err(error) => return refuse_governed_canonicalization(&error),
                 };
             let outcome = route_governed(&paths, &determination, &agent_binding, request, now);
             governed_outcome_status(&paths, &agent_binding, now, outcome)
@@ -310,6 +314,10 @@ fn run(args: &[OsString]) -> i32 {
             ),
         ),
     }
+}
+
+fn refuse_governed_canonicalization(error: &str) -> i32 {
+    refuse(RefusalCode::Unclassified, error)
 }
 
 fn governed_outcome_status(
@@ -474,7 +482,9 @@ fn sticky_governance_disposition(
     }
     let manifest = match resolve_manifest(paths, now) {
         ManifestResolution::Active(manifest) => manifest,
-        ManifestResolution::Regressed(_) | ManifestResolution::Dormant => return None,
+        ManifestResolution::Regressed { .. }
+        | ManifestResolution::Invalid(_)
+        | ManifestResolution::Dormant => return None,
     };
     let agent_binding = resolved_agent_binding(&manifest, cwd)?;
 
@@ -841,7 +851,7 @@ fn origin_remote(cwd: &Path) -> Option<String> {
 
 fn canonical_repository_key(value: &str) -> Option<String> {
     let remote = value.trim().trim_end_matches('/');
-    let path = [
+    let path = if let Some(path) = [
         "https://github.com/",
         "http://github.com/",
         "ssh://git@github.com/",
@@ -851,7 +861,15 @@ fn canonical_repository_key(value: &str) -> Option<String> {
     ]
     .iter()
     .find_map(|prefix| remote.strip_prefix(prefix))
-    .unwrap_or(remote)
+    {
+        path
+    } else if remote.contains("://") || remote.contains('@') || remote.contains(':') {
+        // Repository bindings identify GitHub repositories. A foreign remote is
+        // intentionally unmapped rather than treated as an owner/name string.
+        return None;
+    } else {
+        remote
+    }
     .trim_end_matches(".git")
     .trim_matches('/');
     let mut parts = path.split('/');
@@ -1225,6 +1243,22 @@ impl ManifestProblem {
             ),
         }
     }
+
+    fn fallback_notice_reason(&self) -> String {
+        match self {
+            Self::Missing => "manifest unavailable".to_string(),
+            Self::Invalid(reason) => reason.clone(),
+            Self::BelowFloor { manifest_floor } => {
+                format!("manifest floor {manifest_floor}, shim floor {SCHEMA_FLOOR}")
+            }
+            Self::RolledBack {
+                manifest_version,
+                newest_accepted,
+            } => {
+                format!("manifest version {manifest_version}, newest accepted version {newest_accepted}")
+            }
+        }
+    }
 }
 
 /// Verifier-site contract for the signed routing manifest.
@@ -1441,43 +1475,63 @@ enum ManifestResolution {
     /// The installed artifact failed validation after a prior valid manifest:
     /// governed/admin tuples the cache classifies are refused, while mechanical
     /// operations pass through.
-    Regressed(Manifest),
-    /// No manifest artifact on disk (dormant), or a failing artifact on a
-    /// machine that never validated one: whole-invocation R2 passthrough.
+    Regressed {
+        manifest: Manifest,
+        problem: ManifestProblem,
+    },
+    /// An artifact is installed but failed validation before this machine ever
+    /// accepted one, so the invocation passes through with an identity notice.
+    Invalid(ManifestProblem),
+    /// No manifest artifact is present, so delegate without manifest-based routing.
     Dormant,
 }
 
 impl ManifestResolution {
     fn manifest(&self) -> Option<&Manifest> {
         match self {
-            Self::Active(manifest) | Self::Regressed(manifest) => Some(manifest),
-            Self::Dormant => None,
+            Self::Active(manifest) | Self::Regressed { manifest, .. } => Some(manifest),
+            Self::Invalid(_) | Self::Dormant => None,
         }
     }
 
     fn into_manifest(self) -> Option<Manifest> {
         match self {
-            Self::Active(manifest) | Self::Regressed(manifest) => Some(manifest),
-            Self::Dormant => None,
+            Self::Active(manifest) | Self::Regressed { manifest, .. } => Some(manifest),
+            Self::Invalid(_) | Self::Dormant => None,
+        }
+    }
+
+    fn invalid_problem(&self) -> Option<&ManifestProblem> {
+        match self {
+            Self::Regressed { problem, .. } | Self::Invalid(problem) => Some(problem),
+            Self::Active(_) | Self::Dormant => None,
         }
     }
 }
 
 fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     match load_manifest(paths, now) {
-        Ok(manifest) => return ManifestResolution::Active(manifest),
-        Err(ManifestProblem::Missing) => return ManifestResolution::Dormant,
-        Err(_) => {}
+        Ok(manifest) => ManifestResolution::Active(manifest),
+        Err(ManifestProblem::Missing) => ManifestResolution::Dormant,
+        Err(problem) => match read_last_valid_manifest(paths) {
+            Some(cache) => ManifestResolution::Regressed {
+                manifest: cache.manifest,
+                problem,
+            },
+            None => ManifestResolution::Invalid(problem),
+        },
     }
-    // Artifact present but failing. The last-valid cache immediately enters the
-    // regressed arm because validation failures, rather than time passage, are
-    // what make its classification unsafe. No cache means this machine never
-    // validated a manifest, so there is nothing to regress from and the shim
-    // stays dormant.
-    match read_last_valid_manifest(paths) {
-        Some(cache) => ManifestResolution::Regressed(cache.manifest),
-        None => ManifestResolution::Dormant,
-    }
+}
+
+fn delegate_after_invalid_manifest_notice(args: &[OsString], problem: &ManifestProblem) -> i32 {
+    // Missing manifests identify public installations and must remain silent.
+    // An installed but invalid manifest instead signals a misconfigured
+    // governed seat, so say which ambient identity will execute the fallback.
+    eprintln!(
+        "gh-shim: manifest invalid ({}); executing with ambient gh credentials",
+        problem.fallback_notice_reason().replace(['\n', '\r'], " ")
+    );
+    delegate(args)
 }
 
 /// Disposition of one invocation under the regressed-manifest arm.
@@ -1790,7 +1844,12 @@ fn canonicalize_governed(
     // argv before falling back to a command-local flag or remote inference.
     let repository = explicit_repo(args)
         .or(explicit_repository)
-        .or_else(infer_repository_from_git);
+        .or_else(infer_repository_from_git)
+        .map(|repository| {
+            canonical_repository_key(&repository)
+                .ok_or_else(|| format!("repository {repository} is not owner/name"))
+        })
+        .transpose()?;
     Ok(GovernedRequest {
         action: tuple.to_string(),
         target,
@@ -1841,7 +1900,7 @@ fn explicit_repo(args: &[OsString]) -> Option<String> {
 
 fn infer_repository_from_git() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    origin_remote(&cwd)
+    canonical_repository_key(&origin_remote(&cwd)?)
 }
 
 #[derive(Debug)]
@@ -3092,6 +3151,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_repository_key_parses_github_remotes_and_rejects_foreign_hosts() {
+        for remote in [
+            "https://github.com/CortexKit/Aft",
+            "https://github.com/cortexkit/aft.git",
+            "https://github.com/cortexkit/aft/",
+            "https://github.com/cortexkit/aft.git/",
+            "git@github.com:cortexkit/aft.git",
+            "ssh://git@github.com/cortexkit/aft",
+            "cortexkit/aft",
+        ] {
+            assert_eq!(
+                canonical_repository_key(remote).as_deref(),
+                Some("cortexkit/aft")
+            );
+        }
+        for remote in [
+            "https://gitlab.com/cortexkit/aft.git",
+            "ssh://git@gitlab.com/cortexkit/aft",
+            "git@gitlab.com:cortexkit/aft.git",
+        ] {
+            assert_eq!(canonical_repository_key(remote), None);
+        }
+    }
+
+    #[test]
+    fn invalid_repository_argument_refuses_before_seam_routing() {
+        let manifest = fixture_manifest();
+        let canonical = manifest.canonicalization["issue comment"].clone();
+        let error = canonicalize_governed(
+            &[
+                OsString::from("--repo"),
+                OsString::from("not/an/owner-name"),
+                OsString::from("issue"),
+                OsString::from("comment"),
+                OsString::from("42"),
+                OsString::from("--body"),
+                OsString::from("hello"),
+            ],
+            "issue comment",
+            &canonical,
+            1,
+        )
+        .expect_err("an unparseable repository must abort before seam routing");
+        assert_eq!(error, "repository not/an/owner-name is not owner/name");
+        assert_eq!(
+            refuse_governed_canonicalization(&error),
+            REFUSAL_EXIT_STATUS,
+            "a pre-routing governance refusal must have a nonzero exit status"
+        );
+    }
+
+    #[test]
     fn governed_canonicalization_normalizes_flags_and_explicit_repo_wins() {
         let manifest = fixture_manifest();
         let canonical = manifest.canonicalization["issue comment"].clone();
@@ -3591,9 +3702,9 @@ mod tests {
             ManifestResolution::Dormant
         ));
 
-        // A failing artifact with no last-valid cache is also dormant: nothing
-        // was ever governed on this machine, so there is nothing to regress
-        // from.
+        // A failing artifact with no last-valid cache falls back without a
+        // regressed classification, but remains distinguishable from a missing
+        // public-install manifest so the invocation can announce the fallback.
         let untrusted = signed_with(
             &fixture_manifest(),
             TEST_NOW,
@@ -3603,7 +3714,7 @@ mod tests {
         fs::write(&paths.manifest, serde_json::to_vec(&untrusted).unwrap()).unwrap();
         assert!(matches!(
             resolve_manifest(&paths, TEST_NOW),
-            ManifestResolution::Dormant
+            ManifestResolution::Invalid(ManifestProblem::Invalid(_))
         ));
     }
 
@@ -3625,7 +3736,7 @@ mod tests {
 
         // A failed validation immediately enters the regressed arm; time passing
         // does not participate in manifest validity.
-        let ManifestResolution::Regressed(manifest) = resolve_manifest(&paths, now) else {
+        let ManifestResolution::Regressed { manifest, .. } = resolve_manifest(&paths, now) else {
             panic!("expected the regressed arm");
         };
         let governed = [
