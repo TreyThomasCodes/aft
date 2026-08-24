@@ -306,7 +306,10 @@ describe("BinaryBridge lifecycle", () => {
     expect(r2.success).toBe(true);
     // No restart counter bump — this path uses lazy spawn, not auto-restart.
     expect(bridge.restartCount).toBe(0);
-  });
+    // Two real binary spawns (initial + lazy respawn) can exceed bun's 5s
+    // default on cold CI runners; match the explicit budgets used by other
+    // real-spawn suites.
+  }, 20000);
 
   test("shutdown cleans up child process (no orphans)", async () => {
     bridge = new BinaryBridge(
