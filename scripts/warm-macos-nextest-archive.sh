@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # The archive gate calls this after extracting reusable build metadata and before
-# timed tests start. macOS charges a large first-exec cost per fresh test-binary
-# inode, so archive shards must pay that cost here rather than inside test runs.
+# timed tests start. Gatekeeper assesses every fresh provenance-bearing binary,
+# including identical signed bytes at a new inode, and can show verification UI.
+# Pay that one assessment here rather than from each timed test process.
 if [[ "$(uname)" != "Darwin" || -z "${AFT_NEXTEST_EXTRACT_TO:-}" ]]; then
   exit 0
 fi
@@ -14,10 +15,18 @@ if [[ ! -f "$metadata" ]]; then
   exit 1
 fi
 
+warm_macos_executable() {
+  local binary="$1"
+  shift
+
+  [[ -x "$binary" ]] || return 0
+  codesign -f -s - --identifier aft-dev-gate "$binary" >/dev/null 2>&1 || true
+  "$binary" "$@" >/dev/null 2>&1 || true
+}
+
 while IFS= read -r binary; do
   [[ -n "$binary" && -x "$binary" ]] || continue
-  codesign -f -s - "$binary" 2>/dev/null || true
-  "$binary" --list >/dev/null 2>&1 || true
+  warm_macos_executable "$binary" --list
 done < <(
   python3 - "$metadata" "$AFT_NEXTEST_EXTRACT_TO/target" <<'PY'
 import json
@@ -39,7 +48,4 @@ PY
 # Integration tests spawn the CLI, which is not a test harness and therefore is
 # absent from rust-binaries metadata.
 aft_binary="$AFT_NEXTEST_EXTRACT_TO/target/debug/aft"
-if [[ -x "$aft_binary" ]]; then
-  codesign -f -s - "$aft_binary" 2>/dev/null || true
-  "$aft_binary" --version >/dev/null 2>&1 || true
-fi
+warm_macos_executable "$aft_binary" --version
