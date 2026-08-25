@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::config::Config;
 
@@ -89,7 +92,22 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     let shims_dir = storage_root.join(SHIMS_DIR_NAME);
     if config.gh_shim.enabled {
         let binary = shim_binary(config)?;
-        ensure_gh_entry(&shims_dir, &binary)?;
+        match probe_gh_shim_binary(&binary) {
+            Ok(()) => ensure_gh_entry(&shims_dir, &binary)?,
+            Err(reason) => {
+                crate::slog_warn!(
+                    "[agent_child_env] refusing gh shim candidate {}: {reason}",
+                    binary.display()
+                );
+                if !existing_gh_entry_is_valid(&shims_dir) {
+                    remove_gh_entry(&shims_dir)?;
+                    crate::slog_warn!(
+                        "[agent_child_env] removed unverified gh shim entry after refusing candidate {}",
+                        binary.display()
+                    );
+                }
+            }
+        }
     } else {
         remove_gh_entry(&shims_dir)?;
     }
@@ -167,6 +185,107 @@ pub fn shim_binary(config: &Config) -> Result<PathBuf, String> {
         ));
     }
     Ok(binary)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ShimProbeCacheKey {
+    path: PathBuf,
+    modified: Option<Duration>,
+    size: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct ShimSelfReport {
+    shim_version: String,
+    gh_routing_schema_floor: u64,
+}
+
+static SHIM_PROBE_CACHE: OnceLock<Mutex<HashMap<ShimProbeCacheKey, Result<(), String>>>> =
+    OnceLock::new();
+
+/// Verify behavior rather than executable names: installation may point at a
+/// renamed AFT image, while a process that merely resembles one must not become
+/// the agent child's `gh` command.
+fn probe_gh_shim_binary(binary: &Path) -> Result<(), String> {
+    let metadata =
+        fs::metadata(binary).map_err(|error| format!("could not stat candidate: {error}"))?;
+    let key = ShimProbeCacheKey {
+        path: binary.to_path_buf(),
+        modified: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok()),
+        size: metadata.len(),
+    };
+    let cache = SHIM_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return cached;
+    }
+
+    let result = probe_gh_shim_binary_uncached(binary);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, result.clone());
+    result
+}
+
+fn probe_gh_shim_binary_uncached(binary: &Path) -> Result<(), String> {
+    // Invoke the image directly, including on Windows where the managed entry is
+    // a gh.cmd wrapper. This keeps validation independent of the wrapper's shell.
+    let output = Command::new(binary)
+        .args(["gh-shim", "--shim-version"])
+        .output()
+        .map_err(|error| format!("could not execute --shim-version probe: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "--shim-version probe exited with {status}",
+            status = output.status
+        ));
+    }
+    let report: ShimSelfReport = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("--shim-version probe emitted invalid JSON: {error}"))?;
+    if report.shim_version.is_empty() || report.gh_routing_schema_floor == 0 {
+        return Err("--shim-version probe omitted required shim identity fields".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn existing_gh_entry_is_valid(shims_dir: &Path) -> bool {
+    let entry = shims_dir.join("gh");
+    let binary = match fs::read_link(&entry) {
+        Ok(target) if target.is_absolute() => target,
+        Ok(target) => shims_dir.join(target),
+        Err(_) => entry,
+    };
+    probe_gh_shim_binary(&binary).is_ok()
+}
+
+#[cfg(windows)]
+fn existing_gh_entry_is_valid(shims_dir: &Path) -> bool {
+    let entry = shims_dir.join("gh.cmd");
+    let Ok(wrapper) = fs::read_to_string(entry) else {
+        return false;
+    };
+    let Some(binary) = wrapper
+        .strip_prefix("@echo off\r\n\"")
+        .and_then(|line| line.strip_suffix("\" gh-shim %*\r\n"))
+        .map(|path| PathBuf::from(path.replace("%%", "%")))
+    else {
+        return false;
+    };
+    probe_gh_shim_binary(&binary).is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn existing_gh_entry_is_valid(_shims_dir: &Path) -> bool {
+    false
 }
 
 fn ensure_prepare_commit_msg_hook(hooks_dir: &Path) -> Result<(), String> {
@@ -370,8 +489,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("aft-first");
         let second = temp.path().join("aft-second");
-        fs::write(&first, "first").unwrap();
-        fs::write(&second, "second").unwrap();
+        write_self_reporting_shim(&first);
+        write_self_reporting_shim(&second);
         let mut config = Config::default();
         config.gh_shim.binary_path = Some(first);
         maintain(&config, temp.path()).unwrap();
@@ -391,6 +510,40 @@ mod tests {
         config.gh_shim.enabled = false;
         maintain(&config, temp.path()).unwrap();
         assert!(fs::symlink_metadata(entry).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_maintenance_refuses_harnesses_and_preserves_verified_shims() {
+        let temp = tempfile::tempdir().unwrap();
+        let verified = temp.path().join("aft-verified");
+        let harness = temp.path().join("aft-test-harness");
+        write_self_reporting_shim(&verified);
+        write_executable(
+            &harness,
+            "#!/bin/sh\nif [ \"${2:-}\" = \"--shim-version\" ]; then exit 2; fi\nexit 0\n",
+        );
+
+        let mut config = Config::default();
+        config.gh_shim.binary_path = Some(verified.clone());
+        maintain(&config, temp.path()).unwrap();
+        let entry = temp.path().join("shims/gh");
+        assert_eq!(fs::read_link(&entry).unwrap(), verified);
+
+        config.gh_shim.binary_path = Some(harness);
+        maintain(&config, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_link(&entry).unwrap(),
+            verified,
+            "a rejected candidate must not replace a verified shim"
+        );
+
+        fs::remove_file(&entry).unwrap();
+        maintain(&config, temp.path()).unwrap();
+        assert!(
+            fs::symlink_metadata(entry).is_err(),
+            "a rejected candidate must not install a new gh entry"
+        );
     }
 
     #[test]
@@ -451,6 +604,14 @@ mod tests {
     fn write_executable(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         set_executable(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_self_reporting_shim(path: &Path) {
+        write_executable(
+            path,
+            "#!/bin/sh\nif [ \"${1:-}\" = \"gh-shim\" ] && [ \"${2:-}\" = \"--shim-version\" ]; then\n  printf '%s\\n' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}'\n  exit 0\nfi\nexit 1\n",
+        );
     }
 
     #[cfg(unix)]

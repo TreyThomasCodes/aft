@@ -4666,7 +4666,15 @@ mod tests {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _aft_cache_dir = EnvVarGuard::remove("AFT_CACHE_DIR");
         let temp = tempfile::tempdir().unwrap();
+        let sandboxed_data_home = temp.path().join("xdg-data");
+        let _xdg_data_home = EnvVarGuard::set(
+            "XDG_DATA_HOME",
+            sandboxed_data_home
+                .to_str()
+                .expect("temporary path is UTF-8"),
+        );
         init_git_fixture(temp.path());
 
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
@@ -4689,7 +4697,7 @@ mod tests {
         let resolved = ctx.config().storage_dir.clone();
         assert_eq!(
             resolved,
-            Some(crate::bash_background::storage_dir(None)),
+            Some(sandboxed_data_home.join("cortexkit").join("aft")),
             "configure must default storage_dir to the shared storage root"
         );
     }
