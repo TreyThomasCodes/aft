@@ -56,7 +56,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Prime Rust test binaries

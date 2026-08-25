@@ -69,7 +69,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Build nextest archive (Linux integration suite)
@@ -125,7 +125,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: oven-sh/setup-bun@v2
@@ -275,7 +275,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: actions/setup-node@v5
@@ -368,7 +368,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Release storm tests (production-calibrated latency bounds)
@@ -450,7 +450,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: Swatinem/rust-cache@v2
@@ -504,7 +504,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -625,7 +625,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: actions/download-artifact@v4
@@ -691,7 +691,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Build nextest archive (Windows integration suite)
@@ -743,7 +743,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Rust libtest + watcher gate (Windows)
@@ -787,7 +787,7 @@ jobs:
             *) plat="windows-tar" ;;
           esac
           mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/latest/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - uses: actions/download-artifact@v4

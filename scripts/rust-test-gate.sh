@@ -159,6 +159,13 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
 fi
 
 extract_nextest_archive_for_prewarm() {
+  # Newer cargo-nextest (>= ~0.9.13x) refuses --extract-to when the
+  # destination already holds a target/ tree (older versions merged into
+  # it). CI restores a cached target/ into the workspace before this step
+  # runs, so clear the collision: the archive fully replaces that tree.
+  if [ -d "$AFT_NEXTEST_EXTRACT_TO/target" ]; then
+    rm -rf "$AFT_NEXTEST_EXTRACT_TO/target"
+  fi
   cargo nextest list \
     --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" \
     --extract-to "$AFT_NEXTEST_EXTRACT_TO" \
