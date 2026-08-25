@@ -26,6 +26,13 @@ describe("durable plugin logging", () => {
     );
   });
 
+  test("explicit configured roots preserve their spelling", async () => {
+    await withEnv({ AFT_STORAGE_DIR: undefined }, () => {
+      const configured = join(tmpdir(), "aft-explicit", "spelled", "..");
+      expect(resolveAftStorageRoot(configured)).toBe(configured);
+    });
+  });
+
   test("computed XDG root wins over legacy AFT_CACHE_DIR", async () => {
     const xdg = join(tmpdir(), "aft-xdg-resolution");
     await withEnv(

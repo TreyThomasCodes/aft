@@ -43,7 +43,9 @@ export function resolveCortexKitStorageRoot(): string {
  */
 export function resolveAftStorageRoot(configuredRoot?: string): string {
   if (process.env.AFT_STORAGE_DIR) return resolveCortexKitStorageRoot();
-  if (configuredRoot) return resolveStoragePath(configuredRoot);
+  // Explicit process-state paths are caller-owned; preserve their spelling so
+  // every downstream read/write uses the exact configured root.
+  if (configuredRoot) return configuredRoot;
   return resolveCortexKitStorageRoot();
 }
 

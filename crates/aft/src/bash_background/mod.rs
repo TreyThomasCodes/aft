@@ -330,8 +330,10 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     if let Some(dir) = non_empty_env_path("AFT_STORAGE_DIR") {
         return resolve_storage_path(&dir);
     }
-    if let Some(dir) = configured.filter(|dir| !dir.as_os_str().is_empty()) {
-        return resolve_storage_path(dir);
+    if let Some(dir) = configured {
+        // Explicit process-state paths are already caller-owned. Preserve their
+        // spelling so every downstream read/write uses the exact configured root.
+        return dir.to_path_buf();
     }
     if let Some(root) = cortexkit_data_root() {
         return root.join("cortexkit").join("aft");
@@ -587,6 +589,25 @@ mod storage_root_tests {
                 .parent()
                 .and_then(Path::parent),
             Some(expected_plugin_root.as_path())
+        );
+
+        let spelled_dir = base.path().join("spelled");
+        std::fs::create_dir(&spelled_dir).expect("spelled path component");
+        let explicit_spelling = spelled_dir.join("..");
+        assert_eq!(
+            super::storage_dir(Some(&explicit_spelling)),
+            explicit_spelling
+        );
+        assert_eq!(
+            crate::search_index::resolve_cache_dir(
+                Path::new("/tmp/project"),
+                Some(&explicit_spelling)
+            ),
+            explicit_spelling
+                .join("index")
+                .join(crate::search_index::artifact_cache_key(Path::new(
+                    "/tmp/project"
+                )))
         );
 
         env.set(

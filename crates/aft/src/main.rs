@@ -1674,7 +1674,13 @@ mod graceful_shutdown_search_index_tests {
         // those environment variables to neutralize developer-global ignores.
         let _global_gitignore_env_guard = stable_global_gitignore_env_guard();
         let root = tempfile::tempdir().expect("root tempdir");
-        let storage = tempfile::tempdir().expect("storage tempdir");
+        // Keep the configured root in its /tmp spelling on macOS. The explicit
+        // path must remain byte-identical across flush and readback.
+        let storage = if cfg!(target_os = "macos") {
+            tempfile::tempdir_in("/tmp").expect("/tmp storage tempdir")
+        } else {
+            tempfile::tempdir().expect("storage tempdir")
+        };
         let file = root.path().join("src.txt");
         std::fs::write(&file, "old shutdown token\n").expect("write source");
 
@@ -1682,6 +1688,14 @@ mod graceful_shutdown_search_index_tests {
         let ctx = registry.current();
         let (canonical_root, cache_dir) =
             install_resident_search_index(ctx, root.path(), storage.path());
+        assert_eq!(
+            cache_dir,
+            storage
+                .path()
+                .join("index")
+                .join(aft::search_index::artifact_cache_key(&canonical_root)),
+            "explicit storage spelling must survive cache derivation"
+        );
 
         std::fs::write(&file, "new shutdown token\n").expect("edit source");
         {

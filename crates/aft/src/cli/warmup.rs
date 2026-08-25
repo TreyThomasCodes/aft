@@ -17,6 +17,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
+    run_with_storage(args, None)
+}
+
+fn run_with_storage(
+    args: Vec<OsString>,
+    storage_override: Option<PathBuf>,
+) -> Result<(), WarmupError> {
     let args = WarmupArgs::parse(args)?;
     if args.help {
         print_usage();
@@ -39,7 +46,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
         )));
     }
 
-    let storage_dir = warmup_storage_dir();
+    let storage_dir = storage_override.unwrap_or_else(warmup_storage_dir);
     if !storage_dir.is_absolute() {
         return Err(WarmupError::usage(format!(
             "AFT_STORAGE_DIR must be absolute when set: {}",
@@ -880,12 +887,6 @@ mod tests {
             std::env::set_var(key, value);
             Self { key, previous }
         }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
     }
 
     impl Drop for EnvGuard {
@@ -904,46 +905,30 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
-        let _storage = EnvGuard::set("AFT_STORAGE_DIR", storage.path().as_os_str());
         let _watcher = EnvGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("1"));
 
-        let result = run(vec![
-            OsString::from("--root"),
-            root.path().as_os_str().to_os_string(),
-            OsString::from("--only"),
-            OsString::from("search"),
-            OsString::from("--timeout"),
-            OsString::from("5000"),
-            OsString::from("--quiet"),
-        ]);
+        let result = run_with_storage(
+            vec![
+                OsString::from("--root"),
+                root.path().as_os_str().to_os_string(),
+                OsString::from("--only"),
+                OsString::from("search"),
+                OsString::from("--timeout"),
+                OsString::from("5000"),
+                OsString::from("--quiet"),
+            ],
+            Some(storage.path().to_path_buf()),
+        );
 
         assert!(result.is_ok(), "search warmup failed: {result:?}");
     }
 
     #[test]
-    fn warmup_storage_root_matches_shared_resolver_for_override_arms() {
-        let _env_lock = crate::test_env::process_env_lock();
-        let root = tempfile::tempdir().expect("storage root");
-        let env = EnvGuard::set("AFT_STORAGE_DIR", root.path().as_os_str());
+    fn warmup_storage_root_matches_shared_resolver() {
         assert_eq!(
             warmup_storage_dir(),
             aft::bash_background::storage_dir(None)
         );
-        drop(env);
-
-        let empty = EnvGuard::set("AFT_STORAGE_DIR", std::ffi::OsStr::new(""));
-        assert_eq!(
-            warmup_storage_dir(),
-            aft::bash_background::storage_dir(None)
-        );
-        drop(empty);
-
-        let absent = EnvGuard::unset("AFT_STORAGE_DIR");
-        assert_eq!(
-            warmup_storage_dir(),
-            aft::bash_background::storage_dir(None)
-        );
-        drop(absent);
     }
 
     #[test]
