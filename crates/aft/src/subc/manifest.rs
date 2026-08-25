@@ -69,6 +69,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   watch, detach a wait-mode command when a user message arrives). All are
 ///   session-scoped task plumbing; the untrusted-bind bash denial still fires
 ///   first for every `bash_*` name.
+/// - `bash_regex_match`: pure regex compilation and matching for the plugins'
+///   `bash_watch` validation and output scan; its parameters are only a regex
+///   pattern and text, with no session or configuration privileges.
 /// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
 ///   the bound root; scan work runs on the maintenance class either way.
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
@@ -88,6 +91,7 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_notify"
             | "bash_unnotify"
             | "bash_wait_detach"
+            | "bash_regex_match"
             | "inspect_tier2_run"
             | "hashline_preflight"
     )
@@ -511,6 +515,8 @@ mod tests {
         assert!(is_subc_native_plumbing_tool("bash_notify"));
         assert!(is_subc_native_plumbing_tool("bash_unnotify"));
         assert!(is_subc_native_plumbing_tool("bash_wait_detach"));
+        // Regex validation is session-scoped plumbing with no config/trust input.
+        assert!(is_subc_native_plumbing_tool("bash_regex_match"));
         assert!(is_subc_native_plumbing_tool("inspect_tier2_run"));
         // Hashline preflight parses the patch and reports permission paths; it
         // does not mutate files or expose configuration or trust controls.
@@ -529,6 +535,7 @@ mod tests {
         assert!(!is_subc_agent_core_tool("bash_drain_completions"));
         assert!(!is_subc_agent_core_tool("bash_ack_completions"));
         assert!(!is_subc_agent_core_tool("hashline_preflight"));
+        assert!(!is_subc_agent_core_tool("bash_regex_match"));
 
         // Parse-only preflight and completion drain are reads; ack mutates.
         assert_eq!(command_lane("hashline_preflight"), Lane::PureRead);

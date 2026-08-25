@@ -1098,6 +1098,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
@@ -2672,6 +2673,16 @@ fn subc_bridge_bash_background_returns_launch_text() {
 }
 
 #[test]
+fn subc_bridge_bash_watch_regex_pattern_round_trips_validation() {
+    run_subc_bridge_production_test(
+        "subc_bridge_bash_watch_regex_pattern_round_trips_validation",
+        Duration::from_secs(30),
+        drive_bash_watch_regex_pattern_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_nonzero_exit_renders_exit_code() {
     run_subc_bridge_test(
         "subc_bridge_bash_nonzero_exit_renders_exit_code",
@@ -3593,6 +3604,74 @@ async fn drive_bash_background_daemon(input: FakeDaemonInput) {
     let status = read_frame_timeout(&mut stream, "background bash status").await;
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_watch_regex_pattern_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // This mirrors the plugin's synchronous bash_watch flow: launch a task,
+    // read its output through bash_status, validate the regex, then scan that
+    // output with the same native plumbing command. The regex calls must pass
+    // the production fail-closed route gate before reaching the handler.
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "bash",
+        json!({
+            "command": "sleep 1; printf 'abc ready: 4242\\n'",
+            "background": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    let launch = read_frame_timeout(&mut stream, "bash_watch regex launch").await;
+    assert_eq!(launch.header.corr, 120);
+    assert!(!tool_result_is_error(&launch));
+    let task_id = extract_bash_task_id(&tool_result_text(&launch));
+    let status =
+        wait_for_bash_completion(&mut stream, 1, 200, "bash-watch-session", &task_id).await;
+    assert_tool_success(&status, "bash_watch regex status");
+    let output = status["output_preview"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bash_watch status missing output preview: {status:?}"));
+    assert!(
+        output.contains("ready: 4242"),
+        "unexpected bash_watch output: {output:?}"
+    );
+
+    let pattern = "ready: \\d+";
+    let validation = call_tool_response(
+        &mut stream,
+        1,
+        330,
+        "bash_regex_match",
+        json!({ "pattern": pattern, "text": "" }),
+        "bash_watch regex validation",
+    )
+    .await;
+    assert_tool_success(&validation, "bash_watch regex validation");
+    assert_eq!(validation["matched"], false);
+
+    let matched = call_tool_response(
+        &mut stream,
+        1,
+        331,
+        "bash_regex_match",
+        json!({ "pattern": pattern, "text": output }),
+        "bash_watch regex output scan",
+    )
+    .await;
+    assert_tool_success(&matched, "bash_watch regex output scan");
+    assert_eq!(matched["matched"], true);
+    assert_eq!(matched["match_text"], "ready: 4242");
+    assert_eq!(matched["match_offset"], 4);
+
     send_connection_goodbye(&mut stream).await;
 }
 
