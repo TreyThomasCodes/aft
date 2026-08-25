@@ -23,6 +23,59 @@ fi
 runner="${AFT_RUST_TEST_RUNNER:-nextest}"
 unit_runner="${AFT_UNIT_TEST_RUNNER:-cargo}"
 
+# Shared-box gate mutual exclusion. Full serial gates saturate this machine
+# badly enough to fail NEIGHBORING seats' work (spawn timeouts in release
+# pipelines, cross-gate test flakes, GC races) - three separate casualties on
+# 2026-08-25 alone. Convention agreed across seats: full gates take a
+# machine-wide advisory lock and wait for each other; focused runs (explicit
+# AFT_GATE_PHASES subsets) skip it because they do not saturate the box.
+# The lock is check-and-wait with a 2h staleness floor keyed on started_at,
+# so a crashed gate never wedges the box. AFT_SKIP_BOX_GATE=1 bypasses (CI
+# runners are not shared boxes; the lock is for the dev machine).
+box_gate_lock="${AFT_BOX_GATE_LOCK:-$HOME/.local/share/cortexkit/box-gate.lock}"
+box_gate_acquired=""
+acquire_box_gate() {
+  [ -n "${AFT_SKIP_BOX_GATE:-}" ] && return 0
+  [ -n "${CI:-}" ] && return 0
+  [ -n "${AFT_GATE_PHASES:-}" ] && return 0
+  local waited=0
+  while :; do
+    if [ -f "$box_gate_lock" ]; then
+      local started
+      started=$(python3 -c "import json,sys;print(json.load(open('$box_gate_lock')).get('started_at',0))" 2>/dev/null || echo 0)
+      local now age
+      now=$(date +%s)
+      age=$((now - started))
+      if [ "$age" -lt 7200 ]; then
+        if [ "$waited" -eq 0 ]; then
+          echo "==> box-gate: waiting for $(cat "$box_gate_lock" 2>/dev/null | head -c 200)"
+        fi
+        sleep 30
+        waited=$((waited + 30))
+        # Give up after 90 minutes of waiting and proceed: a full gate rarely
+        # exceeds that, and refusing forever would strand pushes behind a
+        # neighbor's marathon. The proceed is loud, never silent.
+        if [ "$waited" -ge 5400 ]; then
+          echo "==> box-gate: waited ${waited}s; proceeding alongside the holder (loud overlap)"
+          return 0
+        fi
+        continue
+      fi
+      echo "==> box-gate: breaking stale lock (${age}s old)"
+      rm -f "$box_gate_lock"
+    fi
+    mkdir -p "$(dirname "$box_gate_lock")"
+    printf '{"seat":"AFT","task_id":"gate-%s-%s","started_at":%s}' "$$" "$(hostname -s 2>/dev/null || echo box)" "$(date +%s)" > "$box_gate_lock"
+    box_gate_acquired=1
+    trap 'release_box_gate' EXIT
+    return 0
+  done
+}
+release_box_gate() {
+  [ -n "$box_gate_acquired" ] && rm -f "$box_gate_lock"
+}
+acquire_box_gate
+
 run_phase() {
   local label="$1"
   shift
