@@ -85,7 +85,7 @@
     },
     {
       "name": "pr-review-undeclared-flag",
-      "argv": ["pr", "review", "7", "--body", "Looks good.", "--approve"],
+      "argv": ["pr", "review", "7", "--body", "Looks good.", "--web"],
       "reason": "governed canonicalization rejects an undeclared flag"
     },
     {

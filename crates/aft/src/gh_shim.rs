@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1876,12 +1876,25 @@ fn canonicalize_governed(
     };
     let mut positional = Vec::new();
     let mut body = Map::new();
+    let mut review_event = None;
     let mut explicit_repository = None;
     let mut index = subcommand_index + 1;
     while index < args.len() {
         let value = args[index]
             .to_str()
             .ok_or_else(|| "non-UTF-8 governed arguments are undeclared".to_string())?;
+        if tuple == "pr review" {
+            if let Some(event) = declared_review_event(value) {
+                if review_event.replace(event.to_string()).is_some() {
+                    return Err(
+                        "pr review accepts only one of --approve, --comment, or --request-changes"
+                            .to_string(),
+                    );
+                }
+                index += 1;
+                continue;
+            }
+        }
         if value == "--repo" || value == "-R" {
             index += 1;
             let repository = args
@@ -1918,7 +1931,20 @@ fn canonicalize_governed(
         .iter()
         .any(|field| !body.contains_key(field))
     {
-        return Err("required declared body field is absent".to_string());
+        // An explicit approve/request-changes review is valid without prose;
+        // comments still need a body because upstream gh would otherwise open
+        // an interactive prompt that the governed seam cannot reproduce.
+        let body_optional_for_review = tuple == "pr review"
+            && review_event
+                .as_deref()
+                .is_some_and(|event| event != "COMMENT")
+            && canonical.body_fields.iter().all(|field| field == "body");
+        if !body_optional_for_review {
+            return Err("required declared body field is absent".to_string());
+        }
+    }
+    if let Some(event) = review_event {
+        body.insert("event".to_string(), Value::String(event));
     }
     let target = canonical
         .target_fields
@@ -1967,8 +1993,61 @@ fn declared_body_value(
         if let Some(supplied) = value.strip_prefix(&(long + "=")) {
             return Ok(Some((field.clone(), supplied.to_string())));
         }
+
+        // GitHub CLI supports --body-file/-F for commands that submit text
+        // bodies. Read the file here so this shim keeps the request on its
+        // governed path and avoids shell-quoting problems with long Markdown
+        // passed as an inline argument.
+        if field == "body" {
+            let file = if value == "--body-file" || value == "-F" {
+                Some(
+                    next.and_then(|arg| arg.to_str())
+                        .ok_or_else(|| format!("{value} requires a value"))?,
+                )
+            } else {
+                value
+                    .strip_prefix("--body-file=")
+                    .or_else(|| value.strip_prefix("-F="))
+                    .or_else(|| value.strip_prefix("-F"))
+            };
+            if let Some(file) = file {
+                let supplied =
+                    read_body_file(Path::new(file)).map_err(|error| format!("{value}: {error}"))?;
+                return Ok(Some((field.clone(), supplied)));
+            }
+        }
     }
     Ok(None)
+}
+
+fn read_body_file(path: &Path) -> Result<String, String> {
+    let mut stdin = io::stdin().lock();
+    read_body_file_from(path, &mut stdin)
+}
+
+fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, String> {
+    let mut body = String::new();
+    // When the path is '-', upstream gh reads the body from standard input.
+    // Do the same here so callers can provide stdin through this shim instead
+    // of bypassing its governed path.
+    if path == Path::new("-") {
+        stdin
+            .read_to_string(&mut body)
+            .map_err(|error| format!("could not read body from stdin: {error}"))?;
+    } else {
+        body = fs::read_to_string(path)
+            .map_err(|error| format!("could not read body file {}: {error}", path.display()))?;
+    }
+    Ok(body)
+}
+
+fn declared_review_event(value: &str) -> Option<&'static str> {
+    match value {
+        "--approve" => Some("APPROVE"),
+        "--comment" => Some("COMMENT"),
+        "--request-changes" => Some("REQUEST_CHANGES"),
+        _ => None,
+    }
 }
 
 fn explicit_repo(args: &[OsString]) -> Option<String> {
@@ -3369,6 +3448,191 @@ mod tests {
         assert_eq!(request.repository.as_deref(), Some("owner/explicit"));
         assert_eq!(request.target["number"], "42");
         assert_eq!(request.body["body"], "hello");
+    }
+
+    #[test]
+    fn speech_body_file_forms_are_allowed_and_forward_fixture_contents() {
+        let manifest = fixture_manifest();
+        let body_file = fixture_dir().join("governed-speech.md");
+        let expected_body = fs::read_to_string(&body_file).expect("speech body fixture");
+
+        for (expected_tuple, verb, subcommand, target) in [
+            ("issue comment", "issue", "comment", "42"),
+            ("pr comment", "pr", "comment", "7"),
+            ("pr review", "pr", "review", "7"),
+        ] {
+            let canonical = manifest.canonicalization[expected_tuple].clone();
+            for (flag, suffix) in [("--body-file", ""), ("-F", "")]
+                .into_iter()
+                .chain([("--body-file=", "equals"), ("-F=", "equals")])
+            {
+                let file_arg = if suffix.is_empty() {
+                    body_file.to_string_lossy().into_owned()
+                } else {
+                    format!("{flag}{}", body_file.display())
+                };
+                let args = if suffix.is_empty() {
+                    vec![
+                        OsString::from(verb),
+                        OsString::from(subcommand),
+                        OsString::from(target),
+                        OsString::from(flag),
+                        OsString::from(file_arg),
+                    ]
+                } else {
+                    vec![
+                        OsString::from(verb),
+                        OsString::from(subcommand),
+                        OsString::from(target),
+                        OsString::from(file_arg),
+                    ]
+                };
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Governed { ref tuple, .. } if tuple == expected_tuple
+                ));
+                let request = canonicalize_governed(&args, expected_tuple, &canonical, 1)
+                    .expect("body-file form should canonicalize");
+                let wire = governed_wire_request(&RungRecord::r3(1, 1), "agent-7", request);
+                assert_eq!(wire["body"]["body"], expected_body);
+            }
+        }
+
+        let reaction = manifest.canonicalization["issue reaction"].clone();
+        let error = canonicalize_governed(
+            &[
+                OsString::from("issue"),
+                OsString::from("reaction"),
+                OsString::from("42"),
+                OsString::from("--body-file"),
+                OsString::from(body_file),
+            ],
+            "issue reaction",
+            &reaction,
+            1,
+        )
+        .expect_err("body-file is speech-only vocabulary");
+        assert_eq!(error, "undeclared flag --body-file");
+    }
+
+    #[test]
+    fn body_file_failures_refuse_instead_of_forwarding_an_empty_body() {
+        let manifest = fixture_manifest();
+        let canonical = manifest.canonicalization["pr comment"].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+        let invalid = directory.path().join("invalid-utf8.md");
+        fs::write(&invalid, [0xff, 0xfe]).unwrap();
+
+        for path in [missing, invalid] {
+            let error = canonicalize_governed(
+                &[
+                    OsString::from("pr"),
+                    OsString::from("comment"),
+                    OsString::from("7"),
+                    OsString::from("--body-file"),
+                    OsString::from(&path),
+                ],
+                "pr comment",
+                &canonical,
+                1,
+            )
+            .expect_err("an unreadable body file must refuse");
+            assert!(error.starts_with("--body-file: could not read body file "));
+            assert!(error.contains(&path.display().to_string()));
+            assert_eq!(
+                refuse_governed_canonicalization(&error),
+                REFUSAL_EXIT_STATUS
+            );
+        }
+    }
+
+    #[test]
+    fn body_file_dash_reads_stdin_under_the_caller_permissions() {
+        let mut stdin = std::io::Cursor::new("body supplied through stdin");
+        assert_eq!(
+            read_body_file_from(Path::new("-"), &mut stdin).unwrap(),
+            "body supplied through stdin"
+        );
+    }
+
+    #[test]
+    fn pr_review_action_and_body_matrix_reaches_the_governed_payload() {
+        let manifest = fixture_manifest();
+        let canonical = manifest.canonicalization["pr review"].clone();
+        let body_file = fixture_dir().join("governed-speech.md");
+        let expected_body = fs::read_to_string(&body_file).expect("speech body fixture");
+
+        for (action_flag, event) in [
+            ("--approve", "APPROVE"),
+            ("--comment", "COMMENT"),
+            ("--request-changes", "REQUEST_CHANGES"),
+        ] {
+            for (body_flag, body_value) in [("--body", "inline review"), ("-b", "short review")] {
+                let args = vec![
+                    OsString::from("pr"),
+                    OsString::from("review"),
+                    OsString::from("7"),
+                    OsString::from(action_flag),
+                    OsString::from(body_flag),
+                    OsString::from(body_value),
+                ];
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Governed { ref tuple, .. } if tuple == "pr review"
+                ));
+                let request = canonicalize_governed(&args, "pr review", &canonical, 1)
+                    .expect("review action with inline body should canonicalize");
+                assert_eq!(request.body["event"], event);
+                assert_eq!(request.body["body"], body_value);
+            }
+
+            let args = vec![
+                OsString::from("pr"),
+                OsString::from("review"),
+                OsString::from("7"),
+                OsString::from(action_flag),
+                OsString::from("--body-file"),
+                OsString::from(&body_file),
+            ];
+            let request = canonicalize_governed(&args, "pr review", &canonical, 1)
+                .expect("review action with body-file should canonicalize");
+            assert_eq!(request.body["event"], event);
+            assert_eq!(request.body["body"], expected_body);
+        }
+
+        for action_flag in ["--approve", "--request-changes"] {
+            let args = vec![
+                OsString::from("pr"),
+                OsString::from("review"),
+                OsString::from("7"),
+                OsString::from(action_flag),
+            ];
+            let request = canonicalize_governed(&args, "pr review", &canonical, 1)
+                .expect("approve/request-changes may omit review prose");
+            assert_eq!(
+                request.body["event"],
+                action_flag
+                    .trim_start_matches("--")
+                    .to_ascii_uppercase()
+                    .replace('-', "_")
+            );
+            assert!(!request.body.contains_key("body"));
+        }
+
+        let duplicate = [
+            OsString::from("pr"),
+            OsString::from("review"),
+            OsString::from("7"),
+            OsString::from("--approve"),
+            OsString::from("--comment"),
+            OsString::from("--body"),
+            OsString::from("review"),
+        ];
+        assert_eq!(
+            canonicalize_governed(&duplicate, "pr review", &canonical, 1).unwrap_err(),
+            "pr review accepts only one of --approve, --comment, or --request-changes"
+        );
     }
 
     #[test]
