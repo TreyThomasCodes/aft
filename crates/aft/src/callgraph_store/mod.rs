@@ -376,6 +376,37 @@ mod write_amplification_tests {
     use tempfile::tempdir;
 
     #[test]
+    fn callgraph_writer_waits_when_wal_setup_meets_a_write_lock() {
+        let temp = tempdir().unwrap();
+        let sqlite_path = temp.path().join("contended.sqlite");
+        let blocker = Connection::open(&sqlite_path).expect("open blocking connection");
+        blocker
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 CREATE TABLE lock_probe (value INTEGER NOT NULL);
+                 INSERT INTO lock_probe VALUES (1);
+                 BEGIN EXCLUSIVE;
+                 UPDATE lock_probe SET value = 2;",
+            )
+            .expect("hold exclusive write transaction");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let configure = std::thread::spawn(move || {
+            let conn = Connection::open(sqlite_path).expect("open contending connection");
+            started_tx.send(()).expect("signal configure start");
+            configure_connection(&conn)
+        });
+        started_rx.recv().expect("configure thread started");
+        std::thread::sleep(Duration::from_millis(100));
+        blocker.execute_batch("COMMIT").expect("release write lock");
+
+        configure
+            .join()
+            .expect("configure thread joined")
+            .expect("WAL setup waits for the writer instead of failing locked");
+    }
+
+    #[test]
     fn callgraph_writer_and_reader_use_bounded_normal_pragmas() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
@@ -638,6 +669,19 @@ pub enum CallGraphStoreError {
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
     StaleFiles(Vec<String>),
+}
+
+impl CallGraphStoreError {
+    pub(crate) fn is_transient_lock_contention(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
 }
 
 impl fmt::Display for CallGraphStoreError {
@@ -6514,6 +6558,10 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
+    // Changing journal mode takes a database lock. Install the busy handler
+    // first so concurrent cold-build and refresh connections wait rather than
+    // failing immediately, especially under Windows byte-range locking.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     let baseline = write_amplification_baseline_enabled();
     conn.pragma_update(
@@ -6531,13 +6579,15 @@ fn configure_connection(conn: &Connection) -> Result<()> {
         },
     )?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
 
 fn configure_build_connection(conn: &Connection) -> Result<()> {
     // The staging database commits independently recoverable batches. WAL keeps
     // those commits durable without forcing a rollback journal rewrite per batch.
+    // Set the busy handler before WAL because selecting the journal mode itself
+    // can contend with a connection finishing an earlier staged transaction.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(
         None,
@@ -6549,7 +6599,6 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
         },
     )?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
 
