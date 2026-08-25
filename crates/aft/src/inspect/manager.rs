@@ -2781,15 +2781,35 @@ fn build_tier2_callgraph_snapshot_with_refresh(
     )
 }
 
+const BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const BLOCKING_CALLGRAPH_STORE_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+fn open_ready_for_blocking_inspect(
+    callgraph_dir: &Path,
+    project_root: &Path,
+    wait_for_publication: bool,
+) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
+    let deadline = Instant::now() + BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT;
+    loop {
+        match CallGraphStore::open_ready_repairing(
+            callgraph_dir.to_path_buf(),
+            project_root.to_path_buf(),
+        ) {
+            Ok(None) if wait_for_publication && Instant::now() < deadline => {}
+            Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {}
+            result => return result,
+        }
+        std::thread::sleep(BLOCKING_CALLGRAPH_STORE_RETRY_INTERVAL);
+    }
+}
+
 fn open_or_build_blocking_callgraph_store(
     callgraph_dir: PathBuf,
     project_root: PathBuf,
     allow_cold_build: bool,
     refresh_paths: &[PathBuf],
 ) -> Result<Option<CallGraphStore>, CallGraphStoreError> {
-    if let Some(store) =
-        CallGraphStore::open_ready_repairing(callgraph_dir.clone(), project_root.clone())?
-    {
+    if let Some(store) = open_ready_for_blocking_inspect(&callgraph_dir, &project_root, false)? {
         return Ok(Some(store));
     }
     if !allow_cold_build || refresh_paths.is_empty() {
@@ -2802,20 +2822,17 @@ fn open_or_build_blocking_callgraph_store(
         refresh_paths,
     ) {
         Ok((store, _)) => Ok(Some(store)),
-        Err(error @ CallGraphStoreError::Unavailable(_)) => {
-            // Another actor may own the cold build. A blocking inspect waits for
-            // its publication instead of turning that transient into a clean zero.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
-                if let Some(store) = CallGraphStore::open_ready_repairing(
-                    callgraph_dir.clone(),
-                    project_root.clone(),
-                )? {
-                    return Ok(Some(store));
-                }
+        Err(error)
+            if matches!(error, CallGraphStoreError::Unavailable(_))
+                || error.is_transient_lock_contention() =>
+        {
+            // The background builder and an inspect-triggered cold build can
+            // briefly meet on the same generation. Keep either lock loser on
+            // the Building/retry path instead of terminally failing inspect.
+            match open_ready_for_blocking_inspect(&callgraph_dir, &project_root, true)? {
+                Some(store) => Ok(Some(store)),
+                None => Err(error),
             }
-            Err(error)
         }
         Err(error) => Err(error),
     }
@@ -5220,6 +5237,46 @@ export function bannerUnused() {}
             crate::inspect::generated::file_probe_count_for_debug(&root),
             1,
             "a legacy contribution without generated must probe and recover its classification"
+        );
+    }
+
+    #[test]
+    fn inspect_callgraph_open_waits_out_transient_sqlite_writer_lock() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
+                .expect("publish initial generation");
+        let sqlite_path = store.sqlite_path().to_path_buf();
+        drop(store);
+
+        let blocker = rusqlite::Connection::open(&sqlite_path).expect("open blocking connection");
+        blocker
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 BEGIN EXCLUSIVE;
+                 UPDATE meta SET v = v WHERE k = 'ready';",
+            )
+            .expect("hold exclusive write transaction");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let open = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal inspect open start");
+            open_or_build_blocking_callgraph_store(callgraph_dir, root, true, &files)
+        });
+        started_rx.recv().expect("inspect open thread started");
+        std::thread::sleep(Duration::from_millis(100));
+        blocker.execute_batch("COMMIT").expect("release write lock");
+
+        assert!(
+            open.join()
+                .expect("inspect open thread joined")
+                .expect("transient contention must stay on the Building/retry path")
+                .is_some(),
+            "inspect must reopen the ready callgraph instead of failing terminally"
         );
     }
 

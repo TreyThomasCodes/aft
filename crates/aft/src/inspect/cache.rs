@@ -1927,11 +1927,14 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {
+    // WAL selection can require a database lock. Install the busy handler first
+    // so a concurrent inspect reader or writer is waited out instead of making
+    // the cache opener fail immediately on Windows.
+    conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     // Inspect facts are fully recomputable, so NORMAL avoids a full fsync per
     // commit while WAL transactions and writer-lease publication stay atomic.
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
     Ok(())
 }
 
