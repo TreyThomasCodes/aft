@@ -86,7 +86,7 @@ pub fn delete_delivered_terminal_bash_task(
         "DELETE FROM bash_tasks
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
            AND completion_delivered = 1
-           AND status IN ('completed', 'failed', 'killed', 'timed_out')",
+           AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
         params![harness, session_id, task_id],
     )
 }
@@ -125,6 +125,46 @@ pub fn list_bash_tasks_for_session(
 
     let rows = stmt
         .query_map(params![harness, session_id], map_bash_task_row)?
+        .collect();
+    rows
+}
+
+pub fn list_bash_tasks_by_id(
+    conn: &Connection,
+    harness: &str,
+    task_id: &str,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND task_id = ?2
+         ORDER BY started_at DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![harness, task_id], map_bash_task_row)?
+        .collect();
+    rows
+}
+
+pub fn list_replayable_bash_tasks_for_project(
+    conn: &Connection,
+    harness: &str,
+    project_key: &str,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND project_key = ?2
+           AND (status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')
+                OR completion_delivered = 0)
+         ORDER BY started_at ASC, task_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![harness, project_key], map_bash_task_row)?
         .collect();
     rows
 }

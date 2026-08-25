@@ -20,6 +20,13 @@ if [ -z "${AFT_GATE_DEMOTED:-}" ]; then
 fi
 
 
+# A test that exercises the plugin-less storage fallback must never inherit the
+# operator's real data root. Keep the whole gate hermetic, including test binaries
+# that launch child AFT processes without the shared integration helper.
+unset AFT_CACHE_DIR
+export XDG_DATA_HOME="${AFT_GATE_XDG_DATA_HOME:-${CARGO_TARGET_DIR:-$PWD/target}/aft-gate-data-home}"
+mkdir -p "$XDG_DATA_HOME"
+
 runner="${AFT_RUST_TEST_RUNNER:-nextest}"
 unit_runner="${AFT_UNIT_TEST_RUNNER:-cargo}"
 
