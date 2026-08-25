@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::context::AppContext;
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::{PullFileOutcome, ServerAttempt, ServerAttemptResult};
-use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef};
+use crate::lsp::registry::{resolve_server_binary, servers_for_file, ServerDef};
 use crate::protocol::{RawRequest, Response};
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +45,17 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let mut pull_results_json = Vec::new();
+    let mut diagnostics_gaps = outcomes
+        .attempts
+        .iter()
+        .filter_map(|attempt| match &attempt.result {
+            ServerAttemptResult::Ok { .. } => None,
+            result => Some(serde_json::json!({
+                "server_id": attempt.server_id,
+                "reason": spawn_status(result),
+            })),
+        })
+        .collect::<Vec<_>>();
     if !outcomes.successful.is_empty() {
         let pull_results = {
             let mut lsp = ctx.lsp();
@@ -52,6 +63,12 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
                 Ok(results) => results,
                 Err(err) => {
                     crate::slog_warn!("[lsp_inspect] pull_file_diagnostics failed: {err}");
+                    let server_ids = outcomes
+                        .successful
+                        .iter()
+                        .map(|server_key| server_key.kind.id_str().to_string())
+                        .collect::<Vec<_>>();
+                    diagnostics_gaps.extend(pull_failure_gaps(&server_ids, &err.to_string()));
                     Vec::new()
                 }
             }
@@ -59,6 +76,15 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         pull_results_json = pull_results
             .iter()
             .map(|result| {
+                if !matches!(
+                    &result.outcome,
+                    PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged
+                ) {
+                    diagnostics_gaps.push(serde_json::json!({
+                        "server_id": result.server_key.kind.id_str(),
+                        "reason": pull_status(&result.outcome),
+                    }));
+                }
                 serde_json::json!({
                     "server_id": result.server_key.kind.id_str(),
                     "workspace_root": result.server_key.root.display().to_string(),
@@ -99,6 +125,8 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
                 .collect::<Vec<_>>(),
             "matching_servers": matching_servers,
             "pull_results": pull_results_json,
+            "diagnostics_complete": diagnostics_gaps.is_empty(),
+            "diagnostics_gaps": diagnostics_gaps,
             "diagnostics_count": diagnostics.len(),
             "diagnostics": diagnostics_to_json(&diagnostics),
         }),
@@ -111,20 +139,19 @@ fn inspect_server(
     canonical: &Path,
     config: &crate::config::Config,
 ) -> serde_json::Value {
-    let binary_path = resolve_lsp_binary(
-        &def.binary,
-        config.project_root.as_deref(),
-        &config.lsp_paths_extra,
-    );
-    let binary_source = classify_binary_source(
-        &binary_path,
-        config.project_root.as_deref(),
-        &config.lsp_paths_extra,
-    );
     let workspace_root = match attempt.map(|attempt| &attempt.result) {
         Some(ServerAttemptResult::Ok { server_key }) => Some(server_key.root.clone()),
-        _ => def.workspace_root_for_file(canonical),
+        _ => {
+            def.workspace_root_for_file_with_project_root(canonical, config.project_root.as_deref())
+        }
     };
+    let binary_path = resolve_server_binary(def, workspace_root.as_deref(), config);
+    let binary_source = classify_binary_source(
+        &binary_path,
+        workspace_root.as_deref(),
+        config.project_root.as_deref(),
+        &config.lsp_paths_extra,
+    );
     let spawn_status = attempt
         .map(|attempt| spawn_status(&attempt.result))
         .unwrap_or_else(|| "not_attempted".to_string());
@@ -146,6 +173,7 @@ fn inspect_server(
 
 fn classify_binary_source(
     binary_path: &Option<PathBuf>,
+    workspace_root: Option<&Path>,
     project_root: Option<&Path>,
     extra_paths: &[PathBuf],
 ) -> &'static str {
@@ -153,6 +181,14 @@ fn classify_binary_source(
         return "not_found";
     };
 
+    if let Some(root) = workspace_root {
+        if path.starts_with(root.join(".venv")) || path.starts_with(root.join("venv")) {
+            return "project_virtualenv";
+        }
+        if path.starts_with(root.join("node_modules").join(".bin")) {
+            return "project_node_modules";
+        }
+    }
     if let Some(root) = project_root {
         if path.starts_with(root.join("node_modules").join(".bin")) {
             return "project_node_modules";
@@ -183,6 +219,18 @@ fn pull_status(outcome: &PullFileOutcome) -> String {
         PullFileOutcome::PullNotSupported => "pull_not_supported".to_string(),
         PullFileOutcome::RequestFailed { reason } => format!("request_failed: {reason}"),
     }
+}
+
+fn pull_failure_gaps(server_ids: &[String], reason: &str) -> Vec<serde_json::Value> {
+    server_ids
+        .iter()
+        .map(|server_id| {
+            serde_json::json!({
+                "server_id": server_id,
+                "reason": format!("pull_failed: {reason}"),
+            })
+        })
+        .collect()
 }
 
 fn collect_file_diagnostics(ctx: &AppContext, canonical: &Path) -> Vec<StoredDiagnostic> {
@@ -231,4 +279,16 @@ fn sorted_disabled_lsp(disabled: &std::collections::HashSet<String>) -> Vec<Stri
 
 fn normalize_query_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn top_level_pull_failure_produces_incomplete_gaps() {
+        let gaps = super::pull_failure_gaps(&["python".to_string()], "didOpen failed");
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["server_id"], "python");
+        assert_eq!(gaps[0]["reason"], "pull_failed: didOpen failed");
+    }
 }

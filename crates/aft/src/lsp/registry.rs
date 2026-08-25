@@ -43,6 +43,56 @@ pub fn resolve_lsp_binary(
     which::which(binary).ok()
 }
 
+/// Resolve a server binary, adding nested Python workspace lookup before the
+/// configured project-root resolver used by every other language.
+pub fn resolve_server_binary(
+    server: &ServerDef,
+    workspace_root: Option<&Path>,
+    config: &Config,
+) -> Option<PathBuf> {
+    let python_family = matches!(server.kind, ServerKind::Python | ServerKind::Ty);
+
+    if python_family {
+        if let Some(root) = workspace_root.or(config.project_root.as_deref()) {
+            if let Some(found) = probe_project_virtualenv(root, &server.binary) {
+                return Some(found);
+            }
+        }
+        if let Some(root) = workspace_root {
+            if config.project_root.as_deref() != Some(root) {
+                if let Some(found) =
+                    probe_dir(&root.join("node_modules").join(".bin"), &server.binary)
+                {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    // Python-family may fall back to the workspace root when no project root
+    // is configured; every other language keeps the pre-existing ladder rooted
+    // strictly at the configured project root.
+    let project_root = if python_family {
+        config.project_root.as_deref().or(workspace_root)
+    } else {
+        config.project_root.as_deref()
+    };
+    resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra)
+}
+
+fn probe_project_virtualenv(root: &Path, binary: &str) -> Option<PathBuf> {
+    [root.join(".venv"), root.join("venv")]
+        .into_iter()
+        .find_map(|virtualenv| {
+            let bin_dir = if cfg!(windows) {
+                virtualenv.join("Scripts")
+            } else {
+                virtualenv.join("bin")
+            };
+            probe_dir(&bin_dir, binary)
+        })
+}
+
 /// Check `dir/<binary>` and (on Windows) `dir/<binary>.cmd|.exe|.bat`.
 fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
     if !dir.is_dir() {
@@ -217,13 +267,22 @@ impl ServerDef {
             }
         }
 
+        let bounded_to_project = matches!(
+            self.kind,
+            ServerKind::Rust | ServerKind::Python | ServerKind::Ty
+        );
         for marker in &self.priority_root_markers {
-            if let Some(root) = find_workspace_root(file_path, &[marker.as_str()]) {
+            let root = if bounded_to_project {
+                find_workspace_root_within(file_path, &[marker.as_str()], project_root)
+            } else {
+                find_workspace_root(file_path, &[marker.as_str()])
+            };
+            if let Some(root) = root {
                 return Some(root);
             }
         }
 
-        if self.kind == ServerKind::Rust {
+        if bounded_to_project {
             find_workspace_root_within(file_path, &self.root_markers, project_root)
         } else {
             find_workspace_root(file_path, &self.root_markers)
@@ -642,8 +701,8 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
     resolved_servers(config)
         .into_iter()
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
         .filter(|server| server.matches_extension(extension))
+        .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
         .collect()
 }
 
@@ -884,7 +943,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use super::{is_config_file_path, resolve_lsp_binary, servers_for_file, ServerKind};
+    use super::{
+        builtin_servers, is_config_file_path, resolve_lsp_binary, resolve_server_binary,
+        servers_for_file, ServerKind,
+    };
     use crate::config::{Config, UserServerDef};
 
     fn matching_kinds(path: &str, config: &Config) -> Vec<ServerKind> {
@@ -1463,6 +1525,254 @@ mod tests {
             resolved.as_deref(),
             Some(local_bin.join("pyright-langserver").as_path())
         );
+    }
+
+    #[test]
+    fn generic_resolver_does_not_probe_project_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let extra = tmp.path().join("extra");
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("typescript-language-server"));
+        touch_exe(&extra.join("typescript-language-server"));
+
+        let resolved = resolve_lsp_binary(
+            "typescript-language-server",
+            Some(&project),
+            std::slice::from_ref(&extra),
+        );
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(extra.join("typescript-language-server").as_path())
+        );
+    }
+
+    #[test]
+    fn python_resolver_prefers_nested_project_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = tmp.path();
+        let backend = repository.join("backend");
+        let virtualenv_bin = if cfg!(windows) {
+            backend.join(".venv").join("Scripts")
+        } else {
+            backend.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("pyright-langserver"));
+        let cache = repository.join("cache");
+        touch_exe(&cache.join("pyright-langserver"));
+        let config = Config {
+            project_root: Some(repository.to_path_buf()),
+            lsp_paths_extra: vec![cache],
+            ..Config::default()
+        };
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+
+        let resolved = resolve_server_binary(&server, Some(&backend), &config);
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(virtualenv_bin.join("pyright-langserver").as_path())
+        );
+    }
+
+    #[test]
+    fn python_resolver_falls_back_to_project_root_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let workspace = project.join("backend");
+        let project_bin = project.join("node_modules").join(".bin");
+        let hoisted = if cfg!(windows) {
+            project_bin.join("pyright-langserver.cmd")
+        } else {
+            project_bin.join("pyright-langserver")
+        };
+        touch_exe(&hoisted);
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_server_binary(&server, Some(&workspace), &config),
+            Some(hoisted)
+        );
+    }
+
+    #[test]
+    fn python_resolver_prefers_workspace_node_modules_over_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let workspace = project.join("backend");
+        let workspace_bin = workspace.join("node_modules").join(".bin");
+        let project_bin = project.join("node_modules").join(".bin");
+        let binary_name = if cfg!(windows) {
+            "pyright-langserver.cmd"
+        } else {
+            "pyright-langserver"
+        };
+        let nested = workspace_bin.join(binary_name);
+        touch_exe(&nested);
+        touch_exe(&project_bin.join(binary_name));
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_server_binary(&server, Some(&workspace), &config),
+            Some(nested)
+        );
+    }
+
+    #[test]
+    fn ty_resolver_prefers_nested_project_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = tmp.path();
+        let backend = repository.join("backend");
+        let virtualenv_bin = if cfg!(windows) {
+            backend.join(".venv").join("Scripts")
+        } else {
+            backend.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("ty"));
+        let config = Config {
+            project_root: Some(repository.to_path_buf()),
+            ..Config::default()
+        };
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Ty)
+            .unwrap();
+
+        let resolved = resolve_server_binary(&server, Some(&backend), &config);
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(virtualenv_bin.join("ty").as_path())
+        );
+    }
+
+    #[test]
+    fn non_python_resolver_keeps_configured_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = tmp.path().join("repository");
+        let backend = repository.join("backend");
+        let repository_bin = repository.join("node_modules").join(".bin");
+        let backend_bin = backend.join("node_modules").join(".bin");
+        touch_exe(&repository_bin.join("typescript-language-server"));
+        touch_exe(&backend_bin.join("typescript-language-server"));
+        let config = Config {
+            project_root: Some(repository.clone()),
+            ..Config::default()
+        };
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::TypeScript)
+            .unwrap();
+
+        let resolved = resolve_server_binary(&server, Some(&backend), &config);
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(repository_bin.join("typescript-language-server").as_path())
+        );
+    }
+
+    #[test]
+    fn non_python_without_project_root_ignores_workspace_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("backend");
+        let workspace_bin = workspace.join("node_modules").join(".bin");
+        touch_exe(&workspace_bin.join("typescript-language-server"));
+        let config = Config::default();
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::TypeScript)
+            .unwrap();
+
+        // The generic ladder stays rooted at the configured project root only;
+        // with none configured it must not adopt the workspace root. (A PATH
+        // install may still resolve, so assert on provenance, not absence.)
+        let resolved = resolve_server_binary(&server, Some(&workspace), &config);
+        assert!(
+            resolved.map_or(true, |path| !path.starts_with(&workspace)),
+            "generic resolution must not adopt the workspace root"
+        );
+    }
+
+    #[test]
+    fn python_auto_stays_on_pyright_when_local_ty_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let source = project.join("main.py");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("ty"));
+        let config = Config {
+            project_root: Some(project.clone()),
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Python);
+        assert_eq!(servers[0].binary, "pyright-langserver");
+    }
+
+    #[test]
+    fn python_workspace_root_does_not_escape_configured_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ancestor = tmp.path();
+        let project = ancestor.join("project");
+        let source = project.join("src").join("main.py");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "print('ok')\n").unwrap();
+        std::fs::write(
+            ancestor.join("pyproject.toml"),
+            "[project]\nname = 'outside'\n",
+        )
+        .unwrap();
+        let outside_python = if cfg!(windows) {
+            ancestor.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            ancestor.join(".venv").join("bin").join("python")
+        };
+        touch_exe(&outside_python);
+
+        for kind in [ServerKind::Python, ServerKind::Ty] {
+            let server = builtin_servers()
+                .into_iter()
+                .find(|server| server.kind == kind)
+                .unwrap();
+            assert!(
+                server
+                    .workspace_root_for_file_with_project_root(&source, Some(&project))
+                    .is_none(),
+                "{kind:?} must not select a marker above project_root"
+            );
+        }
     }
 
     #[test]

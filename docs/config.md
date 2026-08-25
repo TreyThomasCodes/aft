@@ -340,7 +340,9 @@ canonical shape is the top-level `bash` block shown above. `experimental` now ho
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
-only if their binary is on `PATH`.
+only if their binary can be resolved from project `node_modules/.bin`, AFT's managed cache, or
+`PATH`. Python-family servers additionally check the selected nested workspace's `.venv` or
+`venv` first.
 
 **Built-in servers** (auto-registered, no config needed):
 
@@ -356,7 +358,15 @@ only if their binary is on `PATH`.
 **Experimental:** `ty` (Astral's Python type checker) — gated behind
 `experimental.lsp_ty: true` or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright
 unless you also disable Pyright via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"`
-which does both automatically).
+which does both automatically). Python-family servers first look for their binary in the selected
+nested workspace's `.venv` or `venv`, then its `node_modules/.bin`, the configured project root's
+`node_modules/.bin`, AFT's managed cache, and `PATH`. While ty remains alpha,
+`lsp.python: "auto"` stays on Pyright rather than silently changing diagnostic semantics based on
+which binaries happen to be installed.
+For Pyright, AFT also returns the selected virtualenv interpreter through Pyright's
+`workspace/configuration` request so imports resolve against that environment.
+Project-local language-server binaries and the interpreter selected for Pyright can execute with
+the user's privileges; enable LSPs only for projects and virtual environments you trust.
 
 **Registering a custom server:** add it under `lsp.servers` in your config. The example
 configuration above shows registering `tinymist` for Typst files. Required fields per server:
