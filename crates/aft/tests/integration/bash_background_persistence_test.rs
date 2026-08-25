@@ -485,6 +485,67 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
 }
 
 #[test]
+fn cross_session_project_restart_sweep_delivers_and_acks_fate_unknown() {
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let task_id = "bash-0000000000000199";
+    let paths = task_paths(storage.path(), "session-a", task_id).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        "session-a".to_string(),
+        "release-command".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    metadata.status = BgTaskStatus::Running;
+    metadata.child_pid = Some(999_999);
+    metadata.pgid = Some(999_999);
+    write_task(&paths.json, &metadata).unwrap();
+    fs::write(&paths.stdout, "last release output").unwrap();
+    fs::write(&paths.stderr, "").unwrap();
+
+    let registry = registry();
+    registry.set_harness(aft::harness::Harness::Opencode);
+    let conn = Arc::new(Mutex::new(
+        aft::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    {
+        let db = conn.lock().unwrap();
+        aft::db::bash_tasks::upsert_bash_task(
+            &db,
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+    }
+    registry.set_db_pool(conn);
+
+    registry
+        .replay_session_for_project(storage.path(), "session-b", project.path())
+        .unwrap();
+    let completions = registry.drain_completions_for_session(Some("session-b"));
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].status, BgTaskStatus::FateUnknown);
+    assert!(completions[0].output_preview.contains("last output at"));
+    assert_eq!(
+        registry.ack_completions_for_session(Some("session-b"), &[task_id.to_string()]),
+        vec![task_id.to_string()]
+    );
+    assert_eq!(
+        read_json(storage.path(), "session-a", task_id)["completion_delivered"],
+        true
+    );
+    registry
+        .replay_session_for_project(storage.path(), "session-b", project.path())
+        .unwrap();
+    assert!(registry
+        .drain_completions_for_session(Some("session-b"))
+        .is_empty());
+}
+
+#[test]
 fn bash_status_cross_session_different_project_returns_not_found() {
     let project_a = tempfile::tempdir().unwrap();
     let project_b = tempfile::tempdir().unwrap();
@@ -1610,7 +1671,7 @@ fn session_isolation_on_replay() {
 }
 
 #[test]
-fn replay_stale_running_task_marks_killed_orphaned() {
+fn restart_sweep_marks_dead_pid_fate_unknown_once() {
     let storage = tempfile::tempdir().unwrap();
     let task_id = "bash-0000000000000120";
     let mut metadata = PersistedTask::starting(
@@ -1636,12 +1697,23 @@ fn replay_stale_running_task_marks_killed_orphaned() {
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     registry.replay_session(storage.path(), SESSION).unwrap();
     let replayed = read_json(storage.path(), SESSION, task_id);
-    assert_eq!(replayed["status"], "killed");
-    assert_eq!(replayed["status_reason"], "orphaned (>24h)");
+    assert_eq!(replayed["status"], "fate_unknown");
+    assert!(replayed["status_reason"]
+        .as_str()
+        .unwrap()
+        .contains("daemon restarted, process fate unknown"));
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let completions = registry.drain_completions_for_session(Some(SESSION));
+    assert_eq!(completions.len(), 1, "restart sweep must enqueue once");
+    assert_eq!(completions[0].status, BgTaskStatus::FateUnknown);
+    assert!(completions[0]
+        .output_preview
+        .contains("daemon restarted, process fate unknown"));
+    assert!(completions[0].output_preview.contains("last output at"));
 }
 
 #[test]
-fn replay_session_preserves_started_at_relative_offset() {
+fn restart_sweep_marks_missing_pid_fate_unknown() {
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let task_id = "bash-0000000000000121";
@@ -1665,31 +1737,26 @@ fn replay_session_preserves_started_at_relative_offset() {
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
 
-    let started = Instant::now();
-    loop {
-        let snapshot = registry
-            .status(
-                task_id,
-                SESSION,
-                Some(project.path()),
-                Some(storage.path()),
-                1024,
-            )
-            .expect("rehydrated task should be present");
-        if snapshot.info.status == BgTaskStatus::TimedOut {
-            assert_eq!(snapshot.exit_code, Some(124));
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "watchdog did not preserve elapsed timeout offset: {snapshot:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let snapshot = registry
+        .status(
+            task_id,
+            SESSION,
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("rehydrated task should be present");
+    assert_eq!(snapshot.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(snapshot.exit_code, None);
+    assert!(snapshot
+        .info
+        .status_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains(paths.io_dir.to_string_lossy().as_ref())));
 }
 
 #[test]
-fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker() {
+fn watchdog_marks_rehydrated_detached_task_fate_unknown_when_pid_dies_without_marker() {
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let task_id = "bash-0000000000000122";
@@ -1746,12 +1813,12 @@ fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker()
                 1024,
             )
             .expect("rehydrated task should remain present");
-        if snapshot.info.status == BgTaskStatus::Failed {
+        if snapshot.info.status == BgTaskStatus::FateUnknown {
             let replayed = read_json(storage.path(), SESSION, task_id);
-            assert_eq!(
-                replayed["status_reason"],
-                "process exited without exit marker"
-            );
+            assert!(replayed["status_reason"]
+                .as_str()
+                .unwrap()
+                .contains("daemon restarted, process fate unknown"));
             assert_eq!(snapshot.exit_code, None);
             // The watchdog marks the task terminal under the state lock but
             // enqueues the completion afterwards (the enqueue does heavy I/O
@@ -1771,12 +1838,12 @@ fn watchdog_marks_rehydrated_detached_task_failed_when_pid_dies_without_marker()
                 std::thread::sleep(Duration::from_millis(25));
             }
             assert_eq!(completions.len(), 1);
-            assert_eq!(completions[0].status, BgTaskStatus::Failed);
+            assert_eq!(completions[0].status, BgTaskStatus::FateUnknown);
             break;
         }
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "watchdog did not fail detached dead task: {snapshot:?}"
+            "watchdog did not mark detached dead task fate-unknown: {snapshot:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

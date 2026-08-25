@@ -61,6 +61,7 @@ pub enum BgTaskStatus {
     Failed,
     Killed,
     TimedOut,
+    FateUnknown,
 }
 
 impl BgTaskStatus {
@@ -71,6 +72,7 @@ impl BgTaskStatus {
                 | BgTaskStatus::Failed
                 | BgTaskStatus::Killed
                 | BgTaskStatus::TimedOut
+                | BgTaskStatus::FateUnknown
         )
     }
 }
@@ -433,7 +435,21 @@ mod storage_root_tests {
     // XDG_DATA_HOME || platform data dir, + cortexkit/aft).
     #[test]
     fn plugin_less_fallback_matches_plugin_injected_cortexkit_root() {
+        struct RestoreCacheDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreCacheDir {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("AFT_CACHE_DIR", value),
+                        None => std::env::remove_var("AFT_CACHE_DIR"),
+                    }
+                }
+            }
+        }
+
         let _guard = crate::test_env::process_env_lock();
+        let _cache_dir = RestoreCacheDir(std::env::var_os("AFT_CACHE_DIR"));
+        unsafe { std::env::remove_var("AFT_CACHE_DIR") };
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -452,12 +468,6 @@ mod storage_root_tests {
                 }
             });
         let expected_plugin_injected_root = data_home.join("cortexkit").join("aft");
-
-        let cache_dir_override_absent = std::env::var_os("AFT_CACHE_DIR").is_none();
-        assert!(
-            cache_dir_override_absent,
-            "test requires AFT_CACHE_DIR unset to exercise the real fallback"
-        );
 
         assert_eq!(
             super::storage_dir(None),

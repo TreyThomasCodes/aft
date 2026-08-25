@@ -12,7 +12,7 @@ pub mod removal;
 pub mod standing_roots;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -196,6 +196,15 @@ CREATE INDEX IF NOT EXISTS idx_standing_root_freshness_needs_verify
   ON standing_root_freshness (needs_strict_verify, literal_path);
 "#;
 
+// Fate-unknown tasks are terminal but deliberately distinct from command failure:
+// the daemon cannot reconstruct an exit result after finding the recorded process dead.
+const MIGRATION_V8: &str = r#"
+DROP INDEX IF EXISTS idx_bash_tasks_non_terminal_pid;
+CREATE INDEX idx_bash_tasks_non_terminal_pid
+  ON bash_tasks (pid)
+  WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown');
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(std::io::Error),
@@ -333,6 +342,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         5 => tx.execute_batch(MIGRATION_V5),
         6 => tx.execute_batch(MIGRATION_V6),
         7 => tx.execute_batch(MIGRATION_V7),
+        8 => tx.execute_batch(MIGRATION_V8),
         _ => Ok(()),
     }
     .and_then(|()| {

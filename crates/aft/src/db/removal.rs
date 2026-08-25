@@ -77,7 +77,7 @@ pub fn removal_health_from_connection(
                     SELECT harness, session_id FROM backups GROUP BY harness, session_id
                 )),
                 (SELECT COUNT(*) FROM bash_tasks
-                    WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out'))",
+                    WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown'))",
             [since_millis],
             |row| {
                 Ok((
@@ -245,7 +245,7 @@ mod tests {
     fn running_task_count_excludes_every_terminal_status_from_the_shared_allowlist() {
         let (_dir, conn) = fixture_db();
         let now = USAGE_WINDOW_MILLIS * 10;
-        for (index, status) in ["completed", "failed", "killed", "timed_out"]
+        for (index, status) in ["completed", "failed", "killed", "timed_out", "fate_unknown"]
             .iter()
             .enumerate()
         {
