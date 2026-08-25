@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RotatingLogSink, resolveAftLogPath, resolveAftStorageRoot } from "../durable-log.js";
+import { withEnv } from "./test-utils/env-guard.js";
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -10,18 +11,33 @@ afterEach(() => {
 });
 
 describe("durable plugin logging", () => {
-  test("resolves AFT_CACHE_DIR through the Rust-compatible aft subtree", () => {
-    const previous = process.env.AFT_CACHE_DIR;
-    process.env.AFT_CACHE_DIR = join(tmpdir(), "aft-cache-resolution");
-    try {
-      expect(resolveAftStorageRoot()).toBe(join(process.env.AFT_CACHE_DIR, "aft"));
-      expect(resolveAftLogPath("aft-plugin.log")).toBe(
-        join(process.env.AFT_CACHE_DIR, "aft", "logs", "aft-plugin.log"),
-      );
-    } finally {
-      if (previous === undefined) delete process.env.AFT_CACHE_DIR;
-      else process.env.AFT_CACHE_DIR = previous;
-    }
+  test("AFT_STORAGE_DIR wins over configured and legacy roots", async () => {
+    const storage = join(tmpdir(), "aft-storage-resolution");
+    await withEnv(
+      {
+        AFT_STORAGE_DIR: storage,
+        AFT_CACHE_DIR: join(tmpdir(), "aft-cache-resolution"),
+        XDG_DATA_HOME: join(tmpdir(), "aft-xdg-resolution"),
+      },
+      () => {
+        expect(resolveAftStorageRoot(join(tmpdir(), "wire-root"))).toBe(storage);
+        expect(resolveAftLogPath("aft-plugin.log")).toBe(join(storage, "logs", "aft-plugin.log"));
+      },
+    );
+  });
+
+  test("computed XDG root wins over legacy AFT_CACHE_DIR", async () => {
+    const xdg = join(tmpdir(), "aft-xdg-resolution");
+    await withEnv(
+      {
+        AFT_STORAGE_DIR: undefined,
+        AFT_CACHE_DIR: join(tmpdir(), "aft-cache-resolution"),
+        XDG_DATA_HOME: xdg,
+      },
+      () => {
+        expect(resolveAftStorageRoot()).toBe(join(xdg, "cortexkit", "aft"));
+      },
+    );
   });
 
   test("rotates at the byte threshold and replaces the single backup generation", async () => {

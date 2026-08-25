@@ -1,4 +1,19 @@
 mod cli;
+
+#[cfg(test)]
+mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static PROCESS_ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn process_env_lock() -> MutexGuard<'static, ()> {
+        PROCESS_ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 use aft::bash_background::BgTaskRegistry;
 use aft::config::Config;
 use aft::context::{App, AppContext, SemanticIndexStatus};

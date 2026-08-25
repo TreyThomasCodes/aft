@@ -15,6 +15,9 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
+import { resolveCortexKitStorageRoot } from "./storage-paths.js";
+
+export { resolveCortexKitStorageRoot } from "./storage-paths.js";
 
 type SpawnSyncForMigration = typeof spawnSync;
 
@@ -103,10 +106,6 @@ function homeDir(): string {
 export function resolveLegacyStorageRoot(harness: MigrationHarness): string {
   if (harness === "pi") return join(homeDir(), ".pi", "agent", "aft");
   return join(dataHome(), "opencode", "storage", "plugin", "aft");
-}
-
-export function resolveCortexKitStorageRoot(): string {
-  return join(dataHome(), "cortexkit", "aft");
 }
 
 function stripJsoncForParse(input: string): string {

@@ -2023,16 +2023,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
     }
-    if next_config.storage_dir.is_none() {
-        // Plugin-less consumers (the daemon-supervised module, MCP hosts)
-        // never send the plugin-computed storage_dir param. Resolve the
-        // shared CortexKit storage root here so every artifact lane keys off
-        // one concrete path. Leaving this None made lanes that gate writes on
-        // `Some(storage_dir)` (semantic persistence) silently RAM-only under
-        // the daemon while lanes with their own fallback (trigram) persisted,
-        // splitting the storage universe by transport.
-        next_config.storage_dir = Some(crate::bash_background::storage_dir(None));
-    }
+    // Resolve both plugin-injected and plugin-less paths through the shared
+    // storage resolver. This keeps AFT_STORAGE_DIR ahead of a wire value and
+    // gives every artifact lane one concrete absolute root.
+    let resolved_storage_dir =
+        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    next_config.storage_dir = Some(resolved_storage_dir);
     let child_storage_root =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {

@@ -93,8 +93,6 @@ export {
   DEFAULT_LOG_BYTES,
   DEFAULT_LOG_GENERATIONS,
   RotatingLogSink,
-  resolveAftLogPath,
-  resolveAftStorageRoot,
 } from "./durable-log.js";
 export type { EditSummaryInput } from "./edit-summary.js";
 export { formatEditSummary } from "./edit-summary.js";
@@ -187,6 +185,7 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
+export { resolveAftLogPath, resolveAftStorageRoot } from "./storage-paths.js";
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,

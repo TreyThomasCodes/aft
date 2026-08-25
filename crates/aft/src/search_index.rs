@@ -4348,13 +4348,7 @@ pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
 }
 
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
-    if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
-        return PathBuf::from(override_dir).join("index").join(project_key);
-    }
-    if let Some(dir) = storage_dir {
-        return dir.join("index").join(project_key);
-    }
-    crate::bash_background::storage_dir(None)
+    crate::bash_background::storage_dir(storage_dir)
         .join("index")
         .join(project_key)
 }

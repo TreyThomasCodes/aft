@@ -244,9 +244,8 @@ export function collapsedHealthLights(statusBar: StatusBar | undefined): HealthL
   return { diagnostics, code, todos };
 }
 
-// v0.27 moved AFT storage to the CortexKit root. TUI code must use a
-// lightweight local path helper rather than the shared bridge barrel, which
-// also exports URL-fetch helpers unsuitable for Bun's TUI runtime.
+// Keep the TUI on the bridge's shared resolver so its root matches the
+// configure payload used by the plugin and binary.
 export function resolveTuiStorageDir(): string {
   return resolveCortexKitStorageRoot();
 }

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ensureStorageMigrated,
@@ -26,6 +26,7 @@ describe("storage migration bootstrap", () => {
     releaseEnv = await acquireEnv({
       XDG_DATA_HOME: tempDir,
       HOME: tempDir,
+      AFT_STORAGE_DIR: undefined,
     });
   });
 
@@ -103,6 +104,24 @@ describe("storage migration bootstrap", () => {
   });
 
   test("resolveCortexKitStorageRoot_uses_new_xdg_path", () => {
+    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "cortexkit", "aft"));
+  });
+
+  test("resolveCortexKitStorageRoot_prefers_absolute_environment_override", () => {
+    process.env.AFT_STORAGE_DIR = join(tempDir, "local-storage");
+    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "local-storage"));
+  });
+
+  test("resolveCortexKitStorageRoot_resolves_relative_and_tilde_overrides", () => {
+    process.env.AFT_STORAGE_DIR = "./relative-storage/../local-storage";
+    expect(resolveCortexKitStorageRoot()).toBe(resolve("./local-storage"));
+
+    process.env.AFT_STORAGE_DIR = "~/tilde-storage";
+    expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "tilde-storage"));
+  });
+
+  test("resolveCortexKitStorageRoot_ignores_empty_override", () => {
+    process.env.AFT_STORAGE_DIR = "";
     expect(resolveCortexKitStorageRoot()).toBe(join(tempDir, "cortexkit", "aft"));
   });
 });

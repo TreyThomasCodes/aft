@@ -537,22 +537,12 @@ fn temp_path(path: &Path) -> PathBuf {
 
 fn resolve_manifest_dir(
     storage_dir: Option<&Path>,
-    project_root: &Path,
+    _project_root: &Path,
     project_key: &str,
 ) -> PathBuf {
-    if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
-        return PathBuf::from(override_dir)
-            .join("artifact-owners")
-            .join(project_key);
-    }
-    if let Some(dir) = storage_dir {
-        return dir.join("artifact-owners").join(project_key);
-    }
-    crate::search_index::resolve_cache_dir(project_root, None)
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
+    // Ownership manifests must use the same root as indexes and leases. Resolve
+    // the environment override here instead of maintaining a cache-only branch.
+    crate::bash_background::storage_dir(storage_dir)
         .join("artifact-owners")
         .join(project_key)
 }

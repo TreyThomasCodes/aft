@@ -323,41 +323,103 @@ pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
         .unwrap_or(root)
 }
 
+/// Resolve the process-state storage root exactly once for every Rust entry point.
+/// The environment override is checked here so it wins over a stale plugin wire
+/// value, while both plugin-less fallback and plugin-injected paths share one root.
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
-    if let Some(dir) = configured {
-        return dir.to_path_buf();
+    if let Some(dir) = non_empty_env_path("AFT_STORAGE_DIR") {
+        return resolve_storage_path(&dir);
     }
-    if let Some(dir) = std::env::var_os("AFT_CACHE_DIR") {
-        return PathBuf::from(dir).join("aft");
+    if let Some(dir) = configured.filter(|dir| !dir.as_os_str().is_empty()) {
+        return resolve_storage_path(dir);
     }
-    // Default to the CortexKit shared data root — the SAME location the
-    // plugins inject as `storage_dir` on every configure. Before this, the
-    // fallback was the pre-migration `~/.cache/aft`, which only plugin-less
-    // invocations ever hit; once the daemon-supervised module became such an
-    // invocation it built a parallel storage universe there (duplicate
-    // trigram/semantic/callgraph caches AND a separate artifact-owner
-    // manifest, so cross-front leases could not see each other). Keep this
-    // in sync with resolveCortexKitStorageRoot in the TS packages.
-    cortexkit_data_root().join("cortexkit").join("aft")
+    if let Some(root) = cortexkit_data_root() {
+        return root.join("cortexkit").join("aft");
+    }
+    if let Some(dir) = non_empty_env_path("AFT_CACHE_DIR") {
+        return resolve_storage_path(&dir).join("aft");
+    }
+    std::env::temp_dir().join("cortexkit").join("aft")
 }
 
-fn cortexkit_data_root() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn storage_home_dir() -> Option<PathBuf> {
+    let configured = if cfg!(windows) {
+        non_empty_env_path("USERPROFILE").or_else(|| non_empty_env_path("HOME"))
+    } else {
+        non_empty_env_path("HOME").or_else(|| non_empty_env_path("USERPROFILE"))
+    };
+    configured.or_else(std::env::home_dir)
+}
+
+fn cortexkit_data_root() -> Option<PathBuf> {
+    if let Some(dir) = non_empty_env_path("XDG_DATA_HOME") {
+        return Some(resolve_storage_path(&dir));
+    }
+    if cfg!(windows) {
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("APPDATA").filter(|value| !value.is_empty()))
+            .map(PathBuf::from)
+        {
+            return Some(resolve_storage_path(&dir));
         }
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    if cfg!(windows) {
-        return std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("AppData").join("Local"));
+    storage_home_dir().map(|home| {
+        let root = if cfg!(windows) {
+            home.join("AppData").join("Local")
+        } else {
+            home.join(".local").join("share")
+        };
+        resolve_storage_path(&root)
+    })
+}
+
+fn resolve_storage_path(path: &std::path::Path) -> PathBuf {
+    let expanded = if path == std::path::Path::new("~") {
+        storage_home_dir().unwrap_or_else(std::env::temp_dir)
+    } else if let Some(raw) = path.to_str() {
+        if raw.starts_with("~/") || raw.starts_with("~\\") {
+            storage_home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join(&raw[2..])
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(expanded)
+    };
+    normalize_absolute_path(&absolute)
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
     }
-    home.join(".local").join("share")
+    normalized
 }
 
 pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::harness::Harness) {
@@ -422,8 +484,9 @@ fn dir_has_entries(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod storage_root_tests {
+    use std::ffi::{OsStr, OsString};
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::path::PathBuf;
+    use std::path::Path;
 
     struct NonPanickingCleanup<F: FnOnce()> {
         cleanup: Option<F>,
@@ -448,57 +511,109 @@ mod storage_root_tests {
         }
     }
 
-    // The plugins inject the CortexKit data root as `storage_dir` on every
-    // configure; plugin-less invocations (daemon-supervised module, bare CLI,
-    // warmup) hit the Rust fallback below instead. If the two ever diverge
-    // again, every front pays duplicate cold indexes AND artifact-owner
-    // manifests split across universes so cross-front ReadOnly leasing goes
-    // blind (the v0.45.x daemon-module regression: the fallback still pointed
-    // at pre-migration ~/.cache/aft). This locks all Rust fallback sites to
-    // the same resolution the TS packages use (resolveCortexKitStorageRoot:
-    // XDG_DATA_HOME || platform data dir, + cortexkit/aft).
-    #[test]
-    fn plugin_less_fallback_matches_plugin_injected_cortexkit_root() {
-        let _guard = crate::test_env::process_env_lock();
-        let previous_cache_dir = std::env::var_os("AFT_CACHE_DIR");
-        let _cache_dir = NonPanickingCleanup::new(move || unsafe {
-            match previous_cache_dir {
-                Some(value) => std::env::set_var("AFT_CACHE_DIR", value),
-                None => std::env::remove_var("AFT_CACHE_DIR"),
-            }
-        });
-        unsafe { std::env::remove_var("AFT_CACHE_DIR") };
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(PathBuf::from)
-                    .expect("test environment provides a home directory");
-                if cfg!(windows) {
-                    std::env::var_os("LOCALAPPDATA")
-                        .or_else(|| std::env::var_os("APPDATA"))
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| home.join("AppData").join("Local"))
-                } else {
-                    home.join(".local").join("share")
-                }
-            });
-        let expected_plugin_injected_root = data_home.join("cortexkit").join("aft");
+    struct StorageEnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
 
+    impl StorageEnvGuard {
+        fn capture() -> Self {
+            Self {
+                previous: [
+                    "AFT_STORAGE_DIR",
+                    "AFT_CACHE_DIR",
+                    "XDG_DATA_HOME",
+                    "HOME",
+                    "USERPROFILE",
+                    "LOCALAPPDATA",
+                    "APPDATA",
+                ]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+            }
+        }
+
+        fn set(&self, key: &'static str, value: Option<&OsStr>) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    impl Drop for StorageEnvGuard {
+        fn drop(&mut self) {
+            let previous: Vec<_> = self.previous.drain(..).collect();
+            // Env restoration runs while a failing test may already be
+            // unwinding; a cleanup panic at that point aborts the whole
+            // libtest process (observed on Windows CI), so the restore loop
+            // stays contained like NonPanickingCleanup above.
+            let _ = catch_unwind(AssertUnwindSafe(move || {
+                for (key, value) in previous {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }));
+        }
+    }
+
+
+    // The plugin-injected and plugin-less paths must use one resolver so every
+    // artifact lane sees the same absolute root under every environment arm.
+    #[test]
+    fn fallback_and_injected_roots_agree_with_storage_override_arms() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let env = StorageEnvGuard::capture();
+        let base = tempfile::tempdir().expect("storage root test directory");
+        let data_home = base.path().join("data");
+        let home = base.path().join("home");
+        let expected_plugin_root = data_home.join("cortexkit").join("aft");
+        let cache_root = base.path().join("legacy-cache");
+        env.set("XDG_DATA_HOME", Some(data_home.as_os_str()));
+        env.set("HOME", Some(home.as_os_str()));
+        env.set("USERPROFILE", Some(home.as_os_str()));
+        env.set("AFT_CACHE_DIR", Some(cache_root.as_os_str()));
+        env.set("AFT_STORAGE_DIR", None);
+
+        assert_eq!(super::storage_dir(None), expected_plugin_root);
         assert_eq!(
-            super::storage_dir(None),
-            expected_plugin_injected_root,
-            "bash_background::storage_dir fallback diverged from the plugin-injected root"
+            super::storage_dir(Some(&expected_plugin_root)),
+            expected_plugin_root
+        );
+        assert_eq!(
+            crate::search_index::resolve_cache_dir(Path::new("/tmp/project"), None)
+                .parent()
+                .and_then(Path::parent),
+            Some(expected_plugin_root.as_path())
         );
 
-        let temp_project = tempfile::tempdir().expect("temp project");
-        let resolved = crate::search_index::resolve_cache_dir(temp_project.path(), None);
-        assert!(
-            resolved.starts_with(&expected_plugin_injected_root),
-            "search_index::resolve_cache_dir fallback diverged: {}",
-            resolved.display()
+        env.set(
+            "AFT_STORAGE_DIR",
+            Some(OsStr::new("./relative/../local-aft-storage")),
+        );
+        let expected_relative = super::resolve_storage_path(Path::new("./local-aft-storage"));
+        assert!(expected_relative.is_absolute());
+        assert_eq!(super::storage_dir(None), expected_relative);
+        assert_eq!(
+            super::storage_dir(Some(&expected_plugin_root)),
+            expected_relative
+        );
+
+        env.set("AFT_STORAGE_DIR", Some(OsStr::new("")));
+        assert_eq!(super::storage_dir(None), expected_plugin_root);
+        assert_eq!(
+            super::storage_dir(Some(&expected_plugin_root)),
+            expected_plugin_root
+        );
+
+        env.set("AFT_STORAGE_DIR", Some(OsStr::new("~/tilde-aft-storage")));
+        let expected_tilde = home.join("tilde-aft-storage");
+        assert_eq!(super::storage_dir(None), expected_tilde);
+        assert_eq!(
+            super::storage_dir(Some(&expected_plugin_root)),
+            expected_tilde
         );
     }
 

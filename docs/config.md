@@ -12,6 +12,13 @@ Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/ag
 and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
 location automatically and leaves a `.MOVED_READPLEASE` marker behind.
 
+## Storage Root Environment Override
+
+Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
+
+Storage resolution is identical for plugins, standalone binaries, and warmup:
+`AFT_STORAGE_DIR` (explicit override) > the plugin-injected or computed XDG data root (`.../cortexkit/aft`) > the legacy `AFT_CACHE_DIR/aft` fallback. The statfs-based root key refuses to combine storage roots from different filesystems, preventing a local override from silently sharing indexes with the old NFS root.
+
 ## Config Options
 
 ```jsonc

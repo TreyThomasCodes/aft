@@ -16,6 +16,7 @@ describe("storage migration status", () => {
     releaseEnv = await acquireEnv({
       XDG_DATA_HOME: tempDir,
       HOME: tempDir,
+      AFT_STORAGE_DIR: undefined,
     });
   });
 

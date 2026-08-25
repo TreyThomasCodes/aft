@@ -1,7 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { join } from "node:path";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import type { StatusCompression } from "../shared/status";
 
@@ -53,10 +52,16 @@ const compression = (overrides: Partial<StatusCompression> = {}): StatusCompress
 });
 
 describe("sidebar compression rows", () => {
-  test("TUI storage resolution matches CortexKit storage without importing the bridge barrel", async () => {
-    await withEnv({ XDG_DATA_HOME: "/tmp/aft-tui-storage-test" }, () => {
-      expect(resolveTuiStorageDir()).toBe(join("/tmp/aft-tui-storage-test", "cortexkit", "aft"));
-    });
+  test("TUI storage resolution uses the shared CortexKit helper", async () => {
+    await withEnv(
+      {
+        XDG_DATA_HOME: "/tmp/aft-tui-storage-test",
+        AFT_STORAGE_DIR: "/tmp/aft-tui-storage-override",
+      },
+      () => {
+        expect(resolveTuiStorageDir()).toBe("/tmp/aft-tui-storage-override");
+      },
+    );
   });
 
   test("sidebar snapshot is scoped to the current directory and session", () => {

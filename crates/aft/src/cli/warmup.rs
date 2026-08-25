@@ -258,11 +258,8 @@ fn print_usage() {
 }
 
 fn warmup_storage_dir() -> PathBuf {
-    if let Some(value) = std::env::var_os("AFT_STORAGE_DIR") {
-        return PathBuf::from(value);
-    }
-    // Same CortexKit shared data root the plugins inject — warming here must
-    // land in the storage universe real sessions will read from.
+    // Warmup uses the same resolver as configure and plugin-less bridges so its
+    // indexes, WALs, and leases are visible to the sessions it prepares.
     aft::bash_background::storage_dir(None)
 }
 
@@ -872,8 +869,6 @@ mod tests {
         items.iter().map(OsString::from).collect()
     }
 
-    static WARMUP_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct EnvGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -883,6 +878,12 @@ mod tests {
         fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -899,7 +900,7 @@ mod tests {
 
     #[test]
     fn search_only_warmup_releases_post_configure_start_gate() {
-        let _env_lock = WARMUP_ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env::process_env_lock();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
@@ -917,6 +918,32 @@ mod tests {
         ]);
 
         assert!(result.is_ok(), "search warmup failed: {result:?}");
+    }
+
+    #[test]
+    fn warmup_storage_root_matches_shared_resolver_for_override_arms() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let root = tempfile::tempdir().expect("storage root");
+        let env = EnvGuard::set("AFT_STORAGE_DIR", root.path().as_os_str());
+        assert_eq!(
+            warmup_storage_dir(),
+            aft::bash_background::storage_dir(None)
+        );
+        drop(env);
+
+        let empty = EnvGuard::set("AFT_STORAGE_DIR", std::ffi::OsStr::new(""));
+        assert_eq!(
+            warmup_storage_dir(),
+            aft::bash_background::storage_dir(None)
+        );
+        drop(empty);
+
+        let absent = EnvGuard::unset("AFT_STORAGE_DIR");
+        assert_eq!(
+            warmup_storage_dir(),
+            aft::bash_background::storage_dir(None)
+        );
+        drop(absent);
     }
 
     #[test]

@@ -1,35 +1,14 @@
 import { appendFile, mkdir, rename, rm, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
 /** Maximum size of the active plugin log before its single backup rotates in. */
 export const DEFAULT_LOG_BYTES = 32 * 1024 * 1024;
 /** Retention hygiene keeps one backup generation and no numbered chain. */
 export const DEFAULT_LOG_GENERATIONS = 1;
 
-function homeDir(): string {
-  if (process.platform === "win32") return process.env.USERPROFILE || process.env.HOME || homedir();
-  return process.env.HOME || homedir();
-}
+import { resolveAftLogPath, resolveAftStorageRoot } from "./storage-paths.js";
 
-function dataHome(): string {
-  if (process.env.XDG_DATA_HOME) return process.env.XDG_DATA_HOME;
-  if (process.platform === "win32") {
-    return process.env.LOCALAPPDATA || process.env.APPDATA || join(homeDir(), "AppData", "Local");
-  }
-  return join(homeDir(), ".local", "share");
-}
-
-/** Resolve the same storage root used by the Rust module. */
-export function resolveAftStorageRoot(configuredRoot?: string): string {
-  if (configuredRoot) return configuredRoot;
-  if (process.env.AFT_CACHE_DIR) return join(process.env.AFT_CACHE_DIR, "aft");
-  return join(dataHome(), "cortexkit", "aft");
-}
-
-export function resolveAftLogPath(filename: string, configuredRoot?: string): string {
-  return join(resolveAftStorageRoot(configuredRoot), "logs", filename);
-}
+export { resolveAftLogPath, resolveAftStorageRoot };
 
 export interface RotatingLogOptions {
   maxBytes?: number;
