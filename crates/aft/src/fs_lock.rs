@@ -75,10 +75,25 @@ impl Default for LockConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    start_time: u64,
+    boot_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct LockMetadata {
     pid: u32,
     hostname: String,
+    /// Identifies this PID incarnation so a process in a restarted PID namespace
+    /// cannot be mistaken for an owner that was hard-killed in an earlier launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_time: Option<u64>,
+    /// Linux start times are relative to boot. Keeping the boot ID alongside the
+    /// raw jiffies prevents a reboot from making a newly recycled PID look like
+    /// an earlier owner whose start time happened to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
     created_at_ms: u64,
     heartbeat_at_ms: u64,
     /// Fencing nonce for writer leases. The owner re-reads the lock immediately
@@ -316,9 +331,9 @@ fn acquire_with_config(
             continue;
         }
 
-        if !process_alive(metadata.pid) {
+        if !lock_owner_is_alive(&metadata) {
             slog_warn!(
-                "removing filesystem lock at {} from dead PID {}",
+                "removing filesystem lock at {} from dead or recycled PID {}",
                 path.display(),
                 metadata.pid
             );
@@ -332,11 +347,14 @@ fn acquire_with_config(
         }
 
         if since_heartbeat > config.stale_heartbeat_ms && !warned_stale_live_owner {
-            // Same-host PID liveness is authoritative. A SIGSTOP'd process,
-            // suspended VM, or sleeping laptop can miss heartbeats and later
-            // resume inside the critical section. Breaking that lock would allow
-            // split-brain writers, so a paused live owner blocks acquirers until
-            // it resumes and releases the lock or the PID dies.
+            // Same-host PID plus start-time identity is authoritative. A
+            // SIGSTOP'd process, suspended VM, or sleeping laptop can miss
+            // heartbeats and later resume inside the critical section. Breaking
+            // that lock would allow split-brain writers, so a paused matching
+            // owner blocks acquirers until it resumes and releases the lock or
+            // dies. PID namespaces restart numbering after hard-killed owners,
+            // which turns this safety rule into a deadlock unless the start time
+            // distinguishes the unrelated process that reused the PID.
             slog_warn!(
                 "filesystem lock at {} held by live PID {} has stale heartbeat ({}ms); NOT breaking",
                 path.display(),
@@ -362,12 +380,18 @@ fn acquire_with_config(
 
 fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Result<LockGuard> {
     let now = now_ms();
+    let pid = std::process::id();
+    let process_identity = process_identity(pid);
     let metadata = LockMetadata {
-        pid: std::process::id(),
+        pid,
         hostname: hostname.to_string(),
+        process_start_time: process_identity
+            .as_ref()
+            .map(|identity| identity.start_time),
+        boot_id: process_identity.and_then(|identity| identity.boot_id),
         created_at_ms: now,
         heartbeat_at_ms: now,
-        writer_epoch: format!("{}-{}", std::process::id(), now_nanos()),
+        writer_epoch: format!("{pid}-{}", now_nanos()),
     };
 
     create_lock_file_atomically(path, &metadata)?;
@@ -697,6 +721,8 @@ fn temp_path_for_lock(path: &Path) -> PathBuf {
 fn lock_identity_matches(left: &LockMetadata, right: &LockMetadata) -> bool {
     left.pid == right.pid
         && left.hostname == right.hostname
+        && left.process_start_time == right.process_start_time
+        && left.boot_id == right.boot_id
         && left.created_at_ms == right.created_at_ms
         && left.writer_epoch == right.writer_epoch
 }
@@ -731,9 +757,9 @@ fn remove_lock_file(path: &Path) -> io::Result<()> {
 /// the SAME owner identity we evaluated. Between reading the metadata and
 /// deleting, the stale owner could release and a FRESH owner acquire — blindly
 /// `remove_file` would then delete the fresh owner's lock, allowing split-brain
-/// writers. Re-read immediately before the unlink and bail if the identity
-/// (pid, hostname, created_at_ms) changed or the file vanished. POSIX has no
-/// atomic compare-and-unlink, so a microscopic residual race remains, but this
+/// writers. Re-read immediately before the unlink and bail if the full owner
+/// identity changed or the file vanished. POSIX has no atomic compare-and-unlink,
+/// so a microscopic residual race remains, but this
 /// shrinks the window from the whole judgment/poll duration to a couple of
 /// syscalls — the standard mitigation. Returns true if we removed it.
 fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
@@ -771,12 +797,18 @@ impl Drop for ReclaimTokenGuard {
 
 fn acquire_reclaim_token(lock_path: &Path) -> io::Result<Option<ReclaimTokenGuard>> {
     let token_path = reclaim_token_path(lock_path);
+    let pid = std::process::id();
+    let process_identity = process_identity(pid);
     let metadata = LockMetadata {
-        pid: std::process::id(),
+        pid,
         hostname: current_hostname(),
+        process_start_time: process_identity
+            .as_ref()
+            .map(|identity| identity.start_time),
+        boot_id: process_identity.and_then(|identity| identity.boot_id),
         created_at_ms: now_ms(),
         heartbeat_at_ms: now_ms(),
-        writer_epoch: format!("reclaim-{}-{}", std::process::id(), now_nanos()),
+        writer_epoch: format!("reclaim-{pid}-{}", now_nanos()),
     };
     let mut file = match open_new_lock_file(&token_path) {
         Ok(file) => file,
@@ -866,6 +898,122 @@ fn current_hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string())
 }
 
+/// Returns whether a same-host lock owner is still the same process instance.
+///
+/// Old leases have no start time, so they deliberately retain PID-only liveness
+/// for backward compatibility. If an OS lookup cannot attest a recorded start
+/// time, keep the PID alive: incorrectly reclaiming a paused owner is worse than
+/// waiting for a process that may release the lock later.
+fn lock_owner_is_alive(metadata: &LockMetadata) -> bool {
+    if !process_alive(metadata.pid) {
+        return false;
+    }
+
+    let Some(recorded_start_time) = metadata.process_start_time else {
+        return true;
+    };
+    let Some(current_identity) = process_identity(metadata.pid) else {
+        return true;
+    };
+
+    if current_identity.start_time != recorded_start_time {
+        return false;
+    }
+
+    match &metadata.boot_id {
+        Some(recorded_boot_id) => current_identity
+            .boot_id
+            .as_deref()
+            .map_or(true, |current_boot_id| current_boot_id == recorded_boot_id),
+        None => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    // Field 22 is starttime. Split after the final ')' because a process name is
+    // allowed to contain spaces and parentheses.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start_time = stat
+        .rsplit_once(") ")?
+        .1
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()?
+        .trim()
+        .to_owned();
+    if boot_id.is_empty() {
+        return None;
+    }
+
+    Some(ProcessIdentity {
+        start_time,
+        boot_id: Some(boot_id),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+
+    // PROC_PIDTBSDINFO supplies the kernel-recorded process birth time without
+    // spawning a command or trusting user-controlled process metadata.
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let start_time = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
+
+    Some(ProcessIdentity {
+        start_time,
+        boot_id: None,
+    })
+}
+
+#[cfg(windows)]
+fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    // Windows keeps PID-only liveness for now. Querying creation time requires a
+    // process handle and new FFI/error policy; Linux PID namespaces are the
+    // environment where reused PIDs otherwise persistently deadlock leases.
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
+}
+
 #[cfg(unix)]
 pub(crate) fn process_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
@@ -946,10 +1094,39 @@ mod tests {
         write_lock_metadata_to_file(&mut file, metadata).expect("write synthetic lock");
     }
 
+    #[derive(Serialize)]
+    struct LegacyLockMetadata<'a> {
+        pid: u32,
+        hostname: &'a str,
+        created_at_ms: u64,
+        heartbeat_at_ms: u64,
+        writer_epoch: &'a str,
+    }
+
+    fn write_legacy_lock(path: &Path, metadata: &LockMetadata) -> String {
+        let legacy = LegacyLockMetadata {
+            pid: metadata.pid,
+            hostname: &metadata.hostname,
+            created_at_ms: metadata.created_at_ms,
+            heartbeat_at_ms: metadata.heartbeat_at_ms,
+            writer_epoch: &metadata.writer_epoch,
+        };
+        let contents = format!(
+            "{}\n",
+            serde_json::to_string(&legacy).expect("serialize legacy lock")
+        );
+        fs::write(path, &contents).expect("write legacy synthetic lock");
+        contents
+    }
+
     fn synthetic_metadata(pid: u32, hostname: String, created_at_ms: u64) -> LockMetadata {
         LockMetadata {
             pid,
             hostname,
+            // Synthetic metadata defaults to the legacy shape so tests must opt
+            // in when they need to exercise process-instance identity.
+            process_start_time: None,
+            boot_id: None,
             created_at_ms,
             heartbeat_at_ms: created_at_ms,
             writer_epoch: format!("synthetic-{pid}-{created_at_ms}"),
@@ -958,7 +1135,18 @@ mod tests {
 
     fn current_process_metadata() -> LockMetadata {
         let now = now_ms();
-        synthetic_metadata(std::process::id(), current_hostname(), now)
+        let pid = std::process::id();
+        let process_identity = process_identity(pid);
+        let mut metadata = synthetic_metadata(pid, current_hostname(), now);
+        metadata.process_start_time = process_identity
+            .as_ref()
+            .map(|identity| identity.start_time);
+        metadata.boot_id = process_identity.and_then(|identity| identity.boot_id);
+        metadata
+    }
+
+    fn different_start_time(start_time: u64) -> u64 {
+        start_time.checked_add(1).unwrap_or(start_time - 1)
     }
 
     #[test]
@@ -1163,9 +1351,8 @@ mod tests {
     fn heartbeat_updates_lockfile_timestamp() {
         let (_dir, path) = test_lock_path();
         let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
-        let initial = read_lock_metadata(&path)
-            .expect("read initial metadata")
-            .heartbeat_at_ms;
+        let initial_metadata = read_lock_metadata(&path).expect("read initial metadata");
+        let initial = initial_metadata.heartbeat_at_ms;
 
         // Poll for up to 2s rather than sleeping a fixed multiple of the
         // heartbeat interval. `park_timeout` is a *maximum* wait, not a
@@ -1198,6 +1385,15 @@ mod tests {
         assert!(
             updated > initial,
             "heartbeat timestamp did not advance within 2s"
+        );
+        let updated_metadata = read_lock_metadata(&path).expect("read final metadata");
+        assert_eq!(
+            updated_metadata.process_start_time, guard.metadata.process_start_time,
+            "heartbeat rewrite must preserve the owner's process start time"
+        );
+        assert_eq!(
+            updated_metadata.boot_id, guard.metadata.boot_id,
+            "heartbeat rewrite must preserve the owner's boot identity"
         );
         drop(guard);
     }
@@ -1232,6 +1428,13 @@ mod tests {
     fn stale_heartbeat_from_live_pid_blocks() {
         let (_dir, path) = test_lock_path();
         let mut metadata = current_process_metadata();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let identity = process_identity(std::process::id())
+                .expect("current process should have a start-time identity");
+            assert_eq!(metadata.process_start_time, Some(identity.start_time));
+            assert_eq!(metadata.boot_id, identity.boot_id);
+        }
         metadata.created_at_ms = now_ms().saturating_sub(60_000);
         metadata.heartbeat_at_ms = now_ms().saturating_sub(60_000);
         write_synthetic_lock(&path, &metadata);
@@ -1241,6 +1444,77 @@ mod tests {
         assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_pid_with_wrong_start_time_is_reclaimed() {
+        let (_dir, path) = test_lock_path();
+        let mut metadata = current_process_metadata();
+        let current_identity = process_identity(std::process::id())
+            .expect("current process should have a start-time identity");
+        metadata.process_start_time = Some(different_start_time(current_identity.start_time));
+        metadata.boot_id = current_identity.boot_id;
+        write_synthetic_lock(&path, &metadata);
+
+        let guard = acquire_with_config(&path, Some(Duration::ZERO), test_config())
+            .expect("zero-timeout acquire should reclaim a reused PID");
+        assert_eq!(guard.metadata.pid, std::process::id());
+        assert_eq!(
+            guard.metadata.process_start_time,
+            Some(current_identity.start_time)
+        );
+        drop(guard);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pid_with_wrong_boot_id_is_reclaimed() {
+        let (_dir, path) = test_lock_path();
+        let mut metadata = current_process_metadata();
+        let current_identity = process_identity(std::process::id())
+            .expect("current process should have a start-time identity");
+        metadata.boot_id = Some(format!("wrong-{}", current_identity.boot_id.unwrap()));
+        write_synthetic_lock(&path, &metadata);
+
+        let guard = acquire_with_config(&path, Some(Duration::ZERO), test_config())
+            .expect("zero-timeout acquire should reclaim a rebooted PID identity");
+        assert_eq!(guard.metadata.pid, std::process::id());
+        drop(guard);
+    }
+
+    #[test]
+    fn legacy_live_pid_lock_keeps_pid_only_liveness() {
+        let (_dir, path) = test_lock_path();
+        let stale_at = now_ms().saturating_sub(60_000);
+        let mut metadata = synthetic_metadata(std::process::id(), current_hostname(), stale_at);
+        metadata.heartbeat_at_ms = stale_at;
+        let original = write_legacy_lock(&path, &metadata);
+        assert!(!original.contains("process_start_time"));
+        assert!(!original.contains("boot_id"));
+
+        let result = acquire_with_config(&path, Some(Duration::from_millis(80)), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read legacy lock"),
+            original
+        );
+
+        remove_lock_file(&path).expect("cleanup legacy lock");
+    }
+
+    #[test]
+    fn legacy_dead_pid_lock_is_reclaimed() {
+        let (_dir, path) = test_lock_path();
+        let metadata = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        let original = write_legacy_lock(&path, &metadata);
+        assert!(!original.contains("process_start_time"));
+        assert!(!original.contains("boot_id"));
+
+        let guard = acquire_with_config(&path, Some(Duration::ZERO), test_config())
+            .expect("zero-timeout acquire should reclaim a legacy dead PID lock");
+        assert_eq!(guard.metadata.pid, std::process::id());
+        drop(guard);
     }
 
     #[test]
@@ -1271,13 +1545,17 @@ mod tests {
     fn cross_host_lock_is_not_stolen_before_extended_stale_threshold() {
         let (_dir, path) = test_lock_path();
         let now = now_ms();
-        let metadata = LockMetadata {
-            pid: std::process::id(),
-            hostname: format!("{}-other", current_hostname()),
-            created_at_ms: now,
-            heartbeat_at_ms: now,
-            writer_epoch: format!("cross-host-{now}"),
-        };
+        let mut metadata = current_process_metadata();
+        metadata.hostname = format!("{}-other", current_hostname());
+        metadata.process_start_time = metadata.process_start_time.map(different_start_time);
+        metadata.created_at_ms = now;
+        metadata.heartbeat_at_ms = now;
+        metadata.writer_epoch = format!("cross-host-{now}");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_ne!(
+            metadata.process_start_time,
+            process_identity(std::process::id()).map(|identity| identity.start_time)
+        );
         write_synthetic_lock(&path, &metadata);
 
         let result = acquire_with_config(&path, Some(Duration::from_millis(80)), test_config());
@@ -1292,13 +1570,12 @@ mod tests {
         let (_dir, path) = test_lock_path();
         let stale_at =
             now_ms().saturating_sub(test_config().cross_host_stale_heartbeat_ms() + 1_000);
-        let metadata = LockMetadata {
-            pid: std::process::id(),
-            hostname: format!("{}-other", current_hostname()),
-            created_at_ms: stale_at,
-            heartbeat_at_ms: stale_at,
-            writer_epoch: format!("cross-host-{stale_at}"),
-        };
+        let mut metadata = current_process_metadata();
+        metadata.hostname = format!("{}-other", current_hostname());
+        metadata.process_start_time = metadata.process_start_time.map(different_start_time);
+        metadata.created_at_ms = stale_at;
+        metadata.heartbeat_at_ms = stale_at;
+        metadata.writer_epoch = format!("cross-host-{stale_at}");
         write_synthetic_lock(&path, &metadata);
 
         let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
