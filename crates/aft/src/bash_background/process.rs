@@ -306,17 +306,3 @@ mod tests {
         );
     }
 }
-
-/// Check that a persisted PID still names the process instance launched for a task.
-/// On platforms without process start-time inspection, a live PID is protected;
-/// deleting a live task is worse than temporarily retaining a recycled PID.
-pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
-    const PROCESS_START_GRACE_MS: u64 = 30_000;
-
-    if !is_process_alive(pid) {
-        return false;
-    }
-    crate::root_cache::process_start_time_ms(pid).is_none_or(|started_at_ms| {
-        started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS)
-    })
-}

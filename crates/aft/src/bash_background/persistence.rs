@@ -656,7 +656,6 @@ impl From<BashTaskRow> for PersistedTask {
             "failed" => BgTaskStatus::Failed,
             "killed" => BgTaskStatus::Killed,
             "timed_out" => BgTaskStatus::TimedOut,
-            "fate_unknown" => BgTaskStatus::FateUnknown,
             _ => BgTaskStatus::Failed,
         };
         let started_at = u64::try_from(row.started_at).unwrap_or_default();
@@ -700,7 +699,6 @@ fn status_name(status: &BgTaskStatus) -> &'static str {
         BgTaskStatus::Failed => "failed",
         BgTaskStatus::Killed => "killed",
         BgTaskStatus::TimedOut => "timed_out",
-        BgTaskStatus::FateUnknown => "fate_unknown",
     }
 }
 

@@ -26,11 +26,7 @@ export function formatForegroundResult(data: Record<string, unknown>): string {
 
 export function isTerminalStatus(status: unknown): boolean {
   return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "killed" ||
-    status === "timed_out" ||
-    status === "fate_unknown"
+    status === "completed" || status === "failed" || status === "killed" || status === "timed_out"
   );
 }
 

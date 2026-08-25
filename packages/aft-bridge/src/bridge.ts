@@ -27,7 +27,6 @@ const TERMINAL_BASH_STATUSES = new Set([
   "failed",
   "killed",
   "timed_out",
-  "fate_unknown",
   // Historical/defensive aliases seen in plugin-side compatibility code.
   "cancelled",
   "timeout",

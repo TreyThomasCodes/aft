@@ -113,7 +113,6 @@ mod tests {
             true,
         );
         metadata.status = BgTaskStatus::Running;
-        metadata.child_pid = Some(std::process::id());
         write_task(&paths.json, &metadata).unwrap();
         fs::write(&paths.stdout, "still running\n").unwrap();
         fs::write(&paths.stderr, "").unwrap();

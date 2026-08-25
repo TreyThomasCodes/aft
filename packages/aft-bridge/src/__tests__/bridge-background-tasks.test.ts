@@ -47,7 +47,7 @@ function deliverResponse(
 
 function completionFrame(
   taskId: string,
-  status: "completed" | "failed" | "killed" | "timed_out" | "fate_unknown" = "completed",
+  status: "completed" | "failed" | "killed" | "timed_out" = "completed",
 ): string {
   return JSON.stringify({
     type: "bash_completed",
@@ -93,10 +93,6 @@ describe("BinaryBridge background task accounting", () => {
 
     deliverResponse(bridge, "bash", { success: true, task_id: "bash-timeout", status: "running" });
     internals(bridge).processStdoutLine(completionFrame("bash-timeout", "timed_out"));
-    expect(bridge.hasOutstandingBackgroundTasks()).toBe(false);
-
-    deliverResponse(bridge, "bash", { success: true, task_id: "bash-orphan", status: "running" });
-    internals(bridge).processStdoutLine(completionFrame("bash-orphan", "fate_unknown"));
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(false);
   });
 
