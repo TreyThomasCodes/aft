@@ -422,7 +422,31 @@ fn dir_has_entries(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod storage_root_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::PathBuf;
+
+    struct NonPanickingCleanup<F: FnOnce()> {
+        cleanup: Option<F>,
+    }
+
+    impl<F: FnOnce()> NonPanickingCleanup<F> {
+        fn new(cleanup: F) -> Self {
+            Self {
+                cleanup: Some(cleanup),
+            }
+        }
+    }
+
+    impl<F: FnOnce()> Drop for NonPanickingCleanup<F> {
+        fn drop(&mut self) {
+            let Some(cleanup) = self.cleanup.take() else {
+                return;
+            };
+            // A cleanup panic while the test is already unwinding aborts the whole
+            // libtest process, so cleanup failures must remain contained here.
+            let _ = catch_unwind(AssertUnwindSafe(cleanup));
+        }
+    }
 
     // The plugins inject the CortexKit data root as `storage_dir` on every
     // configure; plugin-less invocations (daemon-supervised module, bare CLI,
@@ -435,20 +459,14 @@ mod storage_root_tests {
     // XDG_DATA_HOME || platform data dir, + cortexkit/aft).
     #[test]
     fn plugin_less_fallback_matches_plugin_injected_cortexkit_root() {
-        struct RestoreCacheDir(Option<std::ffi::OsString>);
-        impl Drop for RestoreCacheDir {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.0.take() {
-                        Some(value) => std::env::set_var("AFT_CACHE_DIR", value),
-                        None => std::env::remove_var("AFT_CACHE_DIR"),
-                    }
-                }
-            }
-        }
-
         let _guard = crate::test_env::process_env_lock();
-        let _cache_dir = RestoreCacheDir(std::env::var_os("AFT_CACHE_DIR"));
+        let previous_cache_dir = std::env::var_os("AFT_CACHE_DIR");
+        let _cache_dir = NonPanickingCleanup::new(move || unsafe {
+            match previous_cache_dir {
+                Some(value) => std::env::set_var("AFT_CACHE_DIR", value),
+                None => std::env::remove_var("AFT_CACHE_DIR"),
+            }
+        });
         unsafe { std::env::remove_var("AFT_CACHE_DIR") };
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .filter(|value| !value.is_empty())
@@ -481,6 +499,28 @@ mod storage_root_tests {
             resolved.starts_with(&expected_plugin_injected_root),
             "search_index::resolve_cache_dir fallback diverged: {}",
             resolved.display()
+        );
+    }
+
+    #[test]
+    fn cleanup_panic_during_unwind_does_not_abort_libtest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cleanup_ran = AtomicBool::new(false);
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = NonPanickingCleanup::new(|| {
+                cleanup_ran.store(true, Ordering::SeqCst);
+                panic!("forced cleanup failure");
+            });
+            panic!("primary test failure");
+        }));
+
+        assert!(cleanup_ran.load(Ordering::SeqCst));
+        assert_eq!(
+            unwind
+                .expect_err("primary panic must escape the inner scope")
+                .downcast_ref::<&str>(),
+            Some(&"primary test failure")
         );
     }
 }
