@@ -117,7 +117,14 @@ pub fn spawn(
         .or_else(|| std::env::current_dir().ok())
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
-    let env = env.unwrap_or_default();
+    let mut env = env.unwrap_or_default();
+    let config = ctx.config();
+    let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
+    if let Err(error) =
+        crate::agent_child_env::inject(config.as_ref(), &child_storage_root, &mut env)
+    {
+        return Response::error(request_id, "child_environment_unavailable", error);
+    }
     let task_kind = if pty {
         SandboxTaskKind::BashPty
     } else if require_background_flag {

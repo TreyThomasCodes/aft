@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "helpers/mod.rs"]
+mod test_helpers;
+
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -7,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aft::config::Config;
 use base64::Engine;
 use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Value};
@@ -136,6 +140,32 @@ fn write_upstream_gh(bin: &Path) {
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&gh, permissions).expect("make fake upstream gh executable");
+}
+
+fn write_upstream_gh_user_api(bin: &Path) {
+    let gh = bin.join("gh");
+    fs::create_dir_all(bin).expect("create fake upstream bin directory");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\n[ \"$1\" = api ] || exit 73\nprintf '289616620\\n'\n",
+    )
+    .expect("write fake upstream gh API");
+    let mut permissions = fs::metadata(&gh)
+        .expect("read fake upstream gh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh, permissions).expect("make fake upstream gh executable");
+}
+
+fn write_numeric_ids(state_home: &Path, ids: Value) {
+    let path = state_home.join("cortexkit/aft/gh-shim/numeric-ids.json");
+    fs::create_dir_all(path.parent().expect("numeric id cache parent"))
+        .expect("create numeric id cache directory");
+    fs::write(
+        path,
+        serde_json::to_vec(&ids).expect("serialize numeric ids"),
+    )
+    .expect("write numeric id cache");
 }
 
 fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option<bool>) {
@@ -460,4 +490,229 @@ fn gh_shim_disabled_by_config_overrides_governance_stickiness() {
         fs::read_to_string(&recorder).expect("read upstream invocation record"),
         "issue comment 42 --body hello\n"
     );
+}
+
+#[test]
+fn co_author_line_uses_the_cached_manifest_binding_and_numeric_id_offline() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_numeric_ids(&state_home, json!({ "alfonso-aft": 289616620 }));
+    write_user_config(&config_home, &connection_file, None);
+
+    let output = shim_command(
+        &["--co-author-line"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn co-author self-report");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(
+        !recorder.exists(),
+        "a warm numeric-id cache must stay offline"
+    );
+}
+
+#[test]
+fn co_author_line_resolves_a_missing_numeric_id_once_and_caches_it() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh_user_api(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
+
+    for _ in 0..2 {
+        let output = shim_command(
+            &["--co-author-line"],
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn co-author self-report");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>\n"
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read API invocation record"),
+        "api users/alfonso-aft --jq .id\n"
+    );
+    let ids: Value = serde_json::from_slice(
+        &fs::read(state_home.join("cortexkit/aft/gh-shim/numeric-ids.json"))
+            .expect("read numeric id cache"),
+    )
+    .expect("parse numeric id cache");
+    assert_eq!(ids["alfonso-aft"], 289616620);
+}
+
+#[test]
+fn auto_child_hook_commits_the_cached_bound_identity_exactly_once_on_amend() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let state_home = temp.path().join("state");
+    let config_home = temp.path().join("config");
+    let home = temp.path().join("home");
+    let storage = temp.path().join("storage");
+    let project = write_project_repo(temp.path());
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_numeric_ids(&state_home, json!({ "alfonso-aft": 289616620 }));
+    fs::write(project.join("tracked.txt"), "joint work\n").expect("write tracked file");
+    for args in [
+        &["config", "user.name", "AFT Test"][..],
+        &["config", "user.email", "aft-test@example.test"][..],
+        &["add", "tracked.txt"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .status()
+            .expect("run git setup command");
+        assert!(status.success(), "git setup failed: {args:?}");
+    }
+
+    let binary = aft_binary();
+    test_helpers::warm_executable(&binary, &["--version"]);
+    let mut config = Config::default();
+    config.gh_shim.enabled = false;
+    config.gh_shim.binary_path = Some(binary);
+    config.git.co_author = "auto".to_string();
+    let inherited_path = std::env::var_os("PATH").expect("test PATH");
+    let mut environment = std::collections::HashMap::from([
+        (
+            "PATH".to_string(),
+            inherited_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_STATE_HOME".to_string(),
+            state_home.to_string_lossy().into_owned(),
+        ),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            config_home.to_string_lossy().into_owned(),
+        ),
+        ("HOME".to_string(), home.to_string_lossy().into_owned()),
+    ]);
+    aft::agent_child_env::inject(&config, &storage, &mut environment)
+        .expect("inject child Git environment");
+
+    for args in [
+        &["commit", "--quiet", "-m", "mason: joint work"][..],
+        &["commit", "--quiet", "--amend", "--no-edit"][..],
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(&project)
+            .envs(&environment)
+            .status()
+            .expect("run governed commit");
+        assert!(status.success(), "governed commit failed: {args:?}");
+    }
+
+    let output = Command::new("git")
+        .args(["log", "-1", "--format=%B"])
+        .current_dir(&project)
+        .output()
+        .expect("read commit message");
+    assert!(output.status.success());
+    let message = String::from_utf8(output.stdout).expect("commit message UTF-8");
+    assert_eq!(message.matches("Co-authored-by:").count(), 1);
+    assert!(message
+        .contains("Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"));
+}
+
+#[test]
+fn shim_invoked_as_gh_skips_its_managed_path_entry_and_execs_upstream_once() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("create test root");
+    let project = write_project_repo(temp.path());
+    let shims = temp.path().join("shims");
+    let upstream = temp.path().join("upstream");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    fs::create_dir_all(&shims).expect("create shims directory");
+    symlink(aft_binary(), shims.join("gh")).expect("create managed gh link");
+    write_upstream_gh(&upstream);
+    let inherited = std::env::var_os("PATH").expect("test PATH");
+    let path = std::env::join_paths(
+        [shims.clone(), upstream]
+            .into_iter()
+            .chain(std::env::split_paths(&inherited)),
+    )
+    .expect("build shim PATH");
+
+    let output = Command::new(shims.join("gh"))
+        .args(["issue", "list"])
+        .current_dir(project)
+        .env("PATH", path)
+        .env("AFT_GH_SHIMS_DIR", &shims)
+        .env("GH_SHIM_TEST_RECORD", &recorder)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("HOME", temp.path().join("home"))
+        .output()
+        .expect("spawn managed gh entry");
+
+    assert_eq!(output.status.code(), Some(73));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "r2-passthrough\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(recorder).expect("read upstream invocation record"),
+        "issue list\n"
+    );
+}
+
+#[test]
+fn co_author_line_is_silently_empty_without_a_cached_manifest_binding() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let project = write_project_repo(temp.path());
+    let upstream = temp.path().join("upstream");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream);
+
+    let output = shim_command(
+        &["--co-author-line"],
+        &project,
+        &temp.path().join("config"),
+        &temp.path().join("state"),
+        &temp.path().join("home"),
+        &upstream,
+        &recorder,
+    )
+    .output()
+    .expect("spawn inert co-author self-report");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert!(!recorder.exists());
 }

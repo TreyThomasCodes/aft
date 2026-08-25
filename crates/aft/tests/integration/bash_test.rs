@@ -19,6 +19,15 @@ fn write_executable_shim(path: &std::path::Path, body: &str) {
 }
 
 #[cfg(unix)]
+fn aft_binary() -> std::path::PathBuf {
+    std::env::var_os("AFT_TEST_AFT_BINARY")
+        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+}
+
+#[cfg(unix)]
 fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::Value {
     let started = std::time::Instant::now();
     loop {
@@ -119,6 +128,105 @@ eval "$2"
         "bash child did not inherit the rc-enriched PATH: {status:?}"
     );
 
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let storage = dir.path().join("storage");
+    let upstream = dir.path().join("upstream");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&upstream).unwrap();
+    let real_gh = upstream.join("gh");
+    write_executable_shim(&real_gh, "#!/bin/sh\nprintf 'real-gh:%s\\n' \"$*\"\n");
+    let requested_path = std::env::join_paths([
+        upstream.clone(),
+        std::path::PathBuf::from("/usr/bin"),
+        std::path::PathBuf::from("/bin"),
+    ])
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+    let binary = aft_binary();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", std::ffi::OsStr::new(&requested_path))]);
+
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "configure-child-governance",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "storage_dir": storage,
+            "config": user_config(serde_json::json!({
+                "gh_shim": { "enabled": true, "binary_path": binary },
+                "git": { "co_author": "off" }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "bash-child-governance",
+            "method": "bash",
+            "params": {
+                "command": "printf '%s\\n' \"${PATH%%:*}\"; command -v gh; gh version; test -z \"${GIT_CONFIG_COUNT+x}\""
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
+    let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+    let shims = storage.join("shims");
+    assert_eq!(status["status"], "completed", "bash failed: {status:?}");
+    assert_eq!(
+        status["output_preview"].as_str().unwrap(),
+        format!(
+            "{}\n{}\nreal-gh:version\n",
+            shims.display(),
+            shims.join("gh").display()
+        )
+    );
+
+    let configure_disabled = aft.send(
+        &serde_json::json!({
+            "id": "configure-child-governance-off",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "storage_dir": storage,
+            "config": user_config(serde_json::json!({
+                "gh_shim": { "enabled": false },
+                "git": { "co_author": "off" }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configure_disabled["success"], true);
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "bash-child-governance-off",
+            "method": "bash",
+            "params": {
+                "command": "printf '%s\\n' \"$PATH\"; command -v gh; test -z \"${GIT_CONFIG_COUNT+x}\"; test -z \"${AFT_GH_SHIMS_DIR+x}\""
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "bash spawn failed: {response:?}");
+    let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+    assert_eq!(status["status"], "completed", "bash failed: {status:?}");
+    assert_eq!(
+        status["output_preview"].as_str().unwrap(),
+        format!("{requested_path}\n{}\n", real_gh.display())
+    );
+    assert!(!shims.join("gh").exists());
     assert!(aft.shutdown().success());
 }
 

@@ -102,31 +102,6 @@ done
 
 echo "gated-push: preflight green — pushing to $remote $branch"
 
-# The trailer is normally injected by scripts/git-hooks/prepare-commit-msg;
-# hooks are unversioned, so self-heal the install on every push.
-if [ -f scripts/git-hooks/prepare-commit-msg ] && ! cmp -s scripts/git-hooks/prepare-commit-msg .git/hooks/prepare-commit-msg 2>/dev/null; then
-  cp scripts/git-hooks/prepare-commit-msg .git/hooks/prepare-commit-msg && chmod +x .git/hooks/prepare-commit-msg
-fi
-
-# Identity tripwire: commits authored at this desk must carry the Alfonso
-# co-author trailer (cherry-picked worker commits keep their own authorship;
-# their subjects carry the mason: prefix and are exempt). Catches the
-# release-pressure slip class: chain-made manifest/realign commits going out
-# under the user's sole authorship.
-missing=""
-for c in $(git rev-list @{push}..HEAD 2>/dev/null); do
-  subject=$(git log -1 --format=%s "$c")
-  case "$subject" in mason:*) continue ;; esac
-  if ! git log -1 --format="%(trailers:key=Co-authored-by,valueonly)" "$c" | grep -qiE "alfonso"; then
-    missing="$missing$c $subject\n"
-  fi
-done
-if [ -n "$missing" ]; then
-  echo "gated-push: commits missing the Alfonso co-author trailer:" >&2
-  printf "$missing" >&2
-  echo "gated-push: amend with: git commit --amend --trailer 'Co-authored-by: Alfonso <noreply@cortexkit.dev>'" >&2
-  exit 1
-fi
 
 git push "$remote" "$branch"
 

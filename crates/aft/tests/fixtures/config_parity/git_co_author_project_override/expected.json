@@ -1,0 +1,9 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "git": {
+    "co_author": "AFT Pair <pair@example.test>"
+  },
+  "restrict_to_project_root": false
+}

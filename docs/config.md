@@ -243,7 +243,16 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
   // is a fleet-rollout safety gate, not a capability switch. USER-only — a
   // project config cannot disable the shim for the user's host.
   "gh_shim": {
-    "enabled": true
+    "enabled": true,
+    // Optional absolute development/deployed AFT image. Defaults to the running image.
+    "binary_path": "/absolute/path/to/aft"
+  },
+
+  // Git co-authorship for commits made by AFT-spawned agent children.
+  // "off" (default) | "auto" | an explicit "Name <email>" identity.
+  // User and project tiers are accepted; normal project-over-user precedence applies.
+  "git": {
+    "co_author": "off"
   }
 }
 ```
@@ -267,7 +276,11 @@ Hashline mode needs the host's unprefixed `edit` slot. If final surface selectio
 
 ## `gh` routing shim
 
-When AFT is installed as the `gh` argv[0] entry point (a `gh` symlink or `aft gh-shim`), the shim decides whether to route `gh` invocations through a governed daemon seam or pass them through byte-transparently to upstream `gh`. The `gh_shim.enabled` knob is an operator hard-off for that routing: set it to `false` in user config to force every invocation to byte-transparent passthrough (R1) before any daemon/catalog probing, so a disabled shim performs zero subc traffic. It adds no capability beyond today's structural rungs — it only gives fleet operators a hard-off for rollout safety. The knob is USER-only: a project config cannot disable the shim for the user's host.
+AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to first-party bash and PTY child processes. The entry dispatches to the running AFT image by default; `gh_shim.binary_path` can select an absolute development or deployed image. The shim routes governed invocations through the daemon seam and passes eligible commands to the first real `gh` later on `PATH`. Set `gh_shim.enabled` to `false` in user config to remove the managed entry and skip child `PATH` injection entirely. The operator's shell startup files and terminal `PATH` are never changed.
+
+## Git co-authorship
+
+`git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. AFT selects `<storage_root>/git-hooks/prepare-commit-msg` through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The generated hook is idempotent and chains to the repository's own executable `prepare-commit-msg`, including custom local `core.hooksPath` configurations. Project config may override this attribution key because attribution is not a trust boundary.
 
 ## Native command sandbox
 

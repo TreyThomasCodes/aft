@@ -91,6 +91,25 @@ describe("loadAftConfig", () => {
     expect((JSON.parse(result.stdout) as { edit_mode?: string }).edit_mode).toBe("default");
   });
 
+  test("git.co_author uses ordinary project-over-user precedence", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ git: { co_author: "auto" } }));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ git: { co_author: "AFT Pair <pair@example.test>" } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout).git).toEqual({
+      co_author: "AFT Pair <pair@example.test>",
+    });
+    expect(result.stderr).not.toContain("Ignoring git");
+  });
+
   test("unknown edit_mode warns, falls back to default, and preserves valid keys", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ edit_mode: "hashline" }));

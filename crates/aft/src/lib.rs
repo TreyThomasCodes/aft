@@ -46,6 +46,7 @@
 // Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
 // production error paths as of v0.6.3 audit.
 
+pub mod agent_child_env;
 pub mod alert_records;
 pub mod alert_state;
 pub mod artifact_owner;

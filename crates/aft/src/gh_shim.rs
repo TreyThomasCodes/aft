@@ -43,6 +43,7 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
+const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
@@ -205,6 +206,12 @@ pub fn run_from_env() -> i32 {
 
 fn run(args: &[OsString]) -> i32 {
     let paths = StatePaths::from_process();
+    if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
+        if let Some(line) = co_author_line(&paths) {
+            println!("{line}");
+        }
+        return 0;
+    }
     if is_reserved_self_report(args) {
         print_self_report(&paths);
         return 0;
@@ -364,6 +371,7 @@ struct StatePaths {
     seam_state: PathBuf,
     last_valid_manifest: PathBuf,
     version_high_water: PathBuf,
+    numeric_ids: PathBuf,
 }
 
 impl StatePaths {
@@ -392,6 +400,7 @@ impl StatePaths {
             seam_state: root.join("seam-state.json"),
             last_valid_manifest: root.join("last-valid-manifest.json"),
             version_high_water: root.join("manifest-version-high-water.json"),
+            numeric_ids: root.join("numeric-ids.json"),
             root,
         }
     }
@@ -825,6 +834,84 @@ fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
         .get(&repo)
         .cloned()
         .map(|agent_id| AgentBinding { repo, agent_id })
+}
+
+fn co_author_line(paths: &StatePaths) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let manifest = load_manifest(paths, unix_seconds()).ok()?;
+    let binding = resolved_agent_binding(&manifest, &cwd)?;
+    let login = binding.agent_id;
+    if !valid_github_login(&login) {
+        return None;
+    }
+    let numeric_id =
+        cached_numeric_id(paths, &login).or_else(|| resolve_and_cache_numeric_id(paths, &login))?;
+    Some(format!(
+        "Co-authored-by: {login} <{numeric_id}+{login}@users.noreply.github.com>"
+    ))
+}
+
+fn valid_github_login(login: &str) -> bool {
+    let core = login.strip_suffix("[bot]").unwrap_or(login);
+    !core.is_empty()
+        && core.len() <= 100
+        && !core.starts_with('-')
+        && !core.ends_with('-')
+        && core
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn cached_numeric_ids(paths: &StatePaths) -> BTreeMap<String, u64> {
+    fs::read(&paths.numeric_ids)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn cached_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
+    cached_numeric_ids(paths)
+        .get(login)
+        .copied()
+        .filter(|id| *id > 0)
+}
+
+fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> {
+    let image = executing_image();
+    let real_gh = resolve_real_gh(&image)?;
+    let encoded_login = url::form_urlencoded::byte_serialize(login.as_bytes()).collect::<String>();
+    let output = Command::new(real_gh)
+        .args(["api", &format!("users/{encoded_login}"), "--jq", ".id"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let numeric_id = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)?;
+    let mut ids = cached_numeric_ids(paths);
+    ids.insert(login.to_string(), numeric_id);
+    write_numeric_ids_silently(paths, &ids);
+    Some(numeric_id)
+}
+
+fn write_numeric_ids_silently(paths: &StatePaths, ids: &BTreeMap<String, u64>) {
+    let Ok(bytes) = serde_json::to_vec(ids) else {
+        return;
+    };
+    if fs::create_dir_all(&paths.root).is_err() {
+        return;
+    }
+    let temporary = paths.root.join("numeric-ids.json.tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        #[cfg(windows)]
+        let _ = fs::remove_file(&paths.numeric_ids);
+        let _ = fs::rename(temporary, &paths.numeric_ids);
+    }
 }
 
 fn repository_key_from_origin(project_root: &Path) -> Option<String> {
@@ -2569,11 +2656,44 @@ fn delegate(args: &[OsString]) -> i32 {
 
 fn resolve_real_gh(executing_image: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|directory| {
-        let candidate = directory.join("gh");
-        (is_executable_file(&candidate) && !same_image(&candidate, executing_image))
-            .then_some(candidate)
+    let shims_dir = std::env::var_os("AFT_GH_SHIMS_DIR").map(PathBuf::from);
+    resolve_real_gh_in_path(executing_image, &path, shims_dir.as_deref())
+}
+
+fn resolve_real_gh_in_path(
+    executing_image: &Path,
+    path: &OsStr,
+    shims_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|directory| {
+        if shims_dir.is_some_and(|shims_dir| same_directory(&directory, shims_dir)) {
+            return None;
+        }
+        gh_candidate_names().iter().find_map(|name| {
+            let candidate = directory.join(name);
+            (is_executable_file(&candidate) && !same_image(&candidate, executing_image))
+                .then_some(candidate)
+        })
     })
+}
+
+#[cfg(windows)]
+fn gh_candidate_names() -> &'static [&'static str] {
+    &["gh.exe", "gh.cmd", "gh.bat", "gh"]
+}
+
+#[cfg(not(windows))]
+fn gh_candidate_names() -> &'static [&'static str] {
+    &["gh"]
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .canonicalize()
+            .ok()
+            .zip(right.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -2756,6 +2876,32 @@ mod tests {
             OsString::from("issue"),
             OsString::from("--status")
         ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_gh_resolution_skips_the_managed_shims_directory_without_recursing() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("aft");
+        fs::write(&image, "image").unwrap();
+        let shims = directory.path().join("shims");
+        let upstream = directory.path().join("upstream");
+        fs::create_dir_all(&shims).unwrap();
+        fs::create_dir_all(&upstream).unwrap();
+        symlink(&image, shims.join("gh")).unwrap();
+        let real = upstream.join("gh");
+        fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&real).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&real, permissions).unwrap();
+        let path = std::env::join_paths([shims.clone(), upstream]).unwrap();
+
+        assert_eq!(
+            resolve_real_gh_in_path(&image, &path, Some(&shims)),
+            Some(real)
+        );
     }
 
     #[test]

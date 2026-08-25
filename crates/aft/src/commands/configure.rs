@@ -2033,6 +2033,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // splitting the storage universe by transport.
         next_config.storage_dir = Some(crate::bash_background::storage_dir(None));
     }
+    let child_storage_root =
+        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
+        return Response::error(&req.id, "child_environment_unavailable", error);
+    }
     // Resolve the plugin-managed ONNX Runtime before the semantic build worker
     // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
     // startup so pre_validate_onnx_runtime finds the runtime the plugin already

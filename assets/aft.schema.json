@@ -574,11 +574,27 @@
         "enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Operator hard-off for the gh routing shim. When false, the shim short-circuits to byte-transparent passthrough (R1) before any daemon/catalog probing, so a disabled shim performs zero subc traffic. Fleet-rollout safety gate, not a capability switch. User-scoped only — a project config cannot disable the shim for the user's host."
+          "description": "Operator hard-off for child PATH injection and governed gh routing. User-scoped only."
+        },
+        "binary_path": {
+          "type": "string",
+          "description": "Absolute deployed or development AFT binary used by the managed gh entry. Defaults to the running AFT image. User-scoped only."
         }
       },
       "additionalProperties": false,
       "description": "gh routing shim operator gate. User-scoped only — a project config cannot disable the shim for the user's host."
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "co_author": {
+          "type": "string",
+          "default": "off",
+          "description": "Git co-author attribution for AFT-spawned agent children: 'off', 'auto', or an explicit 'Name <email>' identity. User and project tiers are accepted with project precedence."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration."
     },
     "auto_update": {
       "type": "boolean",

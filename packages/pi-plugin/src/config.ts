@@ -68,14 +68,15 @@ export interface SubcConfig {
 }
 
 export interface GhShimConfig {
-  /**
-   * Operator hard-off for the `gh` routing shim. Default: true. When false, the
-   * shim short-circuits to byte-transparent passthrough (R1) before any
-   * daemon/catalog probing, so a disabled shim performs zero subc traffic. This
-   * is a fleet-rollout safety gate, not a capability switch. USER-tier ONLY — a
-   * project config cannot disable the shim for the user's host.
-   */
+  /** Operator hard-off for child PATH injection and governed `gh` routing. */
   enabled?: boolean;
+  /** User-tier AFT image used by the managed `gh` entry. Defaults to the running image. */
+  binary_path?: string;
+}
+
+export interface GitConfig {
+  /** "off" (default), "auto", or an explicit "Name <email>" identity. */
+  co_author?: string;
 }
 
 export interface IndexRootConfig {
@@ -277,6 +278,7 @@ export interface AftConfig {
   bridge?: BridgeConfig;
   subc?: SubcConfig;
   gh_shim?: GhShimConfig;
+  git?: GitConfig;
 }
 
 /**
@@ -587,14 +589,28 @@ const SubcConfigSchema = z.object({
 });
 
 const GhShimConfigSchema = z.object({
-  /**
-   * Operator hard-off for the `gh` routing shim. Default: true. When false, the
-   * shim short-circuits to byte-transparent passthrough (R1) before any
-   * daemon/catalog probing, so a disabled shim performs zero subc traffic. This
-   * is a fleet-rollout safety gate, not a capability switch. USER-tier ONLY — a
-   * project config cannot disable the shim for the user's host.
-   */
+  /** Operator hard-off for child PATH injection and governed `gh` routing. */
   enabled: z.boolean().optional(),
+  /** User-tier AFT image used by the managed `gh` entry. Defaults to the running image. */
+  binary_path: z
+    .string()
+    .trim()
+    .refine(isAbsolute, "gh_shim.binary_path must be absolute")
+    .optional(),
+});
+
+const GitCoAuthorSchema = z
+  .string()
+  .trim()
+  .refine(
+    (value) =>
+      value === "off" || value === "auto" || /^[^<>\r\n]+\s+<[^<>\s@]+@[^<>\s@]+>$/.test(value),
+    "git.co_author must be 'off', 'auto', or an explicit 'Name <email>' identity",
+  );
+
+const GitConfigSchema = z.object({
+  /** Attribution injected into Git commits made by AFT-spawned agent children. */
+  co_author: GitCoAuthorSchema.optional(),
 });
 
 const InspectConfigSchema = z.object({
@@ -687,6 +703,7 @@ export const AftConfigSchema = z.preprocess(
       bridge: BridgeConfigSchema.optional(),
       subc: SubcConfigSchema.optional(),
       gh_shim: GhShimConfigSchema.optional(),
+      git: GitConfigSchema.optional(),
     })
     .strict(),
 );
@@ -790,6 +807,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
+  if (config.git !== undefined) overrides.git = config.git;
 
   return overrides;
 }
@@ -1348,6 +1366,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_chunk_size",
   "inspect",
   "worktree",
+  // Git attribution only changes commit metadata; it grants no capabilities and
+  // does not select an executable, so project configuration may override it.
+  "git",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in a

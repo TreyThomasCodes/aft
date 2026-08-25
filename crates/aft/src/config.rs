@@ -222,12 +222,62 @@ pub struct GhShimConfig {
     /// daemon or catalog probe, so a disabled shim produces no subc traffic.
     /// Default true. This is an operator hard-off for fleet rollout safety.
     pub enabled: bool,
+    /// Optional deployed or development AFT image used by managed shim entries.
+    /// The running executable is used when this user-tier field is absent.
+    pub binary_path: Option<PathBuf>,
 }
 
 impl Default for GhShimConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            binary_path: None,
+        }
     }
+}
+
+/// Git behavior applied only to AFT-spawned agent children.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitConfig {
+    /// `off` (default), `auto`, or one explicit `Name <email>` identity.
+    pub co_author: String,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            co_author: "off".to_string(),
+        }
+    }
+}
+
+/// Normalize configuration values into `off`, `auto`, or `Name <email>`.
+pub fn normalize_git_co_author(value: &str) -> Option<String> {
+    let value = value.trim();
+    if matches!(value, "off" | "auto") {
+        return Some(value.to_string());
+    }
+    if value.contains(['\n', '\r']) || !value.ends_with('>') {
+        return None;
+    }
+    let open = value.rfind('<')?;
+    if open == 0 || !value.as_bytes()[open - 1].is_ascii_whitespace() {
+        return None;
+    }
+    let name = value[..open].trim();
+    let email = value[open + 1..value.len() - 1].trim();
+    if name.is_empty()
+        || name.contains(['<', '>'])
+        || email.is_empty()
+        || !email.contains('@')
+        || email
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '<' | '>'))
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// Linked-worktree behavior that never writes shared on-disk artifacts.
@@ -355,6 +405,8 @@ pub struct Config {
     pub worktree: WorktreeConfig,
     /// `gh` routing shim operator gate. Default on; see [`GhShimConfig`].
     pub gh_shim: GhShimConfig,
+    /// Git attribution for AFT-spawned agent children. Default off.
+    pub git: GitConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
     /// User-defined LSP servers registered by the OpenCode plugin.
@@ -444,6 +496,7 @@ impl Default for Config {
             backup: BackupConfig::default(),
             worktree: WorktreeConfig::default(),
             gh_shim: GhShimConfig::default(),
+            git: GitConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),

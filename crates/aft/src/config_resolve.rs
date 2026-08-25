@@ -13,9 +13,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    expand_index_root_path, BackupConfig, Config, GhShimConfig, IndexConfig, IndexKind,
-    IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
+    IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend,
+    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
@@ -118,6 +118,7 @@ pub struct RawAftConfig {
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
     pub gh_shim: Option<RawGhShim>,
+    pub git: Option<RawGit>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -461,6 +462,15 @@ impl RawWorktree {
 #[serde(default)]
 pub struct RawGhShim {
     pub enabled: Option<bool>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub binary_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawGit {
+    #[serde(deserialize_with = "deserialize_opt_git_co_author")]
+    pub co_author: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -709,6 +719,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.gh_shim.is_some() {
         base.gh_shim = override_config.gh_shim;
     }
+    if override_config.git.is_some() {
+        base.git = override_config.git;
+    }
     if override_config.sandbox.is_some() {
         base.sandbox = override_config.sandbox;
     }
@@ -780,6 +793,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
+    if project.git.is_some() {
+        base.git = project.git;
+    }
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
 }
 
@@ -1215,6 +1231,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
+    config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
@@ -1401,7 +1418,18 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
     if let Some(value) = raw.and_then(|raw| raw.enabled) {
         gh_shim.enabled = value;
     }
+    gh_shim.binary_path = raw
+        .and_then(|raw| raw.binary_path.as_ref())
+        .map(PathBuf::from);
     gh_shim
+}
+
+fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
+    GitConfig {
+        co_author: raw
+            .and_then(|raw| raw.co_author.clone())
+            .unwrap_or_else(|| "off".to_string()),
+    }
 }
 
 fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
@@ -1594,6 +1622,22 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
             }
         }
     }
+}
+
+fn deserialize_opt_git_co_author<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            normalize_git_co_author(&value).ok_or_else(|| {
+                de::Error::custom(
+                    "git.co_author must be 'off', 'auto', or an explicit 'Name <email>' identity",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn deserialize_opt_trimmed_non_empty_string<'de, D>(
@@ -2014,6 +2058,29 @@ mod tests {
         ]);
         assert!(!default.config.hashline_enabled);
         assert!(default.dropped.is_empty());
+    }
+
+    #[test]
+    fn git_co_author_accepts_project_precedence_and_rejects_invalid_identities() {
+        let resolved = resolve_config(&[
+            tier("user", r#"{"git":{"co_author":"auto"}}"#),
+            tier(
+                "project",
+                r#"{"git":{"co_author":"Pair Agent <pair@example.test>"}}"#,
+            ),
+        ]);
+        assert_eq!(
+            resolved.config.git.co_author,
+            "Pair Agent <pair@example.test>"
+        );
+        assert!(resolved.dropped.is_empty());
+
+        let invalid = resolve_config(&[tier(
+            "user",
+            r#"{"git":{"co_author":"not-an-identity"},"search_index":true}"#,
+        )]);
+        assert_eq!(invalid.config.git.co_author, "off");
+        assert!(invalid.config.search_index);
     }
 
     #[test]
