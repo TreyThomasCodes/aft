@@ -20,10 +20,81 @@ const fn default_inspect_diagnostics_timeout_ms() -> u64 {
 
 use crate::harness::Harness;
 
-/// Runtime configuration for the aft process.
-///
-/// Holds project-scoped settings and tuning knobs. Values are set at startup
-/// and remain immutable for the lifetime of the process.
+/// The durable index families that a standing root may maintain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexKind {
+    Search,
+    Semantic,
+    Callgraph,
+}
+
+impl IndexKind {
+    pub const ALL: [Self; 3] = [Self::Search, Self::Semantic, Self::Callgraph];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Semantic => "semantic",
+            Self::Callgraph => "callgraph",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "search" => Some(Self::Search),
+            "semantic" => Some(Self::Semantic),
+            "callgraph" => Some(Self::Callgraph),
+            _ => None,
+        }
+    }
+}
+
+/// One user-configured root whose literal path spelling is its durable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexRootConfig {
+    /// The unmodified Unicode spelling supplied in `index.roots[].path`.
+    pub path: String,
+    /// Normalized selected index families, in fixed [`IndexKind::ALL`] order.
+    pub indexes: Vec<IndexKind>,
+}
+
+/// User-tier standing-index configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    pub roots: Vec<IndexRootConfig>,
+}
+
+/// Expand the supported `~` forms before validating that a configured root is
+/// absolute. The literal string is retained separately for durable identity.
+pub fn expand_index_root_path(
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let expanded = if path == "~" {
+        home.ok_or_else(|| {
+            "index.roots path uses ~ but no home directory is available".to_string()
+        })?
+        .to_path_buf()
+    } else if let Some(remainder) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        home.ok_or_else(|| {
+            "index.roots path uses ~ but no home directory is available".to_string()
+        })?
+        .join(remainder)
+    } else {
+        PathBuf::from(path)
+    };
+
+    if !expanded.is_absolute() {
+        return Err(format!(
+            "index.roots path must be absolute after ~ expansion: {path:?}"
+        ));
+    }
+    Ok(expanded)
+}
+
+/// Semantic backend selected by the currently resolved runtime configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticBackend {
@@ -147,11 +218,9 @@ impl Default for BackupConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GhShimConfig {
-    /// When false, the `gh` routing shim short-circuits to byte-transparent
-    /// passthrough (R1) before any daemon/catalog probing, so a disabled shim
-    /// performs zero subc traffic. Default true. This is an operator hard-off
-    /// for fleet rollout safety; it adds no capability beyond today's
-    /// structural rungs.
+    /// When false, the `gh` routing shim passes bytes through before any
+    /// daemon or catalog probe, so a disabled shim produces no subc traffic.
+    /// Default true. This is an operator hard-off for fleet rollout safety.
     pub enabled: bool,
 }
 
@@ -221,7 +290,7 @@ pub struct Config {
     pub formatter_timeout_secs: u32,
     /// Seconds before killing a type-checker subprocess (default: 30).
     pub type_checker_timeout_secs: u32,
-    /// Whether to auto-format files after edits (default: true).
+    /// Whether to auto-format files after edits (default: false).
     pub format_on_edit: bool,
     /// Whether the hashline edit/read surface is enabled for eligible sessions.
     /// Resolved from the public `edit_mode` enum in aft.jsonc.
@@ -240,6 +309,8 @@ pub struct Config {
     pub restrict_to_project_root: bool,
     /// Enable the trigram search index (default: false).
     pub search_index: bool,
+    /// User-tier standing roots. Empty by default, so normal session indexing is unchanged.
+    pub index: IndexConfig,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
     /// Whether the plugin registered the `aft_search` tool for this surface
@@ -295,8 +366,8 @@ pub struct Config {
     pub diagnostics_on_edit: bool,
     /// Extra directories to search when resolving LSP binaries.
     /// The plugin populates these from its own auto-install cache (e.g.
-    /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so a binary AFT
-    /// installed itself is discoverable without needing it on PATH.
+    /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so an LSP binary
+    /// installed by AFT is discoverable without needing it on PATH.
     /// Resolution order: `<project_root>/node_modules/.bin/<bin>` →
     /// `lsp_paths_extra/<bin>` (in order) → PATH via `which`. Python-family
     /// servers additionally probe the selected workspace's `.venv`/`venv` first.
@@ -352,6 +423,7 @@ impl Default for Config {
             // The plugin opts into root restriction explicitly when desired.
             restrict_to_project_root: false,
             search_index: false,
+            index: IndexConfig::default(),
             semantic_search: false,
             aft_search_registered: false,
             callgraph_store: true,
@@ -389,4 +461,20 @@ impl Default for Config {
 
 fn default_foreground_wait_window_ms() -> u64 {
     15_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_root_path_expands_tilde_before_absolute_validation() {
+        let home = std::env::temp_dir().join("aft-home");
+        assert_eq!(
+            expand_index_root_path("~/workspace", Some(&home)).unwrap(),
+            home.join("workspace")
+        );
+        assert!(expand_index_root_path("relative/root", Some(&home)).is_err());
+        assert!(expand_index_root_path("~", None).is_err());
+    }
 }

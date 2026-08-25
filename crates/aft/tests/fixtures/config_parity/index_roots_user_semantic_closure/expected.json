@@ -1,0 +1,17 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "index": {
+    "roots": [
+      {
+        "indexes": [
+          "search",
+          "semantic"
+        ],
+        "path": "~/.aft-standing-root"
+      }
+    ]
+  },
+  "restrict_to_project_root": false
+}

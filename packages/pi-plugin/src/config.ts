@@ -1,4 +1,6 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   type ConfigTier,
@@ -42,7 +44,7 @@ export type Checker =
   | "staticcheck"
   | "none";
 
-/** How configure-time missing-tool warnings are delivered (OpenCode plugin). */
+/** How configure-time missing-tool warnings are delivered by the Pi plugin. */
 export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
 
 export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
@@ -74,6 +76,15 @@ export interface GhShimConfig {
    * project config cannot disable the shim for the user's host.
    */
   enabled?: boolean;
+}
+
+export interface IndexRootConfig {
+  path: string;
+  indexes: Array<"search" | "semantic" | "callgraph">;
+}
+
+export interface IndexConfig {
+  roots?: IndexRootConfig[];
 }
 
 export interface SemanticConfig {
@@ -175,18 +186,7 @@ export interface ConfigureExperimentalOverrides {
 
 export type ToolSurface = "minimal" | "recommended" | "all";
 
-/**
- * Graduated `bash` config. Replaces `experimental.bash.*` in v0.27.2.
- *
- * Mirrors the OpenCode plugin's `AftConfig.bash` shape exactly so projects
- * using both harnesses get identical resolution semantics. See
- * `resolveBashConfig` below for precedence rules.
- *
- * Three shapes:
- *   - `bash: true`     → all sub-features on
- *   - `bash: false`    → hoist disabled entirely; Pi's native bash stays
- *   - `bash: { ... }`  → partial override; missing sub-keys default to true
- */
+/** Sandbox settings for first-party Pi processes. */
 export interface SandboxConfig {
   /** Enable native containment for first-party bash and PTY processes. Default: false. */
   enabled?: boolean;
@@ -196,6 +196,10 @@ export interface SandboxConfig {
   read_deny?: string[];
 }
 
+/**
+ * Graduated `bash` config. It accepts `true`, `false`, or an object whose
+ * omitted fields use the normal bash defaults during resolution.
+ */
 export interface BashConfig {
   rewrite?: boolean;
   compress?: boolean;
@@ -234,6 +238,8 @@ export interface AftConfig {
   disabled_tools?: string[];
   restrict_to_project_root?: boolean;
   search_index?: boolean;
+  /** User-tier standing roots; project config cannot configure this machine state. */
+  index?: IndexConfig;
   semantic_search?: boolean;
   callgraph_store?: boolean;
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
@@ -422,6 +428,40 @@ const CheckerEnum = z.enum([
 ]);
 
 const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
+const IndexKindSchema = z.enum(["search", "semantic", "callgraph"]);
+
+function isSupportedAbsoluteIndexPath(path: string): boolean {
+  if (path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
+    return isAbsolute(homedir());
+  }
+  return isAbsolute(path);
+}
+
+const IndexRootSchema = z
+  .object({
+    path: z.string().refine(isSupportedAbsoluteIndexPath, {
+      message: "index.roots path must be absolute after ~ expansion",
+    }),
+    indexes: z.array(IndexKindSchema).min(1, "index.roots indexes must be non-empty"),
+  })
+  .superRefine(({ indexes }, context) => {
+    if (new Set(indexes).size !== indexes.length) {
+      context.addIssue({
+        code: "custom",
+        message: "index.roots indexes must not contain duplicates",
+      });
+    }
+  })
+  .transform(({ path, indexes }) => ({
+    path,
+    indexes: (["search", "semantic", "callgraph"] as const).filter(
+      (kind) => indexes.includes(kind) || (kind === "search" && indexes.includes("semantic")),
+    ),
+  }));
+
+const IndexConfigSchema = z.object({
+  roots: z.array(IndexRootSchema).optional(),
+});
 
 const SemanticConfigSchema = z.object({
   backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
@@ -625,6 +665,7 @@ export const AftConfigSchema = z.preprocess(
       disabled_tools: z.array(z.string()).optional(),
       restrict_to_project_root: z.boolean().optional(),
       search_index: z.boolean().optional(),
+      index: IndexConfigSchema.optional(),
       semantic_search: z.boolean().optional(),
       callgraph_store: z.boolean().optional(),
       callgraph_chunk_size: z.number().optional(),
@@ -733,6 +774,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   overrides.restrict_to_project_root = config.restrict_to_project_root ?? false;
 
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
+  if (config.index !== undefined) overrides.index = config.index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
   if (config.callgraph_chunk_size !== undefined)
@@ -1158,11 +1200,7 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   return Object.fromEntries(Object.entries(lsp).filter(([, v]) => v !== undefined)) as LspConfig;
 }
 
-/**
- * Deep-merge top-level `bash` config across user + project. Mirrors the
- * OpenCode plugin so a project can override one sub-feature without nuking
- * the user's other sub-features. Handles boolean and object shapes.
- */
+/** Merge ordinary worktree options from user and project tiers. */
 function mergeWorktreeConfig(
   baseWorktree: AftConfig["worktree"],
   overrideWorktree: AftConfig["worktree"],
@@ -1225,6 +1263,7 @@ function mergeSandboxConfig(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+/** Merge top-level `bash` config, expanding booleans before per-field merge. */
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
@@ -1320,6 +1359,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "semantic"/"lsp" handled separately — strict field-level merge.
   // "inspect"/"worktree" handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
+  // "index" — USER ONLY (a repository must not mint machine standing roots).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
@@ -1342,6 +1382,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
+  if (override.index?.roots !== undefined) stripped.push("index.roots");
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { parse as parsePath, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   type ConfigTier,
@@ -50,6 +51,40 @@ export const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
 export type ConfigureWarningsDelivery = z.infer<typeof ConfigureWarningsDeliveryEnum>;
 
 const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
+const IndexKindSchema = z.enum(["search", "semantic", "callgraph"]);
+
+function isSupportedAbsoluteIndexPath(path: string): boolean {
+  if (path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
+    return isAbsolute(homedir());
+  }
+  return isAbsolute(path);
+}
+
+const IndexRootSchema = z
+  .object({
+    path: z.string().refine(isSupportedAbsoluteIndexPath, {
+      message: "index.roots path must be absolute after ~ expansion",
+    }),
+    indexes: z.array(IndexKindSchema).min(1, "index.roots indexes must be non-empty"),
+  })
+  .superRefine(({ indexes }, context) => {
+    if (new Set(indexes).size !== indexes.length) {
+      context.addIssue({
+        code: "custom",
+        message: "index.roots indexes must not contain duplicates",
+      });
+    }
+  })
+  .transform(({ path, indexes }) => ({
+    path,
+    indexes: (["search", "semantic", "callgraph"] as const).filter(
+      (kind) => indexes.includes(kind) || (kind === "search" && indexes.includes("semantic")),
+    ),
+  }));
+
+const IndexConfigSchema = z.object({
+  roots: z.array(IndexRootSchema).optional(),
+});
 
 const SemanticConfigSchema = z.object({
   /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
@@ -385,6 +420,8 @@ export const AftConfigSchema = z.preprocess(
       restrict_to_project_root: z.boolean().optional(),
       /** Enable indexed search for grep and glob hoisting. Default: false. */
       search_index: z.boolean().optional(),
+      /** User-tier standing roots. Project config is rejected at the trust boundary. */
+      index: IndexConfigSchema.optional(),
       /** Enable semantic search. Default: false. */
       semantic_search: z.boolean().optional(),
       /** Enable the persisted callgraph store substrate. Default: true. */
@@ -569,6 +606,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
 
   // Indexed search and semantic search — both are per-project opt-ins.
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
+  if (config.index !== undefined) overrides.index = config.index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
   if (config.callgraph_chunk_size !== undefined)
@@ -1265,22 +1303,7 @@ function mergeInspectConfig(
   ) as AftConfig["inspect"];
 }
 
-/**
- * Deep-merge top-level `bash` config across user + project. Mirrors the
- * field-level union used for `experimental.bash` so a project can override
- * one sub-feature (e.g. `bash: { compress: false }`) without nuking the
- * user's other sub-features.
- *
- * Handles every supported shape for both sides:
- *   - boolean (true/false) collapses to the full object form
- *     ({ rewrite: bool, compress: bool, background: bool }) so the merge
- *     can still operate field-by-field
- *   - object form merges field-by-field with override winning per key
- *   - undefined on either side passes the other through unchanged
- *
- * Returns whatever shape best represents the merged state — the resolver
- * (`resolveBashConfig`) handles all three shapes downstream.
- */
+/** Merge sandbox settings while allowing project tiers to add only read denies or enable containment. */
 function mergeSandboxConfig(
   base: AftConfig["sandbox"],
   project: AftConfig["sandbox"],
@@ -1296,6 +1319,10 @@ function mergeSandboxConfig(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+/**
+ * Deep-merge top-level `bash` config across user and project tiers. Boolean
+ * values expand to all feature fields, while object values merge per field.
+ */
 function mergeBashConfig(
   baseBash: AftConfig["bash"],
   overrideBash: AftConfig["bash"],
@@ -1398,6 +1425,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "semantic"/"lsp" handled separately — strict field-level merge.
   // "inspect"/"worktree" handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
+  // "index" — USER ONLY (a repository must not mint machine standing roots).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "storage_dir" — USER ONLY (controls where AFT writes).
@@ -1423,6 +1451,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.auto_update !== undefined) stripped.push("auto_update");
   if (override.bridge !== undefined) stripped.push("bridge");
   if (override.backup !== undefined) stripped.push("backup");
+  if (override.index?.roots !== undefined) stripped.push("index.roots");
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");

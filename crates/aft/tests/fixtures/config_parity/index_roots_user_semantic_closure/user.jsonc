@@ -1,0 +1,12 @@
+{
+  "index": {
+    "roots": [
+      {
+        "path": "~/.aft-standing-root",
+        "indexes": [
+          "semantic"
+        ]
+      }
+    ]
+  }
+}

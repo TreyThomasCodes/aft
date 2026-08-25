@@ -1,0 +1,16 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "index": {
+    "roots": [
+      {
+        "indexes": [
+          "search"
+        ],
+        "path": "~/.aft-user-root"
+      }
+    ]
+  },
+  "restrict_to_project_root": false
+}

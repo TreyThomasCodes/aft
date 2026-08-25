@@ -4242,7 +4242,7 @@ impl std::error::Error for ArtifactCacheKeyProbeError {}
 pub fn artifact_cache_key(project_root: &Path) -> String {
     let key = match repo_root_commit_with_retry(project_root) {
         RootCommitResolution::Commit(root_commit) => artifact_key_from_git_identity(&root_commit),
-        RootCommitResolution::NotARepo => artifact_key_from_path_identity(project_root),
+        RootCommitResolution::NotARepo => artifact_path_identity_key(project_root),
         RootCommitResolution::Failed(detail) => {
             crate::slog_warn!(
                 "artifact cache key: git root-commit probe failed after retries ({}); \
@@ -4250,9 +4250,9 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
                 detail,
                 project_root.display()
             );
-            artifact_key_from_path_identity(project_root)
+            artifact_path_identity_key(project_root)
         }
-        RootCommitResolution::Cancelled => artifact_key_from_path_identity(project_root),
+        RootCommitResolution::Cancelled => artifact_path_identity_key(project_root),
     };
     record_derived_cache_key(project_root, &key);
     key
@@ -4267,7 +4267,7 @@ pub fn artifact_cache_key_with_memo(
     let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
     let git_marker_state = root_git_marker_state(probe_root, git_common_dir);
     if git_marker_state == GitMarkerState::Absent {
-        return Ok(artifact_key_from_path_identity(probe_root));
+        return Ok(artifact_path_identity_key(probe_root));
     }
 
     match repo_root_commit_with_retry(probe_root) {
@@ -4286,7 +4286,7 @@ pub fn artifact_cache_key_with_memo(
             }
             Ok(key)
         }
-        RootCommitResolution::NotARepo => Ok(artifact_key_from_path_identity(probe_root)),
+        RootCommitResolution::NotARepo => Ok(artifact_path_identity_key(probe_root)),
         RootCommitResolution::Failed(detail) => {
             if let Some(entry) = lookup_artifact_cache_key_memo(storage_root, &memo_root_key) {
                 crate::slog_warn!(
@@ -4298,7 +4298,7 @@ pub fn artifact_cache_key_with_memo(
             }
 
             match git_marker_state {
-                GitMarkerState::Absent => Ok(artifact_key_from_path_identity(probe_root)),
+                GitMarkerState::Absent => Ok(artifact_path_identity_key(probe_root)),
                 GitMarkerState::Present => Err(ArtifactCacheKeyProbeError {
                     root: memo_root.to_path_buf(),
                     detail,
@@ -4359,18 +4359,21 @@ pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>)
         .join(project_key)
 }
 
-fn artifact_key_from_git_identity(root_commit: &str) -> String {
+/// Keep Git-top-level artifact derivation shared with standing roots byte-for-byte.
+pub(crate) fn artifact_key_from_git_identity(root_commit: &str) -> String {
     artifact_hash16(root_commit.as_bytes())
 }
 
-fn artifact_key_from_path_identity(project_root: &Path) -> String {
+/// Existing non-Git path-scope artifact derivation, exposed for the standing
+/// identity classifier so it does not mint a parallel path-key family.
+pub(crate) fn artifact_path_identity_key(project_root: &Path) -> String {
     let canonical_root = canonicalize_or_normalize(project_root);
     artifact_hash16(canonical_root.to_string_lossy().as_bytes())
 }
 
 #[cfg(test)]
 pub(crate) fn artifact_path_identity_key_for_test(project_root: &Path) -> String {
-    artifact_key_from_path_identity(project_root)
+    artifact_path_identity_key(project_root)
 }
 
 fn artifact_hash16(bytes: &[u8]) -> String {
@@ -4581,6 +4584,30 @@ pub(crate) fn git_root_probe_confirms_non_repo(project_root: &Path) -> bool {
         repo_root_commit_with_retry(project_root),
         RootCommitResolution::NotARepo
     )
+}
+
+/// Return the canonical root-commit identity used by Git artifact keys.
+///
+/// Scoped roots consume this exact result as an opaque byte sequence; they must
+/// not independently rebuild the sorted, deduplicated root set.
+pub(crate) fn canonical_git_root_commit_identity(
+    project_root: &Path,
+) -> Result<String, ArtifactCacheKeyProbeError> {
+    match repo_root_commit_with_retry(project_root) {
+        RootCommitResolution::Commit(identity) => Ok(identity),
+        RootCommitResolution::NotARepo => Err(ArtifactCacheKeyProbeError {
+            root: project_root.to_path_buf(),
+            detail: "not a git repository".to_string(),
+        }),
+        RootCommitResolution::Failed(detail) => Err(ArtifactCacheKeyProbeError {
+            root: project_root.to_path_buf(),
+            detail,
+        }),
+        RootCommitResolution::Cancelled => Err(ArtifactCacheKeyProbeError {
+            root: project_root.to_path_buf(),
+            detail: "artifact cache key probe cancelled".to_string(),
+        }),
+    }
 }
 
 /// Resolve the repository root commit, retrying transient git failures.
@@ -6886,7 +6913,7 @@ mod tests {
             .expect("memo should rescue transient probe failure");
 
         assert_eq!(rescued, expected_key);
-        assert_ne!(rescued, artifact_key_from_path_identity(&root));
+        assert_ne!(rescued, artifact_path_identity_key(&root));
     }
 
     #[test]
@@ -6922,7 +6949,7 @@ mod tests {
         let key = artifact_cache_key_with_memo(&root, &root, &storage, None)
             .expect("non-git root keeps legacy path identity fallback");
 
-        assert_eq!(key, artifact_key_from_path_identity(&root));
+        assert_eq!(key, artifact_path_identity_key(&root));
     }
 
     #[test]

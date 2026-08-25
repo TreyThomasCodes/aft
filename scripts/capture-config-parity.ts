@@ -132,6 +132,15 @@ const CASES: ParityCase[] = [
     project: { search_index: true, format_on_edit: false },
   },
   {
+    name: "index_roots_user_semantic_closure",
+    user: { index: { roots: [{ path: "~/.aft-standing-root", indexes: ["semantic"] }] } },
+  },
+  {
+    name: "index_roots_project_stripped",
+    user: { index: { roots: [{ path: "~/.aft-user-root", indexes: ["search"] }] } },
+    project: { index: { roots: [{ path: "~/.aft-project-root", indexes: ["callgraph"] }] } },
+  },
+  {
     name: "enabled_plugin_init_only",
     user: { enabled: false },
     project: { enabled: true },

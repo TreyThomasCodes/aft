@@ -9,9 +9,10 @@ pub mod bash_tasks;
 pub mod bash_watches;
 pub mod compression_events;
 pub mod removal;
+pub mod standing_roots;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -173,6 +174,28 @@ CREATE INDEX IF NOT EXISTS idx_backups_created_activity
   ON backups (created_at, project_key, harness, session_id);
 "#;
 
+// Standing roots are deliberately machine-scoped. Do not add harness, session,
+// or daemon columns: daemon and daemonless CLI share one durable path pin.
+const MIGRATION_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS standing_roots (
+  literal_path           TEXT NOT NULL PRIMARY KEY,
+  resolved_target        TEXT NOT NULL,
+  resolved_git_toplevel  TEXT,
+  scoped_relative_path   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS standing_root_freshness (
+  literal_path          TEXT NOT NULL,
+  index_kind            TEXT NOT NULL CHECK (index_kind IN ('search', 'semantic', 'callgraph')),
+  needs_strict_verify   INTEGER NOT NULL CHECK (needs_strict_verify IN (0, 1)),
+  strict_verified_at    INTEGER,
+  PRIMARY KEY (literal_path, index_kind),
+  FOREIGN KEY (literal_path) REFERENCES standing_roots(literal_path) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_standing_root_freshness_needs_verify
+  ON standing_root_freshness (needs_strict_verify, literal_path);
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(std::io::Error),
@@ -252,8 +275,10 @@ pub fn open_readonly(path: &Path) -> Result<Connection, OpenError> {
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
 pub fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // Set the wait policy before WAL can acquire its journal lock. Otherwise a
+    // concurrently opening daemon may fail immediately instead of honoring it.
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
 }
@@ -307,6 +332,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         4 => apply_migration_v4(&tx),
         5 => tx.execute_batch(MIGRATION_V5),
         6 => tx.execute_batch(MIGRATION_V6),
+        7 => tx.execute_batch(MIGRATION_V7),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -352,6 +378,8 @@ mod tests {
         "backups",
         "harness_state",
         "host_state",
+        "standing_roots",
+        "standing_root_freshness",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[
@@ -372,6 +400,7 @@ mod tests {
         "idx_backups_session_op",
         "idx_backups_session_order",
         "idx_backups_session_path_order",
+        "idx_standing_root_freshness_needs_verify",
     ];
 
     #[test]
@@ -651,6 +680,30 @@ mod tests {
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert!(sqlite_names(&conn, "table").contains(&"bash_pattern_watches".to_string()));
         assert!(sqlite_names(&conn, "index").contains(&"idx_bash_pattern_watches_task".to_string()));
+    }
+
+    #[test]
+    fn migration_v7_adds_machine_scoped_standing_root_tables() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATION_V1).unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V3).unwrap();
+        conn.execute_batch(MIGRATION_V4).unwrap();
+        conn.execute_batch(MIGRATION_V5).unwrap();
+        conn.execute_batch(MIGRATION_V6).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (6)", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert!(sqlite_names(&conn, "table").contains(&"standing_roots".to_string()));
+        assert!(sqlite_names(&conn, "table").contains(&"standing_root_freshness".to_string()));
+        assert!(sqlite_names(&conn, "index")
+            .contains(&"idx_standing_root_freshness_needs_verify".to_string()));
     }
 
     #[test]

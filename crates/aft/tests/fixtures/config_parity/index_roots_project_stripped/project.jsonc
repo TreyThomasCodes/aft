@@ -1,0 +1,12 @@
+{
+  "index": {
+    "roots": [
+      {
+        "path": "~/.aft-project-root",
+        "indexes": [
+          "callgraph"
+        ]
+      }
+    ]
+  }
+}

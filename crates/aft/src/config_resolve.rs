@@ -13,8 +13,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    BackupConfig, Config, GhShimConfig, InspectConfig, SandboxConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    expand_index_root_path, BackupConfig, Config, GhShimConfig, IndexConfig, IndexKind,
+    IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig,
+    UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
@@ -108,6 +109,7 @@ pub struct RawAftConfig {
     pub disabled_tools: Option<Vec<String>>,
     pub restrict_to_project_root: Option<bool>,
     pub search_index: Option<bool>,
+    pub index: Option<RawIndex>,
     pub semantic_search: Option<bool>,
     pub callgraph_store: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
@@ -479,6 +481,24 @@ pub struct RawSandbox {
     pub read_deny: Option<Vec<PathBuf>>,
 }
 
+/// Raw user-tier standing index configuration. Unlike normally stripped nested
+/// fields, unknown entry fields are retained only long enough to emit an
+/// explicit warn-and-ignore notice.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawIndex {
+    pub roots: Option<Vec<RawIndexRoot>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawIndexRoot {
+    pub path: Option<String>,
+    pub indexes: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, Value>,
+}
+
 /// Resolve raw user/project config tiers into the flat core [`Config`].
 ///
 /// Empty input is NOT special-cased: no config file is equivalent to an empty
@@ -514,6 +534,7 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
 
     let mut config = Config::default();
     apply_resolved_config(&merged, &mut config);
+    config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
     ResolveResult {
         config,
         dropped,
@@ -663,6 +684,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.search_index.is_some() {
         base.search_index = override_config.search_index;
+    }
+    if override_config.index.is_some() {
+        base.index = override_config.index;
     }
     if override_config.semantic_search.is_some() {
         base.semantic_search = override_config.semantic_search;
@@ -1065,6 +1089,14 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
     }
+    if raw
+        .index
+        .as_ref()
+        .and_then(|index| index.roots.as_ref())
+        .is_some()
+    {
+        push_drop(dropped, "index.roots", tier, USER_ONLY_REASON);
+    }
     if let Some(sandbox) = &raw.sandbox {
         // enabled:true is an accepted project-tier hardening opt-in (merged by
         // merge_project_sandbox); only the weakening direction is dropped.
@@ -1130,11 +1162,10 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
     });
 }
 
-/// Overlay the resolved core-domain fields from `raw` onto `config`. Scalar
-/// fields are only written when present in the merged tiers (preserving the
-/// caller's base for absent keys); semantic/inspect/lsp are core-domain and are
-/// fully resolved from the tiers. Process-state fields on `config` are never
-/// touched (they are not part of `RawAftConfig`).
+/// Apply merged core-domain fields onto a freshly defaulted `Config`. Absent
+/// scalar fields therefore retain defaults, while semantic, inspect, and LSP
+/// fields are fully resolved from the tiers. Process-state fields are not part
+/// of `RawAftConfig` and are preserved separately by `resolve_config_onto`.
 fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     if let Some(value) = raw.format_on_edit {
@@ -1187,6 +1218,99 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
+}
+
+fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning>) -> IndexConfig {
+    let Some(raw) = raw else {
+        return IndexConfig::default();
+    };
+    let Some(roots) = raw.roots.as_ref() else {
+        return IndexConfig::default();
+    };
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let mut normalized_roots = Vec::with_capacity(roots.len());
+
+    for (position, root) in roots.iter().enumerate() {
+        for field in root.unknown.keys() {
+            warnings.push(ConfigWarning {
+                code: "unknown_index_root_field",
+                key: "index.roots",
+                tier: "user".to_string(),
+                value: field.clone(),
+                message: format!(
+                    "Ignoring unknown field index.roots[{position}].{field}; only path and indexes are defined"
+                ),
+            });
+        }
+
+        let result = (|| -> Result<IndexRootConfig, String> {
+            let path = root.path.as_deref().ok_or_else(|| {
+                "index.roots entry is missing required string field path".to_string()
+            })?;
+            expand_index_root_path(path, home.as_deref())?;
+
+            let indexes = root.indexes.as_ref().ok_or_else(|| {
+                "index.roots entry is missing required non-empty indexes array".to_string()
+            })?;
+            if indexes.is_empty() {
+                return Err("index.roots indexes must be a non-empty array".to_string());
+            }
+
+            let mut normalized = Vec::with_capacity(indexes.len() + 1);
+            for name in indexes {
+                let kind = IndexKind::from_name(name).ok_or_else(|| {
+                    format!(
+                        "index.roots indexes contains unknown name {name:?}; valid names: search, semantic, callgraph"
+                    )
+                })?;
+                if normalized.contains(&kind) {
+                    return Err(format!(
+                        "index.roots indexes contains duplicate name {name:?}"
+                    ));
+                }
+                normalized.push(kind);
+            }
+            if normalized.contains(&IndexKind::Semantic) && !normalized.contains(&IndexKind::Search)
+            {
+                normalized.push(IndexKind::Search);
+                warnings.push(ConfigWarning {
+                    code: "index_dependency_closure",
+                    key: "index.roots",
+                    tier: "user".to_string(),
+                    value: path.to_string(),
+                    message: format!(
+                        "Added search to index.roots[{position}].indexes because semantic depends on search"
+                    ),
+                });
+            }
+            normalized.sort_unstable();
+            Ok(IndexRootConfig {
+                path: path.to_string(),
+                indexes: normalized,
+            })
+        })();
+
+        match result {
+            Ok(root) => normalized_roots.push(root),
+            Err(message) => {
+                warnings.push(ConfigWarning {
+                    code: "invalid_index_roots",
+                    key: "index.roots",
+                    tier: "user".to_string(),
+                    value: position.to_string(),
+                    message,
+                });
+                return IndexConfig::default();
+            }
+        }
+    }
+
+    IndexConfig {
+        roots: normalized_roots,
+    }
 }
 
 fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {
@@ -2402,6 +2526,80 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/proj"))
         );
         assert!(config.search_index);
+    }
+
+    #[test]
+    fn index_roots_are_user_only_normalized_and_validate_before_resolution() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{
+              "index": {
+                "roots": [{
+                  "path": "~/.aft-standing-root",
+                  "indexes": ["semantic", "callgraph"],
+                  "future_field": true
+                }]
+              }
+            }"#,
+        )]);
+        assert_eq!(result.config.index.roots.len(), 1);
+        assert_eq!(result.config.index.roots[0].path, "~/.aft-standing-root");
+        assert_eq!(
+            result.config.index.roots[0].indexes,
+            vec![IndexKind::Search, IndexKind::Semantic, IndexKind::Callgraph]
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "index_dependency_closure"));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "unknown_index_root_field"));
+
+        for invalid in [
+            r#"{ "index": { "roots": [{ "path": "relative", "indexes": ["search"] }] } }"#,
+            r#"{ "index": { "roots": [{ "path": "~/a", "indexes": [] }] } }"#,
+            r#"{ "index": { "roots": [{ "path": "~/a", "indexes": ["search", "search"] }] } }"#,
+            r#"{ "index": { "roots": [{ "path": "~/a", "indexes": ["unknown"] }] } }"#,
+        ] {
+            let invalid = resolve_config(&[tier("user", invalid)]);
+            assert!(invalid.config.index.roots.is_empty());
+            let warning = invalid
+                .warnings
+                .iter()
+                .find(|warning| warning.code == "invalid_index_roots")
+                .expect("invalid standing roots must be named");
+            assert!(warning.message.contains("index.roots"));
+        }
+    }
+
+    #[test]
+    fn index_roots_project_and_mcp_tiers_are_rejected_at_the_trust_boundary() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{ "index": { "roots": [{ "path": "~/user", "indexes": ["search"] }] } }"#,
+            ),
+            tier(
+                "project",
+                r#"{ "index": { "roots": [{ "path": "~/project", "indexes": ["semantic"] }] } }"#,
+            ),
+            tier(
+                "mcp:untrusted",
+                r#"{ "index": { "roots": [{ "path": "~/mcp", "indexes": ["callgraph"] }] } }"#,
+            ),
+        ]);
+        assert_eq!(result.config.index.roots[0].path, "~/user");
+        assert_eq!(
+            result
+                .dropped
+                .iter()
+                .filter(|dropped| dropped.key == "index.roots")
+                .map(|dropped| dropped.tier.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project", "mcp:untrusted"]
+        );
     }
 
     #[test]
