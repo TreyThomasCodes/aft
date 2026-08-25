@@ -42,6 +42,7 @@ import {
   resolveSessionId,
   textResult,
 } from "./_shared.js";
+import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
@@ -637,8 +638,8 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
     renderCall(args, theme, context) {
       return renderBashCall(args?.command, args?.description, theme, context);
     },
-    renderResult(result, _options, theme, context) {
-      return renderBashResult(result, theme, context);
+    renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+      return renderBashResult(result, theme, context, options);
     },
   });
 
@@ -1374,6 +1375,7 @@ function renderBashResult(
   result: AgentToolResult<BashDetails>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ): import("@earendil-works/pi-tui").Component {
   // Errors: red text with error details
   if (context.isError) {
@@ -1444,7 +1446,14 @@ function renderBashResult(
     container.addChild(new Text(truncText, 1, 0));
   }
 
-  return container;
+  const firstOutputLine = rawOutput.split(/\r?\n/, 1)[0] || "(no output)";
+  const exitSummary = exitCode === undefined ? "completed" : `exit ${exitCode}`;
+  return collapsibleResult({
+    summary: `${exitSummary}: ${firstOutputLine}`,
+    full: container,
+    expanded: options.expanded,
+    context,
+  });
 }
 
 function shortenCommand(command: string): string {

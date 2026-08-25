@@ -11,7 +11,9 @@ import { bridgeFor, callToolCall, textResult, withPathAliasPreparation } from ".
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
+  collapsibleResult,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -86,6 +88,7 @@ export function renderFsResult(
   result: AgentToolResult<unknown>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) {
     return renderErrorResult(result, `${toolName} failed`, theme, context);
@@ -114,17 +117,25 @@ export function renderFsResult(
     if (lines.length === 0) {
       lines.push(theme.fg("muted", "(no files deleted)"));
     }
-    return renderSections([lines.join("\n")], context);
+    return collapsibleResult({
+      summary: `${deletedPaths.length} deleted, ${skipped.length} skipped`,
+      full: renderSections([lines.join("\n")], context),
+      expanded: options.expanded,
+      context,
+    });
   }
 
   const moveArgs = args as Static<typeof MoveParams>;
-  return renderSections(
-    [
-      `${theme.fg("success", "✓ moved")} ${theme.fg("accent", shortenPath(moveArgs.path ?? ""))}`,
-      `${theme.fg("muted", "to")} ${theme.fg("accent", shortenPath(moveArgs.destination))}`,
-    ],
+  const sections = [
+    `${theme.fg("success", "✓ moved")} ${theme.fg("accent", shortenPath(moveArgs.path ?? ""))}`,
+    `${theme.fg("muted", "to")} ${theme.fg("accent", shortenPath(moveArgs.destination))}`,
+  ];
+  return collapsibleResult({
+    summary: `moved ${shortenPath(moveArgs.path ?? "")} to ${shortenPath(moveArgs.destination)}`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
     context,
-  );
+  });
 }
 
 export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: FsSurface): void {
@@ -200,8 +211,8 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         renderCall(args, theme, context) {
           return renderFsCall("aft_delete", args, theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderFsResult("aft_delete", context.args, result, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderFsResult("aft_delete", context.args, result, theme, context, options);
         },
       }),
     );
@@ -253,8 +264,8 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         renderCall(args, theme, context) {
           return renderFsCall("aft_move", args, theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderFsResult("aft_move", context.args, result, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderFsResult("aft_move", context.args, result, theme, context, options);
         },
       }),
     );

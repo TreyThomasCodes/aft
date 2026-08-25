@@ -27,9 +27,11 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   collectTextContent,
   extractStructuredPayload,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -278,9 +280,16 @@ export function renderOutlineResult(
   result: AgentToolResult<unknown>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "outline failed", theme, context);
-  return renderSections(buildOutlineSections(collectTextContent(result), theme), context);
+  const sections = buildOutlineSections(collectTextContent(result), theme);
+  return collapsibleResult({
+    summary: sections[0] ?? "outline completed",
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 /** Exported for renderer unit tests. */
@@ -318,9 +327,16 @@ export function renderZoomResult(
   args: Static<typeof ZoomParams>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "zoom failed", theme, context);
-  return renderSections(buildZoomSections(args, extractStructuredPayload(result), theme), context);
+  const sections = buildZoomSections(args, extractStructuredPayload(result), theme);
+  return collapsibleResult({
+    summary: sections[0] ?? "zoom completed",
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 export function registerReadingTools(
@@ -397,8 +413,8 @@ export function registerReadingTools(
         renderCall(args, theme, context) {
           return renderOutlineCall(args, theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderOutlineResult(result, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderOutlineResult(result, theme, context, options);
         },
       }),
     );
@@ -528,8 +544,8 @@ export function registerReadingTools(
         renderCall(args, theme, context) {
           return renderZoomCall(args, theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderZoomResult(result, context.args, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderZoomResult(result, context.args, theme, context, options);
         },
       }),
     );

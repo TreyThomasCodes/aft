@@ -25,8 +25,10 @@ import {
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
+  collapsibleResult,
   extractStructuredPayload,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -115,12 +117,16 @@ export function renderNavigateResult(
   args: NavigateArgs,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "navigate failed", theme, context);
-  return renderSections(
-    buildNavigateSections(args, extractStructuredPayload(result), theme),
+  const sections = buildNavigateSections(args, extractStructuredPayload(result), theme);
+  return collapsibleResult({
+    summary: sections[0] ?? `${args.op} completed`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
     context,
-  );
+  });
 }
 
 export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -192,8 +198,8 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       renderCall(args, theme, context) {
         return renderNavigateCall(args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderNavigateResult(result, context.args, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderNavigateResult(result, context.args, theme, context, options);
       },
     }),
   );

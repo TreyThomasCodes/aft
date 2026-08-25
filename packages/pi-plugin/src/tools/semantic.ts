@@ -19,9 +19,11 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   extractStructuredPayload,
   groupByFile,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -180,12 +182,16 @@ export function renderSemanticResult(
   args: Static<typeof SearchParams>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "search failed", theme, context);
-  return renderSections(
-    buildSemanticSections(args, extractStructuredPayload(result), theme),
+  const sections = buildSemanticSections(args, extractStructuredPayload(result), theme);
+  return collapsibleResult({
+    summary: sections[0] ?? "search completed",
+    full: renderSections(sections, context),
+    expanded: options.expanded,
     context,
-  );
+  });
 }
 
 export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -230,8 +236,8 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       renderCall(args, theme, context) {
         return renderSemanticCall(args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderSemanticResult(result, context.args, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderSemanticResult(result, context.args, theme, context, options);
       },
     }),
   );

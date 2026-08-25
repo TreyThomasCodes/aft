@@ -40,4 +40,50 @@ describe("hoisted renderers", () => {
     expect(out).toContain("+4/-4, 2 edits");
     expect(out).toContain("diff truncated");
   });
+
+  test("renderMutationResult collapses large diffs and preserves tiny diffs", () => {
+    const diff = [
+      "@@ -1,8 +1,8 @@",
+      "-old line 1",
+      "+new line 1",
+      " context 1",
+      "-old line 2",
+      "+new line 2",
+      " context 2",
+      " context 3",
+      " context 4",
+    ].join("\n");
+    const result = makeResult("Edited", { diff, additions: 1, deletions: 1 });
+
+    const collapsed = renderToString(
+      renderMutationResult(result, mockTheme, makeContext({ path: "src/batch.ts" }), {
+        expanded: false,
+      }),
+    );
+    expect(collapsed).toContain("edited src/batch.ts (+1/-1)");
+    expect(collapsed).not.toContain("old line");
+
+    const expanded = renderToString(
+      renderMutationResult(result, mockTheme, makeContext({ path: "src/batch.ts" }), {
+        expanded: true,
+      }),
+    );
+    expect(expanded).toContain("old line");
+    expect(expanded).toContain("new line");
+
+    const tiny = renderToString(
+      renderMutationResult(
+        makeResult("Edited", {
+          diff: "@@ -1 +1 @@\n-old\n+new",
+          additions: 1,
+          deletions: 1,
+        }),
+        mockTheme,
+        makeContext({ path: "src/tiny.ts" }),
+        { expanded: false },
+      ),
+    );
+    expect(tiny).toContain("old");
+    expect(tiny).toContain("new");
+  });
 });

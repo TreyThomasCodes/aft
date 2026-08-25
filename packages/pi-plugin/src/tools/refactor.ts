@@ -23,8 +23,10 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   extractStructuredPayload,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -107,12 +109,16 @@ export function renderRefactorResult(
   args: Static<typeof RefactorParams>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "refactor failed", theme, context);
-  return renderSections(
-    buildRefactorSections(args, extractStructuredPayload(result), theme),
+  const sections = buildRefactorSections(args, extractStructuredPayload(result), theme);
+  return collapsibleResult({
+    summary: sections[0] ?? `${args.op} completed`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
     context,
-  );
+  });
 }
 
 export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -198,8 +204,8 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
       renderCall(args, theme, context) {
         return renderRefactorCall(args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderRefactorResult(result, context.args, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderRefactorResult(result, context.args, theme, context, options);
       },
     }),
   );

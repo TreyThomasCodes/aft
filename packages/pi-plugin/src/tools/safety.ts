@@ -21,9 +21,11 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   extractStructuredPayload,
   formatTimestamp,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -158,12 +160,16 @@ export function renderSafetyResult(
   args: Static<typeof SafetyParams>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "safety failed", theme, context);
-  return renderSections(
-    buildSafetySections(args, extractStructuredPayload(result), theme),
+  const sections = buildSafetySections(args, extractStructuredPayload(result), theme);
+  return collapsibleResult({
+    summary: `${args.op}: ${sections[0] ?? "completed"}`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
     context,
-  );
+  });
 }
 
 export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -249,8 +255,8 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       renderCall(args, theme, context) {
         return renderSafetyCall(args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderSafetyResult(result, context.args, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderSafetyResult(result, context.args, theme, context, options);
       },
     }),
   );

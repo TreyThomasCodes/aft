@@ -18,8 +18,10 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   extractStructuredPayload,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -412,16 +414,20 @@ export function renderInspectResult(
   result: AgentToolResult<unknown>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   const payload = extractStructuredPayload(result);
   const terminal = parseInspectTerminal(payload);
-  if (terminal)
-    return renderSections(
-      [renderInspectTerminal(terminal, asString(asRecord(payload)?.text))],
-      context,
-    );
   if (context.isError) return renderErrorResult(result, "inspect failed", theme, context);
-  return renderSections(buildInspectSections(payload, theme), context);
+  const sections = terminal
+    ? [renderInspectTerminal(terminal, asString(asRecord(payload)?.text))]
+    : buildInspectSections(payload, theme);
+  return collapsibleResult({
+    summary: sections[0] ?? "inspect completed",
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -456,8 +462,8 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     renderCall(args, theme, context) {
       return renderInspectCall(args, theme, context);
     },
-    renderResult(result, _options, theme, context) {
-      return renderInspectResult(result, theme, context);
+    renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+      return renderInspectResult(result, theme, context, options);
     },
   });
 }

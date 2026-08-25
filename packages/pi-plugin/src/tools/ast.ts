@@ -20,11 +20,13 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   collectTextContent,
   extractStructuredPayload,
   formatValue,
   groupByFile,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -265,6 +267,7 @@ export function renderAstResult(
   result: AgentToolResult<unknown>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) {
     return renderErrorResult(result, `${toolName} failed`, theme, context);
@@ -272,15 +275,25 @@ export function renderAstResult(
 
   const payload = extractStructuredPayload(result);
   if (!payload) {
-    const text = collectTextContent(result);
-    return renderSections([text || theme.fg("muted", "No result.")], context);
+    const text = collectTextContent(result) || theme.fg("muted", "No result.");
+    return collapsibleResult({
+      summary: text,
+      full: renderSections([text], context),
+      expanded: options.expanded,
+      context,
+    });
   }
 
   const sections =
     toolName === "ast_grep_replace"
       ? buildAstReplaceSections(payload, theme)
       : buildAstSearchSections(payload, theme);
-  return renderSections(sections, context);
+  return collapsibleResult({
+    summary: sections[0] ?? `${toolName} completed`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: AstSurface): void {
@@ -321,8 +334,8 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
       renderCall(args, theme, context) {
         return renderAstCall("ast_grep_search", args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderAstResult("ast_grep_search", result, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderAstResult("ast_grep_search", result, theme, context, options);
       },
     });
   }
@@ -364,8 +377,8 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
       renderCall(args, theme, context) {
         return renderAstCall("ast_grep_replace", args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderAstResult("ast_grep_replace", result, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderAstResult("ast_grep_replace", result, theme, context, options);
       },
     });
   }

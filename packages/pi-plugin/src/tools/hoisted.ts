@@ -45,6 +45,7 @@ import {
   withPathAliasPreparation,
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
+import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
 type ReadAttachment = {
   kind?: unknown;
@@ -94,9 +95,10 @@ const NON_VISION_IMAGE_NOTE =
 /**
  * Local shape for Pi's render context — the real type is exposed by
  * `@earendil-works/pi-coding-agent`'s internals but not publicly exported.
- * We only read `lastComponent` and `isError` here; everything else is ignored.
+ * We only read `args`, `lastComponent`, and `isError` here; everything else is ignored.
  */
 interface RenderContextLike {
+  args: unknown;
   lastComponent: Component | undefined;
   isError: boolean;
 }
@@ -623,8 +625,8 @@ export function registerHoistedTools(
         renderCall(args, theme, context) {
           return renderMutationCall("write", mutationFilePathArg(args ?? {}), theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderMutationResult(result, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderMutationResult(result, theme, context, options);
         },
       }),
     );
@@ -733,8 +735,8 @@ export function registerHoistedTools(
         renderCall(args, theme, context) {
           return renderMutationCall("edit", mutationFilePathArg(args ?? {}), theme, context);
         },
-        renderResult(result, _options, theme, context) {
-          return renderMutationResult(result, theme, context);
+        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+          return renderMutationResult(result, theme, context, options);
         },
       }),
     );
@@ -976,7 +978,8 @@ export function renderMutationResult(
   result: AgentToolResult<FileMutationDetails>,
   theme: Theme,
   context: RenderContextLike,
-): Container | Text {
+  options: RenderResultOptionsLike = { expanded: true },
+): Component {
   // Errors: red text.
   if (context.isError) {
     const errorText = result.content
@@ -1002,7 +1005,6 @@ export function renderMutationResult(
   if (!diff) {
     const additions = details?.additions ?? 0;
     const deletions = details?.deletions ?? 0;
-    const text = reuseText(context.lastComponent);
     const countDetail =
       typeof details?.editsApplied === "number" && details.editsApplied > 1
         ? `, ${details.editsApplied} edits`
@@ -1016,8 +1018,14 @@ export function renderMutationResult(
     } else if (details?.noOp) {
       suffix = ` ${theme.fg("muted", "(no net change)")}`;
     }
-    text.setText(`\n${summary}${suffix}`);
-    return text;
+    const full = reuseText(context.lastComponent);
+    full.setText(`\n${summary}${suffix}`);
+    return collapsibleResult({
+      summary: `${summary}${suffix}`,
+      full,
+      expanded: options.expanded,
+      context,
+    });
   }
 
   // Diff: render using Pi's built-in renderer for colored lines + intra-line
@@ -1025,8 +1033,28 @@ export function renderMutationResult(
   const container = reuseContainer(context.lastComponent);
   container.clear();
   container.addChild(new Spacer(1));
-  container.addChild(new Text(renderDiff(diff), 1, 0));
-  return container;
+  let renderedDiff: string;
+  try {
+    renderedDiff = renderDiff(diff);
+  } catch {
+    // Renderer tests and non-interactive hosts may not have initialized Pi's theme proxy.
+    renderedDiff = diff;
+  }
+  container.addChild(new Text(renderedDiff, 1, 0));
+  const rawPath =
+    context.args &&
+    typeof context.args === "object" &&
+    typeof (context.args as { path?: unknown }).path === "string"
+      ? (context.args as { path: string }).path
+      : undefined;
+  const summaryPath = rawPath ? ` ${shortenPath(rawPath)}` : "";
+  const summary = `edited${summaryPath} (+${details?.additions ?? 0}/-${details?.deletions ?? 0})`;
+  return collapsibleResult({
+    summary,
+    full: container,
+    expanded: options.expanded,
+    context,
+  });
 }
 
 function shortenPath(path: string): string {

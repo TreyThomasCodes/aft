@@ -1505,7 +1505,7 @@ describe("bash tool adapter", () => {
       },
     };
 
-    const rendered = bashTool.renderResult!(successResult, {}, mockTheme, {
+    const rendered = bashTool.renderResult!(successResult, { expanded: true }, mockTheme, {
       lastComponent: undefined,
       isError: false,
     });
@@ -1524,6 +1524,60 @@ describe("bash tool adapter", () => {
     });
 
     expect(errorRendered).toBeInstanceOf(Text);
+  });
+
+  test("renderResult follows Pi's collapsed and expanded result contract", () => {
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(makeMockBridge()));
+    const bashTool = tools.get("bash")!;
+    const largeResult = {
+      content: [
+        {
+          type: "text",
+          text: ["first output", "second", "third", "fourth", "fifth", "sixth"].join("\n"),
+        },
+      ],
+      details: { exit_code: 0 },
+    };
+    const renderText = (value: unknown): string =>
+      (value as { render: (width: number) => string[] }).render(200).join("\n");
+
+    const collapsed = renderText(
+      bashTool.renderResult!(largeResult, { expanded: false }, mockTheme, {
+        lastComponent: undefined,
+        isError: false,
+      }),
+    );
+    expect(collapsed).toContain("exit 0: first output");
+    expect(collapsed).not.toContain("sixth");
+
+    const omitted = renderText(
+      bashTool.renderResult!(largeResult, undefined, mockTheme, {
+        lastComponent: undefined,
+        isError: false,
+      }),
+    );
+    expect(omitted).toContain("exit 0: first output");
+    expect(omitted).not.toContain("sixth");
+
+    const expanded = renderText(
+      bashTool.renderResult!(largeResult, { expanded: true }, mockTheme, {
+        lastComponent: undefined,
+        isError: false,
+      }),
+    );
+    expect(expanded).toContain("sixth");
+
+    const tiny = renderText(
+      bashTool.renderResult!(
+        { content: [{ type: "text", text: "one\ntwo" }], details: { exit_code: 0 } },
+        { expanded: false },
+        mockTheme,
+        { lastComponent: undefined, isError: false },
+      ),
+    );
+    expect(tiny).toContain("one");
+    expect(tiny).toContain("two");
   });
 
   test("handles missing bg_completions gracefully", async () => {

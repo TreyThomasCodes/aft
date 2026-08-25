@@ -8,8 +8,10 @@ import type { PluginContext } from "../types.js";
 import { bridgeFor, callToolCall, textResult, withPathAliasPreparation } from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
+  collapsibleResult,
   collectTextContent,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -55,11 +57,17 @@ export function renderConflictResult(
   text: string,
   theme: Parameters<typeof renderToolCall>[2],
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   const sections = buildConflictSections(text).map((section, index) =>
     index === 0 ? theme.fg("warning", section) : section,
   );
-  return renderSections(sections, context);
+  return collapsibleResult({
+    summary: sections[0] ?? "No merge conflicts found.",
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 /** Exported for renderer unit tests. */
@@ -67,9 +75,10 @@ export function renderConflictToolResult(
   result: Parameters<typeof renderErrorResult>[0],
   theme: Parameters<typeof renderToolCall>[2],
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "conflicts failed", theme, context);
-  return renderConflictResult(collectTextContent(result), theme, context);
+  return renderConflictResult(collectTextContent(result), theme, context, options);
 }
 
 export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -102,8 +111,8 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
       renderCall(_args, theme, context) {
         return renderConflictCall(theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderConflictToolResult(result, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderConflictToolResult(result, theme, context, options);
       },
     }),
   );

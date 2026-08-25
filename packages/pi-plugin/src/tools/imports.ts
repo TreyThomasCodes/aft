@@ -21,8 +21,10 @@ import {
   asRecord,
   asRecords,
   asString,
+  collapsibleResult,
   extractStructuredPayload,
   type RenderContextLike,
+  type RenderResultOptionsLike,
   renderErrorResult,
   renderSections,
   renderToolCall,
@@ -150,10 +152,17 @@ export function renderImportResult(
   args: Static<typeof ImportParams>,
   theme: Theme,
   context: RenderContextLike,
+  options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "import failed", theme, context);
   const payload = extractStructuredPayload(result);
-  return renderSections(buildImportSections(args, payload, theme), context);
+  const sections = buildImportSections(args, payload, theme);
+  return collapsibleResult({
+    summary: sections[0] ?? `${args.op} import completed`,
+    full: renderSections(sections, context),
+    expanded: options.expanded,
+    context,
+  });
 }
 
 export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void {
@@ -203,8 +212,8 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
       renderCall(args, theme, context) {
         return renderImportCall(args, theme, context);
       },
-      renderResult(result, _options, theme, context) {
-        return renderImportResult(result, context.args, theme, context);
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderImportResult(result, context.args, theme, context, options);
       },
     }),
   );

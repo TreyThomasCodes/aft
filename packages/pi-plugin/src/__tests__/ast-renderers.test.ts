@@ -96,6 +96,44 @@ describe("AST renderers", () => {
     expect(replace).toContain("logger.info(alpha)");
   });
 
+  test("renderAstResult honors collapsed and expanded result views", () => {
+    const payload = {
+      matches: Array.from({ length: 6 }, (_, index) => ({
+        file: "/repo/src/large.ts",
+        line: index + 1,
+        column: 1,
+        text: `console.log(value${index})`,
+      })),
+      total_matches: 6,
+      files_with_matches: 1,
+      files_searched: 1,
+    };
+    const result = makeResult("", payload);
+
+    const collapsed = renderToString(
+      renderAstResult(
+        "ast_grep_search",
+        result,
+        mockTheme,
+        makeContext({ pattern: "console.log($MSG)", lang: "typescript" }),
+        { expanded: false },
+      ),
+    );
+    expect(collapsed).toContain("6 matches");
+    expect(collapsed).not.toContain("value5");
+
+    const expanded = renderToString(
+      renderAstResult(
+        "ast_grep_search",
+        result,
+        mockTheme,
+        makeContext({ pattern: "console.log($MSG)", lang: "typescript" }),
+        { expanded: true },
+      ),
+    );
+    expect(expanded).toContain("value5");
+  });
+
   test("renderAstResult handles error and empty payloads", () => {
     const error = renderToString(
       renderAstResult(

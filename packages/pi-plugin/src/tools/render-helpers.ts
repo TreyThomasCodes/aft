@@ -7,10 +7,18 @@ import { type AgentToolResult, renderDiff, type Theme } from "@earendil-works/pi
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 
 export interface RenderContextLike<TArgs = unknown> {
-  args: TArgs;
+  args?: TArgs;
   lastComponent: Component | undefined;
   isError: boolean;
 }
+
+/** The result-view flags Pi supplies to a custom tool renderer. */
+export interface RenderResultOptionsLike {
+  expanded?: boolean;
+  isPartial?: boolean;
+}
+
+const NATIVE_COLLAPSED_RESULT_MAX_LINES = 5;
 
 export function reuseText(last: Component | undefined): Text {
   return last instanceof Text ? last : new Text("", 0, 0);
@@ -71,6 +79,32 @@ export function renderErrorResult(
   const text = reuseText(context.lastComponent);
   const message = collectTextContent(result) || fallback;
   text.setText(`\n${theme.fg("error", message)}`);
+  return text;
+}
+
+/**
+ * Keep custom result views aligned with Pi's native collapse behavior: short
+ * results remain readable, while larger bodies become one useful summary line.
+ * Pi currently passes a required boolean, but treating an omitted flag as
+ * collapsed keeps older hosts and direct renderer calls safe by default.
+ */
+export function collapsibleResult({
+  summary,
+  full,
+  expanded,
+  context,
+}: {
+  summary: string;
+  full: Component;
+  expanded?: boolean;
+  context: RenderContextLike;
+}): Component {
+  if (expanded === true || full.render(200).length <= NATIVE_COLLAPSED_RESULT_MAX_LINES) {
+    return full;
+  }
+
+  const text = reuseText(context.lastComponent);
+  text.setText(`\n${summary.replace(/[\r\n]+/g, " ").trim()}`);
   return text;
 }
 
