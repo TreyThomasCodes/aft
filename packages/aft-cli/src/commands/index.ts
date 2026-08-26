@@ -9,7 +9,9 @@ import { findAftBinary } from "../lib/binary-probe.js";
 export function runIndex(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error("aft index requires a native AFT binary; run `aft doctor` to install or repair it.");
+    console.error(
+      "aft index requires a native AFT binary; run `aft doctor` to install or repair it.",
+    );
     return 1;
   }
 
