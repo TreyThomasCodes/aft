@@ -32,6 +32,7 @@ pub const SCHEMA_FLOOR: u64 = 1;
 /// the distributed bytes themselves (see the verifier-site contract).
 pub const ENVELOPE_VERSION: u64 = 2;
 pub const REFUSAL_EXIT_STATUS: i32 = 86;
+const UPSTREAM_FAILURE_EXIT_STATUS: i32 = 1;
 const DISCOVERY_BUDGET: Duration = Duration::from_millis(150);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
 /// Clock skew tolerated before a manifest's signed issue time counts as being
@@ -344,6 +345,10 @@ fn governed_outcome_status(
         RouteOutcome::Result(output) => {
             print!("{output}");
             0
+        }
+        RouteOutcome::UpstreamError(body) => {
+            eprintln!("{body}");
+            UPSTREAM_FAILURE_EXIT_STATUS
         }
         RouteOutcome::Refusal(code) => refuse(RefusalCode::SeamRefusal, &seam_refusal_text(&code)),
         RouteOutcome::UnboundIdentity => refuse(
@@ -2099,6 +2104,7 @@ fn infer_repository_from_git() -> Option<String> {
 #[derive(Debug)]
 enum RouteOutcome {
     Result(String),
+    UpstreamError(String),
     Refusal(String),
     UnboundIdentity,
     SchemaMismatch(String),
@@ -2335,6 +2341,9 @@ fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
             let result = object.get("result").ok_or_else(|| {
                 RouteOutcome::SchemaMismatch("governance seam omitted result".to_string())
             })?;
+            if let Some(body) = upstream_error_body(object, result) {
+                return Ok(RouteOutcome::UpstreamError(body));
+            }
             let field_order = object
                 .get("field_order")
                 .and_then(Value::as_array)
@@ -2359,6 +2368,29 @@ fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
             "governance seam returned an unknown outcome".to_string(),
         )),
     }
+}
+
+fn upstream_error_body(response: &Map<String, Value>, result: &Value) -> Option<String> {
+    let result_object = result.as_object();
+    let status = response
+        .get("status")
+        .or_else(|| response.get("status_code"))
+        .or_else(|| result_object.and_then(|object| object.get("status")))
+        .or_else(|| result_object.and_then(|object| object.get("status_code")))
+        .and_then(|value| value.as_u64())?;
+    if (200..300).contains(&status) {
+        return None;
+    }
+    let body = response
+        .get("error")
+        .or_else(|| response.get("body"))
+        .or_else(|| result_object.and_then(|object| object.get("error")))
+        .or_else(|| result_object.and_then(|object| object.get("body")))
+        .unwrap_or(result);
+    Some(match body {
+        Value::String(body) => body.clone(),
+        _ => serde_json::to_string(body).unwrap_or_else(|_| body.to_string()),
+    })
 }
 
 fn render_governed_response(result: &Value, field_order: &[Value]) -> Result<String, RouteOutcome> {
@@ -3740,6 +3772,54 @@ mod tests {
         assert_eq!(
             canonicalize_governed(&duplicate, "pr review", &canonical, 1).unwrap_err(),
             "pr review accepts only one of --approve, --comment, or --request-changes"
+        );
+    }
+
+    #[test]
+    fn upstream_api_errors_fail_without_changing_success_status() {
+        let error_response = json!({
+            "outcome": "result",
+            "gh_route_schema": 1,
+            "result": {
+                "status": 404,
+                "error": {"message": "Not Found", "documentation_url": "https://docs.github.com"}
+            }
+        });
+        let error_outcome =
+            parse_governed_response(&serde_json::to_vec(&error_response).unwrap()).unwrap();
+        let error_body = match error_outcome {
+            RouteOutcome::UpstreamError(body) => body,
+            other => panic!("expected upstream error, got {other:?}"),
+        };
+        assert!(error_body.contains("Not Found"));
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let binding = AgentBinding {
+            repo: "owner/repo".to_string(),
+            agent_id: "agent-7".to_string(),
+        };
+        assert_eq!(
+            governed_outcome_status(
+                &paths,
+                &binding,
+                123,
+                RouteOutcome::UpstreamError(error_body)
+            ),
+            UPSTREAM_FAILURE_EXIT_STATUS
+        );
+
+        let success_response = json!({
+            "outcome": "result",
+            "gh_route_schema": 1,
+            "result": {"status": 201, "url": "https://github.com/example"},
+            "field_order": ["status", "url"]
+        });
+        let success_outcome =
+            parse_governed_response(&serde_json::to_vec(&success_response).unwrap()).unwrap();
+        assert!(matches!(&success_outcome, RouteOutcome::Result(_)));
+        assert_eq!(
+            governed_outcome_status(&paths, &binding, 123, success_outcome),
+            0
         );
     }
 
