@@ -94,6 +94,21 @@ fn main() {
         }
     }
 
+    // The index command is a serial CLI handoff: it performs one finite
+    // snapshot and exits before logging, the App, runtime registry, or subc
+    // scheduler can establish any standing actor or future maintenance work.
+    if std::env::args().nth(1).as_deref() == Some("index") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::index::run(args) {
+            Ok(cli::index::IndexExit::Success) => return,
+            Ok(exit) => std::process::exit(exit.code()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();

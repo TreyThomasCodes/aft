@@ -20,6 +20,7 @@ function printHelp(): void {
   console.log("  Commands:");
   console.log("    --version        Show CLI, binary, and per-harness plugin versions");
   console.log("    setup            Interactive setup wizard");
+  console.log("    index            Build one configured index snapshot (no scheduler)");
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
   console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
@@ -36,6 +37,7 @@ function printHelp(): void {
   console.log("");
   console.log("  Usage:");
   console.log(`    ${CLI} setup`);
+  console.log(`    ${CLI} index`);
   console.log(`    ${CLI} doctor`);
   console.log(`    ${CLI} doctor lsp ./src/main.py`);
   console.log(`    ${CLI} doctor --clear`);
@@ -54,6 +56,10 @@ async function main(): Promise<number> {
   if (command === "setup") {
     const { runSetup } = await import("./commands/setup.js");
     return runSetup(args);
+  }
+  if (command === "index") {
+    const { runIndex } = await import("./commands/index.js");
+    return runIndex(args);
   }
   if (command === "doctor") {
     if (args[0] === "lsp") {
