@@ -1,0 +1,17 @@
+# Standing roots s2 paired-transition ledger
+
+This checklist is normative for the standing actor. A change that adds a transition without its paired entry below is refused in review.
+
+| Transition | Mint or durable set site | Paired consumer | Test coverage |
+| --- | --- | --- | --- |
+| Case-A session bind admission epoch | `ArtifactLifecycle::revoke_and_mint(true)` through `StandingRoots::begin_case_a_bind` | `StandingRoots::publish_if_current` compares `StandingPublicationAdmission::admission_epoch` while `ArtifactPublishEpoch::run_if_current` holds the publication mutex | `publication_is_a_noop_after_bind_epoch_revocation`; `bind_revokes_admission_and_checkpoint_join_is_bounded` |
+| Configuration replacement admission epoch | `StandingRoots::reconcile` calls `revoke_and_mint(false)` before replacing a changed entry | `StandingRoots::publish_if_current` rejects the captured old publication admission | `superseded_snapshot_publication_is_a_noop`; `configuration_add_modify_and_remove_mint_boundaries_and_delete_rows` |
+| Configuration removal admission epoch | `StandingRoots::reconcile` calls `revoke_and_mint(false)` before deleting the durable row | No publication can resolve the deleted literal entry; an already captured epoch is also superseded by the mint | `configuration_add_modify_and_remove_mint_boundaries_and_delete_rows` |
+| New entry or newly selected kind freshness set | `standing_roots::ensure_standing_root` reconciles per-kind rows with `needs_strict_verify = true` | `StandingRoots::record_strict_verification` calls `record_successful_strict_verification` in one transaction | `reconciliation_marks_restart_and_new_kind_for_strict_verification` |
+| Daemon restart freshness set | First non-empty `StandingRoots::reconcile` snapshot marks every selected kind strict | `StandingRoots::record_strict_verification` transactional clear | `daemon_startup_empty_pass_marks_existing_snapshot_strict_on_first_configured_pass` |
+| Case-A bind freshness set | `StandingRoots::begin_case_a_bind` calls `mark_kinds_needing_strict_verify` before the bounded join | `StandingRoots::record_strict_verification` transactional clear after current strict verification | `publication_is_a_noop_after_bind_epoch_revocation`; `suspension_edit_resume_requires_strict_verification_before_query` |
+| Bound-to-standing handoff freshness set | `StandingRoots::resume_after_session` marks every standing kind not proven by the session | `StandingRoots::record_strict_verification` transactional clear | `shared_key_handoff_preserves_session_proven_kind_and_marks_other_kind` |
+| Suspension/edit/resume freshness set | The same `resume_after_session` handoff marks unproven kinds before standing admission reopens | `StandingRoots::record_strict_verification` transactional clear; `route_explicit_path` refuses while set | `suspension_edit_resume_requires_strict_verification_before_query` |
+| CLI/query or crash observation gap freshness set | `StandingRoots::mark_observation_gap` | `StandingRoots::record_strict_verification` transactional clear; query routing refuses before it | `crash_before_freshness_clear_blocks_verify_on_query_until_transactional_clear` |
+
+The publication comparison is intentionally exclusive: `publish_if_current` keeps `ArtifactPublishEpoch` locked across WriterLease validation, captured-versus-current admission comparison, fingerprint and generation comparisons, and the final publication closure. The `WriterLease` remains the cross-process proof; a shared handle is not substituted for it.

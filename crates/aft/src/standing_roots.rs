@@ -297,9 +297,21 @@ impl StandingRoots {
         config: &Config,
     ) -> Result<StandingReconcileReport, StandingRootsError> {
         let entries = resolve_entries(config)?;
-        let db_path =
+        let configured_db_path =
             crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
-        *self.inner.database_path.lock() = Some(db_path.clone());
+        // An empty snapshot removes entries from the last observed user-tier
+        // storage namespace; it must not silently switch to the process default
+        // and leave durable rows behind in the former namespace.
+        let db_path = {
+            let mut current = self.inner.database_path.lock();
+            let path = if entries.is_empty() {
+                current.clone().unwrap_or(configured_db_path)
+            } else {
+                configured_db_path
+            };
+            *current = Some(path.clone());
+            path
+        };
         let mut conn = crate::db::open(&db_path)?;
 
         let mut state = self.inner.state.lock();
@@ -775,6 +787,49 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_snapshot_preserves_configuration_and_fixed_kind_order() {
+        let storage = tempdir().unwrap();
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![
+                root(first.path(), vec![IndexKind::Callgraph, IndexKind::Search]),
+                root(second.path(), vec![IndexKind::Semantic]),
+            ],
+        );
+        let report = roots.reconcile(&cfg).unwrap();
+        let scheduled = report
+            .active_entries
+            .iter()
+            .flat_map(|entry| {
+                IndexKind::ALL
+                    .into_iter()
+                    .filter(move |kind| entry.indexes.contains(kind))
+                    .map(move |kind| (entry.literal_path.clone(), kind))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scheduled,
+            vec![
+                (
+                    first.path().to_string_lossy().into_owned(),
+                    IndexKind::Search
+                ),
+                (
+                    first.path().to_string_lossy().into_owned(),
+                    IndexKind::Callgraph
+                ),
+                (
+                    second.path().to_string_lossy().into_owned(),
+                    IndexKind::Semantic
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn route_falls_back_to_shallower_entry_and_discloses_it() {
         let storage = tempdir().unwrap();
         let outer = tempdir().unwrap();
@@ -838,6 +893,303 @@ mod tests {
             .unwrap();
         assert!(result.is_none());
         assert!(!published.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn publication_fence_holds_epoch_mutex_through_final_rename() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        let mut report = roots.reconcile(&cfg).unwrap();
+        let entry = report.active_entries.remove(0);
+        let admission = roots.admit_build(&entry.literal_path).unwrap();
+        crate::root_cache::configure_artifact_access(
+            &entry.resolved_target,
+            &entry.artifact_key,
+            false,
+        );
+        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
+        let lease = crate::root_cache::WriterLease::acquire_shared(
+            crate::root_cache::RootCacheDomain::Index,
+            &cache_dir,
+            &entry.artifact_key,
+            &entry.resolved_target,
+        )
+        .unwrap()
+        .unwrap();
+        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
+        let (release_rename_tx, release_rename_rx) = std::sync::mpsc::channel();
+        let publish_roots = roots.clone();
+        let publish_literal = entry.literal_path.clone();
+        let publisher = std::thread::spawn(move || {
+            publish_roots
+                .publish_if_current(
+                    &publish_literal,
+                    admission.publication,
+                    &lease,
+                    || true,
+                    || true,
+                    || {
+                        rename_entered_tx.send(()).unwrap();
+                        release_rename_rx.recv().unwrap();
+                    },
+                )
+                .unwrap()
+        });
+        rename_entered_rx.recv().unwrap();
+        let (bind_done_tx, bind_done_rx) = std::sync::mpsc::channel();
+        let bind_roots = roots.clone();
+        let bind_literal = entry.literal_path.clone();
+        let binder = std::thread::spawn(move || {
+            bind_done_tx
+                .send(bind_roots.begin_case_a_bind(&bind_literal))
+                .unwrap();
+        });
+        assert!(bind_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        release_rename_tx.send(()).unwrap();
+        assert!(publisher.join().unwrap().is_some());
+        bind_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        binder.join().unwrap();
+    }
+
+    #[test]
+    fn superseded_snapshot_publication_is_a_noop() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let mut cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        let mut initial = roots.reconcile(&cfg).unwrap();
+        let entry = initial.active_entries.remove(0);
+        let build = roots.admit_build(&entry.literal_path).unwrap();
+        crate::root_cache::configure_artifact_access(
+            &entry.resolved_target,
+            &entry.artifact_key,
+            false,
+        );
+        cfg.index.roots[0].indexes = vec![IndexKind::Semantic];
+        let report = roots.reconcile(&cfg).unwrap();
+        assert_eq!(report.replaced, vec![entry.literal_path.clone()]);
+        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
+        let lease = crate::root_cache::WriterLease::acquire_shared(
+            crate::root_cache::RootCacheDomain::Index,
+            &cache_dir,
+            &entry.artifact_key,
+            &entry.resolved_target,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(roots
+            .publish_if_current(
+                &entry.literal_path,
+                build.publication,
+                &lease,
+                || true,
+                || true,
+                || (),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn crash_before_freshness_clear_blocks_verify_on_query_until_transactional_clear() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        let first = StandingRoots::default();
+        first.reconcile(&cfg).unwrap();
+        first
+            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .unwrap();
+        first
+            .mark_observation_gap(root_dir.path().to_str().unwrap(), &[IndexKind::Search])
+            .unwrap();
+        drop(first);
+
+        // Restarting between verification and its transaction commit must retain
+        // the durable gap and reject a query rather than serving its baseline.
+        let restarted = StandingRoots::default();
+        restarted.reconcile(&cfg).unwrap();
+        assert!(matches!(
+            restarted.route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search),
+            Err(StandingRouteError::StrictVerificationRequired { .. })
+        ));
+        restarted
+            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .unwrap();
+        assert!(restarted
+            .route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search)
+            .is_ok());
+    }
+
+    #[test]
+    fn verify_on_query_retains_observation_gap_between_passes() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        let literal = root_dir.path().to_str().unwrap();
+        roots.reconcile(&cfg).unwrap();
+        roots
+            .record_strict_verification(literal, IndexKind::Search)
+            .unwrap();
+        roots
+            .mark_observation_gap(literal, &[IndexKind::Search])
+            .unwrap();
+        assert!(matches!(
+            roots.route_explicit_path(&root_dir.path().join("query.rs"), IndexKind::Search),
+            Err(StandingRouteError::StrictVerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn suspension_edit_resume_requires_strict_verification_before_query() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        roots.reconcile(&cfg).unwrap();
+        roots
+            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .unwrap();
+        let build = roots
+            .admit_build(root_dir.path().to_str().unwrap())
+            .unwrap();
+        roots
+            .begin_case_a_bind(root_dir.path().to_str().unwrap())
+            .unwrap();
+        assert!(build.checkpoint());
+        std::fs::write(root_dir.path().join("edited.rs"), "fn changed() {}\n").unwrap();
+        roots
+            .resume_after_session(root_dir.path().to_str().unwrap(), &[])
+            .unwrap();
+        assert!(matches!(
+            roots.route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search),
+            Err(StandingRouteError::StrictVerificationRequired { .. })
+        ));
+        roots
+            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .unwrap();
+        assert!(roots
+            .route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search)
+            .is_ok());
+    }
+
+    #[test]
+    fn shared_key_handoff_preserves_session_proven_kind_and_marks_other_kind() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(
+                root_dir.path(),
+                vec![IndexKind::Search, IndexKind::Semantic],
+            )],
+        );
+        roots.reconcile(&cfg).unwrap();
+        let literal = root_dir.path().to_str().unwrap();
+        roots
+            .record_strict_verification(literal, IndexKind::Search)
+            .unwrap();
+        roots
+            .record_strict_verification(literal, IndexKind::Semantic)
+            .unwrap();
+        roots.begin_case_a_bind(literal).unwrap();
+        // The session verified only the Search index. After it ends, Semantic
+        // still needs a durable strict-verification record before it is eligible.
+        roots
+            .record_strict_verification(literal, IndexKind::Search)
+            .unwrap();
+        roots
+            .resume_after_session(literal, &[IndexKind::Search])
+            .unwrap();
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        assert!(
+            !standing_roots::needs_strict_verify(&conn, literal, IndexKind::Search)
+                .unwrap()
+                .unwrap()
+        );
+        assert!(
+            standing_roots::needs_strict_verify(&conn, literal, IndexKind::Semantic)
+                .unwrap()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn configuration_add_modify_and_remove_mint_boundaries_and_delete_rows() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let mut cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        let literal = root_dir.path().to_str().unwrap().to_string();
+        assert_eq!(roots.reconcile(&cfg).unwrap().added, vec![literal.clone()]);
+        let admitted = roots.admit_build(&literal).unwrap();
+        cfg.index.roots[0].indexes = vec![IndexKind::Callgraph];
+        let report = roots.reconcile(&cfg).unwrap();
+        assert_eq!(report.replaced, vec![literal.clone()]);
+        let replacement = roots
+            .admit_build(&literal)
+            .expect("replacement reopens only a new admission");
+        assert_ne!(
+            admitted.publication.admission_epoch,
+            replacement.publication.admission_epoch
+        );
+        let removed = roots.reconcile(&Config::default()).unwrap();
+        assert_eq!(removed.removed, vec![literal.clone()]);
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        assert!(standing_roots::get_standing_root(&conn, &literal)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bounded_join_proceeds_after_two_seconds_without_checkpoint() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        roots.reconcile(&cfg).unwrap();
+        let _build = roots
+            .admit_build(root_dir.path().to_str().unwrap())
+            .unwrap();
+        roots
+            .begin_case_a_bind(root_dir.path().to_str().unwrap())
+            .unwrap();
+        let before = std::time::Instant::now();
+        assert!(!roots
+            .wait_for_case_a_checkpoint(root_dir.path().to_str().unwrap())
+            .unwrap());
+        assert!(before.elapsed() >= Duration::from_secs(2));
+        assert!(before.elapsed() < Duration::from_millis(2300));
     }
 
     #[test]

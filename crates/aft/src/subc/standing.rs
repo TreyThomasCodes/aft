@@ -20,6 +20,10 @@ use crate::standing_roots::{StandingRootEntry, StandingRoots};
 /// drives `due_maintenance_jobs`; no standing timer or scheduler is created.
 pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRAIN_TICK_PERIOD;
 
+#[cfg(test)]
+static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
@@ -337,9 +341,18 @@ fn strict_verify_current_state(
                 // the durable flag deliberately stays set meanwhile.
                 return false;
             };
+            let verify_strategy = crate::cache_freshness::VerifyStrategy::Strict;
+            #[cfg(test)]
+            LAST_STANDING_VERIFY_STRATEGY.store(
+                match verify_strategy {
+                    crate::cache_freshness::VerifyStrategy::StatFirst => 1,
+                    crate::cache_freshness::VerifyStrategy::Strict => 2,
+                },
+                std::sync::atomic::Ordering::SeqCst,
+            );
             !index.verify_against_disk_with_strategy(
                 crate::search_index::current_git_head(&entry.resolved_target),
-                crate::cache_freshness::VerifyStrategy::Strict,
+                verify_strategy,
             )
         }
         // Semantic and callgraph have artifact-specific strict loaders whose
@@ -427,6 +440,51 @@ mod tests {
         assert_eq!(
             STANDING_MAINTENANCE_INTERVAL,
             super::super::DRAIN_TICK_PERIOD
+        );
+    }
+
+    #[test]
+    fn strict_search_verification_accepts_metadata_only_drift() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("main.rs");
+        std::fs::write(&source, "fn stable() {}\n").unwrap();
+        let resolved =
+            crate::scoped_key::resolve_standing_root(root.path().to_str().unwrap()).unwrap();
+        let entry = StandingRootEntry {
+            literal_path: root.path().to_string_lossy().into_owned(),
+            resolved_target: std::path::PathBuf::from(resolved.resolved_target),
+            resolved_git_toplevel: resolved.resolved_git_toplevel.map(std::path::PathBuf::from),
+            scoped_relative_path: resolved.scoped_relative_path.map(std::path::PathBuf::from),
+            artifact_key: resolved.artifact_key,
+            indexes: vec![IndexKind::Search],
+            config_order: 0,
+        };
+        crate::root_cache::configure_artifact_access(
+            &entry.resolved_target,
+            &entry.artifact_key,
+            false,
+        );
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+            &entry.artifact_key,
+            Some(storage.path()),
+        );
+        let mut index = crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
+            &entry.resolved_target,
+            1_048_576,
+            &cache_dir,
+        );
+        assert!(index.write_to_disk(&cache_dir, None));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, "fn stable() {}\n").unwrap();
+        let mut config = Config::default();
+        config.storage_dir = Some(storage.path().to_path_buf());
+        let ctx = AppContext::from_app(App::default_shared(), config);
+        let _ = strict_verify_current_state(&ctx, &entry, IndexKind::Search);
+        assert_eq!(
+            LAST_STANDING_VERIFY_STRATEGY.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "standing search verification must use VerifyStrategy::Strict"
         );
     }
 
