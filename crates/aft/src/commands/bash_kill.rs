@@ -100,7 +100,37 @@ mod tests {
         AppContext::from_app(Arc::clone(app), config)
     }
 
-    fn write_running_project_task(storage: &Path, project: &Path, session: &str, task_id: &str) {
+    /// Spawn a disposable child whose PID can be recorded as a task's
+    /// `child_pid` in KILL-path tests. bash_kill terminates the recorded
+    /// PID for running tasks, and on Windows that termination has no
+    /// process-group indirection: recording the harness's own PID makes
+    /// the kill take down the whole libtest process mid-run (observed as
+    /// a clean exit 1 with no failures summary on Windows CI). Read-only
+    /// paths (status replay, GC refusal) may still use the harness PID as
+    /// an always-alive process; kill paths must use a child like this one.
+    fn spawn_disposable_kill_target() -> std::process::Child {
+        let mut cmd = if cfg!(windows) {
+            // timeout.exe needs a console; ping is the standard sleep shim.
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "31", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn().expect("spawn disposable kill-target child")
+    }
+
+    fn write_running_project_task(
+        storage: &Path,
+        project: &Path,
+        session: &str,
+        task_id: &str,
+        child_pid: u32,
+    ) {
         let paths = task_paths(storage, session, task_id).unwrap();
         let mut metadata = PersistedTask::starting(
             task_id.to_string(),
@@ -113,7 +143,7 @@ mod tests {
             true,
         );
         metadata.status = BgTaskStatus::Running;
-        metadata.child_pid = Some(std::process::id());
+        metadata.child_pid = Some(child_pid);
         write_task(&paths.json, &metadata).unwrap();
         fs::write(&paths.stdout, "still running\n").unwrap();
         fs::write(&paths.stderr, "").unwrap();
@@ -139,7 +169,14 @@ mod tests {
         let ctx_b = actor(&app, project_b.path(), storage.path());
         let session = "shared-session";
         let task_id = "bash-2222222222222222";
-        write_running_project_task(storage.path(), project_a.path(), session, task_id);
+        let mut kill_target = spawn_disposable_kill_target();
+        write_running_project_task(
+            storage.path(),
+            project_a.path(),
+            session,
+            task_id,
+            kill_target.id(),
+        );
 
         let miss = serde_json::to_value(handle(&kill_request(task_id, session), &ctx_b)).unwrap();
         assert_eq!(
@@ -154,5 +191,11 @@ mod tests {
             "owning project kill failed: {killed:?}"
         );
         assert_eq!(killed["status"], "killed");
+
+        // Reap the disposable child: the product kill usually terminated it
+        // already, so both calls are best-effort (kill on a dead child errors,
+        // wait clears the zombie either way).
+        let _ = kill_target.kill();
+        let _ = kill_target.wait();
     }
 }

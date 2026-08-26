@@ -5918,6 +5918,11 @@ mod tests {
             true,
         );
         metadata.status = BgTaskStatus::Running;
+        // The harness's own PID is an always-alive process for READ-ONLY
+        // paths (status replay never signals it). Kill-path tests must never
+        // copy this: recording the harness PID where the product kills
+        // child_pid takes down the whole libtest process on Windows - spawn
+        // a disposable child instead (see bash_kill.rs tests).
         metadata.child_pid = Some(std::process::id());
         write_task(&paths.json, &metadata).unwrap();
         fs::write(&paths.stdout, "still running\n").unwrap();
@@ -7846,6 +7851,9 @@ mod tests {
             true,
             false,
         );
+        // Own-PID is safe here because GC only CHECKS liveness (it refuses
+        // to delete live bundles, never signals them). Kill-path tests must
+        // spawn a disposable child instead - see bash_kill.rs.
         running.mark_running(std::process::id(), std::process::id() as i32);
         write_task(&paths.json, &running).unwrap();
         fs::write(&paths.stdout, b"").unwrap();
