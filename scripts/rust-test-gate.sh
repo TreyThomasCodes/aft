@@ -19,6 +19,8 @@ if [ -z "${AFT_GATE_DEMOTED:-}" ]; then
   exec nice -n 10 "$0" "$@"
 fi
 
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
 
 # A test that exercises the plugin-less storage fallback must never inherit the
 # operator's real data root. Keep the whole gate hermetic, including test binaries
@@ -83,14 +85,74 @@ release_box_gate() {
 }
 acquire_box_gate
 
+# Keep every phase's output in a durable location. The default is deliberately
+# outside /tmp because macOS cleanup can remove a still-running gate's only
+# failure record.
+gate_log_dir="${AFT_GATE_LOG_DIR:-$HOME/.local/share/cortexkit/aft/gate-logs}"
+gate_log="${AFT_GATE_LOG:-$gate_log_dir/gate-$(date -u '+%Y%m%dT%H%M%SZ')-$$.log}"
+mkdir -p "$(dirname "$gate_log")"
+if [[ "${AFT_GATE_LOG_INHERITED:-}" == "1" ]]; then
+  printf '\n--- nested rust test gate ---\n' >> "$gate_log"
+else
+  : > "$gate_log"
+fi
+export AFT_GATE_LOG="$gate_log"
+export AFT_GATE_LOG_INHERITED=1
+
+announce_gate_line() {
+  local line="$1"
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >> "$gate_log"
+}
+
+announce_gate_line "gate log: $gate_log"
+
+report_gate_failure() {
+  local label="$1"
+  local rc="$2"
+  local failed_names
+
+  failed_names="$(grep -F 'FAIL [' "$gate_log" 2>/dev/null || true)"
+  {
+    printf '==> gate phase FAILED: %s (rc=%s)\n' "$label" "$rc"
+    printf '==> failing test names (nextest FAIL [ summary)\n'
+    if [[ -n "$failed_names" ]]; then
+      printf '%s\n' "$failed_names"
+    else
+      printf '%s\n' '(no nextest FAIL [ summary was emitted)'
+    fi
+  } >> "$gate_log"
+
+  # Append the failing test names before taking the tail, so fail-fast output still
+  # identifies the test that caused the failure even when nextest stops before
+  # producing a complete report.
+  tail -n 60 "$gate_log" >&2 || true
+}
+
 run_phase() {
   local label="$1"
   shift
   local started=$SECONDS
+  local -a pipeline_status
+  local rc
+  local tee_rc
 
-  echo "==> $label"
-  "$@"
-  echo "    ok ($((SECONDS - started))s)"
+  announce_gate_line "==> $label"
+  set +e
+  "$@" 2>&1 | tee -a "$gate_log"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  rc="${pipeline_status[0]:-1}"
+  tee_rc="${pipeline_status[1]:-1}"
+  if [[ "$rc" -ne 0 || "$tee_rc" -ne 0 ]]; then
+    if [[ "$rc" -eq 0 ]]; then
+      rc="$tee_rc"
+    fi
+    report_gate_failure "$label" "$rc"
+    return "$rc"
+  fi
+
+  announce_gate_line "    ok ($((SECONDS - started))s)"
 }
 
 # Gatekeeper assesses newly linked Mach-O executables that carry provenance.
@@ -104,7 +166,11 @@ warm_macos_executable() {
   shift
 
   [[ -x "$binary" ]] || return 0
-  codesign -f -s - --identifier aft-dev-gate "$binary" >/dev/null 2>&1 || true
+  # Do not rewrite an already-stably-signed inode: replacing it would make
+  # Gatekeeper assess the same product again instead of reusing the warm result.
+  if ! codesign -d -vv "$binary" 2>&1 | grep -Fq 'Identifier=aft-dev-gate'; then
+    codesign -f -s - --identifier aft-dev-gate "$binary" >/dev/null 2>&1 || true
+  fi
   "$binary" "$@" >/dev/null 2>&1 || true
 }
 
@@ -136,21 +202,29 @@ for p in sorted(seen): print(p)
   warm_macos_executable "$aft_binary" --version
 }
 
-if [[ "$runner" == "cargo" ]]; then
-  if [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
-    run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries" \
-      warm_macos_test_binaries --workspace
-  fi
-  exec cargo test --workspace --quiet
-fi
-
-if [[ "$runner" != "nextest" ]]; then
+if [[ "$runner" != "nextest" && "$runner" != "cargo" ]]; then
   echo "Unsupported AFT_RUST_TEST_RUNNER='$runner' (expected 'nextest' or 'cargo')" >&2
   exit 2
 fi
 if [[ "$unit_runner" != "cargo" && "$unit_runner" != "nextest" ]]; then
   echo "Unsupported AFT_UNIT_TEST_RUNNER='$unit_runner' (expected 'cargo' or 'nextest')" >&2
   exit 2
+fi
+
+# Keep focused phase selections byte-for-byte compatible: lint is part of the
+# default all-phases gate, while an explicit subset remains responsible only for
+# the phases it names (CI already runs the workspace lint separately).
+if [[ "${AFT_GATE_PHASES:-all}" == "all" ]]; then
+  run_phase "bunx biome check ." bunx biome check .
+fi
+
+if [[ "$runner" == "cargo" ]]; then
+  if [[ "$(uname)" == "Darwin" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
+    run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
+      warm_macos_test_binaries --workspace
+  fi
+  run_phase "cargo test --workspace --quiet" cargo test --workspace --quiet
+  exit 0
 fi
 
 if ! command -v cargo-nextest >/dev/null 2>&1; then
@@ -180,7 +254,7 @@ extract_nextest_archive_for_prewarm() {
 # `cargo test --workspace --doc` until doctests actually exist.
 #
 # A CI lane can set AFT_UNIT_TEST_RUNNER=nextest so a nonterminating unit test
-# is named and killed by the unit profile instead of leaving one silent libtest
+# is named and bounded by the gate profile instead of leaving one silent libtest
 # process until the surrounding job times out.
 #
 # CI can split the independent execution phases after one job creates a nextest
@@ -221,8 +295,8 @@ if phase_enabled lib; then
     cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
 
   if [[ "$unit_runner" == "nextest" ]]; then
-    run_phase "cargo nextest run --workspace --lib --bins --profile unit" \
-      cargo nextest run --workspace --lib --bins --profile unit -- \
+    run_phase "cargo nextest run --workspace --lib --bins --profile gate" \
+      cargo nextest run --workspace --lib --bins --profile gate -- \
         --skip platform_verifier_tls_client_subprocess
   else
     run_phase "cargo test --workspace --lib --bins --quiet" \
@@ -232,14 +306,17 @@ if phase_enabled lib; then
 fi
 
 if phase_enabled nextest && [[ "$(uname)" == "Darwin" && -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
-  run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries" \
+  run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
     bash -c "$(declare -f warm_macos_executable)
       $(declare -f warm_macos_test_binaries)
       warm_macos_test_binaries --workspace"
 fi
 
 if phase_enabled nextest; then
-  nextest_args=(cargo nextest run)
+  # The gate profile disables retries by default; only the specific test overrides
+  # listed in .config/nextest.toml may retry. Do not replace this with a blanket
+  # retry profile.
+  nextest_args=(cargo nextest run --profile gate)
   if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && -n "${AFT_NEXTEST_EXTRACT_TO:-}" ]]; then
     # macOS archive shards need a stable extraction path so fresh test-binary
     # inodes can be signed and executed before nextest starts timed tests.
@@ -268,7 +345,7 @@ if phase_enabled nextest; then
     nextest_label+=" --partition $AFT_NEXTEST_PARTITION"
     nextest_args+=(--partition "$AFT_NEXTEST_PARTITION")
   fi
-  run_phase "$nextest_label" "${nextest_args[@]}"
+  run_phase "$nextest_label --profile gate" "${nextest_args[@]}"
 fi
 
 if phase_enabled watcher; then
@@ -286,9 +363,11 @@ fi
 # latency bounds — Linux and macOS CI remain the release-storm arbiters.
 if phase_enabled storm; then
   if [[ "${AFT_GATE_SKIP_RELEASE_STORM:-}" == "1" ]]; then
-    echo "==> release-storm phase skipped (AFT_GATE_SKIP_RELEASE_STORM=1)"
+    announce_gate_line "==> release-storm phase skipped (AFT_GATE_SKIP_RELEASE_STORM=1)"
   else
-    run_phase "cargo nextest run --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-      cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+    # Storm is intentionally on the retry-free default nextest profile: a retry
+    # would hide a real latency regression behind a second warm attempt.
+    run_phase "cargo nextest run --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
+      cargo nextest run --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
   fi
 fi

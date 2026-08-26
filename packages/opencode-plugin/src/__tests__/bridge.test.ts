@@ -46,7 +46,7 @@ describe("BinaryBridge lifecycle", () => {
     expect(response.success).toBe(true);
     expect(response.command).toBe("pong");
     expect(bridge.isAlive()).toBe(true);
-  });
+  }, 20_000);
 
   test("parses pushed bash_completed frames without request correlation", async () => {
     const completions: unknown[] = [];
@@ -272,7 +272,7 @@ describe("BinaryBridge lifecycle", () => {
     // IDs should be unique (ascending)
     const ids = [r1.id, r2.id, r3.id];
     expect(new Set(ids).size).toBe(3);
-  });
+  }, 20_000);
 
   test("bridge recovers via lazy respawn after external SIGKILL", async () => {
     // Issue #14: SIGKILL/SIGTERM are external kills, not crashes — we explicitly
@@ -309,7 +309,7 @@ describe("BinaryBridge lifecycle", () => {
     // Two real binary spawns (initial + lazy respawn) can exceed bun's 5s
     // default on cold CI runners; match the explicit budgets used by other
     // real-spawn suites.
-  }, 20000);
+  }, 20_000);
 
   test("shutdown cleans up child process (no orphans)", async () => {
     bridge = new BinaryBridge(
@@ -335,7 +335,7 @@ describe("BinaryBridge lifecycle", () => {
 
     // Verify the process is gone
     expect(isProcessAlive(pid!)).toBe(false);
-  });
+  }, 20_000);
 
   test("request to dead bridge after max retries rejects with error", async () => {
     bridge = new BinaryBridge(
@@ -372,7 +372,7 @@ describe("BinaryBridge lifecycle", () => {
     // After shutdown, send should reject
     await expect(bridge.send("ping")).rejects.toThrow("shutting down");
     bridge = null; // already shut down
-  });
+  }, 20_000);
 
   test("multiple parallel first calls share one configure (no race)", async () => {
     bridge = new BinaryBridge(
@@ -403,7 +403,7 @@ describe("BinaryBridge lifecycle", () => {
     // All should have distinct IDs
     const ids = results.map((r) => r.id);
     expect(new Set(ids).size).toBe(5);
-  });
+  }, 20_000);
 
   test("bridge death during version check prevents configured=true", async () => {
     bridge = new BinaryBridge(
@@ -439,7 +439,7 @@ describe("BinaryBridge lifecycle", () => {
 
     // configured should be false — the bridge should NOT be marked as configured
     expect((bridge as any).configured).toBe(false);
-  });
+  }, 20_000);
 
   test("crash error stays clean for the agent and points to the log", async () => {
     // Fake binary: writes recognizable stderr lines, waits until the bridge
