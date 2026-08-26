@@ -8,6 +8,8 @@ Both files are JSONC (comments allowed). One location serves every harness:
 | User | `~/.config/cortexkit/aft.jsonc` |
 | Project | `<project>/.cortexkit/aft.jsonc` |
 
+For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
+
 Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
 and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
 location automatically and leaves a `.MOVED_READPLEASE` marker behind.
@@ -17,7 +19,17 @@ location automatically and leaves a `.MOVED_READPLEASE` marker behind.
 Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
 
 Storage resolution is identical for plugins, standalone binaries, and warmup:
-`AFT_STORAGE_DIR` (explicit override) > the plugin-injected or computed XDG data root (`.../cortexkit/aft`) > the legacy `AFT_CACHE_DIR/aft` fallback. The statfs-based root key refuses to combine storage roots from different filesystems, preventing a local override from silently sharing indexes with the old NFS root.
+`AFT_STORAGE_DIR` (explicit override) > `XDG_DATA_HOME/cortexkit/aft` when set > the platform data directory (`~/.local/share/cortexkit/aft` on POSIX, or `%LOCALAPPDATA%/cortexkit/aft` on Windows with its documented fallbacks). The statfs-based root key refuses to combine storage roots from different filesystems, preventing a local override from silently sharing indexes with the old NFS root.
+
+## Uninstall paths
+
+Delete the user and project config files listed above, then delete the data roots below. A non-empty environment override takes precedence over the corresponding default.
+
+**Shared storage root** (`AFT_STORAGE_DIR`): if unset, AFT uses `XDG_DATA_HOME/cortexkit/aft/` when `XDG_DATA_HOME` is set. Otherwise, POSIX uses `~/.local/share/cortexkit/aft/`; Windows uses `%LOCALAPPDATA%/cortexkit/aft/`, then `%APPDATA%/cortexkit/aft/`, then `%USERPROFILE%/AppData/Local/cortexkit/aft/`. This root contains indexes, databases, background-task records, logs, and backup history.
+
+**Downloaded-binary and LSP cache** (`AFT_CACHE_DIR`): if unset, POSIX uses `${XDG_CACHE_HOME}/aft/` when `XDG_CACHE_HOME` is set, otherwise `~/.cache/aft/`. Windows uses `%LOCALAPPDATA%/aft/`, then `%APPDATA%/aft/`, then `%USERPROFILE%/AppData/Local/aft/`. The `bin/`, `lsp-packages/`, and `lsp-binaries/` subdirectories are under this root.
+
+The backup store treats its on-disk tree as authoritative across processes; deleting the storage root permanently deletes undo history for past edits, but does not delete project files.
 
 ## Config Options
 
@@ -469,9 +481,10 @@ roadmap.
 ## Durable logs and performance ticks
 
 AFT keeps its own logs under `<storage_root>/logs/`. The storage root follows the
-same resolution as indexes and other persistent data: configured `storage_dir`,
-then `$AFT_CACHE_DIR/aft`, then the platform CortexKit data directory (normally
-`~/.local/share/cortexkit/aft` on Linux and macOS).
+same resolution as indexes and other persistent data: `AFT_STORAGE_DIR`, then
+`XDG_DATA_HOME/cortexkit/aft` when set, then the platform data directory (normally
+`~/.local/share/cortexkit/aft` on Linux and macOS, or `%LOCALAPPDATA%/cortexkit/aft`
+on Windows). See [Uninstall paths](#uninstall-paths) for the complete fallback order.
 
 - Rust module processes write `aft-<pid>.log`. Each process file rolls at 20 MB
   through `.1` to `.5`; files from dead PIDs are removed after seven days.
