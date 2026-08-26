@@ -406,9 +406,9 @@ export const AftConfigSchema = z.preprocess(
        */
       configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
       /**
-       * Replace opencode's built-in read/write/edit/apply_patch tools with AFT's
-       * faster Rust implementations. Adds backup tracking, auto-formatting,
-       * inline diagnostics, and permission checks. Default: true.
+       * Replace the host's native file and shell tools with AFT implementations.
+       * Default: true. When false, AFT registers its replacements under aft_
+       * names and leaves host-native tools available.
        */
       hoist_builtin_tools: z.boolean().optional(),
       /**

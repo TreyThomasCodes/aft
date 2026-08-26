@@ -146,6 +146,13 @@ const CASES: ParityCase[] = [
     project: { enabled: true },
   },
   {
+    // Registration-local but project-safe: a repository may choose explicit
+    // aft_ names without changing AFT's permissions or Rust configure payload.
+    name: "hoist_builtin_tools_project_safe",
+    user: { hoist_builtin_tools: true },
+    project: { hoist_builtin_tools: false },
+  },
+  {
     name: "drop_restrict",
     user: { restrict_to_project_root: true },
     project: { restrict_to_project_root: false },

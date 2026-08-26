@@ -40,15 +40,15 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   // config can set true to re-enable over a user-level false.
   "enabled": true,
 
-  // Edit/read surface: "default" (default) or "hashline". User and project
-  // tiers both accept this key; ordinary project-over-user precedence applies.
-  "edit_mode": "default",
+   // Edit/read surface: "default" (default) or "hashline". User and project
+   // tiers both accept this key; ordinary project-over-user precedence applies.
+   "edit_mode": "default",
 
-  // Replace the host harness's built-in tools (read/write/edit/apply_patch/grep/etc.)
-  // with AFT-enhanced versions. Default: true. Set to false to use aft_ prefix on all
-  // tools instead — useful when you want to keep the harness defaults and access AFT
-  // tools alongside them under explicit names.
-  "hoist_builtin_tools": true,
+   // Replace the host harness's native tools with AFT-enhanced versions. Default: true.
+   // Set false to keep host-native tools and register AFT replacements under aft_ names
+   // (for example, aft_read and aft_bash). The bash companion tools remain unprefixed
+   // because they control AFT-owned background task IDs.
+   "hoist_builtin_tools": true,
 
   // Auto-format files after edits. Default: false. When enabled, formatting is
   // queued and runs after ~90s without further edits to the file.

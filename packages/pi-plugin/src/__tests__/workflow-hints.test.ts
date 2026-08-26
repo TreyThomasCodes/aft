@@ -153,4 +153,15 @@ describe("Pi buildHintsFromConfig", () => {
     expect(out).toContain("`bash({ command, wait: true })`");
     expect(out).toContain("**Codebase health & diagnostics**");
   });
+
+  test("uses prefixed file and bash names when hoisting is disabled", () => {
+    const config: AftConfig = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: false,
+      bash: true,
+    };
+    const out = buildHintsFromConfig(config, new Set(), false);
+    expect(out).toContain("`aft_read({ path:");
+    expect(out).toContain("`aft_bash({ command, wait: true })`");
+  });
 });

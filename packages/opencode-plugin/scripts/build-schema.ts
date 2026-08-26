@@ -163,7 +163,7 @@ function buildSchema(): Record<string, unknown> {
         type: "boolean",
         default: true,
         description:
-          "Replace the host's built-in read/write/edit/apply_patch (OpenCode) or read/write/edit (Pi) tools with AFT's Rust implementations. Adds backup tracking, auto-formatting, inline diagnostics, and permission checks.",
+          "Replace the host's native file and shell tools with AFT's Rust implementations. Default true. When false, AFT registers its replacements under aft_ names and leaves host-native tools available.",
       },
 
       tool_surface: {

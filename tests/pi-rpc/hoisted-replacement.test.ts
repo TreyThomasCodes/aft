@@ -31,6 +31,7 @@ async function withPiTool(
     setup?: (env: PiIsolatedEnv) => Promise<void>;
     afterTool?: (env: PiIsolatedEnv, toolEnd: Record<string, unknown>) => Promise<void>;
     confirmUi?: boolean;
+    aftConfigOverrides?: Record<string, unknown>;
   },
 ) {
   const env = createPiIsolatedEnv();
@@ -48,6 +49,7 @@ async function withPiTool(
       aftPluginDir: resolvePiPluginDir(),
       configDir: env.configDir,
       workdir: env.workdir,
+      aftConfigOverrides: opts.aftConfigOverrides,
     });
     client = spawned.client;
     client.onExtensionUIRequest((request) => {
@@ -168,6 +170,29 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
       expect(toolEnd.isError).toBe(false);
       expect(resultText(toolEnd)).toContain("Edited (+1/-1).");
     }
+  }, 120_000);
+
+  test("aft_edit round-trips a real edit while host-native slots stay available", async () => {
+    const toolEnd = await withPiTool(
+      {
+        name: "aft_edit",
+        arguments: {
+          filePath: "prefixed.txt",
+          oldString: "before",
+          newString: "after",
+        },
+      },
+      {
+        message: "Update prefixed.txt through AFT's prefixed edit tool.",
+        aftConfigOverrides: { hoist_builtin_tools: false },
+        setup: async (env) => writeFile(join(env.workdir, "prefixed.txt"), "before\n"),
+        afterTool: async (env, event) => {
+          if (event.isError) throw new Error(resultText(event));
+          expect(await readFile(join(env.workdir, "prefixed.txt"), "utf8")).toBe("after\n");
+        },
+      },
+    );
+    expect(toolEnd.isError).toBe(false);
   }, 120_000);
 
   test("grep accepts brace-glob include filters across TypeScript and Rust", async () => {

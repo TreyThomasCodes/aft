@@ -415,12 +415,17 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
   return api.hooks?.bashSpawn;
 }
 
+/** Register AFT's primary bash tool under either the host or aft_ name. */
 export function registerBashTool(
   pi: ExtensionAPI,
   ctx: PluginContext,
   aftSearchRegistered = false,
+  registeredName = "bash",
+  registerCompanions = true,
 ): void {
   const spawnHook = getBashSpawnHook(pi);
+  const readToolName = registeredName === "bash" ? "read" : "aft_read";
+  const grepToolName = registeredName === "bash" ? "grep" : "aft_grep";
   // Agent-facing wording: no internal vocabulary ("hoisted", "Rust handler",
   // "command rewriting") — describe what the tool does and what NOT to use it
   // for. The code-search prohibition steers to aft_search when registered,
@@ -430,8 +435,8 @@ export function registerBashTool(
   // describe a no-op. Background/PTY/watch wording appears only when
   // `bash.background` is enabled.
   const searchSteer = aftSearchRegistered
-    ? "use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead"
-    : "use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead";
+    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`
+    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`;
   const bashCfg = resolveBashConfig(ctx.config);
   // Every command probes the module before fallback. Retain only enough state to
   // clear fallback mode after the first successful module response.
@@ -443,8 +448,8 @@ export function registerBashTool(
     ? ' Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` waits on the task (sync blocks until exit/pattern, async notifies) and `bash_status` peeks at it — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`.'
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
-    name: "bash",
-    label: "bash",
+    name: registeredName,
+    label: registeredName,
     description: `Execute shell commands.${compressionSentence}${tasksSentence}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
@@ -643,15 +648,25 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
     },
   });
 
-  // Background control tools are part of the background surface. When
-  // `bash.background` is disabled, `bash` still registers but runs foreground
-  // commands to completion inline, so these tools are intentionally absent.
-  if (bashCfg.background) {
-    pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
-    pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
-    pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
-    pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
-  }
+  // Standalone registration remains convenient for direct consumers. The
+  // production surface passes false and registers this family independently so
+  // it also works when the primary tool is named `aft_bash`.
+  if (registerCompanions) registerBashCompanionTools(pi, ctx);
+}
+
+/**
+ * Register controls for AFT-owned background task IDs.
+ *
+ * These names deliberately do not follow the primary bash tool's prefix: Pi's
+ * native bash cannot create or inspect AFT task IDs, so the controls do not
+ * replace host-native behavior and must stay discoverable for `aft_bash`.
+ */
+export function registerBashCompanionTools(pi: ExtensionAPI, ctx: PluginContext): void {
+  if (!resolveBashConfig(ctx.config).background) return;
+  pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
+  pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
+  pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
+  pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
 }
 
 /**

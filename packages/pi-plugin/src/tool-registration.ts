@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
 import { registerAstTools } from "./tools/ast.js";
-import { registerBashTool } from "./tools/bash.js";
+import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
 import { registerConflictsTool } from "./tools/conflicts.js";
 import { registerFsTools } from "./tools/fs.js";
 import { registerHoistedTools } from "./tools/hoisted.js";
@@ -17,6 +17,8 @@ import { registerSemanticTool } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
 export interface PiToolSurface {
+  /** Whether AFT replaces host-native tool names instead of registering aft_ alternatives. */
+  hoistBuiltinTools: boolean;
   hoistBash: boolean;
   hoistRead: boolean;
   hoistWrite: boolean;
@@ -44,13 +46,17 @@ const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_
 export function resolvePiToolSurface(config: AftConfig): PiToolSurface {
   const surface = config.tool_surface ?? "recommended";
   const disabled = new Set(config.disabled_tools ?? []);
+  const hoistBuiltinTools = config.hoist_builtin_tools !== false;
   const ok = (name: string): boolean => !disabled.has(name);
+  const builtinToolEnabled = (bareName: string): boolean =>
+    ok(hoistBuiltinTools ? bareName : `aft_${bareName}`);
   const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
   const restrictToProjectRoot = config.restrict_to_project_root ?? false;
 
   if (surface === "minimal") {
     return {
-      hoistBash: ok("bash"),
+      hoistBuiltinTools,
+      hoistBash: builtinToolEnabled("bash"),
       hoistRead: false,
       hoistWrite: false,
       hoistEdit: false,
@@ -73,11 +79,12 @@ export function resolvePiToolSurface(config: AftConfig): PiToolSurface {
   }
 
   const base: PiToolSurface = {
-    hoistBash: ok("bash"),
-    hoistRead: ok("read"),
-    hoistWrite: ok("write"),
-    hoistEdit: ok("edit"),
-    hoistGrep: ok("grep") && config.search_index === true,
+    hoistBuiltinTools,
+    hoistBash: builtinToolEnabled("bash"),
+    hoistRead: builtinToolEnabled("read"),
+    hoistWrite: builtinToolEnabled("write"),
+    hoistEdit: builtinToolEnabled("edit"),
+    hoistGrep: builtinToolEnabled("grep") && config.search_index === true,
     restrictToProjectRoot,
     outline: ok("aft_outline"),
     zoom: ok("aft_zoom"),
@@ -118,7 +125,16 @@ export function registerPiToolSurface(
   surface: PiToolSurface,
 ): void {
   if (surface.hoistBash && resolveBashConfig(ctx.config).enabled) {
-    registerBashTool(pi, ctx, surface.semantic);
+    registerBashTool(
+      pi,
+      ctx,
+      surface.semantic,
+      surface.hoistBuiltinTools ? "bash" : "aft_bash",
+      false,
+    );
+    // Companion tools always address AFT task IDs, so their names remain free
+    // of the primary bash tool's prefix and never collide with Pi's native bash.
+    registerBashCompanionTools(pi, ctx);
   }
   registerHoistedTools(pi, ctx, surface);
 

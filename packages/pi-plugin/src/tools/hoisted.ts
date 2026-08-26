@@ -356,6 +356,8 @@ const GrepParams = Type.Object({
 });
 
 export interface ToolSurfaceFlags {
+  /** True keeps AFT on host-native names; false registers aft_ alternatives. */
+  hoistBuiltinTools?: boolean;
   hoistRead: boolean;
   hoistWrite: boolean;
   hoistEdit: boolean;
@@ -497,15 +499,23 @@ export function registerHoistedTools(
   ctx: PluginContext,
   surface: ToolSurfaceFlags,
 ): void {
+  // Registered names are host-local aliases. Permission checks and bridge calls
+  // use the bare command names, preserving the Rust wire protocol in both modes.
+  const prefix = surface.hoistBuiltinTools === false ? "aft_" : "";
+  const readName = `${prefix}read`;
+  const writeName = `${prefix}write`;
+  const editName = `${prefix}edit`;
+  const grepName = `${prefix}grep`;
+
   if (surface.hoistRead) {
     pi.registerTool(
       withPathAliasPreparation({
-        name: "read",
-        label: "read",
+        name: readName,
+        label: readName,
         description:
           "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
         promptSnippet: "Read file contents (supports offset/limit for large files)",
-        promptGuidelines: ["Use read to examine files instead of cat or sed."],
+        promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,
         async execute(
           _toolCallId: string,
@@ -587,11 +597,11 @@ export function registerHoistedTools(
         : "Existing files are backed up before overwriting (undo via aft_safety).";
     pi.registerTool<typeof WriteParams, FileMutationDetails>(
       withPathAliasPreparation({
-        name: "write",
-        label: "write",
-        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`edit\` tool.`,
+        name: writeName,
+        label: writeName,
+        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool.`,
         promptSnippet: "Create or overwrite files (uses path; auto-formats)",
-        promptGuidelines: ["Use write only for new files or complete rewrites."],
+        promptGuidelines: [`Use ${writeName} only for new files or complete rewrites.`],
         parameters: WriteParams,
         async execute(
           _toolCallId: string,
@@ -634,10 +644,10 @@ export function registerHoistedTools(
 
   if (surface.hoistEdit && ctx.hashlineEffective === true) {
     pi.registerTool<typeof HashlineEditParams, FileMutationDetails>({
-      name: "edit",
-      label: "edit",
+      name: editName,
+      label: editName,
       description: HASHLINE_EDIT_DESCRIPTION,
-      promptSnippet: "Apply a tagged hashline patch through the edit tool",
+      promptSnippet: `Apply a tagged hashline patch through the ${editName} tool`,
       promptGuidelines: [
         "Read a file to obtain its current hashline tag before editing it.",
         "Pass exactly one patch string; paths and tags belong in patch section headers.",
@@ -678,15 +688,15 @@ export function registerHoistedTools(
   if (surface.hoistEdit && ctx.hashlineEffective !== true) {
     pi.registerTool<typeof EditParams, FileMutationDetails>(
       withPathAliasPreparation({
-        name: "edit",
-        label: "edit",
+        name: editName,
+        label: editName,
         description:
           "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
         promptSnippet:
           "Partial file edits via appendContent, edits[], or symbol plus content (exactly one mode per call).",
         promptGuidelines: [
-          "Prefer edit over write when changing part of an existing file.",
-          "Use appendContent when adding text to the end of a file.",
+          `Prefer ${editName} over ${writeName} when changing part of an existing file.`,
+          `Use ${editName} with appendContent when adding text to the end of a file.`,
           "Use edits[] for multiple atomic changes in one file.",
           "Include enough surrounding context in an edits[] find/replace item to make the match unique, or set replaceAll/occurrence explicitly.",
         ],
@@ -745,12 +755,12 @@ export function registerHoistedTools(
   if (surface.hoistGrep) {
     pi.registerTool(
       withPathAliasPreparation({
-        name: "grep",
-        label: "grep",
+        name: grepName,
+        label: grepName,
         description:
           "Search for a regex pattern across files. Uses AFT's trigram index inside the project root for fast repeated queries, and falls back to ripgrep for paths outside the project root.",
         promptSnippet: "Fast regex search across files (trigram-indexed inside the project root)",
-        promptGuidelines: ["Prefer grep over bash-invoked find/rg for in-project searches."],
+        promptGuidelines: [`Prefer ${grepName} over bash-invoked find/rg for in-project searches.`],
         parameters: GrepParams,
         async execute(
           _toolCallId: string,

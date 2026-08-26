@@ -333,6 +333,55 @@ describe("v0.49 production registration profiles", () => {
     });
   }
 
+  test("Pi default and explicit hoisting preserve the existing registration bytes", () => {
+    const base = {
+      tool_surface: "all",
+      backup: { enabled: true },
+      bash: true,
+      search_index: true,
+      semantic_search: true,
+    };
+    const snapshot = (config: Record<string, unknown>) =>
+      JSON.stringify(
+        [...capturePiTools(config)].map(([name, definition]) => ({
+          name,
+          label: definition.label,
+          description: definition.description,
+          parameters: definition.parameters,
+        })),
+      );
+
+    expect(snapshot(base)).toBe(snapshot({ ...base, hoist_builtin_tools: true }));
+  });
+
+  test("Pi prefixed mode preserves native slots and keeps AFT wire names bare", () => {
+    const tools = capturePiTools({
+      tool_surface: "recommended",
+      backup: { enabled: true },
+      bash: true,
+      search_index: true,
+      hoist_builtin_tools: false,
+    });
+    const names = new Set(tools.keys());
+
+    for (const name of [
+      "aft_read",
+      "aft_write",
+      "aft_edit",
+      "aft_grep",
+      "aft_bash",
+      "bash_status",
+      "bash_watch",
+      "bash_write",
+      "bash_kill",
+    ]) {
+      expect(names.has(name), `${name} should register`).toBe(true);
+    }
+    for (const hostName of ["read", "write", "edit", "grep", "bash"]) {
+      expect(names.has(hostName), `${hostName} should remain host-native`).toBe(false);
+    }
+  });
+
   test("full profiles are paired against the checked shared inventory", () => {
     const shared = sorted([
       ...manifest.shared_tool_inventory.tools.map((toolName) => toolName.opencode),

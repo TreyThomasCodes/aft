@@ -157,6 +157,22 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring enabled from project config");
   });
 
+  test("project config can switch to prefixed built-in alternatives", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ hoist_builtin_tools: true }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ hoist_builtin_tools: false }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(
+      (JSON.parse(result.stdout) as { hoist_builtin_tools?: boolean }).hoist_builtin_tools,
+    ).toBe(false);
+    expect(result.stderr).not.toContain("Ignoring hoist_builtin_tools");
+  });
+
   test("honors user backup config and ignores project backup config", () => {
     const fixture = createConfigFixture();
     writeFileSync(
@@ -930,15 +946,29 @@ describe("loadAftConfig", () => {
     }
   });
 
-  test("silently strips OpenCode-only keys but still rejects unknown keys", () => {
-    const otherHarness = AftConfigSchema.safeParse({
+  test("accepts shared hoist_builtin_tools but strips OpenCode-only auto_update", () => {
+    const mixedHarness = AftConfigSchema.safeParse({
       hoist_builtin_tools: true,
       auto_update: false,
     });
-    expect(otherHarness.success).toBe(true);
-    if (otherHarness.success) expect(otherHarness.data).toEqual({});
+    expect(mixedHarness.success).toBe(true);
+    if (mixedHarness.success) expect(mixedHarness.data).toEqual({ hoist_builtin_tools: true });
 
     expect(AftConfigSchema.safeParse({ genuinely_unknown_key: true }).success).toBe(false);
+  });
+
+  test("warns once when stripping the OpenCode-only auto_update key", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ auto_update: false }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(result.stderr).toContain("Ignoring OpenCode-only config key `auto_update`");
+    expect(result.stderr.match(/OpenCode-only config key/g)).toHaveLength(1);
   });
 
   test("strict cutover rejects manually re-added old keys", () => {

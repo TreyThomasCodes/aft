@@ -22,7 +22,7 @@ pi install npm:@cortexkit/aft-pi@0.13.1
 
 ### Hoisted built-in overrides
 
-Pi's default `read`, `write`, `edit`, and `grep` are replaced with AFT-backed versions.
+Pi's default `read`, `write`, `edit`, and `grep` are replaced with AFT-backed versions by default. Set `hoist_builtin_tools: false` to keep Pi's native tools and use `aft_read`, `aft_write`, `aft_edit`, `aft_grep`, and `aft_bash` for AFT instead; AFT background-bash companions remain `bash_status`, `bash_watch`, `bash_write`, and `bash_kill`.
 
 | Tool    | Pi built-in              | AFT replacement                                                                              |
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- |
@@ -68,6 +68,10 @@ All keys are optional. Example:
 {
   // "minimal" | "recommended" (default) | "all"
   "tool_surface": "recommended",
+
+  // Default true replaces Pi's native file and bash tools.
+  // Set false to retain Pi's tools and use aft_read/aft_write/aft_edit/aft_bash for AFT.
+  "hoist_builtin_tools": false,
 
   // Auto-format on write/edit using project formatter config.
   "format_on_edit": true,
@@ -119,7 +123,7 @@ Sensitive semantic backend fields (`backend`, `base_url`, `api_key_env`) are onl
 | Tier              | Tools                                                                                                                   |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `minimal`         | `aft_outline`, `aft_zoom`, `aft_safety`                                                                                 |
-| `recommended` (default) | `minimal` + hoisted `read`/`write`/`edit` + `aft_import` + `ast_grep_*` + `lsp_diagnostics` + `aft_conflicts` + (optional) `grep` + (optional) `aft_search` |
+| `recommended` (default) | `minimal` + `read`/`write`/`edit` (or `aft_` alternatives when hoisting is disabled) + `aft_import` + `ast_grep_*` + `lsp_diagnostics` + `aft_conflicts` + (optional) `grep`/`aft_grep` + (optional) `aft_search` |
 | `all`             | `recommended` + `aft_callgraph` + `aft_delete` + `aft_move` + `aft_refactor`                           |
 
 ## Architecture

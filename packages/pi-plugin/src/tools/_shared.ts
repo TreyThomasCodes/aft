@@ -65,10 +65,12 @@ export function withPathAliasPreparation<
 >(tool: ToolDefinition<TParams, TDetails, TState>): ToolDefinition<TParams, TDetails, TState> {
   const existing = tool.prepareArguments;
   const prepare = (args: unknown): Static<TParams> => {
-    const prepared =
-      tool.name === "edit"
-        ? prepareCanonicalEditArguments(tool.name, args)
-        : prepareCanonicalPathArguments(tool.name, args);
+    const isEditTool = tool.name === "edit" || tool.name === "aft_edit";
+    // Apply the same canonical edit handling to `aft_edit` and bare `edit` so
+    // both registrations accept the same request shapes.
+    const prepared = isEditTool
+      ? prepareCanonicalEditArguments("edit", args)
+      : prepareCanonicalPathArguments(tool.name, args);
     return (existing ? existing(prepared) : prepared) as Static<TParams>;
   };
   return {

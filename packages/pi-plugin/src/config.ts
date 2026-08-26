@@ -235,6 +235,8 @@ export interface AftConfig {
   checker?: Record<string, Checker>;
   /** Configure-time missing-tool warning delivery. Default: toast. */
   configure_warnings_delivery?: ConfigureWarningsDelivery;
+  /** Replace host-native read/write/edit/grep/bash with AFT tools. Default: true; false registers AFT's replacements under aft_ names. */
+  hoist_builtin_tools?: boolean;
   tool_surface?: ToolSurface;
   disabled_tools?: string[];
   restrict_to_project_root?: boolean;
@@ -677,6 +679,12 @@ export const AftConfigSchema = z.preprocess(
       formatter: z.record(z.string(), FormatterEnum).optional(),
       checker: z.record(z.string(), CheckerEnum).optional(),
       configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+      /**
+       * Replace Pi's native read/write/edit/grep/bash tools with AFT's
+       * implementations. Default: true. When false, AFT registers its
+       * equivalents under aft_ names and leaves Pi's native tools available.
+       */
+      hoist_builtin_tools: z.boolean().optional(),
       tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
       disabled_tools: z.array(z.string()).optional(),
       restrict_to_project_root: z.boolean().optional(),
@@ -1087,6 +1095,17 @@ function recordConfigParseFailure(configPath: string, errorMessage: string): voi
   warn(formatConfigParseFailureMessage(configPath, errorMessage));
 }
 
+function warnIgnoredHarnessSpecificConfigKeys(
+  config: Record<string, unknown>,
+  configPath: string,
+): void {
+  const ignored = OPENCODE_ONLY_KEYS.filter((key) => Object.hasOwn(config, key));
+  if (ignored.length === 0) return;
+  warn(
+    `Ignoring OpenCode-only config key${ignored.length === 1 ? "" : "s"} ${ignored.map((key) => `\`${key}\``).join(", ")} in ${configPath}; ${ignored.length === 1 ? "it has" : "they have"} no effect on the Pi harness.`,
+  );
+}
+
 function loadConfigFromPath(configPath: string): AftConfig | null {
   try {
     if (!existsSync(configPath)) return null;
@@ -1102,6 +1121,7 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     // symbols and would silently drop the whole config to defaults (issue #88).
     // Validate against a symbol-free deep copy.
     const cleanConfig = stripJsoncSymbols(rawConfig);
+    warnIgnoredHarnessSpecificConfigKeys(cleanConfig, configPath);
     const result = AftConfigSchema.safeParse(cleanConfig);
 
     if (result.success) {
@@ -1354,7 +1374,8 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "enabled",
   "edit_mode",
   "tool_surface",
-  // (Pi schema does not currently expose `hoist_builtin_tools`; if added, mark safe.)
+  // This only changes the names Pi exposes; AFT permissions and capabilities stay the same.
+  "hoist_builtin_tools",
   "format_on_edit",
   "validate_on_edit",
   "configure_warnings_delivery",

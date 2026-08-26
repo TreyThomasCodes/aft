@@ -3,7 +3,7 @@
  * loader. Both harnesses read the same CortexKit config file, so each schema
  * strips the other harness's declared keys before strict validation.
  */
-export const OPENCODE_ONLY_KEYS = ["hoist_builtin_tools", "auto_update"] as const;
+export const OPENCODE_ONLY_KEYS = ["auto_update"] as const;
 
 /** Pi currently has no top-level keys that OpenCode does not understand. */
 export const PI_ONLY_KEYS = [] as const;

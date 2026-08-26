@@ -25,7 +25,9 @@ from "ran but partial":
 ## Hoisted tools
 
 These replace the host harness's built-ins. Registered under the same names by default. When
-`hoist_builtin_tools: false`, they get the `aft_` prefix instead (e.g. `aft_read`).
+`hoist_builtin_tools: false`, AFT file, search, and primary bash replacements get the `aft_`
+prefix instead (for example, `aft_read` and `aft_bash`). The `bash_status`, `bash_watch`,
+`bash_write`, and `bash_kill` companions remain unprefixed because they control AFT-owned task IDs.
 
 Tools that don't exist natively in a given harness are simply registered as new tools — no
 hoisting needed. (Pi, for example, doesn't ship `apply_patch` or `lsp_diagnostics`; AFT adds
