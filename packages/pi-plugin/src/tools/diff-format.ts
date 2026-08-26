@@ -14,6 +14,7 @@
  */
 
 import { diffLines } from "diff";
+import { normalizeTerminalText } from "./render-helpers.js";
 
 export interface FormattedDiff {
   diff: string;
@@ -131,5 +132,10 @@ export function formatDiffForPi(
     lastWasChange = false;
   }
 
-  return { diff: output.join("\n"), firstChangedLine };
+  return {
+    // This string is passed to Pi's diff renderer; keep CR out of its terminal
+    // input without changing the original before/after file contents.
+    diff: normalizeTerminalText(output.join("\n")),
+    firstChangedLine,
+  };
 }

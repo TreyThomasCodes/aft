@@ -45,7 +45,11 @@ import {
   withPathAliasPreparation,
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
-import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
+import {
+  collapsibleResult,
+  normalizeTerminalText,
+  type RenderResultOptionsLike,
+} from "./render-helpers.js";
 
 type ReadAttachment = {
   kind?: unknown;
@@ -1050,7 +1054,9 @@ export function renderMutationResult(
     // Renderer tests and non-interactive hosts may not have initialized Pi's theme proxy.
     renderedDiff = diff;
   }
-  container.addChild(new Text(renderedDiff, 1, 0));
+  // Normalize before Text wraps the lines, then collapsibleResult applies the
+  // same safeguard to every renderer's final terminal-bound output.
+  container.addChild(new Text(normalizeTerminalText(renderedDiff), 1, 0));
   const rawPath =
     context.args &&
     typeof context.args === "object" &&

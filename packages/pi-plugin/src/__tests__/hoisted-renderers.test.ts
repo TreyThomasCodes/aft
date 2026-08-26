@@ -5,7 +5,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { renderMutationCall, renderMutationResult } from "../tools/hoisted.js";
+import { buildMutationResult, renderMutationCall, renderMutationResult } from "../tools/hoisted.js";
 import { makeContext, makeResult, mockTheme, renderToString } from "./render-test-helpers.js";
 
 describe("hoisted renderers", () => {
@@ -21,6 +21,34 @@ describe("hoisted renderers", () => {
 
     expect(out).toContain("edit");
     expect(out).toContain("src/batch.ts");
+  });
+
+  test("renderMutationResult keeps CRLF diffs visible and terminal-safe", () => {
+    const unchanged = Array.from({ length: 10 }, (_, index) => `context ${index}`).join("\r\n");
+    const result = buildMutationResult({
+      text: "Edited",
+      diff: {
+        before: `old line\r\n${unchanged}\r\n`,
+        after: `new line\r\n${unchanged}\r\n`,
+        additions: 1,
+        deletions: 1,
+      },
+    });
+    const context = makeContext({ path: "src/crlf.ts" });
+
+    const collapsed = renderToString(
+      renderMutationResult(result, mockTheme, context, { expanded: false }),
+    );
+    expect(collapsed).toContain("edited src/crlf.ts (+1/-1)");
+    expect(collapsed).not.toContain("old line");
+    expect(collapsed).not.toContain("\r");
+
+    const expanded = renderToString(
+      renderMutationResult(result, mockTheme, context, { expanded: true }),
+    );
+    expect(expanded).toContain("old line");
+    expect(expanded).toContain("new line");
+    expect(expanded).not.toContain("\r");
   });
 
   test("renderMutationResult keeps batch edit counts when only summary counts are available", () => {

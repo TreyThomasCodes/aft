@@ -15,6 +15,18 @@ describe("formatDiffForPi", () => {
     expect(result.firstChangedLine).toBeUndefined();
   });
 
+  test("strips CR from CRLF content while keeping diff lines visible", () => {
+    const { diff, firstChangedLine } = formatDiffForPi(
+      "old line\r\nkeep\r\n",
+      "new line\r\nkeep\r\n",
+    );
+
+    expect(firstChangedLine).toBe(1);
+    expect(diff).toContain("-1 old line");
+    expect(diff).toContain("+1 new line");
+    expect(diff).not.toContain("\r");
+  });
+
   test("formats a single-line change with Pi's +NN / -NN shape", () => {
     const before = "const a = 1;\n";
     const after = "const a = 2;\n";

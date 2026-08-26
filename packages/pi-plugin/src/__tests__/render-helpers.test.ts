@@ -5,7 +5,9 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import type { Component } from "@earendil-works/pi-tui";
 import {
+  collapsibleResult,
   collectTextContent,
   extractStructuredPayload,
   formatLineRange,
@@ -14,9 +16,10 @@ import {
   formatValue,
   groupByFile,
   joinNonEmpty,
+  normalizeTerminalText,
   severityBadge,
 } from "../tools/render-helpers.js";
-import { mockTheme } from "./render-test-helpers.js";
+import { makeContext, mockTheme } from "./render-test-helpers.js";
 
 describe("render helper utilities", () => {
   test("extractStructuredPayload prefers details and safely parses text fallback", () => {
@@ -32,6 +35,35 @@ describe("render helper utilities", () => {
     expect(
       extractStructuredPayload({ content: [{ type: "text", text: "not json" }] }),
     ).toBeUndefined();
+  });
+
+  test("normalizes carriage returns at the shared result seam", () => {
+    const component = (lines: string[]): Component =>
+      ({
+        render: () => lines,
+        invalidate: () => {},
+      }) as Component;
+
+    const expanded = collapsibleResult({
+      summary: "edited file (+1/-1)",
+      full: component(["- 1 old\r", "+ 1 new\r"]),
+      expanded: true,
+      context: makeContext({}),
+    });
+    const expandedLines = expanded.render(200);
+    expect(expandedLines).toEqual(["- 1 old", "+ 1 new"]);
+    expect(expandedLines.join("\n")).not.toContain("\r");
+
+    const collapsed = collapsibleResult({
+      summary: "edited file (+1/-1)\r",
+      full: component(Array.from({ length: 6 }, (_, index) => `line ${index}\r`)),
+      expanded: false,
+      context: makeContext({}),
+    });
+    const collapsedText = collapsed.render(200).join("\n");
+    expect(collapsedText).toContain("edited file (+1/-1)");
+    expect(collapsedText).not.toContain("\r");
+    expect(normalizeTerminalText("a\rb")).toBe("ab");
   });
 
   test("collectTextContent ignores non-text blocks and trims model-facing text", () => {

@@ -20,6 +20,32 @@ export interface RenderResultOptionsLike {
 
 const NATIVE_COLLAPSED_RESULT_MAX_LINES = 5;
 
+/**
+ * Remove carriage returns from strings that are about to be rendered in Pi's
+ * terminal. A CRLF line ending is two characters in a string, but the terminal
+ * interprets the carriage return as "move to column zero"; if it survives in a
+ * rendered line, later text can overprint it while the TUI still reserves the row.
+ */
+export function normalizeTerminalText(text: string): string {
+  return text.replace(/\r/g, "");
+}
+
+class TerminalSafeComponent implements Component {
+  constructor(private readonly component: Component) {}
+
+  render(width: number): string[] {
+    return this.component.render(width).map(normalizeTerminalText);
+  }
+
+  invalidate(): void {
+    this.component.invalidate?.();
+  }
+
+  handleInput(data: string): void {
+    this.component.handleInput?.(data);
+  }
+}
+
 export function reuseText(last: Component | undefined): Text {
   return last instanceof Text ? last : new Text("", 0, 0);
 }
@@ -99,8 +125,13 @@ export function collapsibleResult({
   expanded?: boolean;
   context: RenderContextLike;
 }): Component {
-  if (expanded === true || full.render(200).length <= NATIVE_COLLAPSED_RESULT_MAX_LINES) {
-    return full;
+  const renderedAtCollapseWidth = full.render(200);
+  const terminalSafeFull = renderedAtCollapseWidth.some((line) => line.includes("\r"))
+    ? new TerminalSafeComponent(full)
+    : full;
+
+  if (expanded === true || renderedAtCollapseWidth.length <= NATIVE_COLLAPSED_RESULT_MAX_LINES) {
+    return terminalSafeFull;
   }
 
   const text = reuseText(context.lastComponent);
@@ -244,17 +275,19 @@ export function formatUnifiedDiffForPi(unifiedDiff: string): string {
   if (entries.length === 0) return "";
 
   const width = String(entries.reduce((max, entry) => Math.max(max, entry.line), 1)).length;
-  return entries
-    .map((entry) => `${entry.prefix}${String(entry.line).padStart(width, " ")} ${entry.text}`)
-    .join("\n");
+  return normalizeTerminalText(
+    entries
+      .map((entry) => `${entry.prefix}${String(entry.line).padStart(width, " ")} ${entry.text}`)
+      .join("\n"),
+  );
 }
 
 export function renderUnifiedDiff(unifiedDiff: string): string {
   const piDiff = formatUnifiedDiffForPi(unifiedDiff);
   if (!piDiff) return "";
   try {
-    return renderDiff(piDiff);
+    return normalizeTerminalText(renderDiff(piDiff));
   } catch {
-    return piDiff;
+    return normalizeTerminalText(piDiff);
   }
 }
