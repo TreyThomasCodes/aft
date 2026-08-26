@@ -114,6 +114,7 @@ pub mod sandbox_spawn;
 pub mod scoped_key;
 pub mod search_index;
 pub mod semantic_index;
+pub mod standing_roots;
 pub mod subc;
 pub mod subc_config;
 pub mod subc_format;

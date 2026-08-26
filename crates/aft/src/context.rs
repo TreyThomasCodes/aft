@@ -1589,6 +1589,9 @@ pub struct AppContext {
     /// closes it for degraded home roots and every heavy-work entry point reads
     /// the same atomic so the decision cannot drift after configure returns.
     heavy_root_work_allowed: Arc<AtomicBool>,
+    /// Standing roots retain artifacts across idle session reaping, but they
+    /// remain subject to every verification and publication fence.
+    standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_store_force_requested: AtomicU64,
@@ -2027,6 +2030,7 @@ impl AppContext {
             artifact_owner_lease: parking_lot::Mutex::new(None),
             degraded_reasons: parking_lot::Mutex::new(Vec::new()),
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
+            standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_store_force_requested: AtomicU64::new(0),
@@ -5046,6 +5050,13 @@ impl AppContext {
         Arc::clone(&self.inspect_manager)
     }
 
+    /// Standing ownership exempts a root from idle artifact eviction only. It
+    /// does not bypass strict verification, budgets, breaker checks, or leases.
+    pub(crate) fn set_standing_artifact_exempt(&self, exempt: bool) {
+        self.standing_artifact_exempt
+            .store(exempt, Ordering::Release);
+    }
+
     pub(crate) fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
         Arc::clone(
             &self
@@ -5992,6 +6003,9 @@ impl AppContext {
     /// live handle. Callers use this as the single safety gate before clearing
     /// resident stores and inspect caches.
     pub fn artifact_eviction_blocked(&self) -> bool {
+        if self.standing_artifact_exempt.load(Ordering::Acquire) {
+            return true;
+        }
         let semantic_refresh_in_flight = match &*self
             .semantic_index_status
             .read()

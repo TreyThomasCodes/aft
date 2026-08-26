@@ -48,6 +48,9 @@ const PROCESS_START_TIME_GRACE_MS: u64 = 1_000;
 pub enum RootCacheDomain {
     Callgraph,
     Inspect,
+    /// Search-index publication for an unbound standing root. This remains a
+    /// root-keyed WriterLease domain, separate from the session-owned cache.
+    Index,
 }
 
 impl RootCacheDomain {
@@ -55,6 +58,7 @@ impl RootCacheDomain {
         match self {
             RootCacheDomain::Callgraph => "callgraph",
             RootCacheDomain::Inspect => "inspect",
+            RootCacheDomain::Index => "index",
         }
     }
 }

@@ -58,28 +58,25 @@ pub(crate) fn acquire_blocking_while_with_limiter(
 
 /// Identify the source of a cold-build request without exposing a limiter knob.
 ///
-/// The classes deliberately have no absolute priority ordering. When both
-/// classes are waiting, the limiter avoids admitting the class that was admitted
-/// most recently. This lets an interactive inspect take the next release after
-/// maintenance without starving maintenance under sustained interactive load.
+/// The classes deliberately have no absolute priority ordering. When a class
+/// was admitted most recently and another class is waiting, the limiter defers
+/// that repeat admission. Standing adds a yielding class to this existing
+/// rotation; it never installs a priority retry path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ColdBuildAdmissionClass {
     InspectTriggered,
     Maintenance,
+    Standing,
 }
+
+const ADMISSION_CLASS_COUNT: usize = 3;
 
 impl ColdBuildAdmissionClass {
     const fn index(self) -> usize {
         match self {
             Self::InspectTriggered => 0,
             Self::Maintenance => 1,
-        }
-    }
-
-    const fn other_index(self) -> usize {
-        match self {
-            Self::InspectTriggered => Self::Maintenance.index(),
-            Self::Maintenance => Self::InspectTriggered.index(),
+            Self::Standing => 2,
         }
     }
 
@@ -87,6 +84,7 @@ impl ColdBuildAdmissionClass {
         match self {
             Self::InspectTriggered => "inspect-triggered",
             Self::Maintenance => "maintenance",
+            Self::Standing => "standing",
         }
     }
 }
@@ -145,6 +143,36 @@ pub(crate) fn acquire_blocking_while_cancellable_with_limiter(
     acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled)
 }
 
+/// A Standing permit preserves the lifecycle admission epoch captured before
+/// limiter acquisition. Checkpoint code drops it before yielding and carries the
+/// same epoch into the next attempt, so an obsolete build cannot become current
+/// merely by waiting for a slot.
+#[derive(Debug)]
+pub(crate) struct StandingColdBuildPermit {
+    _permit: ColdBuildPermit,
+    pub(crate) admission_epoch: u64,
+}
+
+/// Standing performs the same waiter inspection before initial acquisition and
+/// checkpoint reacquisition because both call this one function. It declines
+/// immediately when an interactive or normal-maintenance waiter is visible.
+pub(crate) fn acquire_standing_while_cancellable_with_limiter(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    request_id: impl Into<String>,
+    admission_epoch: u64,
+    admitted: impl Fn() -> bool,
+    cancelled: impl Fn() -> bool,
+) -> Option<StandingColdBuildPermit> {
+    let request = ColdBuildAdmissionRequest::new(request_id, ColdBuildAdmissionClass::Standing);
+    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled).map(|permit| {
+        StandingColdBuildPermit {
+            _permit: permit,
+            admission_epoch,
+        }
+    })
+}
+
 fn acquire_blocking_while_inner(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
@@ -159,10 +187,21 @@ fn acquire_blocking_while_inner(
         if !admitted() || cancelled() {
             return None;
         }
+        // Standing yields to any already-queued interactive or ordinary
+        // maintenance contender. Returning None keeps it resumable; callers
+        // use the same path again at the next checkpoint without priority tags.
+        if request.is_some_and(|request| request.class == ColdBuildAdmissionClass::Standing)
+            && limiter.has_non_standing_waiters()
+        {
+            return None;
+        }
         let revoked_after_acquire = std::cell::Cell::new(false);
         let permit = match request {
             Some(request) => limiter.try_acquire_classified(request, || {
-                let still_admitted = admitted() && !cancelled();
+                let still_admitted = admitted()
+                    && !cancelled()
+                    && (request.class != ColdBuildAdmissionClass::Standing
+                        || !limiter.has_non_standing_waiters());
                 revoked_after_acquire.set(!still_admitted);
                 still_admitted
             }),
@@ -244,12 +283,14 @@ pub(crate) fn acquire_blocking_while_with_test_limiter(
 pub(crate) struct ColdBuildLimiter {
     available: AtomicUsize,
     limit: usize,
+    /// Waiter counts are atomics so a Standing contender can yield without a
+    /// second hot-path lock. Rotation still uses `admission_state` below.
+    waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
     admission_state: Mutex<AdmissionState>,
 }
 
 #[derive(Debug)]
 struct AdmissionState {
-    waiting_by_class: [usize; 2],
     last_admitted_class: Option<ColdBuildAdmissionClass>,
     next_admission_order: u64,
     events: VecDeque<ColdBuildAdmissionEvent>,
@@ -261,8 +302,8 @@ impl ColdBuildLimiter {
         Self {
             available: AtomicUsize::new(limit),
             limit,
+            waiting_by_class: std::array::from_fn(|_| AtomicUsize::new(0)),
             admission_state: Mutex::new(AdmissionState {
-                waiting_by_class: [0; 2],
                 last_admitted_class: None,
                 next_admission_order: 1,
                 events: VecDeque::with_capacity(ADMISSION_EVENT_RETENTION),
@@ -311,7 +352,7 @@ impl ColdBuildLimiter {
         // stranding independent roots behind an artificial one-at-a-time turn.
         let available = self.available.load(Ordering::Acquire);
         if available <= 1
-            && state.waiting_by_class[request.class.other_index()] > 0
+            && self.has_waiter_from_another_class(request.class)
             && state.last_admitted_class == Some(request.class)
         {
             return None;
@@ -352,12 +393,28 @@ impl ColdBuildLimiter {
             .collect()
     }
 
+    /// O(1) waiter-set inspection used by Standing before its initial permit
+    /// and every checkpoint reacquisition. The counters are maintained by RAII
+    /// waiters and therefore need no scheduler-state lock on this hot path.
+    pub(crate) fn has_non_standing_waiters(&self) -> bool {
+        self.waiting_by_class[ColdBuildAdmissionClass::InspectTriggered.index()]
+            .load(Ordering::Acquire)
+            > 0
+            || self.waiting_by_class[ColdBuildAdmissionClass::Maintenance.index()]
+                .load(Ordering::Acquire)
+                > 0
+    }
+
+    fn has_waiter_from_another_class(&self, class: ColdBuildAdmissionClass) -> bool {
+        self.waiting_by_class
+            .iter()
+            .enumerate()
+            .any(|(index, waiters)| index != class.index() && waiters.load(Ordering::Acquire) > 0)
+    }
+
     #[cfg(test)]
-    fn waiting_by_class_for_test(&self) -> [usize; 2] {
-        self.admission_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .waiting_by_class
+    fn waiting_by_class_for_test(&self) -> [usize; ADMISSION_CLASS_COUNT] {
+        std::array::from_fn(|index| self.waiting_by_class[index].load(Ordering::Acquire))
     }
 }
 
@@ -368,12 +425,7 @@ struct AdmissionWaiter {
 
 impl AdmissionWaiter {
     fn register(limiter: &Arc<ColdBuildLimiter>, class: ColdBuildAdmissionClass) -> Self {
-        let mut state = limiter
-            .admission_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.waiting_by_class[class.index()] += 1;
-        drop(state);
+        limiter.waiting_by_class[class.index()].fetch_add(1, Ordering::AcqRel);
         Self {
             limiter: Arc::clone(limiter),
             class,
@@ -383,14 +435,9 @@ impl AdmissionWaiter {
 
 impl Drop for AdmissionWaiter {
     fn drop(&mut self) {
-        let mut state = self
-            .limiter
-            .admission_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let waiting = &mut state.waiting_by_class[self.class.index()];
-        debug_assert!(*waiting > 0);
-        *waiting = waiting.saturating_sub(1);
+        let previous =
+            self.limiter.waiting_by_class[self.class.index()].fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
     }
 }
 
@@ -540,6 +587,49 @@ mod tests {
             limiter.admission_events().is_empty(),
             "cancelled work must not emit a successful admission"
         );
+    }
+
+    #[test]
+    fn standing_yields_before_initial_and_checkpoint_reacquisition_when_non_standing_waits() {
+        let limiter = test_limiter(1);
+        let non_standing_waiter =
+            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::Maintenance);
+
+        assert!(acquire_standing_while_cancellable_with_limiter(
+            &limiter,
+            "standing-initial",
+            "standing-initial",
+            41,
+            || true,
+            || false,
+        )
+        .is_none());
+
+        drop(non_standing_waiter);
+        let first = acquire_standing_while_cancellable_with_limiter(
+            &limiter,
+            "standing-checkpoint",
+            "standing-checkpoint",
+            41,
+            || true,
+            || false,
+        )
+        .expect("standing may acquire once ordinary waiters clear");
+        assert_eq!(first.admission_epoch, 41);
+        drop(first);
+
+        let non_standing_waiter =
+            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::InspectTriggered);
+        assert!(acquire_standing_while_cancellable_with_limiter(
+            &limiter,
+            "standing-reacquire",
+            "standing-reacquire",
+            41,
+            || true,
+            || false,
+        )
+        .is_none());
+        drop(non_standing_waiter);
     }
 
     #[test]

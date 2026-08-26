@@ -150,6 +150,7 @@ mod bash;
 mod health;
 mod manifest;
 mod push;
+mod standing;
 mod wire;
 
 use self::health::{
@@ -2581,6 +2582,7 @@ async fn process_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
+    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
@@ -2596,6 +2598,7 @@ async fn process_route_bind_completion(
         pending_binds,
         installed_route_epochs,
         executor,
+        standing_actor,
         shutdown,
         metrics,
     )
@@ -2614,6 +2617,7 @@ async fn drain_pending_route_bind_completions(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
+    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<usize, SubcError> {
@@ -2630,6 +2634,7 @@ async fn drain_pending_route_bind_completions(
             pending_binds,
             installed_route_epochs,
             executor,
+            standing_actor,
             shutdown,
             metrics,
         )
@@ -2716,6 +2721,12 @@ where
     // the sleep_until arm below only exists to wake an otherwise-idle loop.
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
+    let standing_actor =
+        standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor));
+    // Startup reconciliation is intentionally direct; subsequent passes use
+    // this existing maintenance timer arm and never create a standing timer.
+    standing_actor.reconcile_at_startup();
+    let mut next_standing_pass_at = tokio::time::Instant::now();
     // Rate-limit stamp for opportunistic allocator slack relief (checked on the
     // maintenance tick; policy shared with standalone via memory.rs).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2821,6 +2832,7 @@ where
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
+            &standing_actor,
             &shutdown,
             &dispatch_path_metrics,
         )
@@ -2927,6 +2939,7 @@ where
                     &mut pending_binds,
                     &mut installed_route_epochs,
                     &executor,
+                    &standing_actor,
                     &shutdown,
                     &dispatch_path_metrics,
                 )
@@ -3362,6 +3375,11 @@ where
                     &maintenance_tx,
                     &dispatch_path_metrics,
                 );
+                if tokio::time::Instant::now() >= next_standing_pass_at {
+                    standing_actor.tick();
+                    next_standing_pass_at = tokio::time::Instant::now()
+                        + standing::STANDING_MAINTENANCE_INTERVAL;
+                }
                 // Opportunistic allocator relief, independent of the idle
                 // sweep: the sweep's whole-process idle gate never opens while
                 // any session stays active, which let freed warm-up arenas sit
@@ -3755,6 +3773,7 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
+    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
 ) -> Result<(), SubcError> {
@@ -3897,6 +3916,9 @@ async fn handle_route_bind_completion(
         meta.maintenance_poisoned = false;
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+        // The bind transition revokes any matching unbound standing admission
+        // before this session can select the shared artifact family.
+        standing_actor.begin_session_bind(&ctx);
         ctx.mark_subc_bound();
         if restore_watcher {
             crate::commands::configure::ensure_project_watcher(&ctx);
@@ -8463,6 +8485,9 @@ mod tests {
             HashMap::from([(replay_key, VecDeque::from([completion_frame("b2-replay")]))]);
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
+        let executor = Arc::new(Executor::new());
+        let standing_actor =
+            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
 
         handle_route_bind_completion(
             &writer_tx,
@@ -8474,7 +8499,8 @@ mod tests {
             &mut HashMap::new(),
             &mut pending_binds,
             &mut installed_route_epochs,
-            &Arc::new(Executor::new()),
+            &executor,
+            &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
         )

@@ -67,6 +67,10 @@ pub enum JobClass {
 pub(crate) enum MaintenanceCoalesceKey {
     WatcherDrain,
     LspDrain,
+    /// Standing maintenance is coalesced inside each actor queue. The executor
+    /// already scopes queue state by root, so this key cannot coalesce work for
+    /// separate standing roots.
+    StandingPass,
 }
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
