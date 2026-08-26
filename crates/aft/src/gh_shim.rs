@@ -1729,8 +1729,20 @@ enum Classification {
 
 fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
     let Some((verb, subcommand, _)) = command_head(args) else {
-        return Classification::Unclassified;
+        // Keep malformed argument vectors fail-closed; a valid no-subcommand
+        // vector is the mechanical case described below.
+        if args.iter().any(|arg| arg.to_str().is_none()) {
+            return Classification::Unclassified;
+        }
+        // When no subcommand is provided, the real `gh` can only show top-level
+        // help or version information; it cannot make GitHub requests or change
+        // the active user or account. Therefore this invocation is mechanical.
+        return Classification::Mechanical;
     };
+    if verb == "help" {
+        // `gh help <command>` only renders upstream CLI help and has no GitHub-side effects.
+        return Classification::Mechanical;
+    }
     if verb == "api" {
         return classify_api(args, manifest, platform);
     }
@@ -3307,6 +3319,26 @@ mod tests {
             load_manifest(&paths, now),
             Err(ManifestProblem::BelowFloor { manifest_floor: 0 })
         ));
+    }
+
+    #[test]
+    fn no_verb_and_help_invocations_are_mechanical_on_a_governed_manifest() {
+        let manifest = fixture_manifest();
+        for args in [
+            Vec::new(),
+            vec![OsString::from("--version")],
+            vec![OsString::from("--help")],
+            vec![OsString::from("-h")],
+            vec![OsString::from("help"), OsString::from("pr")],
+        ] {
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Mechanical
+                ),
+                "expected passthrough classification for {args:?}"
+            );
+        }
     }
 
     #[test]
