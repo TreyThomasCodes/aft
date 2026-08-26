@@ -1479,6 +1479,22 @@ impl SearchIndex {
         self.git_head.as_deref()
     }
 
+    /// Count source files whose current stat no longer matches this persisted
+    /// snapshot. Borrowed readers use this bounded-to-metadata probe to disclose
+    /// a stale standing snapshot without restoring the owner's strict hash census.
+    pub(crate) fn borrowed_stat_mismatch_count(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|entry| {
+                let Ok(metadata) = fs::metadata(&entry.path) else {
+                    return true;
+                };
+                metadata.len() != entry.size
+                    || metadata.modified().unwrap_or(UNIX_EPOCH) != entry.modified
+            })
+            .count()
+    }
+
     pub(crate) fn configured_max_file_size(&self) -> u64 {
         self.max_file_size
     }

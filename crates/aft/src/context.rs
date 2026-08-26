@@ -1573,6 +1573,9 @@ pub struct AppContext {
     is_worktree_bridge: parking_lot::Mutex<bool>,
     git_common_dir: parking_lot::Mutex<Option<PathBuf>>,
     shared_artifacts_read_only: AtomicBool,
+    /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
+    /// writer has exited; daemon-bound routes keep their live freshness owner.
+    daemonless_query_mode: AtomicBool,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
@@ -2024,6 +2027,7 @@ impl AppContext {
             is_worktree_bridge: parking_lot::Mutex::new(false),
             git_common_dir: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
+            daemonless_query_mode: AtomicBool::new(false),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
@@ -3641,6 +3645,18 @@ impl AppContext {
 
     pub fn shared_artifacts_read_only(&self) -> bool {
         !self.callgraph_writer()
+    }
+
+    /// Mark whether this context serves standalone NDJSON requests rather than
+    /// a live subc route. Only standalone queries may disclose a stale CLI
+    /// snapshot instead of following the daemon's normal freshness path.
+    #[doc(hidden)]
+    pub fn set_daemonless_query_mode(&self, enabled: bool) {
+        self.daemonless_query_mode.store(enabled, Ordering::SeqCst);
+    }
+
+    pub(crate) fn daemonless_query_mode(&self) -> bool {
+        self.daemonless_query_mode.load(Ordering::SeqCst)
     }
 
     /// True when this root is borrow-only and `worktree.ram_overlay` is on.

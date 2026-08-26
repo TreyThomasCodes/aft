@@ -15,6 +15,7 @@ use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, render_symbol_within_budget,
     BudgetedSymbolRenderStatus,
 };
+use crate::config::IndexKind;
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
@@ -47,6 +48,7 @@ const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
+const STALE_CLI_SNAPSHOT_WARNING: &str = "Serving the last usable standing-root CLI snapshot after its freshness could not be verified; rerun `npx @cortexkit/aft index` to refresh it.";
 /// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
 /// virtually every real function/type so the agent doesn't re-read a file it
 /// already saw in search; a symbol exceeding it falls back to the line-budget
@@ -135,20 +137,54 @@ struct ExternalBorrowMetadata {
     drift_count: usize,
     ignore_rules_differ: bool,
     degraded_reason: Option<&'static str>,
+    standing_snapshot: bool,
+    strict_verification_required: bool,
 }
 
 impl ExternalBorrowMetadata {
-    fn from_search_index(_index: &SearchIndex) -> Self {
-        Self {
-            drift_count: 0,
-            ignore_rules_differ: false,
-            degraded_reason: None,
-        }
-    }
-
     fn record_drift(&mut self, drift_count: usize, ignore_rules_differ: bool) {
         self.drift_count = self.drift_count.max(drift_count);
         self.ignore_rules_differ |= ignore_rules_differ;
+    }
+
+    fn stale_cli_snapshot(&self) -> bool {
+        self.standing_snapshot && (self.strict_verification_required || self.drift_count > 0)
+    }
+}
+
+fn standing_snapshot_metadata(
+    external_root: &Path,
+    storage_dir: Option<&Path>,
+) -> ExternalBorrowMetadata {
+    let db_path = crate::bash_background::storage_dir(storage_dir).join("aft.db");
+    if !db_path.is_file() {
+        return ExternalBorrowMetadata::default();
+    }
+
+    let resolved_target = std::fs::canonicalize(external_root)
+        .unwrap_or_else(|_| external_root.to_path_buf())
+        .display()
+        .to_string();
+    let Ok(conn) = crate::db::open(&db_path) else {
+        return ExternalBorrowMetadata::default();
+    };
+    let Ok(needs_strict_verify) =
+        crate::db::standing_roots::needs_strict_verify_for_resolved_target(
+            &conn,
+            &resolved_target,
+            IndexKind::Search,
+        )
+    else {
+        return ExternalBorrowMetadata::default();
+    };
+
+    let Some(strict_verification_required) = needs_strict_verify else {
+        return ExternalBorrowMetadata::default();
+    };
+    ExternalBorrowMetadata {
+        standing_snapshot: true,
+        strict_verification_required,
+        ..ExternalBorrowMetadata::default()
     }
 }
 
@@ -317,53 +353,60 @@ fn handle_external_search(
     external_root: PathBuf,
 ) -> Response {
     let storage_dir = ctx.config().storage_dir.clone();
-    let (search_index, borrow_metadata) =
-        match ctx.open_borrowed_search_index(&external_root, storage_dir.as_deref()) {
-            ReadOnlyArtifact::Fresh(index) => {
-                let borrow_metadata = ExternalBorrowMetadata::from_search_index(&index);
-                (index, borrow_metadata)
-            }
-            ReadOnlyArtifact::Degraded(degradation) => {
-                return handle_external_borrowed_degraded_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                    degradation,
-                );
-            }
-            ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
-            ReadOnlyArtifact::Absent => {
-                // No index exists for this foreign root. Rather than dead-ending
-                // with a not_indexed error (which reads to an agent as "this tool
-                // can't help here" and pushes it to shell out to grep/bash), do a
-                // bounded, best-effort lexical scan of the root — exactly what the
-                // `grep` tool already does for an unindexed external root — and
-                // disclose that it is lexical-only. Removing the error branch
-                // removes the escape hatch.
-                return handle_external_unindexed_fallback(
-                    req,
-                    ctx,
-                    &params,
-                    top_k,
-                    &shape,
-                    &external_root,
-                );
-            }
-            ReadOnlyArtifact::Stale(stale) => {
-                let mut borrow_metadata = ExternalBorrowMetadata::from_search_index(&stale.index);
-                borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-                crate::slog_warn!(
-                    "{}",
-                    borrowed_drift_log_message("search", &external_root, stale.drift_count)
-                );
-                (stale.index, borrow_metadata)
-            }
-        };
+    let mut borrow_metadata = if ctx.daemonless_query_mode() {
+        standing_snapshot_metadata(&external_root, storage_dir.as_deref())
+    } else {
+        ExternalBorrowMetadata::default()
+    };
+    let search_index = match ctx.open_borrowed_search_index(&external_root, storage_dir.as_deref())
+    {
+        ReadOnlyArtifact::Fresh(index) => index,
+        ReadOnlyArtifact::Degraded(degradation) => {
+            return handle_external_borrowed_degraded_fallback(
+                req,
+                ctx,
+                &params,
+                top_k,
+                &shape,
+                &external_root,
+                degradation,
+            );
+        }
+        ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
+        ReadOnlyArtifact::Absent => {
+            // No index exists for this foreign root. Rather than dead-ending
+            // with a not_indexed error (which reads to an agent as "this tool
+            // can't help here" and pushes it to shell out to grep/bash), do a
+            // bounded, best-effort lexical scan of the root — exactly what the
+            // `grep` tool already does for an unindexed external root — and
+            // disclose that it is lexical-only. Removing the error branch
+            // removes the escape hatch.
+            return handle_external_unindexed_fallback(
+                req,
+                ctx,
+                &params,
+                top_k,
+                &shape,
+                &external_root,
+            );
+        }
+        ReadOnlyArtifact::Stale(stale) => {
+            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+            crate::slog_warn!(
+                "{}",
+                borrowed_drift_log_message("search", &external_root, stale.drift_count)
+            );
+            stale.index
+        }
+    };
+    if borrow_metadata.standing_snapshot {
+        borrow_metadata.record_drift(search_index.borrowed_stat_mismatch_count(), false);
+    }
 
     let mut warnings = Vec::new();
+    if borrow_metadata.stale_cli_snapshot() {
+        warnings.push(STALE_CLI_SNAPSHOT_WARNING.to_string());
+    }
     let mode = choose_mode(&params.query, &shape, true, &mut warnings);
 
     match mode {
@@ -668,20 +711,23 @@ fn handle_external_grep_search(
             .as_object()
             .cloned()
             .unwrap_or_default();
-        return zero_result_escalation_response(
-            req,
-            query,
-            shape,
-            effective_mode,
-            "external",
-            warnings,
-            lexical,
-            top_k,
-            include_tests,
-            external_root,
-            &absolute_display_root(external_root),
-            None,
-            extras,
+        return stale_cli_snapshot_partial_response(
+            zero_result_escalation_response(
+                req,
+                query,
+                shape,
+                effective_mode,
+                "external",
+                warnings,
+                lexical,
+                top_k,
+                include_tests,
+                external_root,
+                &absolute_display_root(external_root),
+                None,
+                extras,
+            ),
+            borrow_metadata.stale_cli_snapshot(),
         );
     }
 
@@ -706,7 +752,7 @@ fn handle_external_grep_search(
             query_kind: query_kind_label(shape.kind),
             semantic_status: "external",
             status: "ready",
-            complete: true,
+            complete: !borrow_metadata.stale_cli_snapshot(),
             text,
             results: result_values,
             more_available: result.truncated || result.total_matches > result.matches.len(),
@@ -901,20 +947,23 @@ fn handle_external_semantic_or_hybrid_search(
             .as_object()
             .cloned()
             .unwrap_or_default();
-        return zero_result_escalation_response(
-            req,
-            &params.query,
-            &shape,
-            mode,
-            "ready",
-            warnings,
-            escalation_lexical,
-            top_k,
-            params.include_tests,
-            &external_root,
-            &absolute_display_root(&external_root),
-            None,
-            extras,
+        return stale_cli_snapshot_partial_response(
+            zero_result_escalation_response(
+                req,
+                &params.query,
+                &shape,
+                mode,
+                "ready",
+                warnings,
+                escalation_lexical,
+                top_k,
+                params.include_tests,
+                &external_root,
+                &absolute_display_root(&external_root),
+                None,
+                extras,
+            ),
+            borrow_metadata.stale_cli_snapshot(),
         );
     }
 
@@ -938,7 +987,7 @@ fn handle_external_semantic_or_hybrid_search(
             query_kind: query_kind_label(shape.kind),
             semantic_status: "ready",
             status: "ready",
-            complete: true,
+            complete: !borrow_metadata.stale_cli_snapshot(),
             text,
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
@@ -1020,6 +1069,16 @@ fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex)
         .fingerprint()
         .map(|fingerprint| fingerprint.as_string() == expected.as_string())
         .unwrap_or(false)
+}
+
+fn stale_cli_snapshot_partial_response(
+    mut response: Response,
+    stale_cli_snapshot: bool,
+) -> Response {
+    if stale_cli_snapshot {
+        response.data["complete"] = serde_json::Value::Bool(false);
+    }
+    response
 }
 
 fn external_response_extras(

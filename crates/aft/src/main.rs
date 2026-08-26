@@ -169,6 +169,7 @@ fn main() {
 
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+    ctx.set_daemonless_query_mode(true);
     let registry = RuntimeRegistry::standalone(app, ctx);
     // P3-02 slice 2: signal handling aggregates all per-actor
     // background registries; drain/dispatch multi-root routing remains later.

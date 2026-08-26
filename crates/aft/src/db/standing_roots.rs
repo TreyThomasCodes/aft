@@ -153,6 +153,27 @@ pub fn needs_strict_verify(
     .map_err(Into::into)
 }
 
+/// Return a standing root's per-kind freshness state by its resolved target.
+/// Daemonless artifact readers know the canonical artifact root, not the user
+/// configuration spelling that keys the durable row.
+pub fn needs_strict_verify_for_resolved_target(
+    conn: &Connection,
+    resolved_target: &str,
+    kind: IndexKind,
+) -> Result<Option<bool>, StandingRootError> {
+    conn.query_row(
+        "SELECT freshness.needs_strict_verify
+         FROM standing_roots AS roots
+         JOIN standing_root_freshness AS freshness
+           ON freshness.literal_path = roots.literal_path
+         WHERE roots.resolved_target = ?1 AND freshness.index_kind = ?2",
+        params![resolved_target, kind.as_str()],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Record an observation gap. A later strict verification is the only API that
 /// clears this flag.
 pub fn mark_needs_strict_verify(
