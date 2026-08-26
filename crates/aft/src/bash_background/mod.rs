@@ -335,11 +335,16 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
         // spelling so every downstream read/write uses the exact configured root.
         return dir.to_path_buf();
     }
-    if let Some(root) = cortexkit_data_root() {
-        return root.join("cortexkit").join("aft");
-    }
+    // AFT_CACHE_DIR outranks the computed data root: it predates
+    // AFT_STORAGE_DIR as the storage sandbox lever, and the data root is
+    // effectively always derivable (any HOME yields one), so ranking it
+    // higher would leave the cache-dir arm permanently dead and leak
+    // sandboxed fixtures onto the real machine root.
     if let Some(dir) = non_empty_env_path("AFT_CACHE_DIR") {
         return resolve_storage_path(&dir).join("aft");
+    }
+    if let Some(root) = cortexkit_data_root() {
+        return root.join("cortexkit").join("aft");
     }
     std::env::temp_dir().join("cortexkit").join("aft")
 }
@@ -561,7 +566,6 @@ mod storage_root_tests {
         }
     }
 
-
     // The plugin-injected and plugin-less paths must use one resolver so every
     // artifact lane sees the same absolute root under every environment arm.
     #[test]
@@ -576,10 +580,23 @@ mod storage_root_tests {
         env.set("XDG_DATA_HOME", Some(data_home.as_os_str()));
         env.set("HOME", Some(home.as_os_str()));
         env.set("USERPROFILE", Some(home.as_os_str()));
-        env.set("AFT_CACHE_DIR", Some(cache_root.as_os_str()));
+        // The fallback==injected agreement is proven with the cache lever
+        // unset: plugin flows always pass `configured`, so AFT_CACHE_DIR
+        // only ever steers plugin-less (sandbox/test) invocations and ranks
+        // above the computed data root for exactly that purpose.
+        env.set("AFT_CACHE_DIR", None);
         env.set("AFT_STORAGE_DIR", None);
 
         assert_eq!(super::storage_dir(None), expected_plugin_root);
+
+        env.set("AFT_CACHE_DIR", Some(cache_root.as_os_str()));
+        assert_eq!(super::storage_dir(None), cache_root.join("aft"));
+        assert_eq!(
+            super::storage_dir(Some(&expected_plugin_root)),
+            expected_plugin_root,
+            "configured root must outrank the cache lever"
+        );
+        env.set("AFT_CACHE_DIR", None);
         assert_eq!(
             super::storage_dir(Some(&expected_plugin_root)),
             expected_plugin_root
