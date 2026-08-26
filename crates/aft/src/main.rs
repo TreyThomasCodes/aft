@@ -98,6 +98,13 @@ fn main() {
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();
 
+    // A server process may itself have been spawned from a governed agent
+    // shell (nested daemons in tests and tooling). Shed inherited governance
+    // markers before threads start so children reflect THIS process's gates,
+    // not an outer daemon's. The gh-shim entry point above runs first and
+    // keeps its legitimate read of these markers.
+    aft::agent_child_env::scrub_inherited_process_markers();
+
     aft::logging::init();
 
     if std::env::args().nth(1).as_deref() == Some("warmup") {

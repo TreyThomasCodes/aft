@@ -118,6 +118,41 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove inherited governance markers from THIS PROCESS's environment.
+///
+/// A daemon is the injector of these markers, never a consumer: when an agent
+/// whose own environment was governed by an outer daemon spawns a nested aft
+/// process (test harnesses, tooling, warmup), the inherited markers would leak
+/// into every child this process spawns regardless of this process's own
+/// configuration gates. Called once at server startup, before threads spawn;
+/// the gh-shim invocation path (which legitimately reads the shims marker)
+/// dispatches before this runs.
+pub fn scrub_inherited_process_markers() {
+    if let Some(stale) = std::env::var_os(GH_SHIMS_DIR_ENV).map(PathBuf::from) {
+        if let Some(inherited) = std::env::var_os("PATH") {
+            let cleaned: Vec<_> = std::env::split_paths(&inherited)
+                .filter(|entry| entry != &stale)
+                .collect();
+            if let Ok(path) = std::env::join_paths(cleaned) {
+                std::env::set_var("PATH", path);
+            }
+        }
+        std::env::remove_var(GH_SHIMS_DIR_ENV);
+    }
+    std::env::remove_var(GIT_CO_AUTHOR_ENV);
+    std::env::remove_var(GH_SHIM_BINARY_ENV);
+    let aft_hooks_value = std::env::var_os("GIT_CONFIG_VALUE_0")
+        .is_some_and(|value| Path::new(&value).ends_with(GIT_HOOKS_DIR_NAME));
+    if aft_hooks_value
+        && std::env::var_os("GIT_CONFIG_KEY_0").as_deref()
+            == Some(std::ffi::OsStr::new("core.hooksPath"))
+    {
+        std::env::remove_var("GIT_CONFIG_COUNT");
+        std::env::remove_var("GIT_CONFIG_KEY_0");
+        std::env::remove_var("GIT_CONFIG_VALUE_0");
+    }
+}
+
 /// Add governance to one child environment. This is the single seam used
 /// before foreground, background, sandboxed, and PTY launch planning.
 pub fn inject(
@@ -127,6 +162,40 @@ pub fn inject(
 ) -> Result<(), String> {
     let gh_enabled = config.gh_shim.enabled;
     let co_author_enabled = config.git.co_author != "off";
+
+    // The inherited environment may already carry governance markers injected
+    // by an OUTER daemon (agents spawn daemons in tests and tooling). Each
+    // feature owns its markers in both directions: when disabled here, strip
+    // what a parent injected so this process's children reflect THIS gate.
+    // Only self-identifying values are removed - user-owned GIT_CONFIG_* is
+    // untouched unless it provably points at an AFT-generated hooks dir.
+    if !gh_enabled {
+        if let Some(stale_shims) = environment.remove(GH_SHIMS_DIR_ENV) {
+            if let Some(inherited) = environment.get("PATH").map(OsString::from) {
+                let stale = PathBuf::from(&stale_shims);
+                let cleaned: Vec<_> = std::env::split_paths(&inherited)
+                    .filter(|entry| entry != &stale)
+                    .collect();
+                if let Ok(path) = std::env::join_paths(cleaned) {
+                    environment.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    if !co_author_enabled {
+        environment.remove(GIT_CO_AUTHOR_ENV);
+        environment.remove(GH_SHIM_BINARY_ENV);
+        let aft_hooks_value = environment
+            .get("GIT_CONFIG_VALUE_0")
+            .is_some_and(|value| Path::new(value).ends_with(GIT_HOOKS_DIR_NAME));
+        if aft_hooks_value
+            && environment.get("GIT_CONFIG_KEY_0").map(String::as_str) == Some("core.hooksPath")
+        {
+            environment.remove("GIT_CONFIG_COUNT");
+            environment.remove("GIT_CONFIG_KEY_0");
+            environment.remove("GIT_CONFIG_VALUE_0");
+        }
+    }
     if !gh_enabled && !co_author_enabled {
         return Ok(());
     }
