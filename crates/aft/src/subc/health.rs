@@ -1,5 +1,6 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -726,13 +727,14 @@ fn memory_rollup_metrics(
         .roots
         .iter()
         .map(|(root, detail)| {
-            (
-                root.clone(),
-                json!({
-                    "attributed_bytes": detail.attributed_bytes,
-                    "status": detail.status,
-                }),
-            )
+            let mut row = json!({
+                "attributed_bytes": detail.attributed_bytes,
+                "status": detail.status,
+            });
+            if detail.standing == Some(true) {
+                row["standing"] = Value::Bool(true);
+            }
+            (root.clone(), row)
         })
         .collect::<serde_json::Map<String, Value>>()
         .into();
@@ -797,10 +799,13 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
 
 fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> HealthDiagnosticRollup {
     struct RootCandidate {
-        root_id: cortexkit_paths::ProjectRootId,
-        health: crate::context::RootHealthSummary,
+        root_label: String,
+        health: RootHealthSnapshot,
+        busy: bool,
+        fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
+        standing: Option<StandingHealthEntry>,
     }
 
     let Some(actor_entries) = executor.try_actor_entries() else {
@@ -813,61 +818,125 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
         };
     };
 
+    let standing_entries = standing_health_entries(&actor_entries);
+    let mut standing_matched = vec![false; standing_entries.len()];
+    let actor_count = actor_entries.len();
     let mut memory_roots = std::collections::BTreeMap::new();
-    let mut candidates = Vec::with_capacity(actor_entries.len());
+    let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
     for (root_id, ctx) in actor_entries {
         let root_label = root_id.as_path().display().to_string();
-        let memory = ctx.memory_root_rollup();
+        let standing_index = standing_entries.iter().position(|entry| {
+            entry
+                .root_id
+                .as_ref()
+                .is_some_and(|entry_root| entry_root == &root_id)
+        });
+        if let Some(index) = standing_index {
+            standing_matched[index] = true;
+        }
+        let standing = standing_index.map(|index| standing_entries[index].clone());
+        let memory_key = standing
+            .as_ref()
+            .and_then(|entry| entry.artifact_key.clone())
+            .unwrap_or_else(|| root_label.clone());
+        let memory = if standing.is_some() {
+            ctx.memory_root_rollup().with_standing()
+        } else {
+            ctx.memory_root_rollup()
+        };
         let attributed_bytes = memory.attributed_bytes;
-        memory_roots.insert(root_label, memory);
+        memory_roots.insert(memory_key, memory);
 
         let project_key = crate::search_index::artifact_cache_key_memoized_only(root_id.as_path());
+        let artifact_key = standing
+            .as_ref()
+            .and_then(|entry| entry.artifact_key.as_deref())
+            .or(project_key.as_deref());
         // Durable breaker state is loaded during the off-path rollup, then the
-        // cached health reply reads only the context snapshot.
-        ctx.refresh_build_suspensions_for_health(root_id.as_path(), project_key.as_deref());
-        let repair_entries_60s = project_key.as_deref().and_then(|key| {
+        // cached health reply reads only the context snapshot. Standing keys can
+        // be scoped or path-based, so they must not depend on the session-key memo.
+        ctx.refresh_build_suspensions_for_health(root_id.as_path(), artifact_key);
+        let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
                 .map(|(count, _window_start)| count)
                 .filter(|count| *count > 0)
         });
+        let health_summary = ctx.try_health_summary();
+        let busy = health_summary.is_busy();
+        let fully_ready = health_summary.is_fully_ready();
         candidates.push(RootCandidate {
-            health: ctx.try_health_summary(),
-            root_id,
+            root_label,
+            health: health_summary.into_snapshot(root_id.as_path()),
+            busy,
+            fully_ready,
             attributed_bytes,
             repair_entries_60s,
+            standing,
         });
     }
 
-    let repair_roots_total = candidates.len();
-    let busy_roots = candidates
-        .iter()
-        .filter(|candidate| candidate.health.is_busy())
-        .count();
+    // A refusal can prevent an entry from owning an actor. Keep it visible in
+    // the same health table, but do not invent a second memory aggregation row.
+    for (index, standing) in standing_entries.into_iter().enumerate() {
+        if standing_matched[index] {
+            continue;
+        }
+        let health = unhosted_standing_health_snapshot(&standing);
+        candidates.push(RootCandidate {
+            root_label: health.project_root.clone(),
+            health,
+            busy: false,
+            fully_ready: false,
+            attributed_bytes: 0,
+            repair_entries_60s: None,
+            standing: Some(standing),
+        });
+    }
+
+    let busy_roots = candidates.iter().filter(|candidate| candidate.busy).count();
     let warming_roots = candidates
         .iter()
-        .filter(|candidate| !candidate.health.is_busy() && !candidate.health.is_fully_ready())
+        .filter(|candidate| !candidate.busy && !candidate.fully_ready)
+        .count();
+    let standing_refusals = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .standing
+                .as_ref()
+                .and_then(|entry| entry.refusal.as_ref())
+                .is_some()
+        })
         .count();
     candidates.sort_by(|left, right| {
         right
             .attributed_bytes
             .cmp(&left.attributed_bytes)
-            .then_with(|| left.root_id.as_path().cmp(right.root_id.as_path()))
+            .then_with(|| left.root_label.cmp(&right.root_label))
     });
     let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
-    let mut roots: Vec<RootHealthSnapshot> = candidates
+    let mut roots: Vec<(String, Value)> = candidates
         .into_iter()
         .take(HEALTH_ROOT_DETAIL_CAP)
         .map(|candidate| {
-            let mut snapshot = candidate.health.into_snapshot(candidate.root_id.as_path());
+            let mut snapshot = candidate.health;
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
-            snapshot
+            let root_label = snapshot.project_root.clone();
+            (
+                root_label,
+                standing_root_health_value(snapshot, candidate.standing.as_ref()),
+            )
         })
         .collect();
-    roots.sort_by(|left, right| left.project_root.cmp(&right.project_root));
+    roots.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let roots = roots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .collect::<Vec<_>>();
 
-    let root_count = repair_roots_total;
+    let root_count = root_details_omitted.saturating_add(roots.len());
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     let memory = memory_rollup_metrics(Some(memory_roots));
@@ -875,6 +944,10 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
     let detail = if busy_roots > 0 {
         Some(format!(
             "{busy_roots} root actor(s) could not be snapshotted without contention"
+        ))
+    } else if standing_refusals > 0 {
+        Some(format!(
+            "{standing_refusals} standing root(s) refused current resolved-path identity"
         ))
     } else if warming_roots > 0 {
         Some(format!(
@@ -885,19 +958,19 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
     };
 
     HealthDiagnosticRollup {
-        status: if busy_roots > 0 {
+        status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
         } else {
             HealthStatus::Ok
         },
         detail,
         metrics: json!({
-            "actor_count": root_count,
+            "actor_count": actor_count,
             "root_count": root_count,
             "root_details_omitted": root_details_omitted,
             "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
             "callgraph_repair_roots_annotated": repair_roots_annotated,
-            "callgraph_repair_roots_total": repair_roots_total,
+            "callgraph_repair_roots_total": actor_count,
             "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
             "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
             "lsp_children": {
@@ -1680,5 +1753,370 @@ mod tests {
             "health-profile roots=50 cached_health_check_reply_us={}",
             median.as_micros()
         );
+    }
+
+    fn standing_config(root: &std::path::Path, storage: &std::path::Path) -> crate::config::Config {
+        crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
+            index: crate::config::IndexConfig {
+                roots: vec![crate::config::IndexRootConfig {
+                    path: root.display().to_string(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                }],
+            },
+            ..crate::config::Config::default()
+        }
+    }
+
+    fn register_standing_health_actor(
+        executor: &Executor,
+        app: &Arc<App>,
+        root: &std::path::Path,
+        config: crate::config::Config,
+    ) {
+        let root_id = ProjectRootId::from_path(root).expect("test root identity");
+        let ctx = Arc::new(crate::context::AppContext::from_app(
+            Arc::clone(app),
+            config,
+        ));
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        assert!(executor.register_actor(root_id, ctx));
+    }
+
+    #[test]
+    fn standing_health_and_memory_reuse_existing_per_root_tables() {
+        let storage = tempfile::tempdir().expect("storage directory");
+        let root = tempfile::tempdir().expect("standing root");
+        let config = standing_config(root.path(), storage.path());
+        let standing = crate::standing_roots::StandingRoots::default();
+        standing
+            .reconcile(&config)
+            .expect("pin configured standing root");
+        let entry = standing
+            .entries()
+            .into_iter()
+            .next()
+            .expect("configured standing entry");
+
+        let app = App::default_shared();
+        let executor = Executor::new();
+        register_standing_health_actor(&executor, &app, root.path(), config.clone());
+        let metrics = DispatchPathMetrics::new();
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let metrics = report.metrics.expect("health metrics");
+        let root_row = metrics["roots"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["standing_entry"] == json!(entry.literal_path))
+            })
+            .expect("standing health row");
+        assert_eq!(root_row["standing"], true);
+        assert!(root_row.get("standing_refusal").is_none());
+
+        let memory = &metrics["memory"];
+        assert_eq!(memory["roots_total"].as_u64(), Some(1));
+        assert_eq!(memory["roots"][entry.artifact_key]["standing"], true);
+        assert!(memory["roots"]
+            .get(&root.path().display().to_string())
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standing_health_names_resolved_path_drift_without_re_recording() {
+        let storage = tempfile::tempdir().expect("storage directory");
+        let original = tempfile::tempdir().expect("original standing root");
+        let retargeted = tempfile::tempdir().expect("retargeted standing root");
+        let link = storage.path().join("standing-link");
+        std::os::unix::fs::symlink(original.path(), &link).expect("initial standing symlink");
+        let config = standing_config(&link, storage.path());
+        let literal_path = config.index.roots[0].path.clone();
+        let standing = crate::standing_roots::StandingRoots::default();
+        standing
+            .reconcile(&config)
+            .expect("pin original resolved path");
+        let before = {
+            let conn = crate::db::open(&storage.path().join("aft.db")).expect("standing database");
+            crate::db::standing_roots::get_standing_root(&conn, &literal_path)
+                .expect("read original record")
+                .expect("original record exists")
+        };
+
+        let app = App::default_shared();
+        let executor = Executor::new();
+        register_standing_health_actor(&executor, &app, original.path(), config.clone());
+        std::fs::remove_file(&link).expect("replace standing symlink");
+        std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
+
+        let metrics = DispatchPathMetrics::new();
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let metrics = report.metrics.expect("health metrics");
+        let root_row = metrics["roots"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["standing_entry"] == json!(literal_path))
+            })
+            .expect("drifted standing health row");
+        assert_eq!(root_row["standing"], true);
+        let refusal = root_row["standing_refusal"]
+            .as_str()
+            .expect("named drift refusal");
+        assert!(refusal.contains("resolved-path-drift refusal"));
+        assert!(refusal.contains("resolved_target"));
+
+        let conn = crate::db::open(&storage.path().join("aft.db")).expect("standing database");
+        let after = crate::db::standing_roots::get_standing_root(&conn, &literal_path)
+            .expect("read retained record")
+            .expect("retained record exists");
+        assert_eq!(after.resolved_target, before.resolved_target);
+    }
+
+    #[test]
+    fn standing_health_preserves_durable_breaker_reason() {
+        let storage = tempfile::tempdir().expect("storage directory");
+        let root = tempfile::tempdir().expect("standing root");
+        let config = standing_config(root.path(), storage.path());
+        let standing = crate::standing_roots::StandingRoots::default();
+        standing
+            .reconcile(&config)
+            .expect("pin configured standing root");
+        let entry = standing
+            .entries()
+            .into_iter()
+            .next()
+            .expect("configured standing entry");
+        let breaker_path = storage
+            .path()
+            .join("callgraph")
+            .join(&entry.artifact_key)
+            .join("build-breaker.sqlite");
+        let breaker =
+            crate::build_breaker::BuildDeathBreaker::open(breaker_path).expect("durable breaker");
+        let breaker_root = ProjectRootId::from_path(root.path()).expect("standing root identity");
+        let breaker_key = crate::build_breaker::BreakerKey::new(
+            breaker_root.as_path().display().to_string(),
+            crate::build_breaker::BuildDomain::CallgraphCold,
+            "standing-health",
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis() as u64;
+        for _ in 0..3 {
+            let crate::build_breaker::BreakerAdmission::Admitted(attempt) = breaker
+                .admit_at(&breaker_key, 10, now_ms)
+                .expect("breaker admission")
+            else {
+                panic!("breaker must admit before the third attributed death");
+            };
+            breaker
+                .record_attributed_death_at(&breaker_key, &attempt.attempt_id, 10, 0, now_ms)
+                .expect("record attributed death");
+        }
+
+        let app = App::default_shared();
+        let executor = Executor::new();
+        register_standing_health_actor(&executor, &app, root.path(), config);
+        let metrics = DispatchPathMetrics::new();
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let metrics = report.metrics.expect("health metrics");
+        let root_row = metrics["roots"]
+            .as_array()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["standing_entry"] == json!(entry.literal_path))
+            })
+            .expect("standing health row");
+        assert_eq!(root_row["standing"], true);
+        assert_eq!(
+            root_row["suspended_domains"][0]["reason"],
+            "zero_credit_death_limit"
+        );
+    }
+}
+
+#[derive(Clone)]
+struct StandingHealthEntry {
+    literal_path: String,
+    root_id: Option<ProjectRootId>,
+    artifact_key: Option<String>,
+    refusal: Option<String>,
+}
+
+/// Read the configuration snapshot already held by an actor and inspect the
+/// standing database without creating or reconciling any durable state. Health
+/// must report a pinned-path refusal without turning the report itself into a
+/// lifecycle owner.
+fn standing_health_entries(
+    actor_entries: &[(ProjectRootId, Arc<crate::context::AppContext>)],
+) -> Vec<StandingHealthEntry> {
+    let mut snapshots = actor_entries
+        .iter()
+        .map(|(root_id, ctx)| (root_id.clone(), ctx.config()))
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()));
+    let Some((_, config)) = snapshots
+        .iter()
+        .find(|(_, config)| config.harness.is_some())
+        .or_else(|| snapshots.first())
+    else {
+        return Vec::new();
+    };
+
+    let database_path =
+        crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
+    let database = rusqlite::Connection::open_with_flags(
+        database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok();
+    let mut entries = std::collections::BTreeMap::new();
+    for root in &config.index.roots {
+        entries
+            .entry(root.path.clone())
+            .or_insert_with(|| standing_health_entry(root, database.as_ref()));
+    }
+    entries.into_values().collect()
+}
+
+fn standing_health_entry(
+    root: &crate::config::IndexRootConfig,
+    database: Option<&rusqlite::Connection>,
+) -> StandingHealthEntry {
+    let recorded = database
+        .and_then(|database| {
+            crate::db::standing_roots::get_standing_root(database, &root.path).ok()
+        })
+        .flatten();
+    match crate::scoped_key::resolve_standing_root(&root.path) {
+        Ok(resolved) => {
+            let refusal = recorded
+                .as_ref()
+                .and_then(|record| resolved_path_drift_refusal(record, &resolved));
+            let use_recorded_identity = refusal.is_some();
+            let root_path = if use_recorded_identity {
+                recorded
+                    .as_ref()
+                    .map(|record| record.resolved_target.as_str())
+                    .unwrap_or(&resolved.resolved_target)
+            } else {
+                &resolved.resolved_target
+            };
+            let artifact_key = if use_recorded_identity {
+                recorded
+                    .as_ref()
+                    .and_then(standing_artifact_key_from_record)
+                    .or_else(|| Some(resolved.artifact_key.clone()))
+            } else {
+                Some(resolved.artifact_key)
+            };
+            StandingHealthEntry {
+                literal_path: root.path.clone(),
+                root_id: ProjectRootId::from_path(Path::new(root_path)).ok(),
+                artifact_key,
+                refusal,
+            }
+        }
+        Err(error) => StandingHealthEntry {
+            literal_path: root.path.clone(),
+            root_id: recorded.as_ref().and_then(|record| {
+                ProjectRootId::from_path(Path::new(&record.resolved_target)).ok()
+            }),
+            artifact_key: recorded
+                .as_ref()
+                .and_then(standing_artifact_key_from_record),
+            refusal: Some(format!("standing root resolution failed: {error}")),
+        },
+    }
+}
+
+fn resolved_path_drift_refusal(
+    recorded: &crate::db::standing_roots::StandingRootRecord,
+    resolved: &crate::scoped_key::ResolvedStandingRoot,
+) -> Option<String> {
+    for (field, recorded_value, resolved_value) in [
+        (
+            "resolved_target",
+            Some(recorded.resolved_target.clone()),
+            Some(resolved.resolved_target.clone()),
+        ),
+        (
+            "resolved_git_toplevel",
+            recorded.resolved_git_toplevel.clone(),
+            resolved.resolved_git_toplevel.clone(),
+        ),
+        (
+            "scoped_relative_path",
+            recorded.scoped_relative_path.clone(),
+            resolved.scoped_relative_path.clone(),
+        ),
+    ] {
+        if recorded_value != resolved_value {
+            return Some(format!(
+                "resolved-path-drift refusal for {:?}: {field} changed from {recorded_value:?} to {resolved_value:?}",
+                resolved.literal_path
+            ));
+        }
+    }
+    None
+}
+
+fn standing_artifact_key_from_record(
+    record: &crate::db::standing_roots::StandingRootRecord,
+) -> Option<String> {
+    crate::scoped_key::classify_resolved_standing_root(
+        Path::new(&record.resolved_target),
+        record.resolved_git_toplevel.as_deref().map(Path::new),
+    )
+    .ok()
+    .map(|identity| identity.artifact_key().to_string())
+}
+
+fn standing_root_health_value(
+    snapshot: RootHealthSnapshot,
+    standing: Option<&StandingHealthEntry>,
+) -> Value {
+    let mut value = serde_json::to_value(snapshot).expect("root health snapshots serialize");
+    let Some(standing) = standing else {
+        return value;
+    };
+    let object = value
+        .as_object_mut()
+        .expect("root health snapshots serialize as objects");
+    object.insert("standing".to_string(), Value::Bool(true));
+    object.insert(
+        "standing_entry".to_string(),
+        Value::String(standing.literal_path.clone()),
+    );
+    if let Some(refusal) = &standing.refusal {
+        object.insert(
+            "standing_refusal".to_string(),
+            Value::String(refusal.clone()),
+        );
+    }
+    value
+}
+
+fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthSnapshot {
+    RootHealthSnapshot {
+        project_root: entry.root_id.as_ref().map_or_else(
+            || entry.literal_path.clone(),
+            |root_id| root_id.as_path().display().to_string(),
+        ),
+        actor_count: 0,
+        state: crate::context::RootHealthState::Ready,
+        search_index: None,
+        semantic_index: None,
+        callgraph_store: None,
+        callgraph_repair_entries_60s: None,
+        callgraph_commits_60s: None,
+        callgraph_pages_or_bytes_written_60s: None,
+        tier2: None,
+        bash: None,
+        suspended_domains: Vec::new(),
     }
 }

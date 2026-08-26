@@ -98,6 +98,11 @@ pub(crate) struct RootMemoryRollup {
     pub(crate) attributed_bytes: u64,
     pub(crate) busy_subsystems: usize,
     pub(crate) not_estimated_subsystems: usize,
+    /// Present only for roots declared as standing. Keeping the marker on the
+    /// existing row uses the same top-eight selection and one omitted-roots
+    /// rollup instead of creating a separate standing-memory table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) standing: Option<bool>,
 }
 
 impl RootMemoryRollup {
@@ -119,7 +124,14 @@ impl RootMemoryRollup {
             attributed_bytes,
             busy_subsystems,
             not_estimated_subsystems,
+            standing: None,
         }
+    }
+
+    /// Attribute this existing per-root rollup to a configured standing entry.
+    pub(crate) fn with_standing(mut self) -> Self {
+        self.standing = Some(true);
+        self
     }
 }
 
@@ -523,6 +535,29 @@ mod snapshot_cap_tests {
             .map(|i| i * 1000)
             .sum();
         assert!(snapshot.process.total_attributed_bytes >= expected_total);
+    }
+
+    #[test]
+    fn standing_rollup_uses_the_shared_top_eight_cap() {
+        let mut roots = BTreeMap::new();
+        for i in 0..=MEMORY_SNAPSHOT_ROOT_DETAIL_CAP {
+            let rollup = root_with_bytes((i as u64 + 1) * 1000).rollup();
+            roots.insert(format!("/root/{i:02}"), rollup);
+        }
+        roots.insert(
+            "standing-artifact-key".to_string(),
+            root_with_bytes(20_000).rollup().with_standing(),
+        );
+
+        let snapshot = MemoryRollupSnapshot::new("ready", roots);
+        assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
+        assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 2);
+        assert_eq!(snapshot.roots_omitted, 2);
+        assert_eq!(
+            snapshot.roots["standing-artifact-key"].standing,
+            Some(true),
+            "standing memory stays in the ordinary per-root table"
+        );
     }
 
     #[test]
