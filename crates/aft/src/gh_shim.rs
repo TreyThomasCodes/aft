@@ -42,6 +42,13 @@ const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
+const READ_ONLY_ACTION_TUPLES: &[&str] = &[
+    "run view",
+    "run list",
+    "run watch",
+    "workflow view",
+    "workflow list",
+];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
@@ -1750,6 +1757,9 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         Some(subcommand) => format!("{verb} {subcommand}"),
         None => verb,
     };
+    if READ_ONLY_ACTION_TUPLES.contains(&tuple.as_str()) {
+        return Classification::Mechanical;
+    }
     match manifest.tier_for_tuple(&tuple, platform) {
         Some(Tier::Mechanical) => Classification::Mechanical,
         Some(Tier::Admin) if V1_ADMIN_TUPLES.contains(&tuple.as_str()) => {
@@ -1807,6 +1817,11 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
                 && glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(&path))
         })
         .collect::<Vec<_>>();
+    if matches.is_empty() && method.eq_ignore_ascii_case("GET") {
+        // A field-free GET cannot write or assert an identity, so it remains a
+        // mechanical read even when the manifest has no endpoint-specific rule.
+        return Classification::Mechanical;
+    }
     if matches.len() != 1 {
         return Classification::Unclassified;
     }
@@ -3337,6 +3352,67 @@ mod tests {
                     Classification::Mechanical
                 ),
                 "expected passthrough classification for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_get_and_actions_reads_are_mechanical_but_writes_remain_unclassified() {
+        let mut manifest = fixture_manifest();
+        manifest.api_rules.clear();
+
+        for args in [
+            vec![
+                OsString::from("api"),
+                OsString::from("/repos/cortexkit/aft/actions/runs"),
+            ],
+            vec![
+                OsString::from("api"),
+                OsString::from("--method"),
+                OsString::from("GET"),
+                OsString::from("/repos/cortexkit/aft/actions/runs"),
+            ],
+            vec![
+                OsString::from("api"),
+                OsString::from("-X"),
+                OsString::from("GET"),
+                OsString::from("/repos/cortexkit/aft/actions/runs"),
+            ],
+            vec![OsString::from("run"), OsString::from("view")],
+            vec![OsString::from("run"), OsString::from("list")],
+            vec![OsString::from("run"), OsString::from("watch")],
+            vec![OsString::from("workflow"), OsString::from("view")],
+            vec![OsString::from("workflow"), OsString::from("list")],
+        ] {
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Mechanical
+                ),
+                "expected read passthrough classification for {args:?}"
+            );
+        }
+
+        for args in [
+            vec![
+                OsString::from("api"),
+                OsString::from("-X"),
+                OsString::from("POST"),
+                OsString::from("/repos/cortexkit/aft/actions/runs"),
+            ],
+            vec![
+                OsString::from("api"),
+                OsString::from("-f"),
+                OsString::from("key=value"),
+                OsString::from("/repos/cortexkit/aft/actions/runs"),
+            ],
+        ] {
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ),
+                "expected fail-closed classification for {args:?}"
             );
         }
     }
