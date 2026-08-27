@@ -78,26 +78,20 @@ function listenForForegroundAbort(
 }
 
 /**
- * Agent-facing tool description, selected from the live configuration so it
- * never advertises behavior this project doesn't have:
- * - code-search prohibition steers to `aft_search` when registered, else the
- *   `grep` tool (same surface logic as the Rust grep-rewrite footer); the
- *   registration variant is selected late in index.ts once the final tool map
- *   is known.
- * - the compression sentence only appears when output compression is on —
- *   advertising `compressed: false` otherwise would describe a no-op.
- * - the background/PTY/watch sentences only appear when `bash.background` is on.
- *   With it off, the foreground tool surface runs commands to completion
- *   inline and treats `timeout` as the hard kill cap.
- *
- * Wording rules: this is read by AGENTS choosing a tool, not by users reading
- * docs. No internal vocabulary ("hoisted", "command rewriting", "unified bash
- * schema") — describe what the tool does and what NOT to use it for.
+ * Agent-facing wording follows the project-resolved setting so the wait behavior
+ * and its per-message escape hatch are explicit to the agent.
  */
+function userMessageDetachDescription(detachOnUserMessage: boolean): string {
+  return detachOnUserMessage
+    ? "A new user message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`."
+    : "Because `bash.detach_on_user_message` is false, a new user message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`.";
+}
+
 export function bashToolDescription(
   aftSearchRegistered: boolean,
   compressionOn: boolean,
   backgroundOn: boolean,
+  detachOnUserMessage = true,
 ): string {
   const searchSteer = aftSearchRegistered
     ? "use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead"
@@ -106,7 +100,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ' Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting, but detaches to background if you send a new message — use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.'
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
@@ -271,7 +265,7 @@ export function createBashTool(
       .boolean()
       .optional()
       .describe(
-        "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; if you send a new message, the wait detaches to background. Use only when you know the result is required before doing anything else.",
+        `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
       ),
     sandbox: z
       .literal("host")

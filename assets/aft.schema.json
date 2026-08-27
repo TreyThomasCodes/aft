@@ -302,6 +302,11 @@
               "default": false,
               "description": "Allow subagents to run background bash. Default false — subagent `background: true` requests are otherwise converted to foreground so the subagent turn does not end early."
             },
+            "detach_on_user_message": {
+              "type": "boolean",
+              "default": true,
+              "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe."
+            },
             "long_running_reminder_enabled": {
               "type": "boolean",
               "default": true,

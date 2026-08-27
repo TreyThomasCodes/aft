@@ -214,6 +214,12 @@ const BashFeaturesSchema = z.object({
    * they know how to use bash_status's wait mode.
    */
   subagent_background: z.boolean().optional(),
+  /**
+   * Detach a wait:true bash call when a new user message arrives. Default: true.
+   * Set false to keep the wait blocking; a message containing `&detach` still
+   * forces detachment; a token-only message becomes `(requested background detach)`.
+   */
+  detach_on_user_message: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   /**
@@ -631,8 +637,18 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // Bash / LSP / semantic all flow through dedicated resolvers because they
   // have their own merge / project-safety rules.
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
-  if (typeof config.bash === "object" && config.bash.host_fallback !== undefined) {
-    overrides.bash = { host_fallback: config.bash.host_fallback };
+  if (
+    typeof config.bash === "object" &&
+    (config.bash.host_fallback !== undefined || config.bash.detach_on_user_message !== undefined)
+  ) {
+    overrides.bash = {
+      ...(config.bash.host_fallback !== undefined
+        ? { host_fallback: config.bash.host_fallback }
+        : {}),
+      ...(config.bash.detach_on_user_message !== undefined
+        ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+    };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
@@ -665,6 +681,8 @@ export interface ResolvedBashConfig {
   host_fallback: boolean;
   /** See BashFeaturesSchema.subagent_background. Default false. */
   subagent_background: boolean;
+  /** Detach wait:true bash calls on user messages; `&detach` overrides and is stripped before delivery. */
+  detach_on_user_message: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -719,6 +737,8 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   // wins; only the object form can set it.
   const topSubagentBg =
     typeof top === "object" && top !== null ? top.subagent_background === true : false;
+  const topDetachOnUserMessage =
+    typeof top === "object" && top !== null ? (top.detach_on_user_message ?? true) : true;
 
   // Foreground wait-window: only the object form can set it; clamp to the
   // 5000ms floor and default to 15000ms when unset.
@@ -736,6 +756,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     background: false,
     host_fallback: false,
     subagent_background: false,
+    detach_on_user_message: true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
@@ -757,6 +778,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
       subagent_background: topSubagentBg,
+      detach_on_user_message: topDetachOnUserMessage,
     };
   }
 

@@ -117,6 +117,13 @@ describe("resolveBashConfig (Pi)", () => {
     expect(r.enabled).toBe(false);
   });
 
+  test("detach_on_user_message defaults to true and supports opt-out", () => {
+    expect(resolveBashConfig(cfg({})).detach_on_user_message).toBe(true);
+    expect(
+      resolveBashConfig(cfg({ bash: { detach_on_user_message: false } })).detach_on_user_message,
+    ).toBe(false);
+  });
+
   // ---- Reminder tuning carries through ---------------------------------
 
   test("long_running_reminder_* on top-level carries through", () => {

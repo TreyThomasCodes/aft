@@ -85,7 +85,11 @@ import {
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
-import { signalBashWaitDetachForProject } from "./bash-wait-detach.js";
+import {
+  shouldDetachBashWaitOnUserMessage,
+  signalBashWaitDetachForProject,
+  stripUserMessageDetachKeyword,
+} from "./bash-wait-detach.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "./tool-registration.js";
@@ -850,10 +854,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         ctx: Parameters<typeof resolveSessionId>[0] & { cwd: string },
       ) => unknown,
     ) => void
-  )("input", (_event, extCtx) => {
+  )("input", (event, extCtx) => {
     const sessionId = resolveSessionId(extCtx);
     signalSyncWatchAbort(sessionId);
-    void signalBashWaitDetachForProject(pool, extCtx.cwd, sessionId);
+    const originalText = event.text;
+    const transformedText = stripUserMessageDetachKeyword(originalText);
+    const shouldDetach = shouldDetachBashWaitOnUserMessage(config, originalText);
+    if (shouldDetach) {
+      void signalBashWaitDetachForProject(pool, extCtx.cwd, sessionId);
+    }
+    if (transformedText !== originalText) {
+      return { action: "transform", text: transformedText };
+    }
   });
 
   // Also register process-level signal handlers so children get an orderly

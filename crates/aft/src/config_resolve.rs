@@ -348,6 +348,7 @@ pub struct RawBashFeatures {
     pub background: Option<bool>,
     pub host_fallback: Option<bool>,
     pub subagent_background: Option<bool>,
+    pub detach_on_user_message: Option<bool>,
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub long_running_reminder_interval_ms: Option<u64>,
@@ -985,6 +986,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 subagent_background: override_features
                     .subagent_background
                     .or(base.subagent_background),
+                detach_on_user_message: override_features
+                    .detach_on_user_message
+                    .or(base.detach_on_user_message),
                 long_running_reminder_enabled: override_features
                     .long_running_reminder_enabled
                     .or(base.long_running_reminder_enabled),
@@ -1007,6 +1011,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             background: Some(*enabled),
             host_fallback: None,
             subagent_background: None,
+            detach_on_user_message: None,
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
@@ -1514,6 +1519,7 @@ struct ResolvedBashConfig {
     background: bool,
     host_fallback: bool,
     subagent_background: bool,
+    detach_on_user_message: bool,
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
@@ -1526,6 +1532,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     // they do not control engine behavior.
     let _registration_only = (bash.enabled, bash.subagent_background);
     config.bash.host_fallback = bash.host_fallback;
+    config.bash.detach_on_user_message = bash.detach_on_user_message;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
@@ -1563,6 +1570,9 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
     let top_subagent_background = top_features
         .and_then(|features| features.subagent_background)
         .unwrap_or(false);
+    let top_detach_on_user_message = top_features
+        .and_then(|features| features.detach_on_user_message)
+        .unwrap_or(true);
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
     let foreground_wait_window_ms = raw_foreground_wait
         .unwrap_or(FOREGROUND_WAIT_WINDOW_DEFAULT_MS)
@@ -1575,6 +1585,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         background: false,
         host_fallback: false,
         subagent_background: false,
+        detach_on_user_message: true,
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
@@ -1596,6 +1607,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
             background: features.background.unwrap_or(true),
             host_fallback: top_host_fallback,
             subagent_background: top_subagent_background,
+            detach_on_user_message: top_detach_on_user_message,
             ..base
         },
         None => {

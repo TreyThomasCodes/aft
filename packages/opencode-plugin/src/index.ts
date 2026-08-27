@@ -15,7 +15,12 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { signalBashWaitDetachForProject } from "./bash-wait-detach.js";
+import {
+  extractUserMessageText,
+  shouldDetachBashWaitOnUserMessage,
+  signalBashWaitDetachForProject,
+  stripUserMessageDetachKeyword,
+} from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
   extractSessionID,
@@ -1104,6 +1109,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         aftSearchRegistered,
         bashCfg.compress,
         bashCfg.background,
+        bashCfg.detach_on_user_message,
       );
     }
   }
@@ -1193,11 +1199,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       }
       await flushConfigureWarningsOnIdle(sessionID);
     },
-    "chat.message": async (messageInput: {
-      sessionID?: string;
-      sessionId?: string;
-      id?: string;
-    }) => {
+    "chat.message": async (
+      messageInput: {
+        sessionID?: string;
+        sessionId?: string;
+        id?: string;
+      },
+      messageOutput?: { parts?: unknown },
+    ) => {
       const sid = messageInput.sessionID ?? messageInput.sessionId ?? messageInput.id;
       // Eagerly warm the session-directory cache so the first tool call from
       // this turn routes to the right project (covers `opencode -s`-from-cwd).
@@ -1210,7 +1219,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         getSessionDirectoryCached(sid) ??
         (await getSessionDirectory(input.client, sid, input.directory)) ??
         input.directory;
-      void signalBashWaitDetachForProject(pool, sessionDir, sid);
+      const projectConfig = loadAftConfig(sessionDir);
+      const messageText = extractUserMessageText(messageOutput);
+      const shouldDetach = shouldDetachBashWaitOnUserMessage(projectConfig, messageText);
+      stripUserMessageDetachKeyword(messageOutput);
+      if (shouldDetach) {
+        void signalBashWaitDetachForProject(pool, sessionDir, sid);
+      }
     },
     "tool.execute.before": async (
       toolInput: { tool: string; sessionID?: string },

@@ -4,7 +4,13 @@ import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { signalBashWaitDetachForProject } from "../bash-wait-detach.js";
+
+import {
+  extractUserMessageText,
+  shouldDetachBashWaitOnUserMessage,
+  signalBashWaitDetachForProject,
+  stripUserMessageDetachKeyword,
+} from "../bash-wait-detach.js";
 
 let projectRoot: string;
 
@@ -17,6 +23,48 @@ afterAll(() => {
 });
 
 describe("bash wait detach helper", () => {
+  test("default config detaches on a plain user message", () => {
+    expect(shouldDetachBashWaitOnUserMessage({}, "please continue")).toBe(true);
+  });
+
+  test("opt-out keeps a plain message blocking but &detach overrides it", () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const plain = "please continue";
+    const forced = "please &detach continue";
+
+    expect(shouldDetachBashWaitOnUserMessage(config, plain)).toBe(false);
+    expect(shouldDetachBashWaitOnUserMessage(config, forced)).toBe(true);
+    expect(forced).toBe("please &detach continue");
+  });
+
+  test("strips every token while preserving the rest of a message", () => {
+    const output = {
+      parts: [{ type: "text", text: "before &detach middle &detach after" }],
+    };
+
+    expect(stripUserMessageDetachKeyword(output)).toBe("before middle after");
+    expect(output.parts[0].text).toBe("before middle after");
+  });
+
+  test("substitutes an honest message when the token is the only user text", () => {
+    const output = { parts: [{ type: "text", text: "  &detach  " }] };
+
+    expect(stripUserMessageDetachKeyword(output)).toBe("(requested background detach)");
+    expect(output.parts[0].text).toBe("(requested background detach)");
+  });
+
+  test("extracts only non-synthetic, non-ignored text parts", () => {
+    const message = extractUserMessageText({
+      parts: [
+        { type: "text", text: "plain" },
+        { type: "text", text: " synthetic", synthetic: true },
+        { type: "text", text: " ignored", ignored: true },
+      ],
+    });
+
+    expect(message).toBe("plain");
+  });
+
   test("user-message detach sends bash_wait_detach on the active bridge", async () => {
     const calls: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [];
     const bridge = {

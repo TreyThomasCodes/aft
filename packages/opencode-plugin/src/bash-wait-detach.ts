@@ -1,8 +1,70 @@
 import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
+import type { AftConfig } from "./config.js";
+import { resolveBashConfig } from "./config.js";
 import { log, warn } from "./logger.js";
 import { BASH_TRANSPORT_TIMEOUT_MS } from "./tools/_shared.js";
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
+
+export const BASH_WAIT_DETACH_MAGIC_KEYWORD = "&detach";
+const EMPTY_DETACH_MESSAGE = "(requested background detach)";
+
+type UserTextPart = { type?: unknown; text?: unknown; synthetic?: unknown; ignored?: unknown };
+
+function userTextParts(output: unknown): Array<UserTextPart & { text: string }> {
+  if (!output || typeof output !== "object") return [];
+  const parts = (output as { parts?: unknown }).parts;
+  if (!Array.isArray(parts)) return [];
+  return parts.filter((part): part is UserTextPart & { text: string } => {
+    if (!part || typeof part !== "object") return false;
+    const textPart = part as UserTextPart;
+    return (
+      textPart.type === "text" &&
+      typeof textPart.text === "string" &&
+      textPart.synthetic !== true &&
+      textPart.ignored !== true
+    );
+  });
+}
+
+/** Return the user-entered text parts from OpenCode's chat.message output. */
+export function extractUserMessageText(output: unknown): string {
+  return userTextParts(output)
+    .map((part) => part.text)
+    .join("\n");
+}
+
+/** Strip control tokens from mutable OpenCode text parts before model delivery. */
+export function stripUserMessageDetachKeyword(output: unknown): string {
+  const parts = userTextParts(output);
+  const original = parts.map((part) => part.text).join("\n");
+  if (!original.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)) return original;
+
+  const stripped = parts
+    .map((part) => part.text.replaceAll(BASH_WAIT_DETACH_MAGIC_KEYWORD, ""))
+    .map((text) => text.replace(/[ \t]{2,}/g, " "));
+  if (stripped.join("\n").trim() === "") {
+    if (parts[0]) parts[0].text = EMPTY_DETACH_MESSAGE;
+    for (const part of parts.slice(1)) part.text = "";
+    return EMPTY_DETACH_MESSAGE;
+  }
+
+  parts.forEach((part, index) => {
+    part.text = stripped[index];
+  });
+  return stripped.join("\n");
+}
+
+/**
+ * Decide whether a user message should signal an active wait:true bash call.
+ * The keyword is checked before the host hook strips it from mutable text parts.
+ */
+export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText: string): boolean {
+  return (
+    resolveBashConfig(config).detach_on_user_message ||
+    messageText.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)
+  );
+}
 
 async function sendBashWaitDetach(
   bridge: AftProjectTransport,

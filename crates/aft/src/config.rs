@@ -18,6 +18,10 @@ const fn default_inspect_diagnostics_timeout_ms() -> u64 {
     DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS
 }
 
+const fn default_bash_detach_on_user_message() -> bool {
+    true
+}
+
 use crate::harness::Harness;
 
 /// The durable index families that a standing root may maintain.
@@ -317,12 +321,25 @@ pub struct SandboxConfig {
     pub read_deny: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashConfig {
     /// Permit plugin-side break-glass execution when its AFT transport is unavailable.
     /// Rust accepts this for cross-language config parity but never acts on it.
     pub host_fallback: bool,
+    /// Whether the hosting plugin detaches wait:true bash calls on user messages.
+    /// Rust accepts this for cross-language config parity but never acts on it.
+    #[serde(default = "default_bash_detach_on_user_message")]
+    pub detach_on_user_message: bool,
+}
+
+impl Default for BashConfig {
+    fn default() -> Self {
+        Self {
+            host_fallback: false,
+            detach_on_user_message: default_bash_detach_on_user_message(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -350,6 +350,11 @@ const CASES: ParityCase[] = [
     project: { bash: { host_fallback: true } },
   },
   {
+    name: "bash_detach_on_user_message_project_safe",
+    user: { bash: { detach_on_user_message: true } },
+    project: { bash: { detach_on_user_message: false } },
+  },
+  {
     name: "jsonc_comments",
     user: `{
   // comment

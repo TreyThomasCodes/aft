@@ -207,6 +207,8 @@ export interface BashConfig {
   background?: boolean;
   /** Permit per-command host fallback after AFT transport failure. Default false. */
   host_fallback?: boolean;
+  /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
+  detach_on_user_message?: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -293,6 +295,8 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
+  /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
+  detach_on_user_message: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -340,6 +344,9 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
 
   // Foreground wait-window: only the object form can set it; clamp to the
   // 5000ms floor and default to 15000ms when unset.
+  const topDetachOnUserMessage =
+    typeof top === "object" && top !== null ? (top.detach_on_user_message ?? true) : true;
+
   const rawForegroundWait =
     typeof top === "object" && top !== null ? top.foreground_wait_window_ms : undefined;
   const foregroundWaitWindowMs = Math.max(
@@ -353,6 +360,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
+    detach_on_user_message: true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
@@ -370,6 +378,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       compress: top.compress ?? true,
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
+      detach_on_user_message: topDetachOnUserMessage,
     };
   }
 
@@ -559,6 +568,7 @@ const BashFeaturesSchema = z.object({
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
   host_fallback: z.boolean().optional(),
+  detach_on_user_message: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   foreground_wait_window_ms: z.number().int().positive().optional(),
@@ -806,8 +816,18 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
-  if (typeof config.bash === "object" && config.bash.host_fallback !== undefined) {
-    overrides.bash = { host_fallback: config.bash.host_fallback };
+  if (
+    typeof config.bash === "object" &&
+    (config.bash.host_fallback !== undefined || config.bash.detach_on_user_message !== undefined)
+  ) {
+    overrides.bash = {
+      ...(config.bash.host_fallback !== undefined
+        ? { host_fallback: config.bash.host_fallback }
+        : {}),
+      ...(config.bash.detach_on_user_message !== undefined
+        ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+    };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;

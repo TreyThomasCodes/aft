@@ -1,0 +1,9 @@
+{
+  "bash": {
+    "detach_on_user_message": false
+  },
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "restrict_to_project_root": false
+}
