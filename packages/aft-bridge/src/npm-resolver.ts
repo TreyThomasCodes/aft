@@ -318,6 +318,12 @@ export function terminateNpmProcessTree(
       } catch {
         // The taskkill process may already have exited.
       }
+      if (exitedSuccessfully()) {
+        settled = true;
+        cleanup();
+        resolve();
+        return;
+      }
       fail(treeKillFailure ?? `taskkill.exe did not finish within ${gracePeriodMs}ms`);
     }, gracePeriodMs);
     const cleanup = () => {

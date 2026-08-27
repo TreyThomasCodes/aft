@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
@@ -291,6 +291,41 @@ describe("npmInvocation", () => {
 
     await expect(termination).resolves.toBeUndefined();
   });
+
+  it.skipIf(process.platform === "win32")(
+    "accepts a successful cmd exit while taskkill remains pending past grace",
+    async () => {
+      const systemRoot = mkdtempSync(join(tmpdir(), "aft-hanging-taskkill-"));
+      try {
+        const system32 = join(systemRoot, "System32");
+        const taskkill = join(system32, "taskkill.exe");
+        mkdirSync(system32, { recursive: true });
+        writeFileSync(taskkill, "#!/bin/sh\nexec sleep 10\n");
+        chmodSync(taskkill, 0o755);
+
+        const child = new EventEmitter() as ChildProcess;
+        let exitCode: number | null = null;
+        Object.defineProperties(child, {
+          pid: { value: 123 },
+          exitCode: { get: () => exitCode },
+          signalCode: { value: null },
+        });
+
+        const termination = terminateNpmProcessTree(
+          child,
+          { command: "cmd.exe", args: [], windowsCmdShim: true },
+          { SystemRoot: systemRoot },
+          25,
+        );
+        exitCode = 0;
+        child.emit("exit", 0, null);
+
+        await expect(termination).resolves.toBeUndefined();
+      } finally {
+        rmSync(systemRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("fails closed when taskkill cannot start", async () => {
     const child = new EventEmitter() as ChildProcess;
