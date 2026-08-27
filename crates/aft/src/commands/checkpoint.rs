@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::checkpoint::CHECKPOINT_DURABILITY;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -10,10 +11,10 @@ use crate::protocol::{RawRequest, Response};
 /// - `files` (array of strings, optional) — files to include. If omitted, uses
 ///   all files tracked by the backup store.
 ///
-/// Returns: `{ name, file_count, created_at }`. When some tracked files have
-/// been deleted since their last edit the checkpoint still succeeds for the
-/// remaining files and adds a `skipped: [{ file, error }, ...]` array so the
-/// caller can surface which paths were dropped.
+/// Returns: `{ name, file_count, created_at, durability }`. Explicit files are
+/// read directly, including untracked or gitignored files. When any requested
+/// file cannot be read, `file_count` includes only restorable snapshots and the
+/// response adds `skipped: [{ file, error }, ...]` for every omitted path.
 pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
     match handle_checkpoint_impl(req, ctx) {
         Ok(resp) | Err(resp) => resp,
@@ -64,6 +65,7 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
                 "name": info.name,
                 "file_count": info.file_count,
                 "created_at": info.created_at,
+                "durability": CHECKPOINT_DURABILITY,
             });
             if !info.skipped.is_empty() {
                 let skipped: Vec<_> = info

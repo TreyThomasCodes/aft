@@ -11,6 +11,12 @@ use crate::fs_lock;
 
 const CHECKPOINT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// User-visible durability contract for every successful named checkpoint.
+pub const CHECKPOINT_DURABILITY: &str = "checkpoint is session-scoped; lost on restart";
+
+/// User-visible explanation when a checkpoint cannot be found after a restart.
+pub const CHECKPOINT_RESTART_NOTICE: &str = "checkpoints do not survive restarts";
+
 /// Metadata about a checkpoint, returned by list/create/restore.
 #[derive(Debug, Clone)]
 pub struct CheckpointInfo {
@@ -122,9 +128,9 @@ impl CheckpointFile {
 /// Partitioned by session (issue #14): two OpenCode sessions sharing one bridge
 /// can both create checkpoints named `snap1` without collision, and restoring
 /// from one session does not leak the other's file set. Checkpoints are kept
-/// in memory only — a bridge crash drops all of them, which is a deliberate
-/// trade-off to keep this refactor bounded. Durable checkpoints are a possible
-/// follow-up.
+/// in memory only, so a bridge or daemon restart drops all of them. The command
+/// response repeats this contract because a successful checkpoint is useful only
+/// if callers know when its bytes remain available.
 #[derive(Debug)]
 pub struct CheckpointStore {
     /// session -> name -> checkpoint

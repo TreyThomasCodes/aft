@@ -1,2 +1,3 @@
 checkpoint restored pre-edit
 files 2
+checkpoint is session-scoped; lost on restart

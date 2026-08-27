@@ -781,12 +781,15 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                     .join("\n");
                 format!("skipped\n{details}")
             };
-            [
+            let mut lines = vec![
                 format!("checkpoint created {name}"),
                 format!("files {files}"),
                 skipped_text,
-            ]
-            .join("\n")
+            ];
+            if let Some(durability) = import_string_field(response, "durability") {
+                lines.push(durability);
+            }
+            lines.join("\n")
         }
         Some("restore") => {
             let name = import_string_field(response, "name")
@@ -794,11 +797,14 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 .unwrap_or_else(|| "(checkpoint)".to_string());
             let files =
                 import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
-            [
+            let mut lines = vec![
                 format!("checkpoint restored {name}"),
                 format!("files {files}"),
-            ]
-            .join("\n")
+            ];
+            if let Some(durability) = import_string_field(response, "durability") {
+                lines.push(durability);
+            }
+            lines.join("\n")
         }
         Some("list") => {
             let checkpoints = records_field(response, "checkpoints");
@@ -829,6 +835,9 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
+            }
+            if let Some(durability) = import_string_field(response, "durability") {
+                lines.push(durability);
             }
             lines.join("\n")
         }

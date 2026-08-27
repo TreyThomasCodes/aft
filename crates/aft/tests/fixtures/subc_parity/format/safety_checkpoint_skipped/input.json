@@ -5,6 +5,7 @@
     "success": true,
     "name": "pre-edit",
     "file_count": 2,
+    "durability": "checkpoint is session-scoped; lost on restart",
     "skipped": [
       {
         "file": "<PROJECT_ROOT>/missing.ts",

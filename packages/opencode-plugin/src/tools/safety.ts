@@ -56,7 +56,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "Ops:\n" +
         "- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n" +
         "- 'history': List all edit snapshots for a file. Requires 'path'.\n" +
-        "- 'checkpoint': Save a named snapshot of tracked files. Requires 'name'. Optional 'files' to snapshot specific files only.\n" +
+        "- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n" +
         "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +
         "- 'list': List all available named checkpoints. No extra params needed.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
@@ -78,7 +78,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .array(z.string())
           .optional()
           .describe(
-            "Specific files to include in checkpoint (optional, defaults to all tracked files)",
+            "Specific files to include in checkpoint (optional, defaults to backup-tracked files; explicit files may be untracked or gitignored)",
           ),
       },
       execute: async (args, context): Promise<string> => {

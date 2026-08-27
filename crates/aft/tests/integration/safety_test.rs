@@ -23,6 +23,7 @@ use aft::protocol::RawRequest;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 /// Helper: create a temp directory with a unique name for this test.
 fn temp_dir(test_name: &str) -> std::path::PathBuf {
@@ -108,6 +109,178 @@ fn test_checkpoint_create_restore_cycle() {
     let status = aft.shutdown();
     assert!(status.success());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    let draft_relative = std::path::Path::new(".cortexkit/alfonso/drafts/spec.md");
+    let draft = root.join(draft_relative);
+    let original = b"draft: original\n\x00byte-exact\n";
+    let mutated = b"draft: changed\n";
+
+    fs::write(root.join(".gitignore"), ".cortexkit/\n").unwrap();
+    fs::create_dir_all(draft.parent().unwrap()).unwrap();
+    fs::write(&draft, original).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success(),
+        "fixture must be a git repository"
+    );
+    assert!(
+        Command::new("git")
+            .args(["check-ignore", "--quiet", draft_relative.to_str().unwrap()])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success(),
+        "fixture draft must be gitignored"
+    );
+    assert!(
+        !Command::new("git")
+            .args([
+                "ls-files",
+                "--error-unmatch",
+                draft_relative.to_str().unwrap()
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "fixture draft must be untracked"
+    );
+
+    let mut aft = AftProcess::spawn();
+    configure_unrestricted(&mut aft, root, "cfg-gitignored-checkpoint");
+
+    let checkpoint = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "gitignored-checkpoint",
+            "command": "tool_call",
+            "session_id": "gitignored-checkpoint-session",
+            "name": "safety",
+            "arguments": {
+                "op": "checkpoint",
+                "name": "gitignored-draft",
+                "files": [draft_relative.display().to_string()],
+            },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(checkpoint["success"], true, "checkpoint: {checkpoint:?}");
+    assert_eq!(checkpoint["file_count"], 1);
+    assert!(
+        checkpoint.get("skipped").is_none(),
+        "checkpoint: {checkpoint:?}"
+    );
+    assert_eq!(
+        checkpoint["durability"],
+        "checkpoint is session-scoped; lost on restart"
+    );
+    assert!(checkpoint["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("checkpoint is session-scoped; lost on restart")));
+
+    let paths = aft.send(
+        r#"{"id":"gitignored-paths","command":"checkpoint_paths","session_id":"gitignored-checkpoint-session","name":"gitignored-draft"}"#,
+    );
+    assert_eq!(paths["success"], true, "checkpoint paths: {paths:?}");
+    assert_eq!(paths["file_count"], 1);
+    assert_eq!(
+        paths["paths"],
+        serde_json::json!([draft.display().to_string()]),
+        "reported success must name the stored restore target"
+    );
+
+    fs::write(&draft, mutated).unwrap();
+    assert_eq!(fs::read(&draft).unwrap(), mutated, "mutation control");
+
+    let restore = aft.send(
+        r#"{"id":"gitignored-restore","command":"tool_call","session_id":"gitignored-checkpoint-session","name":"safety","arguments":{"op":"restore","name":"gitignored-draft"}}"#,
+    );
+    assert_eq!(restore["success"], true, "restore: {restore:?}");
+    assert_eq!(restore["file_count"], 1);
+    assert_eq!(
+        fs::read(&draft).unwrap(),
+        original,
+        "restore must be byte-exact"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn checkpoint_restart_reports_memory_only_durability() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    let file = root.join("checkpoint-target.txt");
+    fs::write(&file, "original\n").unwrap();
+
+    let session = "checkpoint-restart-session";
+    let mut first = AftProcess::spawn();
+    configure_unrestricted(&mut first, root, "cfg-checkpoint-restart-first");
+    let create = first.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-restart-create",
+            "command": "checkpoint",
+            "session_id": session,
+            "name": "restart-checkpoint",
+            "files": [file.display().to_string()],
+        }))
+        .unwrap(),
+    );
+    assert_eq!(create["success"], true, "create: {create:?}");
+    assert_eq!(
+        create["durability"],
+        "checkpoint is session-scoped; lost on restart"
+    );
+    assert!(first.shutdown().success());
+
+    let mut restarted = AftProcess::spawn();
+    configure_unrestricted(&mut restarted, root, "cfg-checkpoint-restart-second");
+    let list = restarted.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-restart-list",
+            "command": "tool_call",
+            "session_id": session,
+            "name": "safety",
+            "arguments": { "op": "list" },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(list["success"], true, "list: {list:?}");
+    assert_eq!(list["checkpoints"], serde_json::json!([]));
+    assert_eq!(list["durability"], "checkpoints do not survive restarts");
+    assert!(list["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("checkpoints do not survive restarts")));
+
+    let restore = restarted.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-restart-restore",
+            "command": "tool_call",
+            "session_id": session,
+            "name": "safety",
+            "arguments": { "op": "restore", "name": "restart-checkpoint" },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(restore["success"], false, "restore: {restore:?}");
+    assert_eq!(restore["code"], "checkpoint_not_found");
+    assert!(restore["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("checkpoints do not survive restarts")));
+    assert!(restore["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("checkpoints do not survive restarts")));
+    assert!(restarted.shutdown().success());
 }
 
 #[test]

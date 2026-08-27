@@ -4,7 +4,8 @@
     "id": "1",
     "success": true,
     "name": "pre-edit",
-    "file_count": 2
+    "file_count": 2,
+    "durability": "checkpoint is session-scoped; lost on restart"
   },
   "ctx": {
     "agent_args": {

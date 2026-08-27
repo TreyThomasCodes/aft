@@ -53,7 +53,8 @@ const SafetyParams = Type.Object({
   ),
   files: Type.Optional(
     Type.Array(Type.String(), {
-      description: "Specific files for checkpoint (optional, defaults to all tracked)",
+      description:
+        "Specific files for checkpoint (optional, defaults to all backup-tracked files; explicit files may be untracked or gitignored)",
     }),
   ),
 });
@@ -110,14 +111,16 @@ export function buildSafetySections(
       skipped.length > 0
         ? `${theme.fg("warning", "skipped")}\n${skipped.map((entry) => `  ↳ ${shortenPath(asString(entry.file) ?? "(file)")}: ${asString(entry.error) ?? "unknown error"}`).join("\n")}`
         : theme.fg("muted", "No skipped files."),
-    ];
+      asString(response.durability),
+    ].filter((section): section is string => Boolean(section));
   }
 
   if (args.op === "restore") {
     return [
       `${theme.fg("success", "checkpoint restored")} ${theme.fg("accent", asString(response.name) ?? args.name ?? "(checkpoint)")}`,
       `${theme.fg("muted", "files")} ${asNumber(response.file_count) ?? 0}`,
-    ];
+      asString(response.durability),
+    ].filter((section): section is string => Boolean(section));
   }
 
   const checkpoints = asRecords(response.checkpoints);
@@ -126,6 +129,8 @@ export function buildSafetySections(
   ];
   if (checkpoints.length === 0) {
     sections.push(theme.fg("muted", "No checkpoints saved."));
+    const durability = asString(response.durability);
+    if (durability) sections.push(theme.fg("muted", durability));
     return sections;
   }
   sections.push(
@@ -138,6 +143,8 @@ export function buildSafetySections(
       })
       .join("\n"),
   );
+  const durability = asString(response.durability);
+  if (durability) sections.push(theme.fg("muted", durability));
   return sections;
 }
 

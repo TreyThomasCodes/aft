@@ -48,6 +48,7 @@ describe("safety renderer", () => {
           name: "cp1",
           file_count: 2,
           skipped: [{ file: "missing.ts", error: "not found" }],
+          durability: "checkpoint is session-scoped; lost on restart",
         }),
         { op: "checkpoint", name: "cp1" },
         mockTheme,
@@ -68,6 +69,7 @@ describe("safety renderer", () => {
     expect(undo).toContain("backup b1");
     expect(history).toContain("pre-edit");
     expect(checkpoint).toContain("skipped");
+    expect(checkpoint).toContain("checkpoint is session-scoped; lost on restart");
     expect(list).toContain("cp1");
   });
 
@@ -82,7 +84,10 @@ describe("safety renderer", () => {
     );
     const empty = renderToString(
       renderSafetyResult(
-        makeResult("", { checkpoints: [] }),
+        makeResult("", {
+          checkpoints: [],
+          durability: "checkpoints do not survive restarts",
+        }),
         { op: "list" },
         mockTheme,
         makeContext({ op: "list" }),
@@ -91,5 +96,6 @@ describe("safety renderer", () => {
 
     expect(error).toContain("no undo history");
     expect(empty).toContain("No checkpoints saved");
+    expect(empty).toContain("checkpoints do not survive restarts");
   });
 });

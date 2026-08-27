@@ -1,2 +1,3 @@
 0 checkpoint(s)
 No checkpoints saved.
+checkpoints do not survive restarts

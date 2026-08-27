@@ -3,7 +3,8 @@
   "native_response_json": {
     "id": "1",
     "success": true,
-    "checkpoints": []
+    "checkpoints": [],
+    "durability": "checkpoints do not survive restarts"
   },
   "ctx": {
     "agent_args": {
