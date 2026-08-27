@@ -92,7 +92,9 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     let shims_dir = storage_root.join(SHIMS_DIR_NAME);
     if config.gh_shim.enabled {
         let binary = shim_binary(config)?;
-        match probe_gh_shim_binary(&binary) {
+        match reject_self_referential_pin(&binary, &shims_dir)
+            .and_then(|()| probe_gh_shim_binary(&binary))
+        {
             Ok(()) => ensure_gh_entry(&shims_dir, &binary)?,
             Err(reason) => {
                 crate::slog_warn!(
@@ -254,6 +256,32 @@ pub fn shim_binary(config: &Config) -> Result<PathBuf, String> {
         ));
     }
     Ok(binary)
+}
+
+/// Refuse a shim candidate that lives inside the managed shims directory.
+///
+/// A pin pointing at the shims dir's own image is self-referential: maintain()
+/// then always finds the link "consistent" with its candidate and the image
+/// can only go stale — no version comparison can ever trigger a refresh. The
+/// 2026-08-27 incident: a frozen Aug-25 copy refused the production-signed
+/// manifest fleet-wide while every validity probe kept passing (a liveness
+/// answer to a freshness question). Pins must reference a path something
+/// external refreshes — the deploy path a placement updates, or no pin at all
+/// so the running binary is the candidate.
+fn reject_self_referential_pin(binary: &Path, shims_dir: &Path) -> Result<(), String> {
+    let canonical_binary = binary
+        .canonicalize()
+        .unwrap_or_else(|_| binary.to_path_buf());
+    let canonical_dir = shims_dir
+        .canonicalize()
+        .unwrap_or_else(|_| shims_dir.to_path_buf());
+    if canonical_binary.starts_with(&canonical_dir) {
+        return Err(format!(
+            "gh_shim.binary_path points inside the managed shims directory ({}); a self-referential pin freezes the shim forever - point it at the deploy path a placement refreshes (e.g. ~/.local/share/cortexkit/bin/ck-aft) or remove it to track the running binary",
+            binary.display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -761,5 +789,37 @@ mod tests {
         let message = commit_message(&repo);
         assert!(message.contains("Co-authored-by: Pair Agent <pair@example.test>"));
         assert!(message.contains("Local-Hook: custom"));
+    }
+}
+
+#[cfg(test)]
+mod self_referential_pin_tests {
+    use super::*;
+
+    /// A pin inside the shims dir freezes the image forever (maintain always
+    /// sees link==candidate); it must refuse with deploy-path steering.
+    #[test]
+    fn pin_inside_shims_dir_is_refused_with_steering() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let frozen = shims.join("gh-shim-image");
+        std::fs::write(&frozen, b"x").unwrap();
+        let error = reject_self_referential_pin(&frozen, &shims).unwrap_err();
+        assert!(error.contains("self-referential"), "{error}");
+        assert!(error.contains("deploy path"), "{error}");
+    }
+
+    /// Negative control: an external pin (the deploy path shape) passes this
+    /// gate; if this fails, the guard over-rejects and no pin works at all.
+    #[test]
+    fn external_pin_is_not_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let deploy = dir.path().join("bin").join("ck-aft");
+        std::fs::create_dir_all(deploy.parent().unwrap()).unwrap();
+        std::fs::write(&deploy, b"x").unwrap();
+        assert!(reject_self_referential_pin(&deploy, &shims).is_ok());
     }
 }
