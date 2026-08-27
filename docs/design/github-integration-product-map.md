@@ -370,6 +370,17 @@ provenance fields rendering on every broken fixture). Live probe results:
   cannot distinguish latched-refusal from repeated-vendor-refusal; only
   custody call counters prove the latch is load-bearing. Same rule as PLEX's
   NULL-enrichment gap and CKCRED's unexercised-op lesson.)
+- THE WIRE-AXIS PAIR (CKCRED, closing the observability finding): when a
+  refusal is CORRECTLY identical on the wire (the consumer's remedy is the
+  same either way, so the wire deliberately does not leak which internal path
+  produced it), the thing the wire hides is provable ONLY from the producer's
+  own records - no consumer-side probe can close it, however well built.
+  Same root as one-validator, different axis: there the cheap surface could
+  not SEE an input; here the honest wire deliberately does not CARRY one.
+  And the absence-as-evidence caveat rides with it: an absent record proves
+  something only when a positive control established, in the same table,
+  what presence looks like - without the control the same emptiness proves
+  nothing (fire 1 before fire 2; the trap this fleet has hit repeatedly).
 - PLEX's ride discharged by PRODUCTION evidence, deliberately: every property
   S2 asks of their layer runs live daily at larger scale (29-repo
   single-grant reads since Aug 14, multi-repo write fences in the estate, the
