@@ -1676,9 +1676,13 @@ mod tests {
         // NotFound under the parallel suite). Mutation control: drop the file_name()
         // guard in cleanup_locked and this test fails.
         let temp_root = tempfile::tempdir().expect("temp root");
+        // lock_path.parent().parent() == temp_root, which is NOT named `checkpoints`,
+        // so the guard must refuse the sweep and the empty sibling must survive.
         let victim = temp_root.path().join("innocent-empty-sibling");
         fs::create_dir(&victim).expect("victim dir");
-        let lock_path = temp_root.path().join("checkpoint.lock");
+        let scope_dir = temp_root.path().join("scope");
+        fs::create_dir(&scope_dir).expect("scope dir");
+        let lock_path = scope_dir.join("checkpoint.lock");
         let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
         store.cleanup_locked().expect("cleanup");
         assert!(
