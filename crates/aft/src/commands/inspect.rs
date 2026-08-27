@@ -1442,6 +1442,7 @@ fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary);
     render_group_category(&mut lines, "Duplicates", summary, details, "duplicates");
+    render_complexity_category(&mut lines, summary, details);
     render_cycles_category(&mut lines, summary, details);
     render_symbol_category(&mut lines, "Dead code", summary, details, "dead_code");
     render_symbol_category(
@@ -1489,6 +1490,45 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
                 "Incomplete {category}: producer {producer} failed ({reason})"
             ));
         }
+    }
+}
+
+fn render_complexity_category(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+) {
+    let Some(section) = summary.get("complexity") else {
+        return;
+    };
+    let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let threshold = section
+        .get("threshold")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    if count == 0 {
+        lines.push(format!("Cyclomatic complexity: 0 functions >= {threshold}"));
+        return;
+    }
+    let worst = section.get("worst").and_then(Value::as_object);
+    let worst_text = worst.map_or_else(String::new, |item| {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
+        let function = item.get("function").and_then(Value::as_str).unwrap_or("?");
+        let complexity = item.get("complexity").and_then(Value::as_u64).unwrap_or(0);
+        format!(" (worst: {file}::{function} {complexity})")
+    });
+    lines.push(format!(
+        "Cyclomatic complexity: {count} functions >= {threshold}{worst_text}"
+    ));
+    let Some(items) = details.get("complexity").and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or("?");
+        let function = item.get("function").and_then(Value::as_str).unwrap_or("?");
+        let line = item.get("line").and_then(Value::as_u64).unwrap_or(0);
+        let complexity = item.get("complexity").and_then(Value::as_u64).unwrap_or(0);
+        lines.push(format!("  {file}:{line} {function} ({complexity})"));
     }
 }
 
@@ -2161,6 +2201,11 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
             "count": count_from_payload(Some(payload)),
             "largest": payload.get("largest").and_then(Value::as_u64).unwrap_or(0),
         }),
+        InspectCategory::Complexity => serde_json::json!({
+            "count": count_from_payload(Some(payload)),
+            "threshold": payload.get("threshold").and_then(Value::as_u64).unwrap_or(10),
+            "worst": payload.get("worst").cloned().unwrap_or(Value::Null),
+        }),
         _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
     }
 }
@@ -2466,6 +2511,44 @@ mod render_text_tests {
 
         assert_eq!(text, "Dead code analysis unavailable (no callgraph)");
         assert!(!text.contains("Dead code: 0"));
+    }
+
+    #[test]
+    fn renders_complexity_summary_and_drill_down() {
+        let text = render_with_details(
+            serde_json::json!({
+                "complexity": {
+                    "count": 2,
+                    "threshold": 10,
+                    "worst": {
+                        "file": "tests/hot.rs",
+                        "function": "test_hotspot",
+                        "line": 9,
+                        "complexity": 99,
+                    },
+                },
+            }),
+            serde_json::json!({
+                "complexity": [{
+                    "file": "src/product.rs",
+                    "function": "product_hotspot",
+                    "line": 5,
+                    "complexity": 10,
+                    "language": "rust",
+                }],
+            }),
+        );
+
+        assert!(
+            text.contains(
+                "Cyclomatic complexity: 2 functions >= 10 (worst: tests/hot.rs::test_hotspot 99)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  src/product.rs:5 product_hotspot (10)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2872,6 +2955,12 @@ mod fresh_payload_tests {
                     }
                     InspectCategory::Duplicates => serde_json::json!({ "count": 1, "groups": [] }),
                     InspectCategory::Cycles => serde_json::json!({ "count": 0, "largest": 0 }),
+                    InspectCategory::Complexity => serde_json::json!({
+                        "count": 1,
+                        "threshold": 10,
+                        "worst": { "file": "src/complex.rs", "function": "hot", "line": 3, "complexity": 12 },
+                        "items": [{ "file": "src/complex.rs", "function": "hot", "line": 3, "complexity": 12, "language": "rust" }],
+                    }),
                     _ => unreachable!("only active categories are emitted"),
                 };
                 (category, payload)

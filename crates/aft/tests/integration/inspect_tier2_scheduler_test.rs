@@ -294,7 +294,13 @@ fn watcher_tick_after_quiet_gap_triggers_tier2_refresh() {
 
     let response = wait_for_tier2(
         &ctx,
-        &["dead_code", "unused_exports", "duplicates", "cycles"],
+        &[
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ],
     );
     assert_eq!(
         response["scanner_state"]["tier2_trigger_reason"].as_str(),
@@ -312,7 +318,7 @@ fn automatic_refresh_without_callgraph_store_skips_dead_code_only() {
         "export function unused() { return 1; }\n",
     );
     let ctx = configured_context_with_storage(&root, &root.join(".aft-test-storage"), false);
-    let expected = vec!["unused_exports", "duplicates", "cycles"];
+    let expected = vec!["unused_exports", "duplicates", "cycles", "complexity"];
 
     assert_eq!(automatic_tier2_category_names(&ctx), expected);
 
@@ -330,7 +336,7 @@ fn automatic_refresh_without_callgraph_store_skips_dead_code_only() {
         ctx.inspect_manager()
             .automatic_tier2_schedule_count_for_test(),
         expected.len() as u64,
-        "automatic scheduling should submit the three callgraph-independent categories"
+        "automatic scheduling should submit every callgraph-independent Tier-2 category"
     );
 }
 
@@ -401,7 +407,13 @@ fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
     );
     assert_eq!(
         automatic_tier2_category_names(&ctx),
-        vec!["dead_code", "unused_exports", "duplicates", "cycles"]
+        vec![
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ]
     );
 
     let base = Instant::now();
@@ -417,8 +429,8 @@ fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
     assert_eq!(
         ctx.inspect_manager()
             .automatic_tier2_schedule_count_for_test(),
-        4,
-        "the next automatic refresh should include dead_code after reconfigure"
+        5,
+        "the next automatic refresh should include dead_code and complexity after reconfigure"
     );
 }
 

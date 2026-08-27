@@ -31,7 +31,7 @@ pub enum InspectCategory {
 }
 
 impl InspectCategory {
-    pub const ACTIVE: [InspectCategory; 7] = [
+    pub const ACTIVE: [InspectCategory; 8] = [
         InspectCategory::Diagnostics,
         InspectCategory::Metrics,
         InspectCategory::Todos,
@@ -39,10 +39,10 @@ impl InspectCategory {
         InspectCategory::UnusedExports,
         InspectCategory::Duplicates,
         InspectCategory::Cycles,
+        InspectCategory::Complexity,
     ];
 
-    pub const DISABLED: [InspectCategory; 6] = [
-        InspectCategory::Complexity,
+    pub const DISABLED: [InspectCategory; 5] = [
         InspectCategory::CircularDeps,
         InspectCategory::OutdatedDeps,
         InspectCategory::Vulnerabilities,

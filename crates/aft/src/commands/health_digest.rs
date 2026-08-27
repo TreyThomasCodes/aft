@@ -48,6 +48,7 @@ pub struct DigestCurrentValues {
     pub dead_code: Option<TicketedCurrent<u64>>,
     pub unused_exports: Option<TicketedCurrent<u64>>,
     pub duplicates: Option<TicketedCurrent<u64>>,
+    pub complexity_over_threshold: Option<TicketedCurrent<u64>>,
     pub todos: Option<TicketedCurrent<u64>>,
     pub watcher_events: Option<TicketedCurrent<u64>>,
 }
@@ -64,6 +65,11 @@ pub fn render_current_values(values: &DigestCurrentValues) -> Value {
         values.unused_exports.as_ref(),
     );
     insert_ticketed(&mut fields, "duplicates", values.duplicates.as_ref());
+    insert_ticketed(
+        &mut fields,
+        "complexity_over_threshold",
+        values.complexity_over_threshold.as_ref(),
+    );
     insert_ticketed(&mut fields, "todos", values.todos.as_ref());
     insert_ticketed(
         &mut fields,
@@ -142,6 +148,13 @@ mod tests {
                     generation: 11,
                 },
             )),
+            complexity_over_threshold: Some(TicketedCurrent::new(
+                1,
+                FreshnessTicket::ArtifactGeneration {
+                    identity: "artifact-complexity".to_string(),
+                    generation: 12,
+                },
+            )),
             ..DigestCurrentValues::default()
         };
 
@@ -158,7 +171,11 @@ mod tests {
         let entries = rendered
             .as_object()
             .expect("ticketed values render as a structured object");
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries["complexity_over_threshold"]["value"].as_u64(),
+            Some(1)
+        );
 
         let mut reported_values = entries
             .values()
@@ -169,7 +186,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         reported_values.sort_unstable();
-        assert_eq!(reported_values, vec![2, 3]);
+        assert_eq!(reported_values, vec![1, 2, 3]);
         assert!(entries.values().all(|entry| {
             entry
                 .as_object()

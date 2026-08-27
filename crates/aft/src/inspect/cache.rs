@@ -176,7 +176,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v32: Rust dead-code reachability follows function items referenced as values,
 /// and callers inside cfg(test) regions move otherwise-dead targets into the
 /// test-only bucket.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 32;
+/// v33: cyclomatic-complexity contributions and thresholded hotspot aggregates
+/// add a Tier-2 category, so unchanged contribution sets need a new roll-up.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 33;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -1993,6 +1995,24 @@ fn contribution_set_hash_with_conn(
     project_root: &Path,
     config: Option<&Config>,
 ) -> Result<String, InspectCacheError> {
+    contribution_set_hash_with_version(
+        conn,
+        category,
+        project_key,
+        project_root,
+        config,
+        TIER2_CONTRIBUTION_CACHE_VERSION,
+    )
+}
+
+fn contribution_set_hash_with_version(
+    conn: &Connection,
+    category: InspectCategory,
+    project_key: &str,
+    project_root: &Path,
+    config: Option<&Config>,
+    cache_version: u32,
+) -> Result<String, InspectCacheError> {
     let mut stmt = conn.prepare(
         "SELECT file_path, file_hash FROM tier2_contributions \
          WHERE category = ?1 AND project_key = ?2 ORDER BY file_path ASC",
@@ -2003,7 +2023,7 @@ fn contribution_set_hash_with_conn(
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"tier2-contributions\0");
-    hasher.update(&TIER2_CONTRIBUTION_CACHE_VERSION.to_le_bytes());
+    hasher.update(&cache_version.to_le_bytes());
     hasher.update(b"\0");
     for row in rows {
         let (file_path, file_hash) = row?;
@@ -2901,7 +2921,60 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 32);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 33);
+    }
+
+    #[test]
+    fn complexity_cache_version_rejects_a_legacy_aggregate_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let source = project_root.join("src/hot.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "fn hot() {}\n").unwrap();
+        let cache = InspectCache::open(temp.path().join("inspect"), project_root.clone()).unwrap();
+        let contribution = FileContribution::new(
+            InspectCategory::Complexity,
+            source.clone(),
+            collect_freshness(&source),
+            serde_json::json!({
+                "file": "src/hot.rs",
+                "language": "rust",
+                "functions": [{ "function": "hot", "line": 1, "complexity": 10 }],
+            }),
+        );
+        let config = Config::default();
+        cache
+            .store_tier2_result_for_config(
+                JobKey::for_project_category(InspectCategory::Complexity),
+                std::slice::from_ref(&source),
+                &[contribution],
+                serde_json::json!({ "count": 1, "items": [] }),
+                &config,
+            )
+            .unwrap();
+
+        let current_hash = cache
+            .contribution_set_hash_for_config(InspectCategory::Complexity, &config)
+            .unwrap();
+        let legacy_hash = contribution_set_hash_with_version(
+            &cache.conn.lock().unwrap(),
+            InspectCategory::Complexity,
+            &cache.project_key,
+            &cache.project_root,
+            Some(&config),
+            32,
+        )
+        .unwrap();
+
+        assert_ne!(current_hash, legacy_hash);
+        assert!(cache
+            .load_aggregate_if_hash_matches(InspectCategory::Complexity, &legacy_hash)
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .load_aggregate_if_hash_matches(InspectCategory::Complexity, &current_hash)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

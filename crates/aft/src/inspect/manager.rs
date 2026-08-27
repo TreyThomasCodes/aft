@@ -3419,6 +3419,7 @@ fn run_tier2_scan(job: &InspectJob, oxc_result: Option<&OxcEngineResult>) -> Ins
         }
         InspectCategory::Duplicates => scanners::duplicates::run_duplicates_scan(job),
         InspectCategory::Cycles => scanners::cycles::run_cycles_scan_with_oxc(job, oxc_result),
+        InspectCategory::Complexity => scanners::complexity::run_complexity_scan(job),
         other => InspectResult::failed(
             job,
             format!("inspect category '{other}' is not an active Tier 2 scanner"),
@@ -3448,6 +3449,9 @@ fn roll_up_tier2_contributions_with_limit(
         }
         InspectCategory::Cycles => {
             roll_up_cycle_contributions(job, contributions, drill_down_limit)
+        }
+        InspectCategory::Complexity => {
+            roll_up_complexity_contributions(job, contributions, drill_down_limit)
         }
         _ => json!({
             "count": 0,
@@ -4004,6 +4008,18 @@ fn roll_up_cycle_contributions(
         &job.project_root,
         contributions,
         skipped_languages(&job.scope_files, LanguageSkipMode::Cycles),
+        drill_down_limit,
+    )
+}
+
+fn roll_up_complexity_contributions(
+    job: &InspectJob,
+    contributions: &[FileContribution],
+    drill_down_limit: Option<usize>,
+) -> Value {
+    super::scanners::complexity::aggregate_complexity_contributions_with_limit(
+        &job.project_root,
+        contributions,
         drill_down_limit,
     )
 }
