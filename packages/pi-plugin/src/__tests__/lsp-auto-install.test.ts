@@ -286,7 +286,8 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/resolveNpm\(\)/);
     expect(source).toMatch(/npmInvocation\(npm,/);
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
-    expect(source).toMatch(/env:\s*npmSpawnEnv\(npm\)/);
+    expect(source).toContain("npmSpawnEnv(npm)");
+    expect(source).toContain("terminateNpmProcessTree(child, invocation)");
     expect(source).toMatch(
       /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*,?\s*\]/,
     );

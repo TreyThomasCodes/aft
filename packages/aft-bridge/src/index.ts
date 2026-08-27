@@ -134,6 +134,7 @@ export {
   npmSpawnEnv,
   probeNpmVersion,
   resolveNpm,
+  terminateNpmProcessTree,
 } from "./npm-resolver.js";
 // --- ONNX runtime ---
 export {

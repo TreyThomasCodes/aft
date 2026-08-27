@@ -10,6 +10,11 @@ mock.module("../../logger.js", () => ({
   error: mock(() => {}),
 }));
 
+const terminateNpmProcessTreeMock = mock((proc: childProcess.ChildProcess) => {
+  proc.kill();
+  return Promise.resolve();
+});
+
 // Make npm resolution deterministic so the test does not depend on the host
 // environment having npm on PATH (the resolver now searches beyond PATH).
 mock.module("@cortexkit/aft-bridge", () => ({
@@ -19,6 +24,7 @@ mock.module("@cortexkit/aft-bridge", () => ({
     args: [...args],
   }),
   npmSpawnEnv: (_npm: unknown, base: NodeJS.ProcessEnv = process.env) => ({ ...base }),
+  terminateNpmProcessTree: terminateNpmProcessTreeMock,
 }));
 
 /**
@@ -227,14 +233,30 @@ describe("auto-update-checker/cache", () => {
       const killMock = mock(() => true);
       proc.kill = killMock;
       const spawnMock = spyOn(childProcess, "spawn").mockReturnValue(proc);
+      let releaseTermination: (() => void) | undefined;
+      terminateNpmProcessTreeMock.mockImplementationOnce((child) => {
+        child.kill();
+        return new Promise<void>((resolve) => {
+          releaseTermination = resolve;
+        });
+      });
       const { runNpmInstallSafe } = await freshCacheImport();
 
-      expect(await runNpmInstallSafe("/tmp/opencode", { timeoutMs: 1 })).toEqual({
+      let completed = false;
+      const install = runNpmInstallSafe("/tmp/opencode", { timeoutMs: 1 }).then((result) => {
+        completed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(completed).toBe(false);
+      releaseTermination?.();
+      expect(await install).toEqual({
         ok: false,
         reason: "timeout",
         stderrTail: undefined,
       });
       expect(killMock).toHaveBeenCalled();
+      expect(terminateNpmProcessTreeMock).toHaveBeenCalled();
 
       spawnMock.mockRestore();
     });

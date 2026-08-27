@@ -46,6 +46,7 @@ import {
   npmInvocation,
   npmSpawnEnv,
   resolveNpm,
+  terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
@@ -323,7 +324,7 @@ function runInstall(
     const child = spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
-      env: npmSpawnEnv(npm),
+      env: { ...npmSpawnEnv(npm), ...invocation.env },
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
     child.unref();
@@ -331,6 +332,7 @@ function runInstall(
     let stderrBuf = "";
     let settled = false;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let terminationPromise: Promise<void> | null = null;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
@@ -344,6 +346,10 @@ function runInstall(
     };
     const onAbort = () => {
       warn(`[lsp] install ${target} aborted during shutdown`);
+      if (invocation.windowsCmdShim) {
+        terminationPromise ??= terminateNpmProcessTree(child, invocation);
+        return;
+      }
       child.kill("SIGTERM");
       killTimer = setTimeout(() => {
         if (!settled) child.kill("SIGKILL");
@@ -368,15 +374,17 @@ function runInstall(
       finish(false);
     });
     child.on("exit", (code) => {
-      if (code === 0) {
-        log(`[lsp] installed ${target}`);
-        finish(true);
-      } else {
-        error(
-          `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
-        );
-        finish(false);
-      }
+      void (terminationPromise ?? Promise.resolve()).then(() => {
+        if (code === 0) {
+          log(`[lsp] installed ${target}`);
+          finish(true);
+        } else {
+          error(
+            `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
+          );
+          finish(false);
+        }
+      });
     });
   });
 }

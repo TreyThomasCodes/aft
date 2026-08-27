@@ -15,7 +15,7 @@
  * its bin directory; `npmSpawnEnv()` prepends that directory to PATH for the
  * spawn so npm can find its own node.
  */
-import { spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
@@ -33,8 +33,12 @@ export interface ResolvedNpm {
 export interface NpmInvocation {
   command: string;
   args: string[];
+  /** Environment additions required by the invocation. */
+  env?: Readonly<Record<string, string>>;
   /** Required when passing a fully quoted command line to cmd.exe. */
   windowsVerbatimArguments?: boolean;
+  /** True when cmd.exe is wrapping an npm.cmd/npm.bat script. */
+  windowsCmdShim?: boolean;
 }
 
 interface ResolveNpmDeps {
@@ -223,19 +227,69 @@ export function npmInvocation(
     return { command: resolved.command, args: [...npmArgs] };
   }
 
-  if (/[\0\r\n"%]/.test(resolved.command)) {
+  if (/[\0\r\n"]/.test(resolved.command)) {
     throw new Error(
       `npm command cannot be represented safely for cmd.exe: ${JSON.stringify(resolved.command)}`,
     );
   }
 
+  // Keep the path out of cmd.exe's command text. In particular, cmd expands
+  // `%NAME%` even inside quotes; expansion is single-pass, so a literal `%` in
+  // the environment value remains literal after `%AFT_NPM_COMMAND%` expands.
+  const commandEnvName = "AFT_NPM_COMMAND";
   const quotedArgs = npmArgs.map(quoteCmdArgument);
-  const commandLine = `""${resolved.command}"${quotedArgs.length > 0 ? ` ${quotedArgs.join(" ")}` : ""}"`;
+  const commandLine = `""%${commandEnvName}%"${quotedArgs.length > 0 ? ` ${quotedArgs.join(" ")}` : ""}"`;
   return {
     command: env.ComSpec ?? env.COMSPEC ?? "cmd.exe",
     args: ["/d", "/s", "/v:off", "/c", commandLine],
+    env: { [commandEnvName]: resolved.command },
     windowsVerbatimArguments: true,
+    windowsCmdShim: true,
   };
+}
+
+/**
+ * Terminate an npm child safely. Windows cmd shims create a cmd.exe -> node.exe
+ * tree, so killing only the immediate child can leave npm writing in the
+ * background after a rollback or install-lock release.
+ */
+export function terminateNpmProcessTree(
+  child: Pick<ChildProcess, "pid" | "kill">,
+  invocation: NpmInvocation,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  if (!invocation.windowsCmdShim || child.pid === undefined) {
+    try {
+      child.kill();
+    } catch {
+      // Best-effort parity with ChildProcess.kill() callers.
+    }
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+    const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
+    const killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    let settled = false;
+    const finish = (fallback: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (fallback) {
+        try {
+          child.kill();
+        } catch {
+          // The process may already have exited.
+        }
+      }
+      resolve();
+    };
+    killer.once("error", () => finish(true));
+    killer.once("exit", (code) => finish(code !== 0));
+  });
 }
 
 /**
@@ -266,7 +320,7 @@ export function probeNpmVersion(resolved: ResolvedNpm): string | null {
   try {
     const invocation = npmInvocation(resolved, ["--version"]);
     const result = spawnSync(invocation.command, invocation.args, {
-      env: npmSpawnEnv(resolved),
+      env: { ...npmSpawnEnv(resolved), ...invocation.env },
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],

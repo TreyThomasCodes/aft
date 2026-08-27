@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { npmInvocation, npmSpawnEnv, probeNpmVersion, resolveNpm } from "../npm-resolver.js";
+import {
+  npmInvocation,
+  npmSpawnEnv,
+  probeNpmVersion,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "../npm-resolver.js";
 
 /**
  * The resolver is dependency-injected (platform/env/home/execPath) so we can
@@ -167,9 +173,11 @@ describe("npmInvocation", () => {
         "/s",
         "/v:off",
         "/c",
-        '""C:\\Program Files\\nodejs\\npm.cmd" "install" "@scope/pkg@1.2.3" "argument with spaces""',
+        '""%AFT_NPM_COMMAND%" "install" "@scope/pkg@1.2.3" "argument with spaces""',
       ],
+      env: { AFT_NPM_COMMAND: "C:\\Program Files\\nodejs\\npm.cmd" },
       windowsVerbatimArguments: true,
+      windowsCmdShim: true,
     });
   });
 
@@ -189,6 +197,7 @@ describe("npmInvocation", () => {
         const invocation = npmInvocation({ command: shim, binDir: root }, ["hello world", "plain"]);
         const result = spawnSync(invocation.command, invocation.args, {
           encoding: "utf8",
+          env: { ...process.env, ...invocation.env },
           windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         });
 
@@ -201,16 +210,46 @@ describe("npmInvocation", () => {
     },
   );
 
-  it.skipIf(process.platform !== "win32")("probes npm.cmd versions through cmd.exe", () => {
-    const root = mkdtempSync(join(tmpdir(), "npm probe "));
-    try {
-      const shim = join(root, "npm.cmd");
-      writeFileSync(shim, "@echo off\r\necho 9.8.7\r\n");
-      expect(probeNpmVersion({ command: shim, binDir: root })).toBe("9.8.7");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
+  it.skipIf(process.platform !== "win32")(
+    "probes npm.cmd from a path containing a literal percent",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "npm %TEMP% probe "));
+      try {
+        const shim = join(root, "npm.cmd");
+        writeFileSync(shim, "@echo off\r\necho 9.8.7\r\n");
+        expect(probeNpmVersion({ command: shim, binDir: root })).toBe("9.8.7");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "terminates the node descendant of a cmd shim",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "npm tree kill "));
+      try {
+        const shim = join(root, "npm.cmd");
+        const sentinel = join(root, "npm-still-running");
+        writeFileSync(
+          shim,
+          "@echo off\r\nnode -e \"setTimeout(function(){require('fs').writeFileSync(process.argv[1], 'leaked')}, 1000)\" \"%~1\"\r\n",
+        );
+        const invocation = npmInvocation({ command: shim, binDir: root }, [sentinel]);
+        const child = spawn(invocation.command, invocation.args, {
+          env: { ...process.env, ...invocation.env },
+          stdio: "ignore",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await terminateNpmProcessTree(child, invocation);
+        await new Promise((resolve) => setTimeout(resolve, 1_100));
+        expect(existsSync(sentinel)).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("npmSpawnEnv", () => {

@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,7 +12,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { npmInvocation, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import {
+  npmInvocation,
+  npmSpawnEnv,
+  type ResolvedNpm,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
@@ -660,6 +666,56 @@ function findSchemaFixTargets(adapters: HarnessAdapter[]): SchemaFixTarget[] {
   return targets;
 }
 
+async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promise<void> {
+  const invocation = npmInvocation(npm, [
+    "install",
+    "--no-audit",
+    "--no-fund",
+    "--no-progress",
+    "--ignore-scripts",
+  ]);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(invocation.command, invocation.args, {
+      cwd: installDir,
+      env: { ...npmSpawnEnv(npm), ...invocation.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
+    let stderr = "";
+    let settled = false;
+    let terminating = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve();
+    };
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 16 * 1024) stderr = stderr.slice(-16 * 1024);
+    });
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code) => {
+      if (terminating) return;
+      const detail = stderr.trim();
+      if (code !== 0) {
+        finish(new Error(`npm install exited with code ${code}${detail ? `: ${detail}` : ""}`));
+      } else {
+        finish();
+      }
+    });
+    timeout = setTimeout(() => {
+      if (settled) return;
+      terminating = true;
+      void terminateNpmProcessTree(child, invocation).then(() => {
+        finish(new Error("npm install timed out after 120000ms"));
+      });
+    }, 120_000);
+  });
+}
+
 async function applyPluginUpdates(
   targets: PluginUpdateTarget[],
 ): Promise<{ updated: number; errors: number }> {
@@ -681,28 +737,7 @@ async function applyPluginUpdates(
       // `npm install` in the plugin's cache dir reinstalls against the
       // package.json dependency spec OpenCode wrote (pinned to @latest), pulling
       // the newest plugin. Mirrors the plugin auto-updater's install flags.
-      const invocation = npmInvocation(npm, [
-        "install",
-        "--no-audit",
-        "--no-fund",
-        "--no-progress",
-        "--ignore-scripts",
-      ]);
-      const result = spawnSync(invocation.command, invocation.args, {
-        cwd: target.installDir,
-        env: npmSpawnEnv(npm),
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 120_000,
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      });
-      if (result.error) throw result.error;
-      if (result.status !== 0) {
-        const detail = result.stderr.trim();
-        throw new Error(
-          `npm install exited with code ${result.status}${detail ? `: ${detail}` : ""}`,
-        );
-      }
+      await runDoctorNpmInstall(npm, target.installDir);
       updated += 1;
       log.success(
         `${target.adapter.displayName}: plugin updated ${target.cached} → ${target.latest} (restart ${target.adapter.displayName} to apply)`,

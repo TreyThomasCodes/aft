@@ -298,7 +298,8 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/resolveNpm\(\)/);
     expect(source).toMatch(/npmInvocation\(npm,/);
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
-    expect(source).toMatch(/env:\s*npmSpawnEnv\(npm\)/);
+    expect(source).toContain("npmSpawnEnv(npm)");
+    expect(source).toContain("terminateNpmProcessTree(child, invocation)");
     expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing
     // the old behavior are fine (they explain the historical bug); only a

@@ -2,7 +2,12 @@ import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { npmInvocation, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import {
+  npmInvocation,
+  npmSpawnEnv,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
@@ -274,7 +279,7 @@ export async function runNpmInstallSafe(
     const proc = spawn(invocation.command, invocation.args, {
       cwd: installDir,
       stdio: ["ignore", "pipe", "pipe"],
-      env: npmSpawnEnv(npm),
+      env: { ...npmSpawnEnv(npm), ...invocation.env },
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
@@ -287,14 +292,15 @@ export async function runNpmInstallSafe(
       // Drain stdout too; stderr carries the actionable failure detail.
     });
 
+    let terminationPromise: Promise<void> | null = null;
     const abortProcess = () => {
-      try {
-        proc.kill();
-      } catch {
-        // best-effort
-      }
+      terminationPromise ??= terminateNpmProcessTree(proc, invocation);
+      return terminationPromise;
     };
-    options.signal?.addEventListener("abort", abortProcess, { once: true });
+    const onAbort = () => {
+      void abortProcess();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
 
     const exitPromise = new Promise<{ ok: boolean; reason?: string }>((resolveExit) => {
       proc.on("error", (err) => resolveExit({ ok: false, reason: `spawn error: ${String(err)}` }));
@@ -310,10 +316,10 @@ export async function runNpmInstallSafe(
       timeout = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs ?? 60_000);
     });
     const result = await Promise.race([exitPromise, timeoutPromise]);
-    options.signal?.removeEventListener("abort", abortProcess);
+    options.signal?.removeEventListener("abort", onAbort);
 
     if (result === "timeout" || options.signal?.aborted) {
-      abortProcess();
+      await abortProcess();
       const snapshot = pendingSnapshots.get(installDir);
       if (snapshot) {
         pendingSnapshots.delete(installDir);
