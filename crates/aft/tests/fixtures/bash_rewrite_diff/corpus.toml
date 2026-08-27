@@ -13,6 +13,15 @@ semantic_dimensions = ["shell-tokenization", "match-completeness", "exit-status"
 manifest = [{ path = "src/notes.txt", content = "first needle\nsecond\n" }]
 
 [[rows]]
+id = "grep-decline-basic-regex-dialect-conflict"
+command = "grep -rn 'a+b' src"
+route = "native"
+basis = "grep-match-set"
+branch_ids = ["grep.decline"]
+semantic_dimensions = ["shell-tokenization", "match-completeness", "exit-status"]
+manifest = [{ path = "src/notes.txt", content = "a+b\nab\naaab\n" }]
+
+[[rows]]
 id = "grep-decline-unsupported-flag"
 command = "grep -x needle src/notes.txt"
 route = "native"

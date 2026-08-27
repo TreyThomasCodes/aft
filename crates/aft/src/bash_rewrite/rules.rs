@@ -772,6 +772,15 @@ fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
     }
 }
 
+fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
+    // Basic grep treats these characters as literals unless escaped, while the
+    // AFT regex engine gives them extended-regex meanings. Native grep is the
+    // only faithful route until the rewrite can translate the complete BRE.
+    pattern
+        .chars()
+        .any(|ch| matches!(ch, '+' | '?' | '|' | '(' | ')' | '{' | '}'))
+}
+
 fn grep_request(command: &str, binary: &str) -> Option<Value> {
     let parsed = parse(command)?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != binary {
@@ -798,6 +807,9 @@ fn grep_request(command: &str, binary: &str) -> Option<Value> {
     }
 
     let pattern = parsed.args.get(index)?.clone();
+    if binary == "grep" && grep_basic_regex_has_dialect_conflict(&pattern) {
+        return None;
+    }
     let path = parsed.args.get(index + 1).cloned();
     if parsed.args.len() > index + 2 {
         return None;
@@ -1038,7 +1050,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{find_request, should_suppress_grep_footer, HeadRule, TailRule};
+    use super::{find_request, grep_request, should_suppress_grep_footer, HeadRule, TailRule};
     use crate::bash_rewrite::{RewriteDecision, RewriteRule};
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
@@ -1115,6 +1127,19 @@ mod tests {
         )
         .unwrap();
         assert!(should_suppress_grep_footer(Some("src/app.ts"), dir.path()));
+    }
+
+    #[test]
+    fn grep_declines_basic_regex_tokens_with_extended_meanings() {
+        assert_eq!(grep_request("grep -rn 'a+b' src", "grep"), None);
+        assert_eq!(
+            grep_request("rg -n 'a+b' src", "rg").unwrap()["pattern"],
+            "a+b"
+        );
+        assert_eq!(
+            grep_request("grep -rn 'a.b' src", "grep").unwrap()["pattern"],
+            "a.b"
+        );
     }
 
     #[test]
