@@ -35,17 +35,25 @@ const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
 const TARGET_VERSION = "0.49.0";
 const PREVIOUS_VERSION = "0.48.1";
 // The version actually being released. Version-consistency checks compare
-// against this; surface-identity checks keep TARGET_VERSION. Every new
-// minor line must be added here BEFORE its first tag: the npm publish job
-// runs this gate from the TAGGED commit, so a missing line fails the
-// release only after crates.io has already published (v0.51.0 incident).
-const GOVERNED_VERSION_LINES = ["0.49.", "0.50.", "0.51.", "0.52."];
+// against this; surface-identity checks keep TARGET_VERSION. The gate
+// governs every 0.x line from 0.49 onward as a RANGE, not an enumerated
+// list: three releases in a row (v0.51.0, v0.52.x, v0.53.0) failed at npm
+// publish because a new minor was tagged before its line was registered,
+// and the surface-identity checks below are the real protection anyway.
+// Revisit the bound when the workspace reaches 1.0 (new surface generation).
+const MIN_GOVERNED = { major: 0, minor: 49 };
 const RELEASE_VERSION = (() => {
   const cargo = readFileSync(join(ROOT, "crates/aft/Cargo.toml"), "utf8");
   const version = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
   if (!version) fail("could not read the workspace version from crates/aft/Cargo.toml");
-  if (!GOVERNED_VERSION_LINES.some((line) => version.startsWith(line)))
-    fail(`workspace version ${version} is outside the version lines this gate governs`);
+  const [major, minor] = version.split(".").map((part) => Number.parseInt(part, 10));
+  if (
+    !Number.isInteger(major) ||
+    !Number.isInteger(minor) ||
+    major !== MIN_GOVERNED.major ||
+    minor < MIN_GOVERNED.minor
+  )
+    fail(`workspace version ${version} is outside the version range this gate governs`);
   return version;
 })();
 const BUN = process.env.BUN_BIN || "bun";
