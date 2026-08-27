@@ -926,6 +926,11 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 // Mirrors per-tool OpenCode wrapper error handling in packages/opencode-plugin/src/tools/*.ts.
 fn format_error(bare_name: &str, data: &Value, ctx: &FormatContext) -> String {
+    if bare_name == "inspect" {
+        if let Some(text) = format_inspect_terminal(data) {
+            return text;
+        }
+    }
     if bare_name == "callgraph" {
         return format_callgraph_error(ctx.callgraph_op.as_deref().unwrap_or("callgraph"), data);
     }
@@ -1969,6 +1974,9 @@ fn format_zoom_call_ref(call: &Value) -> String {
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts inspectTools.
 fn format_inspect(response: &Response) -> String {
+    if let Some(text) = format_inspect_terminal(&response.data) {
+        return text;
+    }
     if let Some(text) = response.data.get("text").and_then(Value::as_str) {
         return append_rendered_diagnostics(text, &response.data);
     }
@@ -2974,6 +2982,46 @@ fn format_optional_memory_bytes(value: Option<&Value>) -> String {
         format!("{sign}{:.1} KiB", magnitude / 1024.0)
     } else {
         format!("{sign}{} B", magnitude as u64)
+    }
+}
+
+fn format_inspect_terminal(data: &Value) -> Option<String> {
+    let kind = data
+        .get("inspect_terminal")
+        .and_then(Value::as_str)
+        .map(|kind| kind.to_ascii_lowercase().replace('_', "-"))?;
+    let completed = data
+        .get("completed_phases")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+
+    match kind.as_str() {
+        "phase-failed" => {
+            let detail = compact_inspect_terminal_field(data.get("failure_detail"), "not supplied");
+            let reason = compact_inspect_terminal_field(data.get("failure_reason"), "not supplied");
+            Some(format!(
+                "inspect could not complete: {detail} ({reason}).\nCompleted phases: {completed}. Retry, or narrow with sections=..."
+            ))
+        }
+        "interrupted" => {
+            let phase_label = if completed == 1 { "phase" } else { "phases" };
+            Some(format!(
+                "inspect was interrupted before it could complete (after {completed} completed {phase_label}); no fresh snapshot was produced.\nRetry is safe; retry inspect, or narrow with sections=..."
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn compact_inspect_terminal_field(value: Option<&Value>, fallback: &str) -> String {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return fallback.to_string();
+    };
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() {
+        fallback.to_string()
+    } else {
+        parts.join(" ")
     }
 }
 

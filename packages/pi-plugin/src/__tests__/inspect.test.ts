@@ -131,7 +131,35 @@ describe("Pi aft_inspect surface", () => {
       failedPhase: undefined,
       failureReason: "missing_executable",
     });
-    expect(renderInspectTerminal(preflight!)).toContain("failure reason: missing_executable");
+    expect(renderInspectTerminal(preflight!)).toContain("(missing_executable)");
+  });
+
+  test("renders phase failures with detail and bounded retry guidance", () => {
+    const terminal = parseInspectTerminal({
+      terminal: "PHASE-FAILED",
+      completed_phases: [{ id: "stat_verification" }],
+      failure_reason: "inspect_not_fresh",
+      failure_detail: "metrics did not complete",
+    });
+
+    const rendered = renderInspectTerminal(terminal!, "request failed");
+    expect(rendered).toContain(
+      "inspect could not complete: metrics did not complete (inspect_not_fresh).",
+    );
+    expect(rendered).toContain("Completed phases: 1. Retry, or narrow with sections=...");
+    expect(rendered).not.toContain("request failed");
+  });
+
+  test("renders interrupted terminals with safe retry guidance", () => {
+    const terminal = parseInspectTerminal({
+      terminal: "INTERRUPTED",
+      completed_phases: [{ id: "lsp_quiescence" }],
+    });
+
+    const rendered = renderInspectTerminal(terminal!, "request failed");
+    expect(rendered).toContain("inspect was interrupted");
+    expect(rendered).toContain("Retry is safe");
+    expect(rendered).not.toContain("request failed");
   });
 
   test("delivers one rendered terminal without a follow-up bridge call", async () => {
@@ -173,7 +201,13 @@ describe("Pi aft_inspect surface", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0]?.command).toBe("tool_call");
       expect(calls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");
-      expect(resultText(result)).toContain(response.terminal);
+      if (response.terminal === "INTERRUPTED") {
+        expect(resultText(result)).toContain("inspect was interrupted");
+      } else if (response.terminal === "PHASE-FAILED") {
+        expect(resultText(result)).toContain("inspect could not complete");
+      } else {
+        expect(resultText(result)).toContain(response.terminal);
+      }
     }
   });
 

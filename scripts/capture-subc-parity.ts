@@ -705,6 +705,8 @@ const FORMAT_CASES: FormatCase[] = [
   { name: "callgraph_symbol_not_found_error", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "missing" }, native_response_json: { id: "1", success: false, code: "symbol_not_found", message: "callers: symbol 'missing' not found" } },
   { name: "callgraph_ambiguous_target_error", tool_name: "callgraph", agent_args: { op: "trace_to_symbol", filePath: "src/main.ts", symbol: "run", toSymbol: "leaf" }, native_response_json: { id: "1", success: false, code: "ambiguous_target", message: "trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate", candidates: [{ file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3, symbol: "leaf" }, { file: `${PROJECT_ROOT}/src/other_leaf.ts`, line: 9, symbol: "leaf" }] } },
   { name: "callgraph_building_error", tool_name: "callgraph", agent_args: { op: "callers", filePath: "src/main.ts", symbol: "run" }, native_response_json: { id: "1", success: false, code: "callgraph_building", message: "callers: call graph is still building" } },
+  { name: "inspect_phase_failed_terminal", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: false, inspect_terminal: "phase_failed", completed_phases: [{ id: "stat_verification" }], failure_reason: "inspect_not_fresh", failure_detail: "metrics did not complete", text: "request failed" } },
+  { name: "inspect_interrupted_terminal", tool_name: "inspect", agent_args: {}, native_response_json: { id: "1", success: false, inspect_terminal: "interrupted", completed_phases: [{ id: "lsp_quiescence" }], text: "request failed" } },
 ];
 
 setupProjectRoot();

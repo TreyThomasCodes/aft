@@ -202,24 +202,41 @@ function formatPhase(entry: InspectPhaseEntry): string {
   return details.length > 0 ? `${entry.id} (${details.join("; ")})` : entry.id;
 }
 
-/** Render every taxonomy field instead of reducing non-fresh terminals to an error. */
+/** Render every terminal honestly without reducing failures to a generic error. */
 export function renderInspectTerminal(terminal: InspectTerminal, serverText?: string): string {
-  const lines: string[] = [terminal.kind];
   if (terminal.kind === "FRESH") {
-    lines.push(`wait-stamp: ${terminal.waitStampText ?? "not supplied"}`);
+    const lines: string[] = [
+      terminal.kind,
+      `wait-stamp: ${terminal.waitStampText ?? "not supplied"}`,
+    ];
+    lines.push(
+      terminal.phases.length > 0
+        ? `completed phases:\n${terminal.phases.map((phase) => `- ${formatPhase(phase)}`).join("\n")}`
+        : "completed phases: none",
+    );
+    if (serverText?.trim()) lines.push(serverText);
+    return lines.join("\n");
   }
+
   if (terminal.kind === "PHASE-FAILED") {
-    if (terminal.failedPhase) lines.push(`failed phase: ${formatPhase(terminal.failedPhase)}`);
-    lines.push(`failure reason: ${terminal.failureReason ?? "not supplied"}`);
-    if (terminal.failureDetail) lines.push(`failure detail: ${terminal.failureDetail}`);
+    const detail = compactTerminalField(terminal.failureDetail, "not supplied");
+    const reason = compactTerminalField(terminal.failureReason, "not supplied");
+    return [
+      `inspect could not complete: ${detail} (${reason}).`,
+      `Completed phases: ${terminal.phases.length}. Retry, or narrow with sections=...`,
+    ].join("\n");
   }
-  lines.push(
-    terminal.phases.length > 0
-      ? `completed phases:\n${terminal.phases.map((phase) => `- ${formatPhase(phase)}`).join("\n")}`
-      : "completed phases: none",
-  );
-  if (serverText?.trim()) lines.push(serverText);
-  return lines.join("\n");
+
+  const phaseLabel = terminal.phases.length === 1 ? "phase" : "phases";
+  return [
+    `inspect was interrupted before it could complete (after ${terminal.phases.length} completed ${phaseLabel}); no fresh snapshot was produced.`,
+    "Retry is safe; retry inspect, or narrow with sections=...",
+  ].join("\n");
+}
+
+function compactTerminalField(value: string | undefined, fallback: string): string {
+  const compact = value?.trim().replace(/\s+/g, " ");
+  return compact || fallback;
 }
 
 export interface InspectToolConfig {

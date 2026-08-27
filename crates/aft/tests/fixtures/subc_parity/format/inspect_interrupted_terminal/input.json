@@ -1,0 +1,18 @@
+{
+  "tool_name": "inspect",
+  "native_response_json": {
+    "id": "1",
+    "success": false,
+    "inspect_terminal": "interrupted",
+    "completed_phases": [
+      {
+        "id": "lsp_quiescence"
+      }
+    ],
+    "text": "request failed"
+  },
+  "ctx": {
+    "agent_args": {},
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

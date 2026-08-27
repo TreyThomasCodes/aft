@@ -1,0 +1,20 @@
+{
+  "tool_name": "inspect",
+  "native_response_json": {
+    "id": "1",
+    "success": false,
+    "inspect_terminal": "phase_failed",
+    "completed_phases": [
+      {
+        "id": "stat_verification"
+      }
+    ],
+    "failure_reason": "inspect_not_fresh",
+    "failure_detail": "metrics did not complete",
+    "text": "request failed"
+  },
+  "ctx": {
+    "agent_args": {},
+    "project_root": "<PROJECT_ROOT>"
+  }
+}
