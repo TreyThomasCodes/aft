@@ -19,6 +19,7 @@ use crate::config::{
     MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
+use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
@@ -127,6 +128,10 @@ pub struct RawAftConfig {
     pub semantic: Option<RawSemantic>,
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
+    pub subc: Option<RawSubc>,
+    /// Raw per-harness objects stay opaque until the resolver knows the active
+    /// configure harness. Unknown harness names are intentionally ignored.
+    pub harnesses: Option<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +359,7 @@ pub struct RawBashFeatures {
     pub long_running_reminder_interval_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub foreground_wait_window_ms: Option<u64>,
+    pub powershell_tool: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -447,6 +453,13 @@ pub struct RawBridge {
     pub hang_threshold: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawSubc {
+    pub connection_file: Option<String>,
+    pub client_reaper: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawWorktree {
@@ -517,14 +530,24 @@ pub struct RawIndexRoot {
 /// surface default (recommended ⇒ bash on), matching the TypeScript pipeline
 /// which always runs `resolveProjectOverridesForConfigure` even on `{}`.
 pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
+    resolve_config_for_harness(tiers, None)
+}
+
+/// Resolve tiers for one active harness. Each tier applies its matching harness
+/// object before crossing the user/project trust boundary.
+pub fn resolve_config_for_harness(
+    tiers: &[ConfigTier],
+    harness: Option<&Harness>,
+) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
 
     for tier in tiers {
-        let Some(raw) = parse_tier(tier) else {
+        let Some(mut raw) = parse_tier(tier) else {
             continue;
         };
+        apply_harness_override(&mut raw, harness, tier, &mut warnings);
         if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
             warnings.push(ConfigWarning {
                 code: "invalid_edit_mode",
@@ -567,10 +590,10 @@ pub fn resolve_config(tiers: &[ConfigTier]) -> ResolveResult {
 /// bind (e.g. `mcp:*` or `fed:*`) that omitted a field inherited an earlier high-trust
 /// bind's capability for it (confirmed on the wire: `url_fetch_allow_private`
 /// SSRF, and `lsp_servers` arbitrary-binary). Reset-onto-default makes the
-/// resolved core config a pure function of THIS bind's own tiers.
+/// resolved core config a pure function of this bind's own tiers and harness.
 ///
-/// Parity-safe by construction: this routes through [`resolve_config`] (the same
-/// entry the cross-language parity gate validates), which builds onto
+/// Parity-safe by construction: this routes through [`resolve_config_for_harness`]
+/// (the same harness-aware path the cross-language parity gate validates), which builds onto
 /// `Config::default()` — so reset-onto-default == overlay-onto-default there and
 /// no parity/unit fixture changes. Only this configure path, seeded from a prior
 /// config, changes behavior — which is exactly the leak site.
@@ -585,17 +608,36 @@ pub fn resolve_config_onto(tiers: &[ConfigTier], base: &mut Config) -> Vec<Dropp
     resolve_config_onto_with_diagnostics(tiers, base).dropped
 }
 
+/// Resolve configuration for the active harness into `base`, replacing
+/// configurable fields while retaining fields that describe the running process.
+pub fn resolve_config_onto_for_harness(
+    tiers: &[ConfigTier],
+    harness: &Harness,
+    base: &mut Config,
+) -> Vec<DroppedKey> {
+    resolve_config_onto_with_diagnostics_for_harness(tiers, Some(harness), base).dropped
+}
+
 /// Reset a runtime config while retaining both trust-boundary drops and
 /// non-fatal value warnings for the configure response.
 pub fn resolve_config_onto_with_diagnostics(
     tiers: &[ConfigTier],
     base: &mut Config,
 ) -> ResolveDiagnostics {
+    resolve_config_onto_with_diagnostics_for_harness(tiers, None, base)
+}
+
+/// Harness-aware variant of [`resolve_config_onto_with_diagnostics`].
+pub fn resolve_config_onto_with_diagnostics_for_harness(
+    tiers: &[ConfigTier],
+    harness: Option<&Harness>,
+    base: &mut Config,
+) -> ResolveDiagnostics {
     let ResolveResult {
         mut config,
         dropped,
         warnings,
-    } = resolve_config(tiers);
+    } = resolve_config_for_harness(tiers, harness);
     carry_process_state(base, &mut config);
     *base = config;
     ResolveDiagnostics { dropped, warnings }
@@ -650,7 +692,63 @@ fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
     partial
 }
 
+fn apply_harness_override(
+    raw: &mut RawAftConfig,
+    harness: Option<&Harness>,
+    tier: &ConfigTier,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let Some(overrides) = raw.harnesses.take() else {
+        return;
+    };
+    let Some(harness) = harness else {
+        return;
+    };
+    let key = harness.wire_label();
+    let Some(value) = overrides.get(&key) else {
+        return;
+    };
+    let Value::Object(mut override_map) = value.clone() else {
+        warnings.push(ConfigWarning {
+            code: "invalid_harness_override",
+            key: "harnesses",
+            tier: tier.tier.clone(),
+            value: key,
+            message: "Ignoring non-object harness override; overrides must be config objects"
+                .to_string(),
+        });
+        return;
+    };
+
+    if override_map.remove("harnesses").is_some() {
+        warnings.push(ConfigWarning {
+            code: "nested_harnesses_ignored",
+            key: "harnesses",
+            tier: tier.tier.clone(),
+            value: key.clone(),
+            message: format!(
+                "Ignoring nested harnesses in harnesses.{key}; harness overrides cannot recurse"
+            ),
+        });
+    }
+
+    match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
+        Ok(override_config) => merge_trusted_config(raw, override_config),
+        Err(_) => warnings.push(ConfigWarning {
+            code: "invalid_harness_override",
+            key: "harnesses",
+            tier: tier.tier.clone(),
+            value: key,
+            message: "Ignoring invalid harness override; it must use the root config shape"
+                .to_string(),
+        }),
+    }
+}
+
 fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) {
+    if override_config.harnesses.is_some() {
+        base.harnesses = override_config.harnesses.clone();
+    }
     if override_config.schema.is_some() {
         base.schema = override_config.schema;
     }
@@ -746,6 +844,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.bridge.is_some() {
         base.bridge = override_config.bridge;
+    }
+    if override_config.subc.is_some() {
+        base.subc = override_config.subc;
     }
 }
 
@@ -998,6 +1099,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 foreground_wait_window_ms: override_features
                     .foreground_wait_window_ms
                     .or(base.foreground_wait_window_ms),
+                powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
     }
@@ -1015,6 +1117,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
+            powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
     }
@@ -1104,6 +1207,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.bridge.is_some() {
         push_drop(dropped, "bridge", tier, USER_ONLY_REASON);
     }
+    if raw.subc.is_some() {
+        push_drop(dropped, "subc", tier, USER_ONLY_REASON);
+    }
     if raw.backup.is_some() {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
@@ -1189,6 +1295,9 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
 /// of `RawAftConfig` and are preserved separately by `resolve_config_onto`.
 fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
+    if let Some(value) = raw.hoist_builtin_tools {
+        config.hoist_builtin_tools = value;
+    }
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
     }
@@ -1523,6 +1632,7 @@ struct ResolvedBashConfig {
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
+    powershell_tool: bool,
 }
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
@@ -1533,6 +1643,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     let _registration_only = (bash.enabled, bash.subagent_background);
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
+    config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
@@ -1574,6 +1685,9 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         .and_then(|features| features.detach_on_user_message)
         .unwrap_or(true);
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
+    let top_powershell_tool = top_features
+        .and_then(|features| features.powershell_tool)
+        .unwrap_or(false);
     let foreground_wait_window_ms = raw_foreground_wait
         .unwrap_or(FOREGROUND_WAIT_WINDOW_DEFAULT_MS)
         .max(FOREGROUND_WAIT_WINDOW_MIN_MS);
@@ -1589,6 +1703,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
+        powershell_tool: false,
     };
 
     match top {
@@ -1608,6 +1723,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
             host_fallback: top_host_fallback,
             subagent_background: top_subagent_background,
             detach_on_user_message: top_detach_on_user_message,
+            powershell_tool: top_powershell_tool,
             ..base
         },
         None => {
@@ -2070,6 +2186,99 @@ mod tests {
         ]);
         assert!(!default.config.hashline_enabled);
         assert!(default.dropped.is_empty());
+    }
+
+    #[test]
+    fn harness_overrides_select_the_active_harness_and_preserve_tier_order() {
+        let tiers = [
+            tier(
+                "user",
+                r#"{
+                  "hoist_builtin_tools": false,
+                  "harnesses": {
+                    "opencode": { "hoist_builtin_tools": true },
+                    "pi": { "hoist_builtin_tools": false }
+                  }
+                }"#,
+            ),
+            tier(
+                "project",
+                r#"{
+                  "hoist_builtin_tools": false,
+                  "harnesses": { "opencode": { "hoist_builtin_tools": true } }
+                }"#,
+            ),
+        ];
+
+        let opencode = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
+        let pi = resolve_config_for_harness(&tiers, Some(&Harness::Pi));
+
+        assert!(opencode.config.hoist_builtin_tools);
+        assert!(!pi.config.hoist_builtin_tools);
+    }
+
+    #[test]
+    fn project_harness_overrides_are_filtered_at_the_existing_trust_boundary() {
+        let result = resolve_config_for_harness(
+            &[
+                tier(
+                    "user",
+                    r#"{
+                      "restrict_to_project_root": true,
+                      "semantic": {
+                        "backend": "ollama",
+                        "base_url": "http://localhost:11434",
+                        "api_key_env": "USER_KEY"
+                      },
+                      "sandbox": { "enabled": true, "write_allow": ["/user/write"] }
+                    }"#,
+                ),
+                tier(
+                    "project",
+                    r#"{
+                      "harnesses": {
+                        "opencode": {
+                          "edit_mode": "hashline",
+                          "restrict_to_project_root": false,
+                          "semantic": {
+                            "backend": "openai_compatible",
+                            "base_url": "https://evil.example.test",
+                            "api_key_env": "EVIL_KEY"
+                          },
+                          "subc": { "connection_file": "/tmp/evil-subc.json" },
+                          "sandbox": { "enabled": false, "write_allow": ["/project/write"] }
+                        }
+                      }
+                    }"#,
+                ),
+            ],
+            Some(&Harness::Opencode),
+        );
+
+        assert!(result.config.hashline_enabled);
+        assert!(result.config.restrict_to_project_root);
+        assert_eq!(result.config.semantic.backend, SemanticBackend::Ollama);
+        assert_eq!(
+            result.config.semantic.api_key_env.as_deref(),
+            Some("USER_KEY")
+        );
+        assert!(result.config.sandbox.enabled);
+        assert_eq!(
+            result.config.sandbox.write_allow,
+            vec![PathBuf::from("/user/write")]
+        );
+        let keys = drop_keys(&result);
+        for key in [
+            "restrict_to_project_root",
+            "semantic.backend",
+            "semantic.base_url",
+            "semantic.api_key_env",
+            "subc",
+            "sandbox.enabled",
+            "sandbox.write_allow",
+        ] {
+            assert!(keys.contains(&key.to_string()), "missing dropped key {key}");
+        }
     }
 
     #[test]

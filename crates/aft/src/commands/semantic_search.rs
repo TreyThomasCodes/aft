@@ -1637,7 +1637,7 @@ fn handle_semantic_or_hybrid_search(
                 project_root,
             );
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
-            let note = building_lexical_note(lexical.ready);
+            let note = building_lexical_note();
             let mut extras = serde_json::Map::new();
             extras.insert("stage".to_string(), serde_json::json!(stage));
             extras.insert("files".to_string(), serde_json::json!(files));
@@ -1672,6 +1672,7 @@ fn handle_semantic_or_hybrid_search(
                         &results,
                         project_root,
                         lexical.ready,
+                        stage == "loading_artifacts",
                     ),
                     results: result_values,
                     more_available: lexical_count > top_k || lexical_engine_capped,
@@ -2695,9 +2696,30 @@ fn collect_lexical_files_from_snapshot(
 }
 
 fn search_index_ready_with_budget(ctx: &AppContext) -> Result<bool, ()> {
-    let search_index =
-        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET).ok_or(())?;
-    Ok(search_index.as_ref().is_some_and(|index| index.ready))
+    let deadline = Instant::now() + INTERACTIVE_ARTIFACT_READ_BUDGET;
+    loop {
+        let search_index = try_read_with_budget(
+            ctx.search_index(),
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(INTERACTIVE_ARTIFACT_READ_BUDGET),
+        )
+        .ok_or(())?;
+        if search_index.as_ref().is_some_and(|index| index.ready) {
+            return Ok(true);
+        }
+        drop(search_index);
+
+        // A read-only root publishes its borrowed artifact on the completion
+        // receiver. Drain it here so a search that races the load can use the
+        // artifact within the existing interactive budget instead of reporting
+        // an empty fallback before publication.
+        crate::runtime_drain::drain_search_index_events(ctx);
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
@@ -3134,7 +3156,7 @@ fn format_lexical_unavailable_text(
 ) -> String {
     if results.is_empty() {
         return format!(
-            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: {footer_reason}]"
+            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic. Retry in a few seconds. [semantic: {footer_reason}]"
         );
     }
 
@@ -3153,7 +3175,7 @@ fn format_grep_lexical_unavailable_text(
 ) -> String {
     if result.matches.is_empty() {
         return format!(
-            "{detail}\nSemantic search unavailable; lexical-only fallback returned 0 result(s). [semantic: {footer_reason}]"
+            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic. Retry in a few seconds. [semantic: {footer_reason}]"
         );
     }
 
@@ -3164,12 +3186,8 @@ fn format_grep_lexical_unavailable_text(
     )
 }
 
-fn building_lexical_note(lexical_index_ready: bool) -> &'static str {
-    if lexical_index_ready {
-        "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
-    } else {
-        "Semantic index is rebuilding; lexical fallback is unavailable because the trigram index is not ready."
-    }
+fn building_lexical_note() -> &'static str {
+    "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
 }
 
 fn format_building_lexical_text(
@@ -3177,8 +3195,20 @@ fn format_building_lexical_text(
     results: &[HybridResult],
     project_root: &Path,
     lexical_index_ready: bool,
+    loading_artifacts: bool,
 ) -> String {
-    let note = building_lexical_note(lexical_index_ready);
+    if results.is_empty() && !lexical_index_ready {
+        if loading_artifacts {
+            return format!(
+                "{detail}\nIndex artifacts are loading for this root; nothing was searched yet because the trigram index is not ready. Retry in a few seconds. [semantic: loading]"
+            );
+        }
+        return format!(
+            "{detail}\nSemantic index is still building and the trigram index is not ready; nothing was searched yet. Retry in a few seconds. [semantic: building]"
+        );
+    }
+
+    let note = building_lexical_note();
     if results.is_empty() {
         return format!(
             "{detail}\n{note}\nFound 0 lexical fallback result(s). [semantic: rebuilding]"
@@ -4290,6 +4320,135 @@ mod tests {
     }
 
     #[test]
+    fn loading_artifacts_without_lexical_index_reports_one_actionable_status() {
+        let text = format_building_lexical_text(
+            "Semantic index is still building (stage: loading_artifacts).",
+            &[],
+            Path::new("/fixture"),
+            false,
+            true,
+        );
+
+        assert!(text.contains("Index artifacts are loading for this root"));
+        assert!(text.contains("nothing was searched yet"));
+        assert!(text.contains("Retry in a few seconds"));
+        assert!(!text.contains("Found 0"));
+        assert!(!text.contains("rebuilding"));
+    }
+
+    #[test]
+    fn empty_lexical_fallback_names_missing_semantic_coverage() {
+        let text = format_lexical_unavailable_text(
+            "Semantic index is loading.",
+            &[],
+            Path::new("/fixture"),
+            "loading",
+        );
+
+        assert!(text.contains("0 lexical matches"));
+        assert!(text.contains("semantic lane is unavailable"));
+        assert!(text.contains("prose-style queries may match only via semantic"));
+        assert!(!text.contains("lexical-only fallback returned 0"));
+    }
+
+    #[test]
+    fn empty_degraded_grep_fallback_names_missing_semantic_coverage() {
+        let result = GrepResult {
+            matches: Vec::new(),
+            total_matches: 0,
+            files_searched: 0,
+            files_with_matches: 0,
+            index_status: IndexStatus::Fallback,
+            truncated: false,
+            fully_degraded: true,
+            engine_capped: false,
+            walk_truncated: false,
+        };
+        let text = format_grep_lexical_unavailable_text(
+            "Semantic index is loading.",
+            &result,
+            Path::new("/fixture"),
+            "loading",
+        );
+
+        assert!(text.contains("0 lexical matches"));
+        assert!(text.contains("semantic lane is unavailable"));
+        assert!(!text.contains("lexical-only fallback returned 0"));
+    }
+
+    #[test]
+    fn borrowed_load_window_waits_for_published_search_index() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        let source = "pub fn waited_for_borrowed_artifact() {}\n";
+        std::fs::write(&source_file, source).expect("write source file");
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let publish_file = source_file.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut index = SearchIndex::new();
+            index.index_file(&publish_file, source.as_bytes());
+            index.ready = true;
+            tx.send(index).expect("publish search index");
+        });
+
+        let started = Instant::now();
+        let response = response_value(handle_semantic_search(
+            &semantic_request("waited_for_borrowed_artifact", 5),
+            &ctx,
+        ));
+
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert!(started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET);
+        assert_eq!(response["interpreted_as"], "lexical");
+        assert!(response["results"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty()));
+    }
+
+    #[test]
+    fn borrowed_load_window_stops_at_interactive_budget_with_actionable_status() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        let started = Instant::now();
+        let response = response_value(handle_semantic_search(
+            &semantic_request("still_loading", 5),
+            &ctx,
+        ));
+
+        assert!(started.elapsed() >= INTERACTIVE_ARTIFACT_READ_BUDGET);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let text = response["text"].as_str().expect("response text");
+        assert!(text.contains("nothing was searched yet"));
+        assert!(text.contains("Retry in a few seconds"));
+        assert!(!text.contains("Found 0"));
+    }
+
+    #[test]
     fn read_only_failed_snapshot_retries_on_semantic_query() {
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");
@@ -4316,7 +4475,7 @@ mod tests {
         assert!(response["text"]
             .as_str()
             .expect("semantic fallback text")
-            .contains("lexical-only fallback"));
+            .contains("semantic lane is unavailable"));
         assert!(ctx.semantic_index_rx().lock().is_some());
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();

@@ -318,10 +318,16 @@ interface BashPermissionAsk {
   command?: string;
   cwd?: string;
   grant_id?: string;
+  patterns?: string[];
+  always?: string[];
 }
 
 function piEscalationAskText(ask: BashPermissionAsk): string {
   return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
+}
+
+function piPowerShellAskText(command: string): string {
+  return `PowerShell commands are conservatively approved one at a time because AFT's POSIX shell scanner cannot safely interpret PowerShell syntax.\n\nExact command:\n${command}`;
 }
 
 async function callBashWithPermissionLoop(
@@ -329,6 +335,7 @@ async function callBashWithPermissionLoop(
   params: Record<string, unknown>,
   extCtx: ExtensionContext,
   options?: BridgeRequestOptions,
+  bridgeCommand = "bash",
 ): Promise<Record<string, unknown>> {
   const granted = Array.isArray(params.permissions_granted)
     ? params.permissions_granted.filter((value): value is string => typeof value === "string")
@@ -338,7 +345,7 @@ async function callBashWithPermissionLoop(
     try {
       return await callBashBridge(
         bridge,
-        "bash",
+        bridgeCommand,
         { ...params, ...(granted.length > 0 ? { permissions_granted: granted } : {}) },
         extCtx,
         options,
@@ -354,30 +361,47 @@ async function callBashWithPermissionLoop(
       const asks = Array.isArray(error.response?.asks)
         ? (error.response.asks as BashPermissionAsk[])
         : [];
-      if (asks.length === 0 || asks.some((ask) => ask.kind !== "escalation")) {
-        throw new Error(
-          "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
-        );
-      }
-      if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+      if (asks.length === 0 || !extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
         throw new BridgeError(
-          "Permission denied: host escalation approval requires an interactive UI.",
+          "Permission denied: command approval requires an interactive UI.",
           "permission_denied",
         );
       }
       for (const ask of asks) {
+        if (ask.kind === "escalation") {
+          const approved = await extCtx.ui.confirm(
+            "Run command unsandboxed on host?",
+            piEscalationAskText(ask),
+            { signal: extCtx.signal },
+          );
+          if (!approved) {
+            throw new BridgeError(
+              "Permission denied: unsandboxed host execution was denied.",
+              "permission_denied",
+            );
+          }
+          if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
+          continue;
+        }
+        if (bridgeCommand !== "powershell") {
+          throw new Error(
+            "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
+          );
+        }
         const approved = await extCtx.ui.confirm(
-          "Run command unsandboxed on host?",
-          piEscalationAskText(ask),
+          "Allow PowerShell command?",
+          piPowerShellAskText(String(params.command ?? "")),
           { signal: extCtx.signal },
         );
         if (!approved) {
           throw new BridgeError(
-            "Permission denied: unsandboxed host execution was denied.",
+            "Permission denied: PowerShell command was denied.",
             "permission_denied",
           );
         }
-        if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
+        for (const grant of [...(ask.always ?? []), ...(ask.patterns ?? [])]) {
+          if (!granted.includes(grant)) granted.push(grant);
+        }
       }
     }
   }
@@ -422,8 +446,10 @@ export function registerBashTool(
   aftSearchRegistered = false,
   registeredName = "bash",
   registerCompanions = true,
+  shell: "bash" | "powershell" = "bash",
 ): void {
-  const spawnHook = getBashSpawnHook(pi);
+  const isPowerShell = shell === "powershell";
+  const spawnHook = isPowerShell ? undefined : getBashSpawnHook(pi);
   const readToolName = registeredName === "bash" ? "read" : "aft_read";
   const grepToolName = registeredName === "bash" ? "grep" : "aft_grep";
   // Agent-facing wording: no internal vocabulary ("hoisted", "Rust handler",
@@ -453,17 +479,21 @@ export function registerBashTool(
   pi.registerTool<typeof BashParams, BashDetails>({
     name: registeredName,
     label: registeredName,
-    description: `Execute shell commands.${compressionSentence}${tasksSentence}
-
-DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
-    promptSnippet: bashCfg.background
-      ? "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
-      : "Run shell commands (timeout in milliseconds; supports workdir and compressed output)",
-    promptGuidelines: [
-      `DO NOT use bash for code search or exploration — ${searchSteer}.`,
-      "Set compressed: false when you need ANSI color codes in the output.",
-      "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
-    ],
+    description: isPowerShell
+      ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
+      : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
+    promptSnippet: isPowerShell
+      ? "Run PowerShell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
+      : bashCfg.background
+        ? "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
+        : "Run shell commands (timeout in milliseconds; supports workdir and compressed output)",
+    promptGuidelines: isPowerShell
+      ? ["Use PowerShell syntax. Every command requires explicit approval."]
+      : [
+          `DO NOT use bash for code search or exploration — ${searchSteer}.`,
+          "Set compressed: false when you need ANSI color codes in the output.",
+          "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
+        ],
     parameters: bashParamsForConfig(bashCfg.background),
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -555,6 +585,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
             block_to_completion: blockToCompletion,
             wait: requestedWait,
             sandbox: params.sandbox,
+            ...(isPowerShell ? { shell: "powershell" } : {}),
           },
           extCtx,
           {
@@ -571,9 +602,10 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
               onUpdate?.(bashResult(displayText, { streaming: true }));
             },
           },
+          isPowerShell ? "powershell" : "bash",
         );
       } catch (error) {
-        if (!bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
+        if (isPowerShell || !bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
         if (rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
@@ -637,7 +669,7 @@ DO NOT use bash for code search or code exploration. If you are about to run gre
 
       const output = (response.output as string | undefined) ?? "";
       return bashResult(
-        usedHostFallback
+        usedHostFallback || isPowerShell
           ? output
           : withBashHints(output, bridgeCommand, aftSearchRegistered, extCtx.cwd),
         details,

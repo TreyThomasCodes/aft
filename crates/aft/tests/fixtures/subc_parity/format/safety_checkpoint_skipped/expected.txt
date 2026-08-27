@@ -3,4 +3,5 @@ files 2
 skipped
   ↳ <PROJECT_ROOT>/missing.ts: not tracked
   ↳ <PROJECT_ROOT>/locked.ts: unknown error
-checkpoint is session-scoped; lost on restart
+evicted older-decision
+durable on disk at <STORAGE_PATH>/opencode/checkpoints/session/pre-edit; survives restarts

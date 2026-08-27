@@ -331,6 +331,9 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
     pub detach_on_user_message: bool,
+    /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
+    /// executor accepts this solely to keep shared config parsing in parity.
+    pub powershell_tool: bool,
 }
 
 impl Default for BashConfig {
@@ -338,6 +341,7 @@ impl Default for BashConfig {
         Self {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
+            powershell_tool: false,
         }
     }
 }
@@ -349,7 +353,9 @@ pub struct Config {
     pub project_root: Option<PathBuf>,
     /// How many levels of call-graph edges to follow during validation (default: 1).
     pub validation_depth: u32,
-    /// Hours before a checkpoint expires and is eligible for cleanup (default: 24).
+    /// Hours before legacy backup-session maintenance may collect inactive history
+    /// (default: 24). Named checkpoint retention is intentionally fixed at fourteen
+    /// days and is not controlled by configuration.
     pub checkpoint_ttl_hours: u32,
     /// Maximum depth for recursive symbol resolution (default: 10).
     pub max_symbol_depth: u32,
@@ -460,6 +466,9 @@ pub struct Config {
     /// Allow URL-fetch commands to access private network hosts.
     /// Default false; hosting plugins only forward this from user-level config.
     pub url_fetch_allow_private: bool,
+    /// Resolved host-tool registration preference. The Rust core retains this
+    /// value for cross-harness config parity; the hosting plugin owns registration.
+    pub hoist_builtin_tools: bool,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
     pub harness: Option<Harness>,
@@ -523,6 +532,7 @@ impl Default for Config {
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
             url_fetch_allow_private: false,
+            hoist_builtin_tools: true,
             harness: None,
             diagnostic_cache_size: 5000,
         }

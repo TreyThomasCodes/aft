@@ -102,8 +102,17 @@ pub(super) fn prepare_bash_elicitation_plan(
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| project_root.to_path_buf());
-    let asks =
-        crate::bash_permissions::scan::scan_with_project_root(&command, project_root, &workdir);
+    // PowerShell is not POSIX shell. Its AST must never be fed to the bash
+    // scanner, so untrusted routes require a conservative exact-command ask.
+    let asks = if translated.args.get("shell").and_then(Value::as_str) == Some("powershell") {
+        vec![crate::bash_permissions::PermissionAsk {
+            kind: crate::bash_permissions::PermissionKind::Bash,
+            patterns: vec![command.clone()],
+            always: Vec::new(),
+        }]
+    } else {
+        crate::bash_permissions::scan::scan_with_project_root(&command, project_root, &workdir)
+    };
     let grants = permission_grants_for_retry(&asks);
     Ok(BashElicitationPlan {
         command,

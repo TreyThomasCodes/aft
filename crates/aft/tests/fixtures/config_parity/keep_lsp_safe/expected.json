@@ -6,5 +6,6 @@
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
   "experimental_lsp_ty": true,
+  "hoist_builtin_tools": true,
   "restrict_to_project_root": false
 }

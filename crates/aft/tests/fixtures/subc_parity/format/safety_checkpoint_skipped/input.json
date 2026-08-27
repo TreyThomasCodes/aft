@@ -5,7 +5,9 @@
     "success": true,
     "name": "pre-edit",
     "file_count": 2,
-    "durability": "checkpoint is session-scoped; lost on restart",
+    "storage_path": "<STORAGE_PATH>/opencode/checkpoints/session/pre-edit",
+    "evicted": ["older-decision"],
+    "durability": "durable on disk at <STORAGE_PATH>/opencode/checkpoints/session/pre-edit; survives restarts",
     "skipped": [
       {
         "file": "<PROJECT_ROOT>/missing.ts",

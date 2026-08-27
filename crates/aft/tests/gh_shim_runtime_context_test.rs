@@ -318,6 +318,10 @@ fn shim_command(
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
         .env("HOME", home)
+        // Direct shim invocations bypass the shared AftProcess helper. Give each
+        // fixture its own root so an unexpected future configure path cannot
+        // write an index into the developer's shared storage.
+        .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", recorder)
         .env_remove("GH_TOKEN")

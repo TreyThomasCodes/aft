@@ -154,7 +154,35 @@ describe("aft_inspect tool", () => {
       failedPhase: undefined,
       failureReason: "missing_executable",
     });
-    expect(renderInspectTerminal(preflight!)).toContain("failure reason: missing_executable");
+    expect(renderInspectTerminal(preflight!)).toContain("(missing_executable)");
+  });
+
+  test("renders phase failures with detail and bounded retry guidance", () => {
+    const terminal = parseInspectTerminal({
+      inspect_terminal: "phase_failed",
+      completed_phases: [{ id: "stat_verification" }],
+      failure_reason: "inspect_not_fresh",
+      failure_detail: "metrics did not complete",
+    });
+
+    const rendered = renderInspectTerminal(terminal!, "request failed");
+    expect(rendered).toContain(
+      "inspect could not complete: metrics did not complete (inspect_not_fresh).",
+    );
+    expect(rendered).toContain("Completed phases: 1. Retry, or narrow with sections=...");
+    expect(rendered).not.toContain("request failed");
+  });
+
+  test("renders interrupted terminals with safe retry guidance", () => {
+    const terminal = parseInspectTerminal({
+      inspect_terminal: "interrupted",
+      completed_phases: [{ id: "lsp_quiescence" }],
+    });
+
+    const rendered = renderInspectTerminal(terminal!, "request failed");
+    expect(rendered).toContain("inspect was interrupted");
+    expect(rendered).toContain("Retry is safe");
+    expect(rendered).not.toContain("request failed");
   });
 
   test("returns exactly one terminal result and no inspect follow-up", async () => {
@@ -187,7 +215,13 @@ describe("aft_inspect tool", () => {
       const result = await tools.aft_inspect.execute({}, createMockSdkContext());
 
       const terminal = response.inspect_terminal.toUpperCase().replaceAll("_", "-");
-      expect(result).toContain(terminal);
+      if (terminal === "INTERRUPTED") {
+        expect(result).toContain("inspect was interrupted");
+      } else if (terminal === "PHASE-FAILED") {
+        expect(result).toContain("inspect could not complete");
+      } else {
+        expect(result).toContain(terminal);
+      }
       expect(toolCallCalls).toHaveLength(1);
       expect(toolCallCalls[0]).toMatchObject({ name: "inspect" });
       expect(toolCallCalls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");

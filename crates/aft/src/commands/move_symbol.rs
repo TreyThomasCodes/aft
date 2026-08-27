@@ -481,7 +481,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Create checkpoint (D105) ---
-    let checkpoint_name = format!("move_symbol:{}", symbol_name);
+    let checkpoint_name = format!("move_symbol-{symbol_name}");
     {
         let mut all_files: Vec<PathBuf> = vec![source_path.to_path_buf()];
         if dest_path.exists() {
@@ -2481,7 +2481,7 @@ fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
 
 /// Restore a checkpoint by name, scoped to the caller's session.
 fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> bool {
-    let cp_store = ctx.checkpoint().lock();
+    let mut cp_store = ctx.checkpoint().lock();
     if let Err(e) = cp_store.restore(session, name) {
         log::debug!(
             "move_symbol rollback: failed to restore checkpoint '{}': {}",

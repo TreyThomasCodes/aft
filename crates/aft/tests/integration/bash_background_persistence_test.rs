@@ -1418,17 +1418,25 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
         .unwrap();
         stdin.flush().unwrap();
     }
+    // Drain stdout from a thread while waiting: configure-time frames (status
+    // snapshot, rearm replay, ack) exceed the OS pipe buffer, and an undrained
+    // pipe deadlocks the child inside its response flush before the sentinel
+    // command ever runs (observed live: main thread parked in write(2) on
+    // stdout while this test waited for the marker).
+    let phase_two_stdout = phase_two.stdout.take().expect("phase-two stdout");
+    let phase_two_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        let mut stdout = phase_two_stdout;
+        let _ = stdout.read_to_string(&mut output);
+        output
+    });
     wait_for_path(&phase_two_ready);
     phase_two.kill().expect("SIGKILL unread re-arm process");
     let phase_two_status = phase_two.wait().expect("reap unread re-arm process");
     assert!(!phase_two_status.success());
-    let mut phase_two_output = String::new();
-    phase_two
-        .stdout
-        .take()
-        .expect("phase-two stdout")
-        .read_to_string(&mut phase_two_output)
-        .expect("read post-crash phase-two output");
+    let phase_two_output = phase_two_reader
+        .join()
+        .expect("join phase-two stdout reader");
     let phase_two_frame = phase_two_output
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())

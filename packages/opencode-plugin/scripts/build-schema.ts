@@ -89,7 +89,7 @@ function buildSchema(): Record<string, unknown> {
     additionalProperties: false,
   };
 
-  return {
+  const schema: Record<string, unknown> = {
     $schema: "http://json-schema.org/draft-07/schema#",
     $id: SCHEMA_URL,
     title: "AFT Configuration",
@@ -421,6 +421,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
               },
+              powershell_tool: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
+              },
             },
             additionalProperties: false,
           },
@@ -681,6 +687,19 @@ function buildSchema(): Record<string, unknown> {
     },
     additionalProperties: false,
   };
+
+  const configProperties = schema.properties as Record<string, unknown>;
+  configProperties.harnesses = {
+    type: "object",
+    description:
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+    additionalProperties: {
+      type: "object",
+      properties: { ...configProperties },
+      additionalProperties: false,
+    },
+  };
+  return schema;
 }
 
 async function main() {

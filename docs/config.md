@@ -14,6 +14,40 @@ Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/ag
 and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
 location automatically and leaves a `.MOVED_READPLEASE` marker behind.
 
+## Harness-specific overrides
+
+Use the top-level `harnesses` object when the same machine runs more than one AFT host. Each
+entry may set any normal config field except `harnesses`; nested `harnesses` objects are ignored
+with a warning. Unknown harness names are ignored so a shared config remains forward-compatible.
+
+For the active harness, AFT resolves settings in this exact order:
+
+1. base user config
+2. user `harnesses.<active>` override
+3. base project config
+4. project `harnesses.<active>` override
+
+An override wins within its own tier. The existing project trust boundary is applied only after
+its harness override is combined: project harness overrides can change project-safe fields such
+as `edit_mode`, but cannot supply user-only settings such as LSP executable configuration,
+semantic credentials, subc transport, or sandbox weakening.
+
+For example, keep OpenCode's built-ins hoisted while Pi exposes both its native tools and the
+`aft_*` alternatives:
+
+```jsonc
+{
+  "harnesses": {
+    "opencode": {
+      "hoist_builtin_tools": true
+    },
+    "pi": {
+      "hoist_builtin_tools": false
+    }
+  }
+}
+```
+
 ## Storage Root Environment Override
 
 Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
@@ -224,7 +258,11 @@ The backup store treats its on-disk tree as authoritative across processes; dele
 
     // How long a foreground bash call blocks before auto-promoting the task
     // to the background. Minimum 5000; lower values are clamped up. Default 8000.
-    "foreground_wait_window_ms": 8000
+    "foreground_wait_window_ms": 8000,
+
+    // Pi-only fallback for older Pi versions that cannot report whether its
+    // optional default PowerShell tool is enabled. OpenCode never registers it.
+    "powershell_tool": false
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
@@ -278,6 +316,8 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   }
 }
 ```
+
+On Pi versions that expose the live default-tool registry, AFT hoists `powershell` only when Pi has enabled its optional built-in tool. If that registry is unavailable, set `bash.powershell_tool` to `true` to mirror Pi's setting explicitly. The default is `false`; this key does not register a tool on OpenCode.
 
 AFT auto-detects the formatter and checker from project config files (`biome.json` → biome,
 `.oxfmtrc.json` / `.oxfmtrc.jsonc` / `oxfmt.config.ts` → oxfmt, `.prettierrc` → prettier,

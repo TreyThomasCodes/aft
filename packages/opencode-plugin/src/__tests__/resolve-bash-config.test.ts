@@ -47,6 +47,11 @@ describe("resolveBashConfig", () => {
     });
   });
 
+  test("PowerShell registration fallback defaults off and requires explicit opt-in", () => {
+    expect(resolveBashConfig(cfg({ bash: true })).powershell_tool).toBe(false);
+    expect(resolveBashConfig(cfg({ bash: { powershell_tool: true } })).powershell_tool).toBe(true);
+  });
+
   test("host fallback defaults off even when bash features default on", () => {
     expect(resolveBashConfig(cfg({ bash: true })).host_fallback).toBe(false);
     expect(resolveBashConfig(cfg({ bash: {} })).host_fallback).toBe(false);

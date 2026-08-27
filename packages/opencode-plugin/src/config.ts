@@ -17,6 +17,40 @@ import { z } from "zod";
 
 import { error, log, warn } from "./logger.js";
 
+const ACTIVE_HARNESS = "opencode";
+
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeConfigForActiveHarness(value: unknown): unknown {
+  const config = stripHarnessSpecificConfigKeys(value, PI_ONLY_KEYS);
+  if (!isConfigRecord(config) || !isConfigRecord(config.harnesses)) return config;
+
+  const override = config.harnesses[ACTIVE_HARNESS];
+  return {
+    ...config,
+    // Other harnesses deliberately remain opaque to this plugin so future
+    // harness-specific settings never make an older OpenCode plugin reject the
+    // shared config file.
+    harnesses:
+      override === undefined
+        ? {}
+        : { [ACTIVE_HARNESS]: stripHarnessSpecificConfigKeys(override, PI_ONLY_KEYS) },
+  };
+}
+
+function warnIgnoredNestedHarnesses(rawConfig: Record<string, unknown>, configPath: string): void {
+  const override = isConfigRecord(rawConfig.harnesses)
+    ? rawConfig.harnesses[ACTIVE_HARNESS]
+    : undefined;
+  if (isConfigRecord(override) && Object.hasOwn(override, "harnesses")) {
+    warn(
+      `Ignoring nested harnesses in harnesses.${ACTIVE_HARNESS} from ${configPath}; harness overrides cannot recurse`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Zod schema
 // ---------------------------------------------------------------------------
@@ -227,6 +261,9 @@ const BashFeaturesSchema = z.object({
    * background. Default 15000ms; values below the 5000ms floor are clamped up.
    */
   foreground_wait_window_ms: z.number().int().positive().optional(),
+  // Pi-only registration fallback. OpenCode accepts this shared config key but
+  // never registers a PowerShell tool.
+  powershell_tool: z.boolean().optional(),
 });
 
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
@@ -363,138 +400,152 @@ const BackupConfigSchema = z.object({
   max_file_size: z.number().int().positive().optional(),
 });
 
+const AftConfigFieldsSchema = z.object({
+  /**
+   * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+   * runtime — only present so VS Code/Cursor/etc. pick up the published
+   * schema for autocomplete + validation. `aft setup` auto-inserts this.
+   */
+  $schema: z.string().optional(),
+  /**
+   * Master switch for AFT in this config scope. Default: true. Set false in
+   * user config to disable AFT everywhere, or in project config to disable it
+   * only for that project. Project config may set this field because turning
+   * AFT off is not a privilege escalation.
+   */
+  enabled: z.boolean().optional(),
+  /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
+  edit_mode: z.enum(["default", "hashline"]).optional(),
+  /**
+   * Whether to auto-format files after edits. Default: false — formatting can
+   * reflow the file under the agent and stale the next edit's context. Opt in
+   * with `true` if you want AFT to format after edits.
+   */
+  format_on_edit: z.boolean().optional(),
+  /**
+   * Maximum seconds an external formatter is allowed to run before AFT
+   * kills it and reports `format_skipped_reason: "timeout"`. Bounded
+   * 1..=600. Default: 10. Raise for slow formatters (e.g. ruff in large
+   * Python projects); lower for tighter test loops.
+   */
+  formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
+  /** Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker). */
+  validate_on_edit: z.enum(["syntax", "full"]).optional(),
+  /** Per-language formatter overrides. Keys: "typescript", "python", "rust", "go". */
+  formatter: z.record(z.string(), FormatterEnum).optional(),
+  /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
+  checker: z.record(z.string(), CheckerEnum).optional(),
+  /**
+   * How missing formatter/checker/LSP warnings are shown after configure.
+   * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
+   * - `log`: plugin log only
+   * - `chat`: legacy ignored user messages in the session transcript
+   *
+   * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
+   * `checker` instead.
+   */
+  configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+  /**
+   * Replace the host's native file and shell tools with AFT implementations.
+   * Default: true. When false, AFT registers its replacements under aft_
+   * names and leaves host-native tools available.
+   */
+  hoist_builtin_tools: z.boolean().optional(),
+  /**
+   * Tool surface level. Controls which tools are registered:
+   * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
+   * - "recommended": minimal + hoisted read/write/edit/apply_patch
+   *                  + ast_grep_search/replace + aft_import (default)
+   * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
+   */
+  tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+  /**
+   * List of tool names to disable. Disabled tools are not registered with
+   * OpenCode and will be invisible to agents. Use exact tool names, e.g.
+   * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
+   * aft-prefixed names both work. Applied after tool_surface filtering.
+   */
+  disabled_tools: z.array(z.string()).optional(),
+  /**
+   * Restrict file operations to within the project root directory.
+   * When true, write-capable commands reject paths outside project_root.
+   * Default: false (matches OpenCode's built-in behavior).
+   */
+  restrict_to_project_root: z.boolean().optional(),
+  /** Enable indexed search for grep and glob hoisting. Default: false. */
+  search_index: z.boolean().optional(),
+  /** User-configured filesystem roots for indexed search; project config cannot change them. */
+  index: IndexConfigSchema.optional(),
+  /** Enable semantic search. Default: false. */
+  semantic_search: z.boolean().optional(),
+  /** Enable the persisted callgraph store substrate. Default: true. */
+  callgraph_store: z.boolean().optional(),
+  /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
+  callgraph_chunk_size: z.number().optional(),
+  /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+  inspect: InspectConfigSchema.optional(),
+  /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
+  backup: BackupConfigSchema.optional(),
+  /**
+   * Linked-worktree RAM overlay. Default off. A repo may opt its worktrees
+   * in at project tier; it only spends that machine's RAM.
+   */
+  worktree: WorktreeConfigSchema.optional(),
+  /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
+  sandbox: SandboxConfigSchema.optional(),
+  /**
+   * Bash tool family (hoist + rewrite + compress + background execution).
+   * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+   *
+   * Accepts three shapes:
+   *   - `true`  — all sub-features on, hoist enabled
+   *   - `false` — hoist disabled entirely; OpenCode's native bash stays
+   *   - `{ rewrite?, compress?, background?, ... }` — partial override;
+   *     missing sub-keys default to `true`
+   *
+   * Replaces `experimental.bash.*` (still accepted for backward compat).
+   */
+  bash: BashConfigSchema.optional(),
+  /** Experimental opt-in features. Default: all false. */
+  experimental: ExperimentalConfigSchema.optional(),
+  /** User-defined and built-in LSP server configuration. */
+  lsp: LspConfigSchema.optional(),
+  /** Allow URL fetch tools to request private/link-local hosts. Default: false. */
+  url_fetch_allow_private: z.boolean().optional(),
+  /** External semantic backend configuration for embedding and retrieval. */
+  semantic: SemanticConfigSchema.optional(),
+  /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
+  auto_update: z.boolean().optional(),
+  /** Per-bridge transport timeout and stalled-connection handling; user-only across the shared pool. */
+  bridge: BridgeConfigSchema.optional(),
+  /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
+  subc: SubcConfigSchema.optional(),
+  /** `gh` routing shim gate and binary location; user configuration only, enabled by default. */
+  gh_shim: GhShimConfigSchema.optional(),
+  /** Agent-child Git attribution. Project config may override user config. */
+  git: GitConfigSchema.optional(),
+});
+
+const HarnessOverrideSchema = z.preprocess((value) => {
+  if (!isConfigRecord(value) || !Object.hasOwn(value, "harnesses")) return value;
+  const { harnesses: _nestedHarnesses, ...override } = value;
+  return override;
+}, AftConfigFieldsSchema.strict());
+
 export const AftConfigSchema = z.preprocess(
-  (value) => stripHarnessSpecificConfigKeys(value, PI_ONLY_KEYS),
-  z
-    .object({
-      /**
-       * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
-       * runtime — only present so VS Code/Cursor/etc. pick up the published
-       * schema for autocomplete + validation. `aft setup` auto-inserts this.
-       */
-      $schema: z.string().optional(),
-      /**
-       * Master switch for AFT in this config scope. Default: true. Set false in
-       * user config to disable AFT everywhere, or in project config to disable it
-       * only for that project. Project config may set this field because turning
-       * AFT off is not a privilege escalation.
-       */
-      enabled: z.boolean().optional(),
-      /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
-      edit_mode: z.enum(["default", "hashline"]).optional(),
-      /**
-       * Whether to auto-format files after edits. Default: false — formatting can
-       * reflow the file under the agent and stale the next edit's context. Opt in
-       * with `true` if you want AFT to format after edits.
-       */
-      format_on_edit: z.boolean().optional(),
-      /**
-       * Maximum seconds an external formatter is allowed to run before AFT
-       * kills it and reports `format_skipped_reason: "timeout"`. Bounded
-       * 1..=600. Default: 10. Raise for slow formatters (e.g. ruff in large
-       * Python projects); lower for tighter test loops.
-       */
-      formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
-      /** Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker). */
-      validate_on_edit: z.enum(["syntax", "full"]).optional(),
-      /** Per-language formatter overrides. Keys: "typescript", "python", "rust", "go". */
-      formatter: z.record(z.string(), FormatterEnum).optional(),
-      /** Per-language type checker overrides. Keys: "typescript", "python", "rust", "go". */
-      checker: z.record(z.string(), CheckerEnum).optional(),
-      /**
-       * How missing formatter/checker/LSP warnings are shown after configure.
-       * - `toast`: 10s TUI toast (or HTTP show-toast when available); no session chat
-       * - `log`: plugin log only
-       * - `chat`: legacy ignored user messages in the session transcript
-       *
-       * There is no top-level `formatters` key — use `format_on_edit`, `formatter`, and
-       * `checker` instead.
-       */
-      configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
-      /**
-       * Replace the host's native file and shell tools with AFT implementations.
-       * Default: true. When false, AFT registers its replacements under aft_
-       * names and leaves host-native tools available.
-       */
-      hoist_builtin_tools: z.boolean().optional(),
-      /**
-       * Tool surface level. Controls which tools are registered:
-       * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
-       * - "recommended": minimal + hoisted read/write/edit/apply_patch
-       *                  + ast_grep_search/replace + aft_import (default)
-       * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
-       */
-      tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
-      /**
-       * List of tool names to disable. Disabled tools are not registered with
-       * OpenCode and will be invisible to agents. Use exact tool names, e.g.
-       * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
-       * aft-prefixed names both work. Applied after tool_surface filtering.
-       */
-      disabled_tools: z.array(z.string()).optional(),
-      /**
-       * Restrict file operations to within the project root directory.
-       * When true, write-capable commands reject paths outside project_root.
-       * Default: false (matches OpenCode's built-in behavior).
-       */
-      restrict_to_project_root: z.boolean().optional(),
-      /** Enable indexed search for grep and glob hoisting. Default: false. */
-      search_index: z.boolean().optional(),
-      /** User-tier standing roots. Project config is rejected at the trust boundary. */
-      index: IndexConfigSchema.optional(),
-      /** Enable semantic search. Default: false. */
-      semantic_search: z.boolean().optional(),
-      /** Enable the persisted callgraph store substrate. Default: true. */
-      callgraph_store: z.boolean().optional(),
-      /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
-      callgraph_chunk_size: z.number().optional(),
-      /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
-      inspect: InspectConfigSchema.optional(),
-      /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
-      backup: BackupConfigSchema.optional(),
-      /**
-       * Linked-worktree RAM overlay. Default off. A repo may opt its worktrees
-       * in at project tier; it only spends that machine's RAM.
-       */
-      worktree: WorktreeConfigSchema.optional(),
-      /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
-      sandbox: SandboxConfigSchema.optional(),
-      /**
-       * Bash tool family (hoist + rewrite + compress + background execution).
-       * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
-       *
-       * Accepts three shapes:
-       *   - `true`  — all sub-features on, hoist enabled
-       *   - `false` — hoist disabled entirely; OpenCode's native bash stays
-       *   - `{ rewrite?, compress?, background?, ... }` — partial override;
-       *     missing sub-keys default to `true`
-       *
-       * Replaces `experimental.bash.*` (still accepted for backward compat).
-       */
-      bash: BashConfigSchema.optional(),
-      /** Experimental opt-in features. Default: all false. */
-      experimental: ExperimentalConfigSchema.optional(),
-      /** User-defined and built-in LSP server configuration. */
-      lsp: LspConfigSchema.optional(),
-      /** Allow URL fetch tools to request private/link-local hosts. Default: false. */
-      url_fetch_allow_private: z.boolean().optional(),
-      /** External semantic backend configuration for embedding and retrieval. */
-      semantic: SemanticConfigSchema.optional(),
-      /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
-      auto_update: z.boolean().optional(),
-      /** Per-bridge transport timeout and hang-escalation (USER-only; shared pool). */
-      bridge: BridgeConfigSchema.optional(),
-      /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
-      subc: SubcConfigSchema.optional(),
-      /** `gh` routing shim gate and binary location; user configuration only, enabled by default. */
-      gh_shim: GhShimConfigSchema.optional(),
-      /** Agent-child Git attribution. Project config may override user config. */
-      git: GitConfigSchema.optional(),
-    })
-    .strict(),
+  normalizeConfigForActiveHarness,
+  AftConfigFieldsSchema.extend({
+    harnesses: z.record(z.string(), HarnessOverrideSchema).optional(),
+  }).strict(),
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+type AftConfigFields = z.infer<typeof AftConfigFieldsSchema>;
+
+function applyActiveHarnessOverride(config: AftConfig): AftConfig {
+  const { harnesses: _harnesses, ...base } = config;
+  return { ...base, ...config.harnesses?.[ACTIVE_HARNESS] } as AftConfigFields;
+}
 
 /** Resolve the blocking diagnostics deadline for tools that wait on `aft_inspect`. */
 export function resolveInspectDiagnosticsTimeoutMs(config: AftConfig): number {
@@ -639,7 +690,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   if (
     typeof config.bash === "object" &&
-    (config.bash.host_fallback !== undefined || config.bash.detach_on_user_message !== undefined)
+    (config.bash.host_fallback !== undefined ||
+      config.bash.detach_on_user_message !== undefined ||
+      config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
       ...(config.bash.host_fallback !== undefined
@@ -647,6 +700,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+      ...(config.bash.powershell_tool !== undefined
+        ? { powershell_tool: config.bash.powershell_tool }
         : {}),
     };
   }
@@ -690,6 +746,8 @@ export interface ResolvedBashConfig {
    * Always resolved: defaults to 15000, floored at 5000.
    */
   foreground_wait_window_ms: number;
+  /** Pi-only manual PowerShell registration fallback. Default false. */
+  powershell_tool: boolean;
 }
 
 /** Default foreground wait-window before auto-promotion (ms). */
@@ -760,6 +818,8 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
+    powershell_tool:
+      typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
   };
 
   // Top-level wins over legacy when both are present.
@@ -779,6 +839,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       host_fallback: top.host_fallback ?? false,
       subagent_background: topSubagentBg,
       detach_on_user_message: topDetachOnUserMessage,
+      powershell_tool: top.powershell_tool ?? false,
     };
   }
 
@@ -1199,17 +1260,19 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     // Validate against a symbol-free deep copy; the migration disk-write path
     // above still uses the symbol-bearing object so comments survive.
     const cleanConfig = stripJsoncSymbols(rawConfig);
+    warnIgnoredNestedHarnesses(cleanConfig, configPath);
     const result = AftConfigSchema.safeParse(cleanConfig);
 
     if (result.success) {
       log(`Config loaded from ${configPath}`);
-      return result.data;
+      return applyActiveHarnessOverride(result.data);
     }
 
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
 
-    return parseConfigPartially(cleanConfig);
+    const partial = parseConfigPartially(cleanConfig);
+    return partial ? applyActiveHarnessOverride(partial) : null;
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);

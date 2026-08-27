@@ -1,21 +1,46 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use crate::backup::{BackupStore, CapturedRegularFile};
+use serde::{Deserialize, Serialize};
+
+use crate::backup::{hash_session, BackupStore, CapturedRegularFile};
 use crate::error::AftError;
 use crate::fs_lock;
 
 const CHECKPOINT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// User-visible durability contract for every successful named checkpoint.
-pub const CHECKPOINT_DURABILITY: &str = "checkpoint is session-scoped; lost on restart";
+/// Named checkpoints are deliberately bounded per session so a busy session
+/// cannot grow an unbounded durable artifact store.
+const MAX_NAMED_CHECKPOINTS_PER_SESSION: usize = 20;
+/// Durable named checkpoints keep decisions long enough to survive ordinary
+/// work interruptions without becoming permanent storage.
+const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
+const NAMED_CHECKPOINT_RETENTION_SECS: u64 = NAMED_CHECKPOINT_RETENTION_DAYS * 24 * 60 * 60;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const UNBOUND_HARNESS_SEGMENT: &str = "unbound";
 
-/// User-visible explanation when a checkpoint cannot be found after a restart.
-pub const CHECKPOINT_RESTART_NOTICE: &str = "checkpoints do not survive restarts";
+static CHECKPOINT_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// User-visible explanation when no durable checkpoints were found after hydration.
+pub const CHECKPOINT_RESTART_NOTICE: &str =
+    "no durable checkpoints found on disk; in-memory checkpoints do not survive restarts";
+/// User-visible explanation when a checkpoint list was hydrated from disk.
+pub const CHECKPOINT_HYDRATED_NOTICE: &str =
+    "durable checkpoints are hydrated from disk and survive restarts";
+
+/// Describe the durable location for a successful checkpoint.
+pub fn checkpoint_durability(storage_path: &Path) -> String {
+    format!(
+        "durable on disk at {}; survives restarts",
+        storage_path.display()
+    )
+}
 
 /// Metadata about a checkpoint, returned by list/create/restore.
 #[derive(Debug, Clone)]
@@ -23,6 +48,10 @@ pub struct CheckpointInfo {
     pub name: String,
     pub file_count: usize,
     pub created_at: u64,
+    /// Durable checkpoint directory, when the store has a storage namespace.
+    pub storage_path: Option<PathBuf>,
+    /// Older checkpoint names evicted to keep the per-session retention cap.
+    pub evicted: Vec<String>,
     /// Paths that could not be snapshotted (e.g. deleted since last edit),
     /// paired with the OS-level error that stopped us from reading them.
     /// Empty on successful round-trips. Populated only on `create()` — the
@@ -36,12 +65,44 @@ struct Checkpoint {
     name: String,
     file_contents: HashMap<PathBuf, CheckpointFile>,
     created_at: u64,
+    /// Nanosecond-resolution creation ordering prevents ties from making
+    /// retention nondeterministic when callers create several checkpoints in a second.
+    created_order: u64,
 }
 
 #[derive(Debug, Clone)]
 struct CheckpointFile {
-    metadata: fs::Metadata,
+    /// Fresh in-memory checkpoints retain the platform metadata so restore keeps
+    /// its existing behavior. Disk hydration rebuilds from the portable mode.
+    metadata: Option<fs::Metadata>,
+    mode: Option<u32>,
     kind: CheckpointFileKind,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiskCheckpointMeta {
+    schema_version: u32,
+    session_id: String,
+    name: String,
+    created_at: u64,
+    created_order: u64,
+    files: Vec<DiskCheckpointFileMeta>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiskCheckpointFileMeta {
+    original_path: String,
+    blob: String,
+    kind: DiskCheckpointFileKind,
+    mode: Option<u32>,
+    target_is_dir: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DiskCheckpointFileKind {
+    Regular,
+    Symlink,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +126,8 @@ impl CheckpointFile {
                 .map(|target_metadata| target_metadata.is_dir())
                 .unwrap_or(false);
             return Ok(Self {
-                metadata,
+                mode: checkpoint_mode(&metadata),
+                metadata: Some(metadata),
                 kind: CheckpointFileKind::Symlink {
                     target,
                     target_is_dir,
@@ -97,8 +159,10 @@ impl CheckpointFile {
     /// is only for regular files; symlinks continue through [`Self::read`].
     fn from_captured(path: &Path, capture: &mut CapturedRegularFile) -> io::Result<Self> {
         capture.refresh_if_stale(path)?;
+        let metadata = capture.metadata().clone();
         Ok(Self {
-            metadata: capture.metadata().clone(),
+            mode: checkpoint_mode(&metadata),
+            metadata: Some(metadata),
             kind: CheckpointFileKind::Regular {
                 bytes: capture.shared_bytes(),
             },
@@ -106,8 +170,10 @@ impl CheckpointFile {
     }
 
     fn from_fresh_capture(capture: CapturedRegularFile) -> Self {
+        let metadata = capture.metadata().clone();
         Self {
-            metadata: capture.metadata().clone(),
+            mode: checkpoint_mode(&metadata),
+            metadata: Some(metadata),
             kind: CheckpointFileKind::Regular {
                 bytes: capture.shared_bytes(),
             },
@@ -121,27 +187,62 @@ impl CheckpointFile {
             Err(error) => Err(error),
         }
     }
+
+    fn from_disk(meta: &DiskCheckpointFileMeta, bytes: Vec<u8>) -> Result<Self, String> {
+        let kind = match &meta.kind {
+            DiskCheckpointFileKind::Regular => CheckpointFileKind::Regular {
+                bytes: bytes.into(),
+            },
+            DiskCheckpointFileKind::Symlink => {
+                let target = String::from_utf8(bytes)
+                    .map(PathBuf::from)
+                    .map_err(|error| format!("checkpoint symlink target is not UTF-8: {error}"))?;
+                CheckpointFileKind::Symlink {
+                    target,
+                    target_is_dir: meta.target_is_dir,
+                }
+            }
+        };
+        Ok(Self {
+            metadata: None,
+            mode: meta.mode,
+            kind,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_mode(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn checkpoint_mode(_metadata: &fs::Metadata) -> Option<u32> {
+    None
 }
 
 /// Workspace-wide, per-session checkpoint store.
 ///
-/// Partitioned by session (issue #14): two OpenCode sessions sharing one bridge
-/// can both create checkpoints named `snap1` without collision, and restoring
-/// from one session does not leak the other's file set. Checkpoints are kept
-/// in memory only, so a bridge or daemon restart drops all of them. The command
-/// response repeats this contract because a successful checkpoint is useful only
-/// if callers know when its bytes remain available.
+/// Partitioned by session: two sessions sharing one bridge can both create
+/// checkpoints named `snap1` without collision, and restoring from one session
+/// does not leak the other's file set. The durable disk tree is authoritative;
+/// in-memory entries are rehydrated under the mutation lock before each read or
+/// change that depends on them.
 #[derive(Debug)]
 pub struct CheckpointStore {
-    /// session -> name -> checkpoint
+    /// session -> name -> checkpoint, derived from the durable disk tree.
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
     lock_path: PathBuf,
     lock_timeout: Duration,
+    storage_dir: Option<PathBuf>,
+    storage_harness: Option<String>,
+    blob_counter: AtomicU64,
 }
 
 /// Owns a checkpoint mutation lock and removes its project scope directory after
-/// the filesystem lock has released. The directory exists only to scope the
-/// lockfile to one project because named checkpoints themselves live in memory.
+/// the filesystem lock has released. The directory scopes only the transient
+/// lockfile; durable checkpoint bytes live under the harness namespace instead.
 struct CheckpointLockGuard {
     guard: Option<fs_lock::LockGuard>,
     scope_dir: Option<PathBuf>,
@@ -165,11 +266,17 @@ impl CheckpointStore {
     pub fn new() -> Self {
         let project_root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
         let project_key = crate::path_identity::project_scope_key(&project_root);
-        let lock_path = crate::bash_background::storage_dir(None)
+        let storage_dir = crate::bash_background::storage_dir(None);
+        let lock_path = storage_dir
             .join("checkpoints")
             .join(project_key)
             .join("checkpoint.lock");
-        Self::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT)
+        let mut store = Self::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        // Commands received before configure still need an honest durable home.
+        // Configure replaces this isolated namespace with the concrete harness.
+        store.storage_dir = Some(storage_dir);
+        store.storage_harness = Some(UNBOUND_HARNESS_SEGMENT.to_string());
+        store
     }
 
     /// Point this store's mutation lock at a private path. Tests use this for
@@ -177,7 +284,35 @@ impl CheckpointStore {
     /// var, which races parallel lib tests that resolve storage paths.
     #[cfg(test)]
     pub(crate) fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
+        self.storage_dir = lock_path.parent().map(Path::to_path_buf);
+        self.storage_harness = Some("test".to_string());
         self.lock_path = lock_path;
+    }
+
+    /// Select the harness-scoped durable namespace. Rebinding a different
+    /// namespace drops only the derived in-memory cache; disk remains authoritative.
+    pub fn set_storage_dir_for_harness(&mut self, dir: PathBuf, harness: crate::harness::Harness) {
+        let harness = harness.storage_segment();
+        if self.storage_dir.as_ref() == Some(&dir)
+            && self.storage_harness.as_deref() == Some(&harness)
+        {
+            return;
+        }
+        if self.storage_dir.as_ref() == Some(&dir)
+            && self.storage_harness.as_deref() == Some(UNBOUND_HARNESS_SEGMENT)
+        {
+            match self.acquire_mutation_lock() {
+                Ok(_lock) => migrate_unbound_checkpoint_namespace(&dir, &harness),
+                Err(error) => crate::slog_warn!(
+                    "could not migrate unbound durable checkpoints into {}: {}",
+                    harness,
+                    error
+                ),
+            }
+        }
+        self.storage_dir = Some(dir);
+        self.storage_harness = Some(harness);
+        self.checkpoints.clear();
     }
 
     fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
@@ -185,6 +320,9 @@ impl CheckpointStore {
             checkpoints: HashMap::new(),
             lock_path,
             lock_timeout,
+            storage_dir: None,
+            storage_harness: None,
+            blob_counter: AtomicU64::new(0),
         }
     }
 
@@ -197,19 +335,31 @@ impl CheckpointStore {
             })?;
         }
 
-        let guard =
-            fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(
-                |error| match error {
-                    fs_lock::AcquireError::Timeout => AftError::IoError {
-                        path: self.lock_path.display().to_string(),
-                        message: "timed out acquiring checkpoint mutation lock".to_string(),
-                    },
-                    fs_lock::AcquireError::Io(error) => AftError::IoError {
-                        path: self.lock_path.display().to_string(),
-                        message: format!("failed to acquire checkpoint mutation lock: {error}"),
-                    },
-                },
-            )?;
+        let acquire_result = match fs_lock::try_acquire(&self.lock_path, self.lock_timeout) {
+            // A releasing peer removes the empty lock scope after its heartbeat
+            // exits. It can win the tiny interval after our create_dir_all and
+            // before lock creation, so recreate once and retry the acquisition.
+            Err(fs_lock::AcquireError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = scope_dir.as_deref() {
+                    fs::create_dir_all(parent).map_err(|error| AftError::IoError {
+                        path: parent.display().to_string(),
+                        message: format!("failed to recreate checkpoint lock directory: {error}"),
+                    })?;
+                }
+                fs_lock::try_acquire(&self.lock_path, self.lock_timeout)
+            }
+            result => result,
+        };
+        let guard = acquire_result.map_err(|error| match error {
+            fs_lock::AcquireError::Timeout => AftError::IoError {
+                path: self.lock_path.display().to_string(),
+                message: "timed out acquiring checkpoint mutation lock".to_string(),
+            },
+            fs_lock::AcquireError::Io(error) => AftError::IoError {
+                path: self.lock_path.display().to_string(),
+                message: format!("failed to acquire checkpoint mutation lock: {error}"),
+            },
+        })?;
 
         Ok(CheckpointLockGuard {
             guard: Some(guard),
@@ -260,6 +410,9 @@ impl CheckpointStore {
         mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
+        validate_checkpoint_name(name)?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
         let explicit_request = !files.is_empty();
         let file_list = if files.is_empty() {
             backup_store.tracked_files(session)
@@ -313,18 +466,32 @@ impl CheckpointStore {
         }
 
         let created_at = current_timestamp();
+        let created_order = current_timestamp_nanos()
+            .saturating_add(self.blob_counter.fetch_add(1, Ordering::Relaxed));
         let file_count = file_contents.len();
-
         let checkpoint = Checkpoint {
             name: name.to_string(),
             file_contents,
             created_at,
+            created_order,
         };
+        let storage_path = self.durable_checkpoint_dir(session, name);
 
+        self.persist_checkpoint_locked(session, &checkpoint)?;
         self.checkpoints
             .entry(session.to_string())
             .or_default()
             .insert(name.to_string(), checkpoint);
+
+        let evicted = self.evicted_checkpoint_names(session);
+        for evicted_name in &evicted {
+            self.remove_checkpoint_from_disk_locked(session, evicted_name)?;
+        }
+        if let Some(session_checkpoints) = self.checkpoints.get_mut(session) {
+            for evicted_name in &evicted {
+                session_checkpoints.remove(evicted_name);
+            }
+        }
 
         if skipped.is_empty() {
             crate::slog_info!("checkpoint created: {} ({} files)", name, file_count);
@@ -341,37 +508,46 @@ impl CheckpointStore {
             name: name.to_string(),
             file_count,
             created_at,
+            storage_path,
+            evicted,
             skipped,
         })
     }
 
     /// Restore a checkpoint by overwriting files with stored content.
-    pub fn restore(&self, session: &str, name: &str) -> Result<CheckpointInfo, AftError> {
+    pub fn restore(&mut self, session: &str, name: &str) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
+        let storage_path = self.durable_checkpoint_dir(session, name);
         let checkpoint = self.get(session, name)?;
         let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
         paths.sort();
 
         restore_paths_atomically(checkpoint, &paths)?;
-
         crate::slog_info!("checkpoint restored: {}", name);
 
         Ok(CheckpointInfo {
             name: checkpoint.name.clone(),
             file_count: checkpoint.file_contents.len(),
             created_at: checkpoint.created_at,
+            storage_path,
+            evicted: Vec::new(),
             skipped: Vec::new(),
         })
     }
 
     /// Restore a checkpoint using a caller-validated path list.
     pub fn restore_validated(
-        &self,
+        &mut self,
         session: &str,
         name: &str,
         validated_paths: &[PathBuf],
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
+        let storage_path = self.durable_checkpoint_dir(session, name);
         let checkpoint = self.get(session, name)?;
 
         for path in validated_paths {
@@ -383,25 +559,33 @@ impl CheckpointStore {
                 })?;
         }
         restore_paths_atomically(checkpoint, validated_paths)?;
-
         crate::slog_info!("checkpoint restored: {}", name);
 
         Ok(CheckpointInfo {
             name: checkpoint.name.clone(),
             file_count: checkpoint.file_contents.len(),
             created_at: checkpoint.created_at,
+            storage_path,
+            evicted: Vec::new(),
             skipped: Vec::new(),
         })
     }
 
     /// Return the file paths stored for a checkpoint.
-    pub fn file_paths(&self, session: &str, name: &str) -> Result<Vec<PathBuf>, AftError> {
+    pub fn file_paths(&mut self, session: &str, name: &str) -> Result<Vec<PathBuf>, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
         let checkpoint = self.get(session, name)?;
         Ok(checkpoint.file_contents.keys().cloned().collect())
     }
 
     /// Return absolute file paths stored for a checkpoint without restoring it.
-    pub fn absolute_file_paths(&self, session: &str, name: &str) -> Result<Vec<PathBuf>, AftError> {
+    pub fn absolute_file_paths(
+        &mut self,
+        session: &str,
+        name: &str,
+    ) -> Result<Vec<PathBuf>, AftError> {
         let mut paths: Vec<PathBuf> = self
             .file_paths(session, name)?
             .into_iter()
@@ -413,6 +597,36 @@ impl CheckpointStore {
 
     /// Delete a checkpoint from a session. Returns true when a checkpoint was removed.
     pub fn delete(&mut self, session: &str, name: &str) -> bool {
+        let _mutation_lock = match self.acquire_mutation_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::slog_warn!("checkpoint delete lock failed for {}: {}", name, error);
+                return false;
+            }
+        };
+        if let Err(error) = self.run_process_maintenance_once_locked() {
+            crate::slog_warn!(
+                "checkpoint delete maintenance failed for {}: {}",
+                name,
+                error
+            );
+            return false;
+        }
+        if let Err(error) = self.hydrate_session_locked(session) {
+            crate::slog_warn!("checkpoint delete hydration failed for {}: {}", name, error);
+            return false;
+        }
+        if self
+            .checkpoints
+            .get(session)
+            .is_none_or(|checkpoints| !checkpoints.contains_key(name))
+        {
+            return false;
+        }
+        if let Err(error) = self.remove_checkpoint_from_disk_locked(session, name) {
+            crate::slog_warn!("checkpoint delete failed for {}: {}", name, error);
+            return false;
+        }
         let Some(session_checkpoints) = self.checkpoints.get_mut(session) else {
             return false;
         };
@@ -423,51 +637,556 @@ impl CheckpointStore {
         removed
     }
 
-    /// List all checkpoints for this session with metadata.
-    pub fn list(&self, session: &str) -> Vec<CheckpointInfo> {
-        self.checkpoints
+    /// List all checkpoints for this session with metadata, hydrating from the
+    /// authoritative durable tree before returning.
+    pub fn list(&mut self, session: &str) -> Result<Vec<CheckpointInfo>, AftError> {
+        let _mutation_lock = self.acquire_mutation_lock()?;
+        self.run_process_maintenance_once_locked()?;
+        self.hydrate_session_locked(session)?;
+        let mut list = self
+            .checkpoints
             .get(session)
-            .map(|s| {
-                s.values()
-                    .map(|cp| CheckpointInfo {
-                        name: cp.name.clone(),
-                        file_count: cp.file_contents.len(),
-                        created_at: cp.created_at,
+            .map(|checkpoints| {
+                checkpoints
+                    .values()
+                    .map(|checkpoint| CheckpointInfo {
+                        name: checkpoint.name.clone(),
+                        file_count: checkpoint.file_contents.len(),
+                        created_at: checkpoint.created_at,
+                        storage_path: self.durable_checkpoint_dir(session, &checkpoint.name),
+                        evicted: Vec::new(),
                         skipped: Vec::new(),
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        list.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(list)
     }
 
-    /// Total checkpoint count across all sessions (for `/aft-status`).
+    /// Total checkpoint count across all sessions already hydrated in this process.
     pub fn total_count(&self) -> usize {
-        self.checkpoints.values().map(|s| s.len()).sum()
+        self.checkpoints
+            .values()
+            .map(|checkpoints| checkpoints.len())
+            .sum()
     }
 
-    /// Remove checkpoints older than `ttl_hours` across all sessions.
-    /// Empty session entries are pruned after cleanup. The filesystem sweep
-    /// removes empty project scope directories left behind by released locks.
-    pub fn cleanup(&mut self, ttl_hours: u32) {
-        let now = current_timestamp();
-        let ttl_secs = ttl_hours as u64 * 3600;
-        self.checkpoints.retain(|_, session_cps| {
-            session_cps.retain(|_, cp| now.saturating_sub(cp.created_at) < ttl_secs);
-            !session_cps.is_empty()
-        });
-
-        if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
-            sweep_empty_scope_dirs(checkpoints_root);
+    /// Sweep checkpoints older than the fixed fourteen-day retention window.
+    /// The limit is intentionally not configurable: named checkpoints protect
+    /// irreplaceable decisions, while predictable retention keeps the store bounded.
+    pub fn cleanup(&mut self) {
+        let _mutation_lock = match self.acquire_mutation_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                crate::slog_warn!("checkpoint cleanup lock failed: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = self.cleanup_locked() {
+            crate::slog_warn!("checkpoint cleanup failed: {}", error);
         }
     }
 
     fn get(&self, session: &str, name: &str) -> Result<&Checkpoint, AftError> {
         self.checkpoints
             .get(session)
-            .and_then(|s| s.get(name))
+            .and_then(|checkpoints| checkpoints.get(name))
             .ok_or_else(|| AftError::CheckpointNotFound {
                 name: name.to_string(),
             })
+    }
+
+    fn durable_checkpoints_dir(&self) -> Option<PathBuf> {
+        self.storage_dir
+            .as_ref()
+            .zip(self.storage_harness.as_ref())
+            .map(|(storage_dir, harness)| storage_dir.join(harness).join("checkpoints"))
+    }
+
+    fn durable_session_dir(&self, session: &str) -> Option<PathBuf> {
+        self.durable_checkpoints_dir()
+            .map(|checkpoints_dir| checkpoints_dir.join(hash_session(session)))
+    }
+
+    fn durable_checkpoint_dir(&self, session: &str, name: &str) -> Option<PathBuf> {
+        self.durable_session_dir(session)
+            .map(|session_dir| session_dir.join(name))
+    }
+
+    fn run_process_maintenance_once_locked(&mut self) -> Result<(), AftError> {
+        let Some(storage_dir) = self.storage_dir.clone() else {
+            return Ok(());
+        };
+        let Some(harness) = self.storage_harness.clone() else {
+            return Ok(());
+        };
+        if !CHECKPOINT_MAINTENANCE_KEYS
+            .lock()
+            .unwrap()
+            .insert((storage_dir, harness))
+        {
+            return Ok(());
+        }
+        self.cleanup_locked()
+    }
+
+    fn cleanup_locked(&mut self) -> Result<(), AftError> {
+        let now = current_timestamp();
+        self.checkpoints.retain(|_, session_checkpoints| {
+            session_checkpoints.retain(|_, checkpoint| {
+                now.saturating_sub(checkpoint.created_at) < NAMED_CHECKPOINT_RETENTION_SECS
+            });
+            !session_checkpoints.is_empty()
+        });
+
+        if let Some(checkpoints_dir) = self.durable_checkpoints_dir() {
+            sweep_expired_durable_checkpoints(&checkpoints_dir, now);
+        }
+        if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
+            // Fail-closed guard: the sweep root is DERIVED from lock_path depth, and a
+            // caller with a nonstandard (shallower) lock path would resolve this to an
+            // unrelated directory - in tests, the OS temp root itself, where removing
+            // "empty scope dirs" deletes other processes' freshly created temp dirs.
+            // Only a directory actually named `checkpoints` is a legitimate sweep root.
+            if checkpoints_root.file_name() == Some(std::ffi::OsStr::new("checkpoints")) {
+                sweep_empty_scope_dirs(checkpoints_root);
+            }
+        }
+        Ok(())
+    }
+
+    fn hydrate_session_locked(&mut self, session: &str) -> Result<(), AftError> {
+        let Some(session_dir) = self.durable_session_dir(session) else {
+            return Ok(());
+        };
+        if !session_dir.exists() {
+            self.checkpoints.remove(session);
+            return Ok(());
+        }
+
+        let entries = fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
+            path: session_dir.display().to_string(),
+            message: format!("failed to read durable checkpoint session: {error}"),
+        })?;
+        let mut hydrated = HashMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| AftError::IoError {
+                path: session_dir.display().to_string(),
+                message: format!("failed to read durable checkpoint entry: {error}"),
+            })?;
+            let checkpoint_dir = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|error| AftError::IoError {
+                    path: checkpoint_dir.display().to_string(),
+                    message: format!("failed to inspect durable checkpoint entry: {error}"),
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_safe_checkpoint_name(&name) {
+                continue;
+            }
+            let meta_path = checkpoint_dir.join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let checkpoint = read_checkpoint_from_disk(&checkpoint_dir, session, &name)?;
+            hydrated.insert(name, checkpoint);
+        }
+        if hydrated.is_empty() {
+            self.checkpoints.remove(session);
+        } else {
+            self.checkpoints.insert(session.to_string(), hydrated);
+        }
+        Ok(())
+    }
+
+    fn persist_checkpoint_locked(
+        &self,
+        session: &str,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), AftError> {
+        let Some(checkpoint_dir) = self.durable_checkpoint_dir(session, &checkpoint.name) else {
+            return Ok(());
+        };
+        fs::create_dir_all(&checkpoint_dir).map_err(|error| AftError::IoError {
+            path: checkpoint_dir.display().to_string(),
+            message: format!("failed to create durable checkpoint directory: {error}"),
+        })?;
+
+        let mut files = Vec::with_capacity(checkpoint.file_contents.len());
+        for (index, (path, file)) in checkpoint.file_contents.iter().enumerate() {
+            let blob = format!(
+                "file_{}_{}_{}.blob",
+                checkpoint.created_order,
+                index,
+                self.blob_counter.fetch_add(1, Ordering::Relaxed)
+            );
+            let bytes = checkpoint_file_bytes(file);
+            write_temp_fsync_rename(&checkpoint_dir, &blob, &bytes).map_err(|error| {
+                AftError::IoError {
+                    path: checkpoint_dir.join(&blob).display().to_string(),
+                    message: format!("failed to write durable checkpoint blob: {error}"),
+                }
+            })?;
+            files.push(DiskCheckpointFileMeta {
+                original_path: path.display().to_string(),
+                blob,
+                kind: match &file.kind {
+                    CheckpointFileKind::Regular { .. } => DiskCheckpointFileKind::Regular,
+                    CheckpointFileKind::Symlink { .. } => DiskCheckpointFileKind::Symlink,
+                },
+                mode: file.mode,
+                target_is_dir: matches!(
+                    &file.kind,
+                    CheckpointFileKind::Symlink {
+                        target_is_dir: true,
+                        ..
+                    }
+                ),
+            });
+        }
+        fsync_dir(&checkpoint_dir).map_err(|error| AftError::IoError {
+            path: checkpoint_dir.display().to_string(),
+            message: format!("failed to sync durable checkpoint blobs: {error}"),
+        })?;
+
+        let meta = DiskCheckpointMeta {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            session_id: session.to_string(),
+            name: checkpoint.name.clone(),
+            created_at: checkpoint.created_at,
+            created_order: checkpoint.created_order,
+            files,
+        };
+        let bytes = serde_json::to_vec_pretty(&meta).map_err(|error| AftError::IoError {
+            path: checkpoint_dir.join("meta.json").display().to_string(),
+            message: format!("failed to serialize durable checkpoint metadata: {error}"),
+        })?;
+        write_temp_fsync_rename(&checkpoint_dir, "meta.json", &bytes).map_err(|error| {
+            AftError::IoError {
+                path: checkpoint_dir.join("meta.json").display().to_string(),
+                message: format!("failed to write durable checkpoint metadata: {error}"),
+            }
+        })?;
+        fsync_dir(&checkpoint_dir).map_err(|error| AftError::IoError {
+            path: checkpoint_dir.display().to_string(),
+            message: format!("failed to sync durable checkpoint metadata: {error}"),
+        })?;
+        prune_unreferenced_checkpoint_blobs(&checkpoint_dir, &meta.files).map_err(|error| {
+            AftError::IoError {
+                path: checkpoint_dir.display().to_string(),
+                message: format!("failed to prune stale durable checkpoint blobs: {error}"),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn remove_checkpoint_from_disk_locked(
+        &self,
+        session: &str,
+        name: &str,
+    ) -> Result<(), AftError> {
+        let Some(checkpoint_dir) = self.durable_checkpoint_dir(session, name) else {
+            return Ok(());
+        };
+        match fs::remove_dir_all(&checkpoint_dir) {
+            Ok(()) => {
+                if let Some(session_dir) = checkpoint_dir.parent() {
+                    let _ = fs::remove_dir(session_dir);
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(AftError::IoError {
+                path: checkpoint_dir.display().to_string(),
+                message: format!("failed to remove durable checkpoint: {error}"),
+            }),
+        }
+    }
+
+    fn evicted_checkpoint_names(&self, session: &str) -> Vec<String> {
+        let Some(checkpoints) = self.checkpoints.get(session) else {
+            return Vec::new();
+        };
+        let overflow = checkpoints
+            .len()
+            .saturating_sub(MAX_NAMED_CHECKPOINTS_PER_SESSION);
+        let mut checkpoints = checkpoints
+            .values()
+            .map(|checkpoint| (checkpoint.created_order, checkpoint.name.clone()))
+            .collect::<Vec<_>>();
+        checkpoints.sort();
+        checkpoints
+            .into_iter()
+            .take(overflow)
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    pub fn session_is_empty(&self, session: &str) -> bool {
+        self.checkpoints.get(session).is_none_or(HashMap::is_empty)
+    }
+}
+
+fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
+    let source = storage_dir
+        .join(UNBOUND_HARNESS_SEGMENT)
+        .join("checkpoints");
+    if !source.exists() {
+        return;
+    }
+    let target = storage_dir.join(harness).join("checkpoints");
+    if !target.exists() {
+        if let Some(parent) = target.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                crate::slog_warn!(
+                    "failed to create durable checkpoint harness directory {}: {}",
+                    parent.display(),
+                    error
+                );
+                return;
+            }
+        }
+        if let Err(error) = fs::rename(&source, &target) {
+            crate::slog_warn!(
+                "failed to move unbound durable checkpoints into {}: {}",
+                target.display(),
+                error
+            );
+        }
+        return;
+    }
+
+    let Ok(session_entries) = fs::read_dir(&source) else {
+        return;
+    };
+    for session_entry in session_entries.flatten() {
+        let source_session = session_entry.path();
+        let target_session = target.join(session_entry.file_name());
+        if !target_session.exists() {
+            let _ = fs::rename(&source_session, &target_session);
+            continue;
+        }
+        let Ok(checkpoint_entries) = fs::read_dir(&source_session) else {
+            continue;
+        };
+        for checkpoint_entry in checkpoint_entries.flatten() {
+            let source_checkpoint = checkpoint_entry.path();
+            let target_checkpoint = target_session.join(checkpoint_entry.file_name());
+            if !target_checkpoint.exists() {
+                let _ = fs::rename(source_checkpoint, target_checkpoint);
+            }
+        }
+        let _ = fs::remove_dir(&source_session);
+    }
+    let _ = fs::remove_dir(&source);
+}
+
+fn validate_checkpoint_name(name: &str) -> Result<(), AftError> {
+    if is_safe_checkpoint_name(name) {
+        Ok(())
+    } else {
+        Err(AftError::InvalidRequest {
+            message: "checkpoint name must be a single non-empty path component".to_string(),
+        })
+    }
+}
+
+fn is_safe_checkpoint_name(name: &str) -> bool {
+    matches!(
+        Path::new(name).components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    ) && !name.chars().any(|character| {
+        character.is_control()
+            || matches!(character, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    })
+}
+
+fn is_safe_blob_name(name: &str) -> bool {
+    is_safe_checkpoint_name(name) && name.starts_with("file_") && name.ends_with(".blob")
+}
+
+fn read_checkpoint_from_disk(
+    checkpoint_dir: &Path,
+    session: &str,
+    expected_name: &str,
+) -> Result<Checkpoint, AftError> {
+    let meta_path = checkpoint_dir.join("meta.json");
+    let bytes = fs::read(&meta_path).map_err(|error| AftError::IoError {
+        path: meta_path.display().to_string(),
+        message: format!("failed to read durable checkpoint metadata: {error}"),
+    })?;
+    let meta = serde_json::from_slice::<DiskCheckpointMeta>(&bytes).map_err(|error| {
+        AftError::IoError {
+            path: meta_path.display().to_string(),
+            message: format!("failed to parse durable checkpoint metadata: {error}"),
+        }
+    })?;
+    if meta.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        return Err(AftError::IoError {
+            path: meta_path.display().to_string(),
+            message: format!(
+                "unsupported durable checkpoint metadata schema {}",
+                meta.schema_version
+            ),
+        });
+    }
+    if meta.session_id != session
+        || meta.name != expected_name
+        || !is_safe_checkpoint_name(&meta.name)
+    {
+        return Err(AftError::IoError {
+            path: meta_path.display().to_string(),
+            message: "durable checkpoint metadata does not match its session or directory"
+                .to_string(),
+        });
+    }
+
+    let mut file_contents = HashMap::with_capacity(meta.files.len());
+    for file in &meta.files {
+        if !is_safe_blob_name(&file.blob) {
+            return Err(AftError::IoError {
+                path: meta_path.display().to_string(),
+                message: format!("invalid durable checkpoint blob name {}", file.blob),
+            });
+        }
+        let blob_path = checkpoint_dir.join(&file.blob);
+        let blob = fs::read(&blob_path).map_err(|error| AftError::IoError {
+            path: blob_path.display().to_string(),
+            message: format!("failed to read durable checkpoint blob: {error}"),
+        })?;
+        let path = PathBuf::from(&file.original_path);
+        let checkpoint_file =
+            CheckpointFile::from_disk(file, blob).map_err(|message| AftError::IoError {
+                path: blob_path.display().to_string(),
+                message,
+            })?;
+        if file_contents
+            .insert(path.clone(), checkpoint_file)
+            .is_some()
+        {
+            return Err(AftError::IoError {
+                path: meta_path.display().to_string(),
+                message: format!("duplicate durable checkpoint path {}", path.display()),
+            });
+        }
+    }
+
+    Ok(Checkpoint {
+        name: meta.name,
+        file_contents,
+        created_at: meta.created_at,
+        created_order: meta.created_order,
+    })
+}
+
+fn checkpoint_file_bytes(file: &CheckpointFile) -> Vec<u8> {
+    match &file.kind {
+        CheckpointFileKind::Regular { bytes } => bytes.to_vec(),
+        CheckpointFileKind::Symlink { target, .. } => {
+            target.as_os_str().to_string_lossy().as_bytes().to_vec()
+        }
+    }
+}
+
+fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp_name = format!(
+        ".{}.{}.{}.tmp",
+        final_name,
+        std::process::id(),
+        current_timestamp_nanos()
+    );
+    let tmp_path = dir.join(tmp_name);
+    let final_path = dir.join(final_name);
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp_path, final_path)
+}
+
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn prune_unreferenced_checkpoint_blobs(
+    checkpoint_dir: &Path,
+    files: &[DiskCheckpointFileMeta],
+) -> io::Result<()> {
+    let referenced = files
+        .iter()
+        .map(|file| file.blob.as_str())
+        .collect::<HashSet<_>>();
+    for entry in fs::read_dir(checkpoint_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if (name.starts_with("file_") && name.ends_with(".blob") && !referenced.contains(name))
+            || name.contains(".tmp.")
+            || name.ends_with(".tmp")
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
+    let Ok(session_entries) = fs::read_dir(checkpoints_dir) else {
+        return;
+    };
+    for session_entry in session_entries.flatten() {
+        let session_dir = session_entry.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let Ok(checkpoint_entries) = fs::read_dir(&session_dir) else {
+            continue;
+        };
+        for checkpoint_entry in checkpoint_entries.flatten() {
+            let checkpoint_dir = checkpoint_entry.path();
+            if !checkpoint_dir.is_dir() {
+                continue;
+            }
+            let meta_path = checkpoint_dir.join("meta.json");
+            let Ok(bytes) = fs::read(&meta_path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<DiskCheckpointMeta>(&bytes) else {
+                continue;
+            };
+            if now.saturating_sub(meta.created_at) < NAMED_CHECKPOINT_RETENTION_SECS {
+                continue;
+            }
+            if let Err(error) = fs::remove_dir_all(&checkpoint_dir) {
+                crate::slog_warn!(
+                    "failed to remove expired durable checkpoint {}: {}",
+                    checkpoint_dir.display(),
+                    error
+                );
+            }
+        }
+        let _ = fs::remove_dir(&session_dir);
     }
 }
 
@@ -588,11 +1307,9 @@ fn write_restored_file(
                 path: path.display().to_string(),
                 message: format!("failed to restore checkpoint file contents: {error}"),
             })?;
-            fs::set_permissions(path, snapshot.metadata.permissions()).map_err(|error| {
-                AftError::IoError {
-                    path: path.display().to_string(),
-                    message: format!("failed to restore checkpoint file permissions: {error}"),
-                }
+            restore_checkpoint_permissions(path, snapshot).map_err(|error| AftError::IoError {
+                path: path.display().to_string(),
+                message: format!("failed to restore checkpoint file permissions: {error}"),
             })
         }
         CheckpointFileKind::Symlink {
@@ -609,6 +1326,27 @@ fn write_restored_file(
             })
         }
     }
+}
+
+fn restore_checkpoint_permissions(path: &Path, snapshot: &CheckpointFile) -> io::Result<()> {
+    if let Some(metadata) = &snapshot.metadata {
+        return fs::set_permissions(path, metadata.permissions());
+    }
+    restore_checkpoint_mode(path, snapshot.mode)
+}
+
+#[cfg(unix)]
+fn restore_checkpoint_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_checkpoint_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
+    Ok(())
 }
 
 fn create_parent_dirs(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<(), AftError> {
@@ -724,6 +1462,16 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn current_timestamp_nanos() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,17 +1488,19 @@ mod tests {
         (path, dir)
     }
 
-    fn checkpoint_store() -> (CheckpointStore, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir
-            .path()
+    fn fresh_checkpoint_store(storage: &Path) -> CheckpointStore {
+        let lock_path = storage
             .join("checkpoints")
             .join("test-project")
             .join("checkpoint.lock");
-        (
-            CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT),
-            dir,
-        )
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.set_storage_dir_for_harness(storage.to_path_buf(), crate::harness::Harness::Opencode);
+        store
+    }
+
+    fn checkpoint_store() -> (CheckpointStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (fresh_checkpoint_store(dir.path()), dir)
     }
 
     fn checkpoint_file(content: &str) -> CheckpointFile {
@@ -789,6 +1539,216 @@ mod tests {
         assert_eq!(fs::read_to_string(&path2).unwrap(), "world");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn durable_checkpoint_hydrates_after_restart_with_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("durable-mode.bin");
+        let original = b"draft decision\n\0byte exact\n";
+        fs::write(&path, original).unwrap();
+        let mut mode = fs::metadata(&path).unwrap().permissions();
+        mode.set_mode(0o600);
+        fs::set_permissions(&path, mode).unwrap();
+
+        let backup_store = BackupStore::new();
+        let (mut first, storage) = checkpoint_store();
+        let info = first
+            .create(
+                DEFAULT_SESSION_ID,
+                "restart-mode",
+                vec![path.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        let durable_path = info.storage_path.expect("durable checkpoint path");
+        assert!(durable_path.join("meta.json").is_file());
+        assert!(
+            fs::read_dir(&durable_path)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "blob")),
+            "checkpoint must persist one or more file blobs"
+        );
+
+        fs::write(&path, b"mutated\n").unwrap();
+        let mut changed_mode = fs::metadata(&path).unwrap().permissions();
+        changed_mode.set_mode(0o644);
+        fs::set_permissions(&path, changed_mode).unwrap();
+        drop(first);
+
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        let listed = restarted.list(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "fresh store must hydrate durable checkpoint"
+        );
+        assert_eq!(listed[0].name, "restart-mode");
+        restarted
+            .restore(DEFAULT_SESSION_ID, "restart-mode")
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_checkpoint_hydrates_symlink_without_following_target() {
+        let files = tempfile::tempdir().unwrap();
+        let target = files.path().join("target.txt");
+        let link = files.path().join("link.txt");
+        fs::write(&target, "target content").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let backup_store = BackupStore::new();
+        let (mut first, storage) = checkpoint_store();
+        first
+            .create(
+                DEFAULT_SESSION_ID,
+                "restart-symlink",
+                vec![link.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "plain replacement").unwrap();
+        drop(first);
+
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        restarted
+            .restore(DEFAULT_SESSION_ID, "restart-symlink")
+            .unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+    }
+
+    #[test]
+    fn checkpoint_retention_evicts_oldest_name_from_memory_and_disk() {
+        let (path, _files) = temp_file("retention.txt", "version-0");
+        let backup_store = BackupStore::new();
+        let (mut store, storage) = checkpoint_store();
+
+        for index in 0..=MAX_NAMED_CHECKPOINTS_PER_SESSION {
+            fs::write(&path, format!("version-{index}")).unwrap();
+            let info = store
+                .create(
+                    DEFAULT_SESSION_ID,
+                    &format!("checkpoint-{index:02}"),
+                    vec![path.clone()],
+                    &backup_store,
+                )
+                .unwrap();
+            if index == MAX_NAMED_CHECKPOINTS_PER_SESSION {
+                assert_eq!(info.evicted, vec!["checkpoint-00"]);
+            } else {
+                assert!(info.evicted.is_empty());
+            }
+        }
+
+        let listed = store.list(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(listed.len(), MAX_NAMED_CHECKPOINTS_PER_SESSION);
+        assert!(listed.iter().all(|info| info.name != "checkpoint-00"));
+        let old_dir = storage
+            .path()
+            .join("opencode")
+            .join("checkpoints")
+            .join(hash_session(DEFAULT_SESSION_ID))
+            .join("checkpoint-00");
+        assert!(!old_dir.exists(), "evicted checkpoint must leave disk too");
+    }
+
+    #[test]
+    fn cleanup_refuses_to_sweep_scope_dirs_outside_a_checkpoints_root() {
+        // Regression: edit_match tests set lock_path = <TempDir>/checkpoint.lock, so
+        // lock_path.parent().parent() is the OS TEMP ROOT. Before the named-root guard,
+        // cleanup_locked swept empty sibling directories there and deleted other tests'
+        // freshly created TempDirs (observed live: read.rs fixture writes failing with
+        // NotFound under the parallel suite). Mutation control: drop the file_name()
+        // guard in cleanup_locked and this test fails.
+        let temp_root = tempfile::tempdir().expect("temp root");
+        // lock_path.parent().parent() == temp_root, which is NOT named `checkpoints`,
+        // so the guard must refuse the sweep and the empty sibling must survive.
+        let victim = temp_root.path().join("innocent-empty-sibling");
+        fs::create_dir(&victim).expect("victim dir");
+        let scope_dir = temp_root.path().join("scope");
+        fs::create_dir(&scope_dir).expect("scope dir");
+        let lock_path = scope_dir.join("checkpoint.lock");
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.cleanup_locked().expect("cleanup");
+        assert!(
+            victim.exists(),
+            "cleanup must not sweep empty dirs outside a `checkpoints` root"
+        );
+    }
+
+    #[test]
+    fn cleanup_sweeps_durable_checkpoints_older_than_fourteen_days() {
+        let (path, _files) = temp_file("durable-gc.txt", "original");
+        let backup_store = BackupStore::new();
+        let (mut store, _storage) = checkpoint_store();
+        let info = store
+            .create(
+                DEFAULT_SESSION_ID,
+                "expired-durable",
+                vec![path],
+                &backup_store,
+            )
+            .unwrap();
+        let durable_path = info.storage_path.unwrap();
+        let meta_path = durable_path.join("meta.json");
+        let mut meta: DiskCheckpointMeta =
+            serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta.created_at = current_timestamp()
+            .saturating_sub(NAMED_CHECKPOINT_RETENTION_SECS)
+            .saturating_sub(1);
+        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+        store.cleanup();
+        assert!(
+            !durable_path.exists(),
+            "fourteen-day cleanup must remove the durable checkpoint directory"
+        );
+    }
+
+    #[test]
+    fn durable_hydration_fails_when_a_referenced_blob_is_missing() {
+        let (path, _files) = temp_file("hydration-control.txt", "original");
+        let backup_store = BackupStore::new();
+        let (mut first, storage) = checkpoint_store();
+        let info = first
+            .create(
+                DEFAULT_SESSION_ID,
+                "hydration-control",
+                vec![path],
+                &backup_store,
+            )
+            .unwrap();
+        let durable_path = info.storage_path.unwrap();
+        let meta: DiskCheckpointMeta =
+            serde_json::from_slice(&fs::read(durable_path.join("meta.json")).unwrap()).unwrap();
+        fs::remove_file(durable_path.join(&meta.files[0].blob)).unwrap();
+        drop(first);
+
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        let error = restarted.list(DEFAULT_SESSION_ID).unwrap_err();
+        match error {
+            AftError::IoError { message, .. } => {
+                assert!(message.contains("failed to read durable checkpoint blob"));
+            }
+            other => panic!("expected durable hydration I/O error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn overwrite_existing_name() {
         let (path, _dir) = temp_file("cp_overwrite.txt", "v1");
@@ -825,13 +1785,13 @@ mod tests {
             .create("other_session", "c", vec![path.clone()], &backup_store)
             .unwrap();
 
-        let default_list = store.list(DEFAULT_SESSION_ID);
+        let default_list = store.list(DEFAULT_SESSION_ID).unwrap();
         assert_eq!(default_list.len(), 2);
         let names: Vec<&str> = default_list.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
 
-        let other_list = store.list("other_session");
+        let other_list = store.list("other_session").unwrap();
         assert_eq!(other_list.len(), 1);
         assert_eq!(other_list[0].name, "c");
     }
@@ -910,14 +1870,15 @@ mod tests {
                     name: "old".to_string(),
                     file_contents: HashMap::new(),
                     created_at: 1000, // far in the past
+                    created_order: 1000,
                 },
             );
 
         assert_eq!(store.total_count(), 2);
-        store.cleanup(24); // 24 hours
+        store.cleanup();
         assert_eq!(store.total_count(), 1);
-        assert_eq!(store.list(DEFAULT_SESSION_ID)[0].name, "recent");
-        assert!(store.list("other").is_empty());
+        assert_eq!(store.list(DEFAULT_SESSION_ID).unwrap()[0].name, "recent");
+        assert!(store.list("other").unwrap().is_empty());
     }
 
     #[test]
@@ -936,7 +1897,7 @@ mod tests {
             .join("current-scope")
             .join("checkpoint.lock");
         let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
-        store.cleanup(24);
+        store.cleanup();
 
         assert!(!empty_a.exists());
         assert!(!empty_b.exists());
@@ -958,7 +1919,7 @@ mod tests {
             .join("current-scope")
             .join("checkpoint.lock");
         let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
-        store.cleanup(24);
+        store.cleanup();
 
         assert!(scope_dir.is_dir());
         assert!(scope_dir.join("checkpoint.lock").is_file());
@@ -966,7 +1927,7 @@ mod tests {
 
     #[test]
     fn restore_nonexistent_returns_error() {
-        let (store, _store_dir) = checkpoint_store();
+        let (mut store, _store_dir) = checkpoint_store();
         let result = store.restore(DEFAULT_SESSION_ID, "nope");
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1341,6 +2302,7 @@ mod tests {
                 (path_b.clone(), checkpoint_file("checkpoint-b")),
             ]),
             created_at: current_timestamp(),
+            created_order: current_timestamp_nanos(),
         };
 
         let result = restore_paths_atomically(&checkpoint, &[path_a.clone(), path_b.clone()]);

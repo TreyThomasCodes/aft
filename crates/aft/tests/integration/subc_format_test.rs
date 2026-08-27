@@ -190,6 +190,52 @@ fn bash_error_renders_as_text_not_raw_json() {
 }
 
 #[test]
+fn inspect_phase_failed_text_preserves_failure_details_and_retry_guidance() {
+    let response = Response {
+        id: "inspect".to_string(),
+        success: false,
+        data: serde_json::json!({
+            "inspect_terminal": "phase_failed",
+            "completed_phases": [{"id": "stat_verification"}],
+            "failure_reason": "inspect_not_fresh",
+            "failure_detail": "metrics did not complete",
+            "text": "request failed"
+        }),
+    };
+
+    let text = format_response_with_context("inspect", &response, &FormatContext::default());
+    assert!(
+        text.contains("inspect could not complete: metrics did not complete (inspect_not_fresh).")
+    );
+    assert!(text.contains("Completed phases: 1. Retry, or narrow with sections=..."));
+    assert!(
+        !text.contains("request failed"),
+        "generic failure leaked into text: {text}"
+    );
+}
+
+#[test]
+fn inspect_interrupted_text_names_the_terminal_and_safe_retry() {
+    let response = Response {
+        id: "inspect".to_string(),
+        success: false,
+        data: serde_json::json!({
+            "inspect_terminal": "interrupted",
+            "completed_phases": [{"id": "lsp_quiescence"}],
+            "text": "request failed"
+        }),
+    };
+
+    let text = format_response_with_context("inspect", &response, &FormatContext::default());
+    assert!(text.contains("inspect was interrupted"));
+    assert!(text.contains("Retry is safe"));
+    assert!(
+        !text.contains("request failed"),
+        "generic failure leaked into text: {text}"
+    );
+}
+
+#[test]
 fn callgraph_format_matches_typescript_golden_fixtures() {
     let root = fixtures_root();
     let mut cases: Vec<PathBuf> = fs::read_dir(&root)

@@ -254,7 +254,14 @@ impl AppContext {
             0
         };
         let session_checkpoints = if backups_enabled {
-            self.checkpoint().lock().list(session_id).len()
+            self.checkpoint()
+                .lock()
+                .list(session_id)
+                .map(|checkpoints| checkpoints.len())
+                .unwrap_or_else(|error| {
+                    crate::slog_warn!("status checkpoint hydration failed: {}", error);
+                    0
+                })
         } else {
             0
         };

@@ -325,7 +325,7 @@ fn snapshot_affected_files(
             captures.insert(path.clone(), capture);
         }
     }
-    let checkpoint_name = format!("lsp_rename:{op_id}");
+    let checkpoint_name = format!("lsp_rename-{op_id}");
     {
         let backup = ctx.backup().lock();
         let mut checkpoint = ctx.checkpoint().lock();

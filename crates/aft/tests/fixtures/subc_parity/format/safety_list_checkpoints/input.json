@@ -13,7 +13,8 @@
         "file_count": 2,
         "created_at": "2026-06-28 10:00:00Z"
       }
-    ]
+    ],
+    "durability": "durable checkpoints are hydrated from disk and survive restarts"
   },
   "ctx": {
     "agent_args": {

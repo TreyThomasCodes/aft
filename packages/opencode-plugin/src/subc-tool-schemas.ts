@@ -34,6 +34,7 @@ const STATUS_SCHEMA = {
 const BARE_TOOL_ORDER = [
   "status",
   "bash",
+  "powershell",
   "read",
   "write",
   "edit",
@@ -144,10 +145,21 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     description:
       "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
   };
+  bashProperties.shell = {
+    type: "string",
+    enum: ["powershell"],
+    description: "Consumer-set shell selector for Pi's PowerShell tool.",
+  };
+  const powershellSchema = {
+    ...bashSchema,
+    description:
+      "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
+  };
 
   return {
     status: { ...STATUS_SCHEMA, description: STATUS_DESCRIPTION },
     bash: bashSchema,
+    powershell: powershellSchema,
     read: argsToJsonSchema(read),
     write: argsToJsonSchema(write),
     edit: argsToJsonSchema(edit),

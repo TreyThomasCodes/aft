@@ -1930,7 +1930,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(error) => return Response::error(&req.id, "invalid_request", error),
     };
     let config_diagnostics =
-        crate::config_resolve::resolve_config_onto_with_diagnostics(&tiers, &mut next_config);
+        crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
+            &tiers,
+            Some(&harness),
+            &mut next_config,
+        );
     let config_dropped_keys = config_diagnostics.dropped;
     let mut configure_warnings = config_diagnostics
         .warnings
@@ -2759,11 +2763,9 @@ pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
 }
 
 /// Restart a search-index load after its build receiver disconnected without
-/// delivering an index (the worker exited through a generation/admission check
-/// and dropped its sender). Without this, the root is left with no in-RAM index
-/// and no receiver, so health reports "building" forever — nothing reschedules
-/// the load until a later search query happens to call
-/// [`trigger_search_index_reload_if_evicted`]. Capped via
+/// delivering an index. This includes a read-only borrowed snapshot that stopped
+/// at its bounded load budget: without one maintenance continuation, the root
+/// stays index-less until another query retries the same load. Capped via
 /// `allow_search_index_disconnect_reschedule` at one automatic replacement per
 /// configure generation; after that the query-triggered reload remains the
 /// recovery path so a persistently failing worker cannot loop on the drain
@@ -2778,7 +2780,7 @@ pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bo
         if !missing_artifact_loads(ctx).search {
             return false;
         }
-        if ctx.shared_artifacts_read_only() || ctx.canonical_cache_root_opt().is_none() {
+        if ctx.canonical_cache_root_opt().is_none() {
             return false;
         }
         // Consume the one-per-generation slot only now that every guard passed,
@@ -4062,10 +4064,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                 );
             }
             ctx.backup().lock().set_storage_dir_for_harness(
-                storage_dir,
+                storage_dir.clone(),
                 job.harness.clone(),
                 ctx.config().checkpoint_ttl_hours,
             );
+            ctx.checkpoint()
+                .lock()
+                .set_storage_dir_for_harness(storage_dir, job.harness.clone());
         }
 
         if job.refresh_project_runtime {
@@ -4085,6 +4090,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
             Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
         }
+        crate::search_index::sweep_orphaned_index_dirs(&job.storage_root);
 
         let db_path = job.storage_root.join("aft.db");
         match ctx.app().open_db(&db_path) {
@@ -4276,7 +4282,7 @@ mod tests {
     use crate::context::{AppContext, SemanticRefreshEvent, SemanticRefreshRequest};
     use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
-    use crate::search_index::CacheLock;
+    use crate::search_index::{CacheLock, SearchIndex};
     use crate::semantic_index::SemanticIndex;
     use std::process::Command;
 
@@ -6621,6 +6627,65 @@ mod tests {
             "a later query must be able to retry the read-only snapshot"
         );
         assert!(ctx.search_index_rx().read().unwrap().is_some());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    #[test]
+    fn read_only_borrowed_load_continuation_reaches_ready_without_another_query() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "pub fn continuation_marker() {}\n",
+        )
+        .unwrap();
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let cache_dir =
+            crate::search_index::resolve_cache_dir_with_key(&project_key, Some(storage.path()));
+        let mut artifact = SearchIndex::build(root.path());
+        assert!(artifact.write_to_disk(&cache_dir, None));
+
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.search_index = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(false, true);
+
+        // A budget-stopped borrowed reader drops its receiver without publishing
+        // an index. The completion drain must schedule one maintenance retry;
+        // it must not require a later search request to make progress.
+        let (sender, receiver) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(receiver, ctx.configure_generation());
+        drop(sender);
+        crate::runtime_drain::drain_search_index_events(&ctx);
+        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        assert!(
+            !super::trigger_search_index_reload_if_evicted(&ctx),
+            "the scheduled continuation must coalesce duplicate query-triggered reloads"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|index| !index.ready)
+        {
+            crate::runtime_drain::drain_search_index_events(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "borrowed continuation did not publish a ready index"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
     }

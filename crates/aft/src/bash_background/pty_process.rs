@@ -24,6 +24,8 @@ pub(crate) fn spawn_pty_for_command(
     task_id: &str,
     session_id: &str,
     user_command: &str,
+    shell_kind: super::BashShell,
+    shell_path: &Path,
     paths: &TaskPaths,
     workdir: &Path,
     env: &HashMap<String, String>,
@@ -34,10 +36,7 @@ pub(crate) fn spawn_pty_for_command(
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
-        let shell = spawn_plan
-            .host_shell_path()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(resolve_posix_shell);
+        let _ = shell_kind;
         let args = if let Some(prepared) = spawn_plan.prepared_task() {
             vec![
                 OsString::from("-c"),
@@ -50,7 +49,7 @@ pub(crate) fn spawn_pty_for_command(
             spawn_plan,
             task_id,
             session_id,
-            shell.as_os_str(),
+            shell_path.as_os_str(),
             &args,
             paths,
             workdir,
@@ -63,9 +62,14 @@ pub(crate) fn spawn_pty_for_command(
     }
     #[cfg(windows)]
     {
+        let _ = shell_path;
         use crate::windows_shell::shell_candidates;
 
-        let candidates = shell_candidates();
+        let candidates = if shell_kind.is_powershell() {
+            vec![crate::windows_shell::WindowsShell::Pwsh]
+        } else {
+            shell_candidates()
+        };
         let mut last_err = String::from("no Windows shell candidates available");
 
         for shell in candidates {

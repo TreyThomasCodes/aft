@@ -4,7 +4,7 @@
     "id": "1",
     "success": true,
     "checkpoints": [],
-    "durability": "checkpoints do not survive restarts"
+    "durability": "no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
   },
   "ctx": {
     "agent_args": {

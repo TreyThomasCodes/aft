@@ -1,3 +1,3 @@
 checkpoint restored pre-edit
 files 2
-checkpoint is session-scoped; lost on restart
+durable on disk at <STORAGE_PATH>/opencode/checkpoints/session/pre-edit; survives restarts

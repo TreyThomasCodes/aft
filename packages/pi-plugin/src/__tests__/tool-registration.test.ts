@@ -2,7 +2,11 @@
 
 import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
-import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
+import {
+  piPowerShellEnabledFromHost,
+  registerPiToolSurface,
+  resolvePiToolSurface,
+} from "../tool-registration.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 function register(config: AftConfig) {
@@ -20,6 +24,32 @@ function publicSurface(
     .map(({ name, label, description, parameters }) => ({ name, label, description, parameters }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
+
+describe("Pi PowerShell registration", () => {
+  test("uses the config fallback only when Pi's enabled-tool registry is unavailable", () => {
+    expect(resolvePiToolSurface({ bash: { powershell_tool: true } }).hoistPowershell).toBe(true);
+    expect(resolvePiToolSurface({ bash: {} }).hoistPowershell).toBe(false);
+
+    const host = {
+      getAllTools: () => [{ name: "powershell", sourceInfo: { source: "builtin" } }],
+      getActiveTools: () => ["powershell"],
+    } as any;
+    expect(piPowerShellEnabledFromHost(host)).toBe(true);
+    expect(resolvePiToolSurface({ bash: {} }, host).hoistPowershell).toBe(true);
+
+    host.getActiveTools = () => [];
+    expect(resolvePiToolSurface({ bash: { powershell_tool: true } }, host).hoistPowershell).toBe(
+      false,
+    );
+  });
+
+  test("registers PowerShell under the hoisted or aft_ name without OpenCode-style aliases", () => {
+    expect(register({ bash: { powershell_tool: true } }).tools.has("powershell")).toBe(true);
+    const dual = register({ bash: { powershell_tool: true }, hoist_builtin_tools: false });
+    expect(dual.tools.has("aft_powershell")).toBe(true);
+    expect(dual.tools.has("powershell")).toBe(false);
+  });
+});
 
 describe("Pi dual-mode tool registration", () => {
   test("defaults and explicit hoisting preserve the existing registered surface", () => {

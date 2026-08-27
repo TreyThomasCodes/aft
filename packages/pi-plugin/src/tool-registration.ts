@@ -20,6 +20,7 @@ export interface PiToolSurface {
   /** Whether AFT replaces host-native tool names instead of registering aft_ alternatives. */
   hoistBuiltinTools: boolean;
   hoistBash: boolean;
+  hoistPowershell: boolean;
   hoistRead: boolean;
   hoistWrite: boolean;
   hoistEdit: boolean;
@@ -42,8 +43,47 @@ export interface PiToolSurface {
 
 const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
 
+/**
+ * Pi's tool registry is unavailable while extension factories load. Older Pi
+ * versions expose no registry, so this project-safe switch manually mirrors
+ * Pi's default-tools setting in either case.
+ */
+function resolvePiPowerShellFallback(config: AftConfig): boolean {
+  return resolveBashConfig(config).powershell_tool;
+}
+
+/** Return Pi's enabled built-in PowerShell state when its live registry is readable. */
+export function piPowerShellEnabledFromHost(pi: ExtensionAPI): boolean | undefined {
+  const api = pi as unknown as {
+    getActiveTools?: () => Array<string | { name: string }>;
+    getAllTools?: () => Array<{
+      name: string;
+      source?: string;
+      sourceInfo?: { source?: string };
+    }>;
+  };
+  if (typeof api.getActiveTools !== "function" || typeof api.getAllTools !== "function") {
+    return undefined;
+  }
+  try {
+    const tool = api.getAllTools().find((candidate) => candidate.name === "powershell");
+    // An empty pre-bind registry is not evidence that PowerShell is disabled;
+    // preserve the explicit fallback until Pi exposes a real built-in entry.
+    const source = tool?.sourceInfo?.source ?? tool?.source;
+    if (!tool || source === undefined) return undefined;
+    return (
+      source === "builtin" &&
+      api
+        .getActiveTools()
+        .some((active) => (typeof active === "string" ? active : active.name) === "powershell")
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 /** Resolve the feature predicates used by Pi's production registration path. */
-export function resolvePiToolSurface(config: AftConfig): PiToolSurface {
+export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiToolSurface {
   const surface = config.tool_surface ?? "recommended";
   const disabled = new Set(config.disabled_tools ?? []);
   const hoistBuiltinTools = config.hoist_builtin_tools !== false;
@@ -52,11 +92,14 @@ export function resolvePiToolSurface(config: AftConfig): PiToolSurface {
     ok(hoistBuiltinTools ? bareName : `aft_${bareName}`);
   const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
   const restrictToProjectRoot = config.restrict_to_project_root ?? false;
+  const powershellEnabled =
+    (pi ? piPowerShellEnabledFromHost(pi) : undefined) ?? resolvePiPowerShellFallback(config);
 
   if (surface === "minimal") {
     return {
       hoistBuiltinTools,
       hoistBash: builtinToolEnabled("bash"),
+      hoistPowershell: powershellEnabled && builtinToolEnabled("powershell"),
       hoistRead: false,
       hoistWrite: false,
       hoistEdit: false,
@@ -81,6 +124,7 @@ export function resolvePiToolSurface(config: AftConfig): PiToolSurface {
   const base: PiToolSurface = {
     hoistBuiltinTools,
     hoistBash: builtinToolEnabled("bash"),
+    hoistPowershell: powershellEnabled && builtinToolEnabled("powershell"),
     hoistRead: builtinToolEnabled("read"),
     hoistWrite: builtinToolEnabled("write"),
     hoistEdit: builtinToolEnabled("edit"),
@@ -124,7 +168,10 @@ export function registerPiToolSurface(
   ctx: PluginContext,
   surface: PiToolSurface,
 ): void {
-  if (surface.hoistBash && resolveBashConfig(ctx.config).enabled) {
+  const bashCfg = resolveBashConfig(ctx.config);
+  const bashRegistered = surface.hoistBash && bashCfg.enabled;
+  const powershellRegistered = surface.hoistPowershell && bashCfg.enabled;
+  if (bashRegistered) {
     registerBashTool(
       pi,
       ctx,
@@ -132,15 +179,23 @@ export function registerPiToolSurface(
       surface.hoistBuiltinTools ? "bash" : "aft_bash",
       false,
     );
-    // Companion tools always address AFT task IDs, so their names remain free
-    // of the primary bash tool's prefix and never collide with Pi's native bash.
-    registerBashCompanionTools(pi, ctx);
   }
+  if (powershellRegistered) {
+    registerBashTool(
+      pi,
+      ctx,
+      surface.semantic,
+      surface.hoistBuiltinTools ? "powershell" : "aft_powershell",
+      false,
+      "powershell",
+    );
+  }
+  // These controls address AFT task IDs, so one shell-family registration makes
+  // the shared controls available without colliding with a host-native tool.
+  if (bashRegistered || powershellRegistered) registerBashCompanionTools(pi, ctx);
   registerHoistedTools(pi, ctx, surface);
 
-  if (surface.outline || surface.zoom) {
-    registerReadingTools(pi, ctx, surface);
-  }
+  if (surface.outline || surface.zoom) registerReadingTools(pi, ctx, surface);
   if (surface.semantic) registerSemanticTool(pi, ctx);
   if (surface.inspect) registerInspectTool(pi, ctx);
   if (surface.navigate) registerNavigateTool(pi, ctx);

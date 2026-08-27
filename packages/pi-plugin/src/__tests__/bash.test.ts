@@ -262,6 +262,25 @@ describe("bash tool adapter", () => {
     expect(bashTool!.description).not.toContain("pty: true");
   });
 
+  test("PowerShell registration routes through the unified bash command family", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({ output: "ok", exit_code: 0 });
+    const ctx = makeMockContext(bridge);
+
+    registerBashTool(api, ctx, false, "powershell", false, "powershell");
+    await tools
+      .get("powershell")!
+      .execute("test-call", { command: "Get-ChildItem" }, undefined, undefined, {
+        cwd: projectRoot,
+        hasUI: false,
+      });
+
+    const call = calls[0] as [string, Record<string, unknown>];
+    expect(call[0]).toBe("powershell");
+    expect(call[1]).toMatchObject({ command: "Get-ChildItem", shell: "powershell" });
+  });
+
   test("execute calls bridge with correct parameters", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

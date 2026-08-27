@@ -91,6 +91,50 @@ describe("loadAftConfig", () => {
     expect((JSON.parse(result.stdout) as { edit_mode?: string }).edit_mode).toBe("default");
   });
 
+  test("selects the Pi harness override from a shared config", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        hoist_builtin_tools: false,
+        harnesses: {
+          opencode: { hoist_builtin_tools: true },
+          pi: { hoist_builtin_tools: false },
+        },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout).hoist_builtin_tools).toBe(false);
+  });
+
+  test("ignores nested Pi harnesses with a warning", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        harnesses: {
+          pi: {
+            hoist_builtin_tools: false,
+            harnesses: { opencode: { hoist_builtin_tools: true } },
+          },
+        },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout).hoist_builtin_tools).toBe(false);
+    expect(result.stderr).toContain("Ignoring nested harnesses in harnesses.pi");
+  });
+
   test("git.co_author uses ordinary project-over-user precedence", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ git: { co_author: "auto" } }));

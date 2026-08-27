@@ -10,8 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aft::config::{Config, UserServerDef};
-use aft::config_resolve::{resolve_config, ConfigTier};
+use aft::config_resolve::{resolve_config_for_harness, ConfigTier};
+use aft::harness::Harness;
 use serde_json::Value;
+use std::str::FromStr;
 
 fn fixtures_root() -> PathBuf {
     crate::helpers::cargo_manifest_dir()
@@ -75,6 +77,16 @@ fn fill_server_defaults(golden: &mut Value) {
     }
 }
 
+fn read_harness(dir: &Path) -> Harness {
+    let path = dir.join("harness.json");
+    let value = fs::read_to_string(path)
+        .ok()
+        .and_then(|doc| serde_json::from_str::<String>(&doc).ok())
+        .unwrap_or_else(|| "opencode".to_string());
+    Harness::from_str(&value)
+        .unwrap_or_else(|error| panic!("invalid fixture harness {value:?}: {error}"))
+}
+
 fn assert_case(dir: &Path) -> Option<String> {
     let case = dir.file_name().unwrap().to_string_lossy().to_string();
 
@@ -88,7 +100,8 @@ fn assert_case(dir: &Path) -> Option<String> {
         tiers.push(project);
     }
 
-    let resolved = resolve_config(&tiers).config;
+    let harness = read_harness(dir);
+    let resolved = resolve_config_for_harness(&tiers, Some(&harness)).config;
     let mut resolved_json = serde_json::to_value(&resolved).expect("serialize resolved config");
 
     // Expected = Config::default() with the captured TS configure params overlaid.
@@ -124,8 +137,8 @@ fn config_resolver_matches_typescript_golden_fixtures() {
     cases.sort();
 
     assert!(
-        cases.len() >= 24,
-        "expected >=24 parity fixtures, found {}",
+        cases.len() >= 51,
+        "expected at least 51 parity fixtures after capture regeneration, found {}",
         cases.len()
     );
 

@@ -61,6 +61,7 @@ import {
   getConfigLoadErrors,
   loadAftConfig,
   migrateAftConfigLocations,
+  resolveBashConfig,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
@@ -94,6 +95,7 @@ import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "./tool-registration.js";
 import { resolveSessionId } from "./tools/_shared.js";
+import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -661,7 +663,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   }
   pool.setConfigureOverride("harness", "pi");
-  const surface = resolvePiToolSurface(config);
+  const surface = resolvePiToolSurface(config, pi);
   const hashlineEditRegistered = config.edit_mode === "hashline" && surface.hoistEdit;
   pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   // Tell Rust whether `aft_search` is registered for this surface so the
@@ -776,6 +778,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   registerPiToolSurface(pi, ctx, surface);
+
+  // Pi binds its live tool registry after extension factories run. A modern Pi
+  // can therefore reveal that its optional built-in PowerShell tool is active
+  // only at session start; older hosts use bash.powershell_tool instead.
+  let powershellRegistered = surface.hoistPowershell && resolveBashConfig(config).enabled;
+  (pi.on as (event: "session_start", handler: () => unknown) => void)("session_start", () => {
+    if (powershellRegistered) return;
+    const liveSurface = resolvePiToolSurface(config, pi);
+    if (!liveSurface.hoistPowershell || !resolveBashConfig(config).enabled) return;
+    registerBashTool(
+      pi,
+      ctx,
+      liveSurface.semantic,
+      liveSurface.hoistBuiltinTools ? "powershell" : "aft_powershell",
+      false,
+      "powershell",
+    );
+    registerBashCompanionTools(pi, ctx);
+    powershellRegistered = true;
+  });
 
   // Workflow hints: short system-prompt block teaching token-efficient
   // AFT workflows. Hooked into Pi's `before_agent_start` event with
