@@ -43,6 +43,7 @@ const ROUTING_HOLDER_MODULE_ID: &str = "prefrontal-core";
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
+const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
 const READ_ONLY_ACTION_TUPLES: &[&str] = &[
     "run view",
     "run list",
@@ -1991,6 +1992,10 @@ enum Classification {
     Unclassified,
 }
 
+fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
+    V1_ADMIN_TUPLES.contains(&tuple) || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
+}
+
 fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
     let Some((verb, subcommand, _)) = command_head(args) else {
         // Keep malformed argument vectors fail-closed; a valid no-subcommand
@@ -2019,7 +2024,7 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     }
     match manifest.tier_for_tuple(&tuple, platform) {
         Some(Tier::Mechanical) => Classification::Mechanical,
-        Some(Tier::Admin) if V1_ADMIN_TUPLES.contains(&tuple.as_str()) => {
+        Some(Tier::Admin) if is_reviewed_admin_tuple(manifest.manifest_version, &tuple) => {
             Classification::Admin { tuple }
         }
         Some(Tier::Governed) if V1_GOVERNED_TUPLES.contains(&tuple.as_str()) => manifest
@@ -2028,9 +2033,10 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
             .cloned()
             .map(|canonical| Classification::Governed { tuple, canonical })
             .unwrap_or(Classification::Unclassified),
-        // Manifest entries outside the v1 tuple set do not acquire a policy from
-        // nearby command names. A reviewed manifest and implementation change are
-        // both required before another write shape can be classified.
+        // Only tuples named by the manifest and a generation-specific classifier
+        // allowlist can be governed or admin. Command names alone do not opt an
+        // entry in; a new write shape needs both a manifest declaration and a
+        // matching classifier allowlist entry.
         Some(Tier::Governed | Tier::Admin) | None => Classification::Unclassified,
     }
 }
@@ -3251,6 +3257,11 @@ mod tests {
         .expect("initial manifest fixture")
     }
 
+    fn v9_fixture_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v9-manifest.json"))
+            .expect("v9 manifest fixture")
+    }
+
     fn signed_with(
         manifest: &Manifest,
         fetched_at_unix_secs: u64,
@@ -3550,6 +3561,73 @@ mod tests {
         fixture_manifest()
             .validate()
             .expect("valid initial manifest");
+    }
+
+    #[test]
+    fn v9_admin_tuple_fixture_differentiates_native_writes_from_raw_api_delete() {
+        let manifest = v9_fixture_manifest();
+        assert_eq!(manifest.manifest_version, 9);
+        manifest.validate().expect("valid v9 manifest");
+
+        for (args, expected_tuple) in [
+            (
+                vec![
+                    OsString::from("repo"),
+                    OsString::from("edit"),
+                    OsString::from("cortexkit/insula"),
+                    OsString::from("--visibility"),
+                    OsString::from("public"),
+                ],
+                "repo edit",
+            ),
+            (
+                vec![
+                    OsString::from("repo"),
+                    OsString::from("edit"),
+                    OsString::from("cortexkit/insula"),
+                    OsString::from("--visibility"),
+                    OsString::from("private"),
+                ],
+                "repo edit",
+            ),
+            (
+                vec![
+                    OsString::from("run"),
+                    OsString::from("delete"),
+                    OsString::from("123"),
+                    OsString::from("--repo"),
+                    OsString::from("cortexkit/insula"),
+                ],
+                "run delete",
+            ),
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { tuple } if tuple == expected_tuple
+            ));
+        }
+
+        let raw_api_delete = [
+            OsString::from("api"),
+            OsString::from("-X"),
+            OsString::from("DELETE"),
+            OsString::from("repos/cortexkit/insula/actions/runs/123"),
+        ];
+        assert!(matches!(
+            classify(&raw_api_delete, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        let get_control = [
+            OsString::from("api"),
+            OsString::from("repos/cortexkit/insula"),
+            OsString::from("--jq"),
+            OsString::from(".name"),
+        ];
+        assert!(matches!(
+            classify(&get_control, &manifest, "macos"),
+            Classification::Mechanical
+        ));
     }
 
     #[test]

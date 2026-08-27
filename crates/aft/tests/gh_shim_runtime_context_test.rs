@@ -68,6 +68,14 @@ fn write_fresh_manifest(state_home: &Path, now: u64) {
     );
 }
 
+fn write_fresh_v9_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/v9-manifest.json"),
+    );
+}
+
 fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
     write_fresh_manifest_from_fixture(
         state_home,
@@ -77,6 +85,10 @@ fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
 }
 
 fn write_fresh_r3_cache(state_home: &Path, now: u64) {
+    write_fresh_r3_cache_for_manifest(state_home, now, 1);
+}
+
+fn write_fresh_r3_cache_for_manifest(state_home: &Path, now: u64, manifest_version: u64) {
     let rung_path = state_home.join("cortexkit/aft/gh-shim/rung-cache.json");
     fs::create_dir_all(rung_path.parent().expect("rung cache parent"))
         .expect("create shim state directory");
@@ -92,7 +104,7 @@ fn write_fresh_r3_cache(state_home: &Path, now: u64) {
                 "manifest": "ready",
                 "agent_credentials_present": "absent"
             },
-            "manifest_version": 1
+            "manifest_version": manifest_version
         }))
         .expect("serialize R3 rung cache"),
     )
@@ -654,6 +666,105 @@ fn gh_shim_governed_manifest_passthroughs_no_verb_and_help_invocations() {
     assert_eq!(
         fs::read_to_string(&recorder).expect("read upstream invocation record"),
         "\n--version\n--help\n-h\nhelp pr\n"
+    );
+}
+
+#[test]
+fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_v9_manifest(&state_home, now);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 9);
+    write_user_config(&config_home, &connection_file, None);
+
+    let expected_admin_refusal =
+        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    for args in [
+        &["repo", "edit", "cortexkit/insula", "--visibility", "public"][..],
+        &[
+            "repo",
+            "edit",
+            "cortexkit/insula",
+            "--visibility",
+            "private",
+        ][..],
+        &["run", "delete", "123", "--repo", "cortexkit/insula"][..],
+    ] {
+        let output = shim_command(
+            args,
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn v9 admin gh shim invocation");
+        assert_eq!(output.status.code(), Some(86));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected_admin_refusal
+        );
+    }
+
+    let raw_api_delete = shim_command(
+        &[
+            "api",
+            "-X",
+            "DELETE",
+            "repos/cortexkit/insula/actions/runs/123",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn raw API delete gh shim invocation");
+    assert_eq!(raw_api_delete.status.code(), Some(86));
+    assert!(raw_api_delete.stdout.is_empty());
+    let raw_api_refusal = String::from_utf8_lossy(&raw_api_delete.stderr);
+    assert_eq!(
+        raw_api_refusal,
+        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest 9)\n"
+    );
+    assert_ne!(
+        expected_admin_refusal, raw_api_refusal,
+        "native admin and raw API delete refusals must remain distinguishable"
+    );
+
+    let get_control = shim_command(
+        &["api", "repos/cortexkit/insula", "--jq", ".name"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn mechanical GET gh shim invocation");
+    assert_eq!(get_control.status.code(), Some(73));
+    assert_eq!(
+        String::from_utf8_lossy(&get_control.stdout),
+        "r2-passthrough\n"
+    );
+    assert!(get_control.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&recorder).expect("read mechanical GET invocation record"),
+        "api repos/cortexkit/insula --jq .name\n"
     );
 }
 
