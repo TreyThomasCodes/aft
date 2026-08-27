@@ -482,6 +482,11 @@ impl RungRecord {
                 .get("catalog_gh_route_absent")
                 .map(String::as_str)
                 == Some("failed")
+            || self
+                .inputs
+                .get("gh_route_holder_unbound")
+                .map(String::as_str)
+                == Some("failed")
     }
 }
 
@@ -626,7 +631,14 @@ fn determine_rung_from_doc(
         }
         ProbeResult::Unreachable => RungRecord::r2(now, "daemon_unreachable", None),
         ProbeResult::NoRoute => RungRecord::r2(now, "catalog_gh_route_absent", None),
-        ProbeResult::Unbound => RungRecord::r2(now, "agent_binding_unavailable", None),
+        // The holder module is registered but not bound (module restart or
+        // ceremony window). This is governance INFRASTRUCTURE unavailability,
+        // not an unmanifested repo: the reason string must stay distinct from
+        // "agent_binding_unavailable" so sticky no-degrade engages and governed
+        // verbs refuse instead of silently passing through under ambient
+        // credentials (four misattributed posts on 2026-08-27 came from this
+        // arm sharing the unmanifested-repo label).
+        ProbeResult::Unbound => RungRecord::r2(now, "gh_route_holder_unbound", None),
         ProbeResult::TimedOut => cached
             .filter(|record| record.fresh_at(now))
             .unwrap_or_else(|| RungRecord::r1(now, "discovery_budget_exhausted")),
@@ -4565,6 +4577,48 @@ mod tests {
             assert_eq!(
                 disk, bytes,
                 "fixture {name} drifted from its generator; rerun with AFT_GH_SHIM_REGEN=1"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod holder_unbound_sticky_tests {
+    use super::*;
+
+    fn record_with(reason: &str) -> RungRecord {
+        RungRecord::r2(1_787_800_000, reason, None)
+    }
+
+    /// An unbound gh.route holder is governance infrastructure unavailability:
+    /// sticky no-degrade must see it, or governed verbs on manifest-bound
+    /// repos silently pass through under ambient operator credentials (the
+    /// 2026-08-27 misattribution class).
+    #[test]
+    fn holder_unbound_counts_as_infrastructure_unavailable() {
+        assert!(record_with("gh_route_holder_unbound").governance_infrastructure_unavailable());
+    }
+
+    /// Negative control: a genuinely unmanifested repo (no agent binding) is
+    /// NOT infrastructure unavailability - public users keep transparent
+    /// passthrough. If this starts passing for the wrong reason, the two arms
+    /// have been re-merged and the mislabel bug is back.
+    #[test]
+    fn unmanifested_repo_is_not_infrastructure_unavailable() {
+        assert!(!record_with("agent_binding_unavailable").governance_infrastructure_unavailable());
+    }
+
+    /// The remaining infra reasons stay covered alongside the new one.
+    #[test]
+    fn existing_infra_reasons_remain_covered() {
+        for reason in ["daemon_unreachable", "catalog_gh_route_absent"] {
+            let mut record = record_with(reason);
+            record
+                .inputs
+                .insert(reason.to_string(), "failed".to_string());
+            assert!(
+                record.governance_infrastructure_unavailable(),
+                "{reason} must remain infra-unavailable"
             );
         }
     }
