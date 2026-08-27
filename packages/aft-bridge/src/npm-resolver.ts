@@ -251,44 +251,56 @@ export function npmInvocation(
 /**
  * Terminate an npm child safely. Windows cmd shims create a cmd.exe -> node.exe
  * tree, so killing only the immediate child can leave npm writing in the
- * background after a rollback or install-lock release.
+ * background after a rollback or install-lock release. Resolves only after the
+ * immediate child exits; direct children escalate to SIGKILL after a grace period.
  */
 export function terminateNpmProcessTree(
-  child: Pick<ChildProcess, "pid" | "kill">,
+  child: ChildProcess,
   invocation: NpmInvocation,
   env: NodeJS.ProcessEnv = process.env,
+  gracePeriodMs = 5_000,
 ): Promise<void> {
-  if (!invocation.windowsCmdShim || child.pid === undefined) {
-    try {
-      child.kill();
-    } catch {
-      // Best-effort parity with ChildProcess.kill() callers.
-    }
-    return Promise.resolve();
-  }
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
 
   return new Promise((resolve) => {
-    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
-    const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
-    const killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
     let settled = false;
-    const finish = (fallback: boolean) => {
+    let forceTimer: ReturnType<typeof setTimeout> | null = null;
+    const finish = () => {
       if (settled) return;
       settled = true;
-      if (fallback) {
-        try {
-          child.kill();
-        } catch {
-          // The process may already have exited.
-        }
-      }
+      if (forceTimer) clearTimeout(forceTimer);
+      child.removeListener("exit", finish);
       resolve();
     };
-    killer.once("error", () => finish(true));
-    killer.once("exit", (code) => finish(code !== 0));
+    const killDirectChild = (signal?: NodeJS.Signals) => {
+      try {
+        child.kill(signal);
+      } catch {
+        // The process may have exited between the state check and signal.
+      }
+    };
+
+    child.once("exit", finish);
+    forceTimer = setTimeout(() => killDirectChild("SIGKILL"), gracePeriodMs);
+
+    if (!invocation.windowsCmdShim || child.pid === undefined) {
+      killDirectChild();
+    } else {
+      const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+      const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
+      const killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      const fallback = () => killDirectChild();
+      killer.once("error", fallback);
+      killer.once("exit", (code) => {
+        if (code !== 0) fallback();
+      });
+    }
+
+    // Cover a process that exited between the initial check and listener setup.
+    if (child.exitCode !== null || child.signalCode !== null) finish();
   });
 }
 

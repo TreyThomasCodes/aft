@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -185,6 +186,70 @@ describe("npmInvocation", () => {
     expect(() =>
       npmInvocation({ command: "C:\\nodejs\\npm.cmd", binDir: "C:\\nodejs" }, ["%PATH%"], "win32"),
     ).toThrow("cannot be represented safely");
+  });
+
+  it("waits for a direct child to report its actual exit", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return true;
+        },
+      },
+    });
+
+    let settled = false;
+    const termination = terminateNpmProcessTree(
+      child,
+      { command: "/usr/bin/npm", args: ["install"] },
+      process.env,
+      1_000,
+    ).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(signals).toEqual([undefined]);
+    expect(settled).toBe(false);
+    exitCode = 0;
+    child.emit("exit", 0, null);
+    await termination;
+    expect(settled).toBe(true);
+  });
+
+  it("force-kills a direct child after the termination grace period", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          if (signal === "SIGKILL") {
+            exitCode = 1;
+            child.emit("exit", null, "SIGKILL");
+          }
+          return true;
+        },
+      },
+    });
+
+    await terminateNpmProcessTree(
+      child,
+      { command: "/usr/bin/npm", args: ["install"] },
+      process.env,
+      10,
+    );
+    expect(signals).toEqual([undefined, "SIGKILL"]);
   });
 
   it.skipIf(process.platform !== "win32")(
