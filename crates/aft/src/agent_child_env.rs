@@ -204,12 +204,20 @@ pub fn inject(
     }
 
     // Hooks and shims can invoke the AFT binary after the daemon's configure
-    // request has completed. Preserve the resolved root so those child commands
-    // do not fall back to a different machine-wide storage universe.
-    environment.insert(
-        STORAGE_DIR_ENV.to_string(),
-        storage_root.to_string_lossy().into_owned(),
-    );
+    // request has completed. PROPAGATE an explicit storage override so those
+    // child commands stay in the same storage universe - but never ORIGINATE
+    // one: injecting the default-resolved shared root as an explicit env var
+    // outranks XDG-based isolation in every nested process (field incident:
+    // the daemon injected the real shared root into agent bash lanes, and 41
+    // test-suite fixtures that isolate via HOME/XDG resolved the production
+    // store). Children that resolve storage by default reach the same root
+    // anyway; explicitness is only preserved, never minted.
+    if let Some(explicit) = std::env::var_os(STORAGE_DIR_ENV) {
+        environment.insert(
+            STORAGE_DIR_ENV.to_string(),
+            explicit.to_string_lossy().into_owned(),
+        );
+    }
     maintain(config, storage_root)?;
 
     if gh_enabled {
@@ -720,18 +728,35 @@ mod tests {
     }
 
     #[test]
-    fn active_child_environment_inherits_the_resolved_storage_root() {
+    fn child_environment_propagates_explicit_storage_override_but_never_originates_one() {
+        let _guard = crate::test_env::process_env_lock();
         let storage = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.git.co_author = "Pair Agent <pair@example.test>".to_string();
+
+        // No explicit override in the parent: the child gets NONE. Injecting the
+        // default-resolved root as an explicit env var would outrank XDG-based
+        // isolation in nested processes (the 41-fixture field incident).
+        let previous = std::env::var_os(STORAGE_DIR_ENV);
+        std::env::remove_var(STORAGE_DIR_ENV);
         let mut environment = HashMap::new();
-
         inject(&config, storage.path(), &mut environment).unwrap();
+        assert_eq!(environment.get(STORAGE_DIR_ENV), None);
 
+        // Explicit override present: propagated verbatim so spawned children
+        // stay in the same storage universe (the original leak-class fix).
+        let explicit = tempfile::tempdir().unwrap();
+        std::env::set_var(STORAGE_DIR_ENV, explicit.path());
+        let mut environment = HashMap::new();
+        inject(&config, storage.path(), &mut environment).unwrap();
         assert_eq!(
             environment.get(STORAGE_DIR_ENV),
-            Some(&storage.path().to_string_lossy().into_owned())
+            Some(&explicit.path().to_string_lossy().into_owned())
         );
+        match previous {
+            Some(value) => std::env::set_var(STORAGE_DIR_ENV, value),
+            None => std::env::remove_var(STORAGE_DIR_ENV),
+        }
     }
 
     #[cfg(unix)]
