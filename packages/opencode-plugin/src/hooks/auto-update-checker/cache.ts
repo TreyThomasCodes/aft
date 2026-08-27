@@ -41,6 +41,7 @@ interface AutoUpdateSnapshot {
 }
 
 const pendingSnapshots = new Map<string, AutoUpdateSnapshot>();
+const quarantinedInstallDirs = new Set<string>();
 
 function createAutoUpdateSnapshot(
   installDir: string,
@@ -159,6 +160,13 @@ function ensureDependencyVersion(
   }
 }
 
+function restorePendingSnapshot(installDir: string): void {
+  const snapshot = pendingSnapshots.get(installDir);
+  if (!snapshot) return;
+  pendingSnapshots.delete(installDir);
+  restoreAutoUpdateSnapshot(snapshot);
+}
+
 function removeInstalledPackage(installDir: string, packageName: string): boolean {
   const packageDir = join(installDir, "node_modules", packageName);
   if (!existsSync(packageDir)) return false;
@@ -204,11 +212,14 @@ export function preparePackageUpdate(
       return null;
     }
 
-    const pendingSnapshot = pendingSnapshots.get(installContext.installDir);
-    if (pendingSnapshot) {
+    if (quarantinedInstallDirs.has(installContext.installDir)) {
+      const recoverySnapshot = pendingSnapshots.get(installContext.installDir);
+      const recoveryDetail = recoverySnapshot
+        ? ` Recovery snapshot: ${recoverySnapshot.tempDir}`
+        : "";
       warn(
         `[auto-update-checker] Auto-update blocked after unconfirmed npm termination; ` +
-          `restart OpenCode to retry. Recovery snapshot: ${pendingSnapshot.tempDir}`,
+          `restart OpenCode to retry.${recoveryDetail}`,
       );
       return null;
     }
@@ -267,13 +278,17 @@ export async function runNpmInstallSafe(
   let stderrTail = "";
 
   try {
-    if (options.signal?.aborted) return { ok: false, reason: "aborted" };
+    if (options.signal?.aborted) {
+      restorePendingSnapshot(installDir);
+      return { ok: false, reason: "aborted" };
+    }
     // Resolve npm beyond PATH: GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT
     // and the update silently never installs. resolveNpm() also yields the bin
     // dir so npm's `#!/usr/bin/env node` shebang can find its sibling node.
     const npm = resolveNpm();
     if (!npm) {
+      restorePendingSnapshot(installDir);
       const reason = "npm not found on PATH or in known version-manager locations";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason };
@@ -335,6 +350,7 @@ export async function runNpmInstallSafe(
         // Fail closed: restoring while an unobserved npm descendant may still
         // write would turn a timeout into cache corruption. Keep the staged
         // snapshot and report the unknown outcome for manual recovery/restart.
+        quarantinedInstallDirs.add(installDir);
         const recoverySnapshot = pendingSnapshots.get(installDir);
         const recoveryDetail = recoverySnapshot
           ? `; auto-update quarantined for this session; recovery snapshot: ${recoverySnapshot.tempDir}`
@@ -343,11 +359,7 @@ export async function runNpmInstallSafe(
         warnNpmInstallFailure(reason, stderrTail);
         return { ok: false, reason, stderrTail: stderrTail || undefined };
       }
-      const snapshot = pendingSnapshots.get(installDir);
-      if (snapshot) {
-        pendingSnapshots.delete(installDir);
-        restoreAutoUpdateSnapshot(snapshot);
-      }
+      restorePendingSnapshot(installDir);
       const reason = options.signal?.aborted ? "aborted" : "timeout";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason, stderrTail: stderrTail || undefined };
@@ -364,11 +376,7 @@ export async function runNpmInstallSafe(
     }
     return { ...result, stderrTail: stderrTail || undefined };
   } catch (err) {
-    const snapshot = pendingSnapshots.get(installDir);
-    if (snapshot) {
-      pendingSnapshots.delete(installDir);
-      restoreAutoUpdateSnapshot(snapshot);
-    }
+    restorePendingSnapshot(installDir);
     const reason = `exception: ${String(err)}`;
     warnNpmInstallFailure(reason, stderrTail);
     return { ok: false, reason, stderrTail: stderrTail || undefined };

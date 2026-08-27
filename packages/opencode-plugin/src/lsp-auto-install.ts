@@ -56,6 +56,7 @@ import {
   lspPackageDir,
   readInstalledMeta,
   readVersionCheck,
+  retainInstallLock,
   shouldRecheckVersion,
   withInstallLock,
   writeInstalledMeta,
@@ -353,6 +354,7 @@ function runInstall(
         terminationPromise ??= terminateNpmProcessTree(child, invocation);
         void terminationPromise.catch((terminationError) => {
           quarantinedNpmInstalls.add(spec.npm);
+          retainInstallLock(spec.npm);
           error(
             `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
           );

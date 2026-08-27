@@ -263,6 +263,48 @@ describe("auto-update-checker/cache", () => {
       spawnMock.mockRestore();
     });
 
+    test("restores a staged snapshot when cancellation happens before spawn", async () => {
+      const root = join(tmpdir(), "aft-auto-update-pre-spawn-abort");
+      const packageJsonPath = join(root, "package.json");
+      const packageDir = join(root, "node_modules", "@cortexkit", "aft-opencode");
+      const runtimePath = join(packageDir, "package.json");
+      const existsSpy = spyOn(fs, "existsSync").mockImplementation((path: fs.PathLike) => {
+        const value = String(path);
+        return value === packageJsonPath || value === packageDir;
+      });
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation((path) => {
+        if (String(path) === packageJsonPath) {
+          return JSON.stringify({ dependencies: { "@cortexkit/aft-opencode": "0.17.1" } });
+        }
+        return "";
+      });
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation(() => {});
+      const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const mkdtempSpy = spyOn(fs, "mkdtempSync").mockReturnValue(
+        join(tmpdir(), "aft-test-pre-spawn-snapshot"),
+      );
+      const cpSpy = spyOn(fs, "cpSync").mockReturnValue(undefined);
+      const { preparePackageUpdate, runNpmInstallSafe } = await freshCacheImport();
+      const controller = new AbortController();
+      controller.abort();
+
+      expect(preparePackageUpdate("0.17.2", "@cortexkit/aft-opencode", runtimePath)).toBe(root);
+      expect(await runNpmInstallSafe(root, { signal: controller.signal })).toEqual({
+        ok: false,
+        reason: "aborted",
+      });
+      expect(cpSpy).toHaveBeenCalledTimes(2);
+      expect(preparePackageUpdate("0.17.3", "@cortexkit/aft-opencode", runtimePath)).toBe(root);
+      expect(cpSpy).toHaveBeenCalledTimes(3);
+
+      cpSpy.mockRestore();
+      mkdtempSpy.mockRestore();
+      rmSpy.mockRestore();
+      writeSpy.mockRestore();
+      readSpy.mockRestore();
+      existsSpy.mockRestore();
+    });
+
     test("quarantines the staged snapshot when process-tree termination is unconfirmed", async () => {
       const root = join(tmpdir(), "aft-auto-update-unknown");
       const packageJsonPath = join(root, "package.json");

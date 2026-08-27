@@ -290,6 +290,7 @@ describe("runAutoInstall", () => {
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
     expect(source).toContain("quarantining retries for this session");
     expect(source).toContain("quarantinedNpmInstalls.has(spec.npm)");
+    expect(source).toContain("retainInstallLock(spec.npm)");
     expect(source).toContain("finish(false)");
     expect(source).toMatch(
       /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*,?\s*\]/,

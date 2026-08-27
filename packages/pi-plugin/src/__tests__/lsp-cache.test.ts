@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
@@ -14,7 +14,9 @@ import {
   lspPackageDir,
   readVersionCheck,
   releaseInstallLock,
+  retainInstallLock,
   shouldRecheckVersion,
+  withInstallLock,
   writeVersionCheck,
 } from "../lsp-cache";
 
@@ -126,6 +128,20 @@ describe("install lock", () => {
 
   test("releaseInstallLock on a non-existent lock is safe", () => {
     expect(() => releaseInstallLock("never-acquired")).not.toThrow();
+  });
+
+  test("retains the cross-process lock until stale recovery when requested", async () => {
+    expect(
+      await withInstallLock("pkg-retained", async () => {
+        retainInstallLock("pkg-retained");
+        return true;
+      }),
+    ).toBe(true);
+
+    const lockFile = join(lspPackageDir("pkg-retained"), ".aft-installing");
+    expect(existsSync(lockFile)).toBe(true);
+    expect(acquireInstallLock("pkg-retained")).toBe(false);
+    unlinkSync(lockFile);
   });
 
   test("locks for different packages are independent", () => {

@@ -145,6 +145,7 @@ function lockPath(npmPackage: string): string {
 }
 
 const STALE_LOCK_MS = 30 * 60 * 1000;
+const retainedInstallLocks = new Set<string>();
 
 /**
  * Acquire an install lock for `lockKey` using an atomic `O_EXCL` open.
@@ -246,6 +247,11 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** Keep the current lock file for bounded stale-lock recovery after an unknown process-tree outcome. */
+export function retainInstallLock(lockKey: string): void {
+  retainedInstallLocks.add(lockKey);
+}
+
 export function releaseInstallLock(lockKey: string): void {
   const lock = lockPath(lockKey);
   // TOCTOU defense — only unlink if we still own the lock.
@@ -300,7 +306,14 @@ export async function withInstallLock<T>(
   try {
     return await task();
   } finally {
-    releaseInstallLock(lockKey);
+    if (retainedInstallLocks.delete(lockKey)) {
+      warn(
+        `[lsp] retaining install lock for ${lockKey} after unconfirmed npm termination; ` +
+          `cross-process retries remain blocked until stale-lock recovery`,
+      );
+    } else {
+      releaseInstallLock(lockKey);
+    }
   }
 }
 
