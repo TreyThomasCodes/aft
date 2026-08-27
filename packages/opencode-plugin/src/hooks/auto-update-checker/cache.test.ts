@@ -2,6 +2,8 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 mock.module("../../logger.js", () => ({
   log: mock(() => {}),
@@ -261,22 +263,55 @@ describe("auto-update-checker/cache", () => {
       spawnMock.mockRestore();
     });
 
-    test("reports unknown outcome when process-tree termination is unconfirmed", async () => {
+    test("quarantines the staged snapshot when process-tree termination is unconfirmed", async () => {
+      const root = join(tmpdir(), "aft-auto-update-unknown");
+      const packageJsonPath = join(root, "package.json");
+      const packageDir = join(root, "node_modules", "@cortexkit", "aft-opencode");
+      const runtimePath = join(packageDir, "package.json");
+      const existsSpy = spyOn(fs, "existsSync").mockImplementation((path: fs.PathLike) => {
+        const value = String(path);
+        return value === packageJsonPath || value === packageDir;
+      });
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation((path) => {
+        if (String(path) === packageJsonPath) {
+          return JSON.stringify({ dependencies: { "@cortexkit/aft-opencode": "0.17.1" } });
+        }
+        return "";
+      });
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation(() => {});
+      const rmSpy = spyOn(fs, "rmSync").mockReturnValue(undefined);
+      const mkdtempSpy = spyOn(fs, "mkdtempSync").mockReturnValue(
+        join(tmpdir(), "aft-test-snapshot"),
+      );
+      const cpSpy = spyOn(fs, "cpSync").mockReturnValue(undefined);
       const proc = new EventEmitter() as childProcess.ChildProcess;
       proc.stdout = new EventEmitter() as childProcess.ChildProcess["stdout"];
       proc.stderr = new EventEmitter() as childProcess.ChildProcess["stderr"];
       const spawnMock = spyOn(childProcess, "spawn").mockReturnValue(proc);
       terminateNpmProcessTreeMock.mockRejectedValueOnce(new Error("taskkill failed"));
-      const { runNpmInstallSafe } = await freshCacheImport();
+      const { preparePackageUpdate, runNpmInstallSafe } = await freshCacheImport();
 
-      const result = await runNpmInstallSafe("/tmp/opencode", { timeoutMs: 1 });
+      expect(preparePackageUpdate("0.17.2", "@cortexkit/aft-opencode", runtimePath)).toBe(root);
+      const writesAfterPrepare = writeSpy.mock.calls.length;
+      const result = await runNpmInstallSafe(root, { timeoutMs: 1 });
 
-      expect(result).toMatchObject({
-        ok: false,
-        reason: expect.stringContaining("termination outcome unknown"),
-      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBeDefined();
+      const reason = String(result.reason);
+      expect(reason).toContain("auto-update quarantined for this session");
+      expect(reason).toContain("aft-test-snapshot");
       expect(terminateNpmProcessTreeMock).toHaveBeenCalled();
+      expect(writeSpy).toHaveBeenCalledTimes(writesAfterPrepare);
+      expect(cpSpy).toHaveBeenCalledTimes(1);
+      expect(preparePackageUpdate("0.17.3", "@cortexkit/aft-opencode", runtimePath)).toBeNull();
+
       spawnMock.mockRestore();
+      cpSpy.mockRestore();
+      mkdtempSpy.mockRestore();
+      rmSpy.mockRestore();
+      writeSpy.mockRestore();
+      readSpy.mockRestore();
+      existsSpy.mockRestore();
     });
 
     test("captures stderr tail on npm install failure", async () => {

@@ -159,6 +159,9 @@ interface InFlightAutoInstall {
 }
 
 const inFlightAutoInstalls = new Set<InFlightAutoInstall>();
+// A taskkill failure leaves descendant liveness unknowable. Block retries for
+// this host session without creating a permanent cross-process tombstone.
+const quarantinedNpmInstalls = new Set<string>();
 
 function trackInFlightAutoInstall(
   controller: AbortController,
@@ -334,9 +337,11 @@ function runInstall(
       if (invocation.windowsCmdShim) {
         terminationPromise ??= terminateNpmProcessTree(child, invocation);
         void terminationPromise.catch((terminationError) => {
+          quarantinedNpmInstalls.add(spec.npm);
           error(
-            `[lsp] install ${target} termination outcome unknown; retaining install lock: ${String(terminationError)}`,
+            `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
           );
+          finish(false);
         });
         return;
       }
@@ -376,10 +381,7 @@ function runInstall(
             finish(false);
           }
         },
-        () => {
-          // Keep withInstallLock pending: the npm descendant may still be
-          // mutating this target, so another install must not overlap it.
-        },
+        () => finish(false),
       );
     });
   });
@@ -391,6 +393,13 @@ async function ensureServerInstalled(
   fetchImpl: typeof fetch,
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
+  if (quarantinedNpmInstalls.has(spec.npm)) {
+    return {
+      started: false,
+      reason: "install blocked after unconfirmed npm termination; restart the host to retry",
+    };
+  }
+
   // The lock MUST be held through install completion, not just through the
   // start decision. Two parallel sessions would otherwise both pass the
   // "is install needed" check and run `bun add` into the same cache dir

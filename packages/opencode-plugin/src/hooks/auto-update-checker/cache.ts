@@ -204,6 +204,15 @@ export function preparePackageUpdate(
       return null;
     }
 
+    const pendingSnapshot = pendingSnapshots.get(installContext.installDir);
+    if (pendingSnapshot) {
+      warn(
+        `[auto-update-checker] Auto-update blocked after unconfirmed npm termination; ` +
+          `restart OpenCode to retry. Recovery snapshot: ${pendingSnapshot.tempDir}`,
+      );
+      return null;
+    }
+
     const snapshot = createAutoUpdateSnapshot(
       installContext.installDir,
       installContext.packageJsonPath,
@@ -326,7 +335,11 @@ export async function runNpmInstallSafe(
         // Fail closed: restoring while an unobserved npm descendant may still
         // write would turn a timeout into cache corruption. Keep the staged
         // snapshot and report the unknown outcome for manual recovery/restart.
-        const reason = `termination outcome unknown: ${String(error)}`;
+        const recoverySnapshot = pendingSnapshots.get(installDir);
+        const recoveryDetail = recoverySnapshot
+          ? `; auto-update quarantined for this session; recovery snapshot: ${recoverySnapshot.tempDir}`
+          : "; auto-update quarantined for this session";
+        const reason = `termination outcome unknown: ${String(error)}${recoveryDetail}`;
         warnNpmInstallFailure(reason, stderrTail);
         return { ok: false, reason, stderrTail: stderrTail || undefined };
       }
