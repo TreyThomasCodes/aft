@@ -216,6 +216,8 @@ export interface BashConfig {
    * Default 15000ms; values below the 5000ms floor are clamped up.
    */
   foreground_wait_window_ms?: number;
+  /** Manual fallback for Pi versions that do not expose enabled default tools. */
+  powershell_tool?: boolean;
 }
 
 export interface AftConfig {
@@ -304,6 +306,8 @@ export interface ResolvedBashConfig {
    * Always resolved: defaults to 15000, floored at 5000.
    */
   foreground_wait_window_ms: number;
+  /** Manual PowerShell registration fallback. Default false. */
+  powershell_tool: boolean;
 }
 
 /** Default foreground wait-window before auto-promotion (ms). */
@@ -364,6 +368,8 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
+    powershell_tool:
+      typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
   };
 
   if (top === false) return base;
@@ -572,6 +578,9 @@ const BashFeaturesSchema = z.object({
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   foreground_wait_window_ms: z.number().int().positive().optional(),
+  // Pi mirrors the host's optional PowerShell default tool when its API can
+  // report that state. This project-safe fallback is used only on older hosts.
+  powershell_tool: z.boolean().optional(),
 });
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
@@ -818,7 +827,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   if (
     typeof config.bash === "object" &&
-    (config.bash.host_fallback !== undefined || config.bash.detach_on_user_message !== undefined)
+    (config.bash.host_fallback !== undefined ||
+      config.bash.detach_on_user_message !== undefined ||
+      config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
       ...(config.bash.host_fallback !== undefined
@@ -826,6 +837,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+      ...(config.bash.powershell_tool !== undefined
+        ? { powershell_tool: config.bash.powershell_tool }
         : {}),
     };
   }

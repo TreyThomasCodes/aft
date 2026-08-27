@@ -30,12 +30,63 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
 
-#[cfg(unix)]
-pub(crate) fn resolved_shell_path(pty: bool) -> PathBuf {
-    if pty {
-        pty_process::resolve_posix_shell()
-    } else {
-        registry::resolve_posix_shell()
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BashShell {
+    #[default]
+    Bash,
+    Powershell,
+}
+
+impl BashShell {
+    pub(crate) fn is_powershell(self) -> bool {
+        matches!(self, Self::Powershell)
+    }
+
+    pub(crate) fn command_text(self, command: &str) -> String {
+        if self.is_powershell() {
+            // Match Pi's optional tool: both .NET and PowerShell's pipeline use
+            // UTF-8 before user code runs, so redirected native output remains
+            // readable across macOS, Linux, and Windows.
+            format!(
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+            )
+        } else {
+            command.to_string()
+        }
+    }
+}
+
+fn resolve_powershell_path_with(
+    lookup: impl FnOnce(&str) -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let candidate = "pwsh.exe";
+    #[cfg(not(windows))]
+    let candidate = "pwsh";
+    lookup(candidate).ok_or_else(|| {
+        "PowerShell (pwsh) is not installed or is not on PATH. Install PowerShell 7+: https://aka.ms/powershell"
+            .to_string()
+    })
+}
+
+pub(crate) fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
+    if shell.is_powershell() {
+        return resolve_powershell_path_with(|candidate| which::which(candidate).ok());
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(if pty {
+            pty_process::resolve_posix_shell()
+        } else {
+            registry::resolve_posix_shell()
+        })
+    }
+    #[cfg(windows)]
+    {
+        let _ = pty;
+        Ok(PathBuf::from("cmd.exe"))
     }
 }
 
@@ -83,6 +134,8 @@ pub fn spawn(
     request_id: &str,
     session_id: &str,
     command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     timeout_ms: Option<u64>,
@@ -170,7 +223,6 @@ pub fn spawn(
         if plan.refusal_code().is_some() {
             (plan, Some(task))
         } else {
-            let shell_path = resolved_shell_path(pty);
             let root = project_root.as_deref().unwrap_or(&workdir);
             let environment = crate::sandbox_spawn::approved_environment_for_plan(&plan, &env);
             match crate::sandbox_spawn::prepare_task_payload(
@@ -236,9 +288,11 @@ pub fn spawn(
 
     let cleanup_plan = spawn_plan.clone();
     let spawn_result = if pty {
-        ctx.bash_background().spawn_pty(
+        ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
             command,
+            shell,
+            shell_path,
             session_id.to_string(),
             workdir,
             env,
@@ -252,9 +306,11 @@ pub fn spawn(
             pty_cols,
         )
     } else {
-        ctx.bash_background().spawn(
+        ctx.bash_background().spawn_with_shell(
             spawn_plan,
             command,
+            shell,
+            shell_path,
             session_id.to_string(),
             workdir,
             env,
@@ -653,6 +709,13 @@ mod storage_root_tests {
             super::storage_dir(Some(&expected_plugin_root)),
             expected_tilde
         );
+    }
+
+    #[test]
+    fn powershell_absence_has_an_honest_install_remedy() {
+        let error = super::resolve_powershell_path_with(|_| None).expect_err("pwsh is absent");
+        assert!(error.contains("PowerShell (pwsh) is not installed"));
+        assert!(error.contains("https://aka.ms/powershell"));
     }
 
     #[test]

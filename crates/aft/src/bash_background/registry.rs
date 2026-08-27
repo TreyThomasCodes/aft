@@ -1159,6 +1159,41 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, String> {
+        self.spawn_with_shell(
+            spawn_plan,
+            command,
+            super::BashShell::Bash,
+            resolve_posix_shell(),
+            session_id,
+            workdir,
+            env,
+            timeout,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_shell(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        timeout: Option<Duration>,
+        storage_dir: PathBuf,
+        max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+    ) -> Result<String, String> {
         self.start_watchdog();
 
         let running = self.running_count();
@@ -1179,7 +1214,6 @@ impl BgTaskRegistry {
         } else {
             let task = allocate_task_layout(&storage_dir, &session_id)
                 .map_err(|error| format!("failed to create background task layout: {error}"))?;
-            let shell = resolve_posix_shell();
             let root = project_root.as_deref().unwrap_or(&workdir);
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -1189,7 +1223,7 @@ impl BgTaskRegistry {
                 root,
                 &workdir,
                 &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
-                &shell,
+                &shell_path,
                 &environment,
             ) {
                 Ok(prepared) => prepared,
@@ -1224,12 +1258,9 @@ impl BgTaskRegistry {
         // exists on the Windows spawn path.
         #[cfg(unix)]
         let capture_pipeline_status = {
-            let shell = spawn_plan
-                .host_shell_path()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(resolve_posix_shell);
             let pipeline = single_top_level_pipeline(command);
-            let capture = should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell);
+            let capture = !shell.is_powershell()
+                && should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell_path);
             if capture {
                 metadata.pipeline_segments = pipeline
                     .as_ref()
@@ -1261,6 +1292,8 @@ impl BgTaskRegistry {
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
+            shell,
+            &shell_path,
             &paths,
             &workdir,
             &env,
@@ -1327,6 +1360,45 @@ impl BgTaskRegistry {
         rows: u16,
         cols: u16,
     ) -> Result<String, String> {
+        self.spawn_pty_with_shell(
+            spawn_plan,
+            command,
+            super::BashShell::Bash,
+            super::resolve_shell_path(true, super::BashShell::Bash)
+                .expect("POSIX shell must resolve for bash PTY"),
+            session_id,
+            workdir,
+            env,
+            timeout,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+            rows,
+            cols,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_pty_with_shell(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        timeout: Option<Duration>,
+        storage_dir: PathBuf,
+        max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<String, String> {
         self.start_watchdog();
 
         let running = self.running_count();
@@ -1348,7 +1420,6 @@ impl BgTaskRegistry {
         } else {
             let task = allocate_task_layout(&storage_dir, &session_id)
                 .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
-            let shell = super::resolved_shell_path(true);
             let root = project_root.as_deref().unwrap_or(&workdir);
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -1358,7 +1429,7 @@ impl BgTaskRegistry {
                 root,
                 &workdir,
                 &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
-                &shell,
+                &shell_path,
                 &environment,
             ) {
                 Ok(prepared) => prepared,
@@ -1405,6 +1476,8 @@ impl BgTaskRegistry {
             &task_id,
             &session_id,
             command,
+            shell,
+            &shell_path,
             &paths,
             &workdir,
             &env,
@@ -1478,6 +1551,41 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, String> {
+        self.spawn_with_shell(
+            spawn_plan,
+            command,
+            super::BashShell::Bash,
+            PathBuf::from("cmd.exe"),
+            session_id,
+            workdir,
+            env,
+            timeout,
+            storage_dir,
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_shell(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        timeout: Option<Duration>,
+        storage_dir: PathBuf,
+        max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+    ) -> Result<String, String> {
         self.start_watchdog();
 
         let running = self.running_count();
@@ -1522,6 +1630,8 @@ impl BgTaskRegistry {
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
+            shell,
+            &shell_path,
             &paths,
             &workdir,
             &env,
@@ -5355,6 +5465,8 @@ fn detached_shell_command_for(
 fn spawn_detached_child(
     spawn_plan: &SpawnPlan,
     command: &str,
+    shell: super::BashShell,
+    shell_path: &Path,
     paths: &TaskPaths,
     workdir: &Path,
     env: &HashMap<String, String>,
@@ -5364,7 +5476,7 @@ fn spawn_detached_child(
     #[cfg(windows)]
     let _ = capture_pipeline_status;
     #[cfg(not(windows))]
-    let _ = command;
+    let _ = (command, shell);
     #[cfg(not(windows))]
     {
         use std::os::fd::AsRawFd;
@@ -5389,11 +5501,8 @@ fn spawn_detached_child(
             .then(|| io_handles.inheritable_file(TaskArtifact::PipelineStatus))
             .transpose()
             .map_err(|e| format!("failed to inherit pipeline status handle: {e}"))?;
-        let shell = spawn_plan
-            .host_shell_path()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(resolve_posix_shell);
-        let pipeline_shell = super::process::pipeline_shell_kind(&shell).unwrap_or("");
+        let shell_path = spawn_plan.host_shell_path().unwrap_or(shell_path);
+        let pipeline_shell = super::process::pipeline_shell_kind(shell_path).unwrap_or("");
         let pipeline_status_fd = if capture_pipeline_status {
             crate::sandbox_spawn::CHILD_PIPE_STATUS_FD.to_string()
         } else {
@@ -5403,7 +5512,7 @@ fn spawn_detached_child(
             OsString::from("-c"),
             payload.wrapper_text.clone(),
             OsString::from("aft-payload-wrapper"),
-            shell.as_os_str().to_os_string(),
+            shell_path.as_os_str().to_os_string(),
             payload.command_text.clone(),
             OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
             OsString::from(pipeline_status_fd),
@@ -5438,6 +5547,7 @@ fn spawn_detached_child(
     }
     #[cfg(windows)]
     {
+        let _ = shell_path;
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
             SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {}
@@ -5454,7 +5564,11 @@ fn spawn_detached_child(
         // process-flag layer (CREATE_NO_WINDOW instead of DETACHED_PROCESS,
         // see flag block below), so we no longer need to misroute PS
         // commands through cmd.
-        let candidates: Vec<crate::windows_shell::WindowsShell> = shell_candidates();
+        let candidates: Vec<crate::windows_shell::WindowsShell> = if shell.is_powershell() {
+            vec![crate::windows_shell::WindowsShell::Pwsh]
+        } else {
+            shell_candidates()
+        };
         // Win32 process creation flags. We try with CREATE_BREAKAWAY_FROM_JOB
         // first (so the bg child outlives the AFT process when AFT is killed),
         // then fall back without it for environments where the parent is in a

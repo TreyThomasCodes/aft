@@ -64,6 +64,8 @@ struct BashParams {
     #[serde(default)]
     sandbox: Option<BashSandbox>,
     #[serde(default)]
+    shell: crate::bash_background::BashShell,
+    #[serde(default)]
     permissions_granted: Vec<String>,
     #[serde(default)]
     permissions_requested: bool,
@@ -77,7 +79,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .get("params")
         .cloned()
         .unwrap_or_else(|| req.params.clone());
-    let params = match serde_json::from_value::<BashParams>(raw_params) {
+    let mut params = match serde_json::from_value::<BashParams>(raw_params) {
         Ok(params) => params,
         Err(e) => {
             return Response::error(
@@ -87,10 +89,21 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    // The dedicated external route is defensive as well as convenient: callers
+    // cannot accidentally execute Bash merely by omitting the selector.
+    if req.command == "powershell" {
+        params.shell = crate::bash_background::BashShell::Powershell;
+    }
 
     if let Some(description) = params.description.as_deref() {
         log::debug!("bash description: {description}");
     }
+
+    let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
+        Ok(path) => path,
+        Err(message) => return Response::error(&req.id, "powershell_not_installed", message),
+    };
+    let execution_command = params.shell.command_text(&params.command);
 
     // NOTE (v0.30.1 prep, unblock-only): the previous two rejections
     // ("PTY mode requires background: true" and "ptyRows/ptyCols require
@@ -195,8 +208,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         };
-        let shell_path = crate::bash_background::resolved_shell_path(params.pty);
-        let shell_path = std::fs::canonicalize(&shell_path).unwrap_or(shell_path);
+        let shell_path = std::fs::canonicalize(&shell_path).unwrap_or_else(|_| shell_path.clone());
         let environment =
             crate::sandbox_spawn::approved_payload_environment(&params.env, &std::env::temp_dir());
         if let Some(grant_id) = params
@@ -206,7 +218,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         {
             host_escalation = Some(crate::sandbox_spawn::HostEscalationAttempt {
                 grant_id: grant_id.clone(),
-                command: params.command.as_bytes().to_vec(),
+                command: execution_command.as_bytes().to_vec(),
                 root,
                 cwd: cwd.clone(),
                 shell_path,
@@ -218,7 +230,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             let grant_id = match crate::sandbox_spawn::mint_host_escalation_grant(
                 ctx,
                 &principal,
-                params.command.as_bytes(),
+                execution_command.as_bytes(),
                 &root,
                 &cwd,
                 &shell_path,
@@ -248,12 +260,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let native_report_only =
         crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal) && host_escalation.is_none();
-    let permission_asks =
-        if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
-            crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
-        } else {
-            Vec::new()
-        };
+    // The bash scanner parses POSIX grammar and must not treat PowerShell
+    // syntax as understood. PowerShell therefore takes an explicit, per-command
+    // approval path instead of a potentially unsafe rewrite or auto-allow.
+    let permission_asks = if params.shell.is_powershell() {
+        conservative_powershell_permission_asks(&params.command)
+    } else if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
+        crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
+    } else {
+        Vec::new()
+    };
     if !native_report_only
         && !permission_asks.is_empty()
         && !permissions_granted_cover(&permission_asks, &params.permissions_granted)
@@ -274,7 +290,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
-    if host_escalation.is_none() && workdir_matches_project_root(&workdir, ctx) {
+    if !params.shell.is_powershell()
+        && host_escalation.is_none()
+        && workdir_matches_project_root(&workdir, ctx)
+    {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
             &params.command,
             &req.id,
@@ -288,12 +307,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             return response;
         }
     } else {
-        let reason = if host_escalation.is_some() {
+        let reason = if params.shell.is_powershell() {
+            "PowerShell syntax bypasses POSIX rewrite rules"
+        } else if host_escalation.is_some() {
             "host escalation owns process execution"
         } else {
             "bash workdir differs from the project root"
         };
-        let branch = if host_escalation.is_some() {
+        let branch = if params.shell.is_powershell() || host_escalation.is_some() {
             "dispatch.native.no_rule"
         } else {
             "dispatch.native.non_root_workdir"
@@ -327,7 +348,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     crate::bash_background::spawn(
         &req.id,
         req.session(),
-        &params.command,
+        &execution_command,
+        params.shell,
+        shell_path,
         workdir,
         env,
         params.timeout,
@@ -389,6 +412,16 @@ fn permissions_granted_cover(
             .chain(ask.always.iter())
             .any(|pattern| granted.iter().any(|grant| grant == pattern))
     })
+}
+
+fn conservative_powershell_permission_asks(
+    command: &str,
+) -> Vec<crate::bash_permissions::PermissionAsk> {
+    vec![crate::bash_permissions::PermissionAsk {
+        kind: crate::bash_permissions::PermissionKind::Bash,
+        patterns: vec![command.to_string()],
+        always: Vec::new(),
+    }]
 }
 
 fn default_compressed() -> bool {
@@ -501,6 +534,15 @@ mod tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[test]
+    fn powershell_commands_require_approval_without_posix_scanning() {
+        // `cat` is a POSIX rewrite candidate, but PowerShell has its own syntax
+        // and aliases. The request must remain an explicit permission ask.
+        let asks = conservative_powershell_permission_asks("cat $env:USERPROFILE\\secret.txt");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].patterns, ["cat $env:USERPROFILE\\secret.txt"]);
     }
 
     // Command rewriting resolves relative paths against the project root, so it

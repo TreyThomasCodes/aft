@@ -421,6 +421,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up.",
               },
+              powershell_tool: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Pi-only fallback for manually mirroring Pi's optional PowerShell default tool when the host does not expose its enabled-tool registry. OpenCode never registers this tool.",
+              },
             },
             additionalProperties: false,
           },

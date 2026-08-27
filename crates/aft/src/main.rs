@@ -761,7 +761,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         ),
         "echo" => handle_echo(&req),
         "tool_call" => aft::commands::tool_call::handle(&req, ctx),
-        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash" | "powershell" => aft::commands::bash::handle(&req, ctx),
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
@@ -887,7 +887,7 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
             Arc::clone(ctx),
         );
     }
-    if req.command == "bash"
+    if matches!(req.command.as_str(), "bash" | "powershell")
         && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
     {
         let spawn_response = aft::commands::bash::handle(&req, ctx);

@@ -331,6 +331,9 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
     pub detach_on_user_message: bool,
+    /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
+    /// executor accepts this solely to keep shared config parsing in parity.
+    pub powershell_tool: bool,
 }
 
 impl Default for BashConfig {
@@ -338,6 +341,7 @@ impl Default for BashConfig {
         Self {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
+            powershell_tool: false,
         }
     }
 }

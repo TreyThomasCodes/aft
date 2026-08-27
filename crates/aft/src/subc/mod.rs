@@ -4637,7 +4637,7 @@ async fn handle_tool_call(
         .map(|meta| meta.diagnostics_on_edit)
         .unwrap_or(false);
 
-    let requests_host = bare_name == "bash"
+    let requests_host = matches!(bare_name.as_str(), "bash" | "powershell")
         && arguments
             .get("sandbox")
             .or_else(|| {
@@ -4673,7 +4673,8 @@ async fn handle_tool_call(
 
     if matches!(bind_trust, BindTrust::Untrusted)
         && is_bash_family_tool(&bare_name)
-        && (bare_name != "bash" || !identity.consumer_elicitation_capable)
+        && (!matches!(bare_name.as_str(), "bash" | "powershell")
+            || !identity.consumer_elicitation_capable)
     {
         let response = bash::bash_denied_untrusted_response(request_id.clone());
         let text = crate::subc_format::format_response_with_context(
@@ -4733,7 +4734,7 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
 
-    if bare_name == "bash" {
+    if matches!(bare_name.as_str(), "bash" | "powershell") {
         if matches!(bind_trust, BindTrust::Untrusted) {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,

@@ -249,6 +249,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
         bare_name,
         "status"
             | "bash"
+            | "powershell"
             | "read"
             | "write"
             | "edit"
@@ -311,7 +312,7 @@ pub fn format_response_with_context(
         "zoom" => format_zoom(data, ctx),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
-        "bash" => data["output"].as_str().unwrap_or_default().to_string(),
+        "bash" | "powershell" => data["output"].as_str().unwrap_or_default().to_string(),
         "callgraph" => format_callgraph(
             ctx.callgraph_op.as_deref().unwrap_or("callgraph"),
             data,

@@ -224,7 +224,11 @@ The backup store treats its on-disk tree as authoritative across processes; dele
 
     // How long a foreground bash call blocks before auto-promoting the task
     // to the background. Minimum 5000; lower values are clamped up. Default 8000.
-    "foreground_wait_window_ms": 8000
+    "foreground_wait_window_ms": 8000,
+
+    // Pi-only fallback for older Pi versions that cannot report whether its
+    // optional default PowerShell tool is enabled. OpenCode never registers it.
+    "powershell_tool": false
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
@@ -278,6 +282,8 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   }
 }
 ```
+
+On Pi versions that expose the live default-tool registry, AFT hoists `powershell` only when Pi has enabled its optional built-in tool. If that registry is unavailable, set `bash.powershell_tool` to `true` to mirror Pi's setting explicitly. The default is `false`; this key does not register a tool on OpenCode.
 
 AFT auto-detects the formatter and checker from project config files (`biome.json` → biome,
 `.oxfmtrc.json` / `.oxfmtrc.jsonc` / `oxfmt.config.ts` → oxfmt, `.prettierrc` → prettier,

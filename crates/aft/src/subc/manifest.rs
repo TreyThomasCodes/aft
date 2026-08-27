@@ -7,7 +7,7 @@ use super::{
 };
 
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
-    name == "bash" || name.starts_with("bash_")
+    name == "bash" || name == "powershell" || name.starts_with("bash_")
 }
 
 pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
@@ -15,6 +15,7 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
         name,
         "status"
             | "bash"
+            | "powershell"
             | "read"
             | "write"
             | "edit"
@@ -139,6 +140,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         }
 
         "bash"
+        | "powershell"
         | "bash_abort_inflight"
         | "bash_ack_completions"
         | "bash_notify"
@@ -234,6 +236,7 @@ pub(super) fn build_manifest() -> ModuleManifest {
             tools: vec![
                 tool("status", ExecutionMode::Pure),
                 tool("bash", ExecutionMode::Mutating),
+                tool("powershell", ExecutionMode::Mutating),
                 tool("read", ExecutionMode::Pure),
                 tool("write", ExecutionMode::Mutating),
                 tool("edit", ExecutionMode::Mutating),
@@ -297,6 +300,7 @@ mod tests {
     const CORE_TOOLS: &[&str] = &[
         "status",
         "bash",
+        "powershell",
         "read",
         "write",
         "edit",
@@ -468,6 +472,7 @@ mod tests {
         // Mutating tools can write files, change safety state, or spawn processes.
         for name in [
             "bash",
+            "powershell",
             "write",
             "edit",
             "apply_patch",

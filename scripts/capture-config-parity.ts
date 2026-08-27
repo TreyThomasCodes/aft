@@ -153,6 +153,13 @@ const CASES: ParityCase[] = [
     project: { hoist_builtin_tools: false },
   },
   {
+    // Pi uses this project-safe fallback only when its host cannot report
+    // whether the optional default PowerShell tool is enabled.
+    name: "bash_powershell_tool_project_safe",
+    user: { bash: { powershell_tool: false } },
+    project: { bash: { powershell_tool: true } },
+  },
+  {
     name: "drop_restrict",
     user: { restrict_to_project_root: true },
     project: { restrict_to_project_root: false },

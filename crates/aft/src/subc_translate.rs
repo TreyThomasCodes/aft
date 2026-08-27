@@ -861,6 +861,7 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
     matches!(
         bare_name,
         "bash"
+            | "powershell"
             | "status"
             | "read"
             | "write"
@@ -958,6 +959,7 @@ pub fn subc_translate_owned_with_context(
     let agent_args = normalize_path_arguments(bare_name, agent_args)?;
     match bare_name {
         "bash" => translate_bash(agent_args, project_root),
+        "powershell" => translate_powershell(agent_args, project_root),
         "status" => Ok(Translated {
             command: "status".into(),
             args: Map::new(),
@@ -1011,6 +1013,13 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
 
     let mut out = Map::new();
     out.insert("command".to_string(), Value::String(command.to_string()));
+
+    if let Some(shell) = map_in.get("shell") {
+        if shell.as_str() != Some("powershell") {
+            return Err(invalid_request("bash: 'shell' must be 'powershell'"));
+        }
+        out.insert("shell".to_string(), Value::String("powershell".to_string()));
+    }
 
     if let Some(timeout) =
         coerce_optional_int_result(map_in.get("timeout"), "timeout", 1, MAX_SAFE_INTEGER)?
@@ -1129,6 +1138,14 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         command: "bash".into(),
         args: out,
     })
+}
+
+fn translate_powershell(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let mut translated = translate_bash(args, project_root)?;
+    translated
+        .args
+        .insert("shell".to_string(), Value::String("powershell".to_string()));
+    Ok(translated)
 }
 
 fn translate_callgraph(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -2931,9 +2948,30 @@ mod tests {
     // allowlist isn't updated, that tool would silently bypass translation and
     // dispatch as a raw native command — this proves the two sets agree.
     #[test]
+    fn powershell_translation_selects_the_unified_bash_executor() {
+        let translated = subc_translate_owned(
+            "powershell",
+            serde_json::json!({ "command": "Get-ChildItem", "workdir": "scripts" }),
+            Path::new("/project"),
+        )
+        .expect("PowerShell tool must translate");
+
+        assert_eq!(translated.command, "bash");
+        assert_eq!(
+            translated.args.get("shell"),
+            Some(&Value::String("powershell".into()))
+        );
+        assert_eq!(
+            translated.args.get("workdir"),
+            Some(&Value::String("/project/scripts".into()))
+        );
+    }
+
+    #[test]
     fn supports_tool_covers_every_translated_arm() {
         for name in [
             "bash",
+            "powershell",
             "status",
             "read",
             "write",
