@@ -230,21 +230,37 @@ describe("npmInvocation", () => {
       const root = mkdtempSync(join(tmpdir(), "npm tree kill "));
       try {
         const shim = join(root, "npm.cmd");
+        const started = join(root, "npm-descendant-started");
         const sentinel = join(root, "npm-still-running");
         writeFileSync(
           shim,
-          "@echo off\r\nnode -e \"setTimeout(function(){require('fs').writeFileSync(process.argv[1], 'leaked')}, 1000)\" \"%~1\"\r\n",
+          "@echo off\r\n\"%AFT_TEST_NODE%\" -e \"require('fs').writeFileSync(process.argv[1], 'started'); setTimeout(function(){require('fs').writeFileSync(process.argv[2], 'leaked')}, 1000)\" \"%~1\" \"%~2\"\r\n",
         );
-        const invocation = npmInvocation({ command: shim, binDir: root }, [sentinel]);
+        const invocation = npmInvocation({ command: shim, binDir: root }, [started, sentinel]);
         const child = spawn(invocation.command, invocation.args, {
-          env: { ...process.env, ...invocation.env },
+          env: {
+            ...process.env,
+            PATH: "",
+            AFT_TEST_NODE: process.execPath,
+            ...invocation.env,
+          },
           stdio: "ignore",
           windowsVerbatimArguments: invocation.windowsVerbatimArguments,
         });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        await terminateNpmProcessTree(child, invocation);
-        await new Promise((resolve) => setTimeout(resolve, 1_100));
-        expect(existsSync(sentinel)).toBe(false);
+        let terminated = false;
+        try {
+          const startDeadline = Date.now() + 3_000;
+          while (!existsSync(started) && Date.now() < startDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          expect(existsSync(started)).toBe(true);
+          await terminateNpmProcessTree(child, invocation);
+          terminated = true;
+          await new Promise((resolve) => setTimeout(resolve, 1_100));
+          expect(existsSync(sentinel)).toBe(false);
+        } finally {
+          if (!terminated) await terminateNpmProcessTree(child, invocation);
+        }
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

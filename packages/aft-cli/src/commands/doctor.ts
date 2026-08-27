@@ -678,7 +678,7 @@ async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promis
     const child = spawn(invocation.command, invocation.args, {
       cwd: installDir,
       env: { ...npmSpawnEnv(npm), ...invocation.env },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", "pipe"],
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
     let stderr = "";
