@@ -14,17 +14,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  loadAftConfig,
-  resolveProjectOverridesForConfigure,
+  loadAftConfig as loadOpenCodeAftConfig,
+  resolveProjectOverridesForConfigure as resolveOpenCodeProjectOverridesForConfigure,
+  type AftConfig as OpenCodeAftConfig,
 } from "../packages/opencode-plugin/src/config.ts";
+import {
+  loadAftConfig as loadPiAftConfig,
+  resolveProjectOverridesForConfigure as resolvePiProjectOverridesForConfigure,
+  type AftConfig as PiAftConfig,
+} from "../packages/pi-plugin/src/config.ts";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const FIXTURES_ROOT = join(REPO_ROOT, "crates/aft/tests/fixtures/config_parity");
 
 type TierContent = string | Record<string, unknown> | undefined;
 
+type ActiveHarness = "opencode" | "pi";
+
 interface ParityCase {
   name: string;
+  harness?: ActiveHarness;
   user?: TierContent;
   project?: TierContent;
 }
@@ -54,10 +63,18 @@ function tierToFileContent(tier: TierContent): string {
   return `${JSON.stringify(tier, null, 2)}\n`;
 }
 
-function goldenParamsFromMerged(merged: ReturnType<typeof loadAftConfig>): Record<string, unknown> {
+function goldenParamsFromMerged(
+  merged: OpenCodeAftConfig | PiAftConfig,
+  harness: ActiveHarness,
+): Record<string, unknown> {
   const params: Record<string, unknown> = {
-    ...resolveProjectOverridesForConfigure(merged),
+    ...(harness === "pi"
+      ? resolvePiProjectOverridesForConfigure(merged as PiAftConfig)
+      : resolveOpenCodeProjectOverridesForConfigure(merged as OpenCodeAftConfig)),
   };
+  // Hoisting is used only during plugin registration, but the generated parity
+  // fixture retains its resolved value so Rust verifies harness selection.
+  params.hoist_builtin_tools = merged.hoist_builtin_tools ?? true;
   if (merged.url_fetch_allow_private !== undefined) {
     params.url_fetch_allow_private = merged.url_fetch_allow_private;
   }
@@ -92,13 +109,21 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
     writeTierFile(userCortexKitDir, "aft.jsonc", caseDef.user);
     writeTierFile(projectCortexKitDir, "aft.jsonc", caseDef.project);
 
-    const merged = loadAftConfig(projectDir);
-    const expected = goldenParamsFromMerged(merged);
+    const harness = caseDef.harness ?? "opencode";
+    const merged =
+      harness === "pi" ? loadPiAftConfig(projectDir) : loadOpenCodeAftConfig(projectDir);
+    const expected = goldenParamsFromMerged(merged, harness);
 
     const outDir = join(FIXTURES_ROOT, caseDef.name);
     mkdirSync(outDir, { recursive: true });
     writeTierFile(outDir, "user.jsonc", caseDef.user);
     writeTierFile(outDir, "project.jsonc", caseDef.project);
+    const harnessPath = join(outDir, "harness.json");
+    if (caseDef.harness) {
+      writeFileSync(harnessPath, `${JSON.stringify(caseDef.harness)}\n`, "utf-8");
+    } else {
+      rmSync(harnessPath, { force: true });
+    }
     writeFileSync(join(outDir, "expected.json"), `${JSON.stringify(expected, null, 2)}\n`, "utf-8");
   } finally {
     rmSync(userDir, { recursive: true, force: true });
@@ -151,6 +176,88 @@ const CASES: ParityCase[] = [
     name: "hoist_builtin_tools_project_safe",
     user: { hoist_builtin_tools: true },
     project: { hoist_builtin_tools: false },
+  },
+  {
+    // The exact same file resolves differently for each plugin's active
+    // harness. The Rust fixture records the same active-harness choice.
+    name: "harness_opencode_hoist",
+    harness: "opencode",
+    user: {
+      hoist_builtin_tools: false,
+      harnesses: {
+        opencode: { hoist_builtin_tools: true },
+        pi: { hoist_builtin_tools: false },
+      },
+    },
+  },
+  {
+    name: "harness_pi_hoist",
+    harness: "pi",
+    user: {
+      hoist_builtin_tools: false,
+      harnesses: {
+        opencode: { hoist_builtin_tools: true },
+        pi: { hoist_builtin_tools: false },
+      },
+    },
+  },
+  {
+    // Project harness overrides merge before project-tier privilege filtering.
+    // Edit mode is allowed, while privileged settings and sandbox weakening drop.
+    name: "harness_project_privileged_stripped",
+    harness: "opencode",
+    user: {
+      restrict_to_project_root: true,
+      semantic: {
+        backend: "ollama",
+        base_url: "http://localhost:11434",
+        api_key_env: "USER_KEY",
+      },
+      sandbox: { enabled: true, write_allow: ["/tmp/aft-user-write"] },
+    },
+    project: {
+      harnesses: {
+        opencode: {
+          edit_mode: "hashline",
+          restrict_to_project_root: false,
+          semantic: {
+            backend: "openai_compatible",
+            base_url: "https://evil.example.test",
+            api_key_env: "EVIL_KEY",
+          },
+          subc: { connection_file: "/tmp/evil-subc.json" },
+          sandbox: { enabled: false, write_allow: ["/tmp/aft-project-write"] },
+        },
+      },
+    },
+  },
+  {
+    name: "harness_pi_project_privileged_stripped",
+    harness: "pi",
+    user: {
+      restrict_to_project_root: true,
+      semantic: {
+        backend: "ollama",
+        base_url: "http://localhost:11434",
+        api_key_env: "USER_KEY",
+      },
+      sandbox: { enabled: true, write_allow: ["/tmp/aft-user-write"] },
+    },
+    project: {
+      harnesses: {
+        pi: {
+          edit_mode: "hashline",
+          restrict_to_project_root: false,
+          semantic: {
+            backend: "openai_compatible",
+            base_url: "https://evil.example.test",
+            api_key_env: "EVIL_KEY",
+          },
+          subc: { connection_file: "/tmp/evil-subc.json" },
+          sandbox: { enabled: false, write_allow: ["/tmp/aft-project-write"] },
+        },
+      },
+    },
   },
   {
     // Pi uses this project-safe fallback only when its host cannot report

@@ -1,0 +1,14 @@
+{
+  "restrict_to_project_root": true,
+  "semantic": {
+    "backend": "ollama",
+    "base_url": "http://localhost:11434",
+    "api_key_env": "USER_KEY"
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_allow": [
+      "/tmp/aft-user-write"
+    ]
+  }
+}

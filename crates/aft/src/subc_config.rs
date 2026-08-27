@@ -1,16 +1,14 @@
 //! Subc-mode local config read (subc edge only).
 //!
-//! Config is single-per-project, read by AFT directly off disk from the
-//! CortexKit config files: user `~/.config/cortexkit/aft.jsonc` and project
-//! `<root>/.cortexkit/aft.jsonc`. There is NO wire-relayed config path — a front
-//! (runner, `mcp:*`, or `fed:*`) cannot push config over the connection. This makes the
-//! resolved config harness-INDEPENDENT: every harness binding a project reads
-//! the identical on-disk config, so two trust domains sharing the per-root actor
-//! can never diverge or inherit each other's capabilities.
+//! Config is read directly from the CortexKit user and project files: user
+//! `~/.config/cortexkit/aft.jsonc` and project `<root>/.cortexkit/aft.jsonc`.
+//! There is NO wire-relayed config path, so a front (runner, `mcp:*`, or `fed:*`)
+//! cannot push config over the connection. `config_resolve` then selects the
+//! active bind's optional harness override from each file tier.
 //!
-//! Trust is purely per-TIER, applied by `config_resolve` to the FILE tiers: the
-//! user file is trusted (the user's own disk), the project file is untrusted
-//! (in-repo) and has its privileged fields dropped.
+//! Trust remains purely per-TIER after that selection: the user file is trusted
+//! (the user's own disk), while privileged fields from the untrusted in-repo
+//! project file, including its harness override, are dropped.
 
 use crate::config_resolve::ConfigTier;
 use std::ffi::OsStr;
@@ -182,11 +180,9 @@ mod tests {
     }
 
     // ---- the security property: per-tier file trust ----
-    // Config is harness-independent — it comes from the FILES, identical for every
-    // harness binding a project, so there is nothing for one harness to inject or
-    // another to inherit. The only trust distinction is per-TIER: the user FILE is
-    // trusted (the user's own disk), the project FILE is untrusted (in-repo) and
-    // has its privileged fields dropped by the resolver.
+    // The active harness chooses only its matching override from each FILE tier.
+    // The user file remains trusted; the project file is untrusted and its
+    // privileged fields are dropped after that harness selection.
 
     const PRIVILEGED_DOC: &str = r#"{ "semantic": { "api_key_env": "SECRET_KEY" } }"#;
 

@@ -1,0 +1,11 @@
+{
+  "hoist_builtin_tools": false,
+  "harnesses": {
+    "opencode": {
+      "hoist_builtin_tools": true
+    },
+    "pi": {
+      "hoist_builtin_tools": false
+    }
+  }
+}

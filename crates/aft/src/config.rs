@@ -466,6 +466,9 @@ pub struct Config {
     /// Allow URL-fetch commands to access private network hosts.
     /// Default false; hosting plugins only forward this from user-level config.
     pub url_fetch_allow_private: bool,
+    /// Resolved host-tool registration preference. The Rust core retains this
+    /// value for cross-harness config parity; the hosting plugin owns registration.
+    pub hoist_builtin_tools: bool,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
     pub harness: Option<Harness>,
@@ -529,6 +532,7 @@ impl Default for Config {
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
             url_fetch_allow_private: false,
+            hoist_builtin_tools: true,
             harness: None,
             diagnostic_cache_size: 5000,
         }

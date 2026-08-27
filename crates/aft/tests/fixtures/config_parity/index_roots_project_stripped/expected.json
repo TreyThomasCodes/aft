@@ -2,6 +2,7 @@
   "experimental_bash_background": true,
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
+  "hoist_builtin_tools": true,
   "index": {
     "roots": [
       {

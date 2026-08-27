@@ -89,7 +89,7 @@ function buildSchema(): Record<string, unknown> {
     additionalProperties: false,
   };
 
-  return {
+  const schema: Record<string, unknown> = {
     $schema: "http://json-schema.org/draft-07/schema#",
     $id: SCHEMA_URL,
     title: "AFT Configuration",
@@ -687,6 +687,19 @@ function buildSchema(): Record<string, unknown> {
     },
     additionalProperties: false,
   };
+
+  const configProperties = schema.properties as Record<string, unknown>;
+  configProperties.harnesses = {
+    type: "object",
+    description:
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+    additionalProperties: {
+      type: "object",
+      properties: { ...configProperties },
+      additionalProperties: false,
+    },
+  };
+  return schema;
 }
 
 async function main() {

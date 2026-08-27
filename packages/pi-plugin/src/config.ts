@@ -17,6 +17,40 @@ import { z } from "zod";
 
 import { error, log, warn } from "./logger.js";
 
+const ACTIVE_HARNESS = "pi";
+
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeConfigForActiveHarness(value: unknown): unknown {
+  const config = stripHarnessSpecificConfigKeys(value, OPENCODE_ONLY_KEYS);
+  if (!isConfigRecord(config) || !isConfigRecord(config.harnesses)) return config;
+
+  const override = config.harnesses[ACTIVE_HARNESS];
+  return {
+    ...config,
+    // Other harnesses deliberately remain opaque to this plugin so future
+    // harness-specific settings never make an older Pi plugin reject the shared
+    // config file.
+    harnesses:
+      override === undefined
+        ? {}
+        : { [ACTIVE_HARNESS]: stripHarnessSpecificConfigKeys(override, OPENCODE_ONLY_KEYS) },
+  };
+}
+
+function warnIgnoredNestedHarnesses(rawConfig: Record<string, unknown>, configPath: string): void {
+  const override = isConfigRecord(rawConfig.harnesses)
+    ? rawConfig.harnesses[ACTIVE_HARNESS]
+    : undefined;
+  if (isConfigRecord(override) && Object.hasOwn(override, "harnesses")) {
+    warn(
+      `Ignoring nested harnesses in harnesses.${ACTIVE_HARNESS} from ${configPath}; harness overrides cannot recurse`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Config shape (mirrors aft-opencode's schema, simplified for Pi)
 // ---------------------------------------------------------------------------
@@ -285,6 +319,8 @@ export interface AftConfig {
   subc?: SubcConfig;
   gh_shim?: GhShimConfig;
   git?: GitConfig;
+  /** Per-harness config overrides; nested harnesses are ignored. */
+  harnesses?: Record<string, Omit<AftConfig, "harnesses">>;
 }
 
 /**
@@ -673,67 +709,83 @@ const BackupConfigSchema = z.object({
   max_file_size: z.number().int().positive().optional(),
 });
 
+const AftConfigFieldsSchema = z.object({
+  /**
+   * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
+   * runtime — only present so VS Code/Cursor/etc. pick up the published
+   * schema for autocomplete + validation. `aft setup` auto-inserts this.
+   */
+  $schema: z.string().optional(),
+  /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
+  enabled: z.boolean().optional(),
+  /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
+  edit_mode: z.enum(["default", "hashline"]).optional(),
+  /**
+   * Whether to auto-format files after edits. Default: false — formatting can
+   * reflow the file under the agent and stale the next edit's context. Opt in
+   * with `true` if you want AFT to format after edits.
+   */
+  format_on_edit: z.boolean().optional(),
+  formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
+  validate_on_edit: z.enum(["syntax", "full"]).optional(),
+  formatter: z.record(z.string(), FormatterEnum).optional(),
+  checker: z.record(z.string(), CheckerEnum).optional(),
+  configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
+  /**
+   * Replace Pi's native read/write/edit/grep/bash tools with AFT's
+   * implementations. Default: true. When false, AFT registers its
+   * equivalents under aft_ names and leaves Pi's native tools available.
+   */
+  hoist_builtin_tools: z.boolean().optional(),
+  tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
+  disabled_tools: z.array(z.string()).optional(),
+  restrict_to_project_root: z.boolean().optional(),
+  search_index: z.boolean().optional(),
+  /** User-configured filesystem roots for indexed search; project config cannot change them. */
+  index: IndexConfigSchema.optional(),
+  semantic_search: z.boolean().optional(),
+  callgraph_store: z.boolean().optional(),
+  callgraph_chunk_size: z.number().optional(),
+  inspect: InspectConfigSchema.optional(),
+  backup: BackupConfigSchema.optional(),
+  worktree: WorktreeConfigSchema.optional(),
+  sandbox: SandboxConfigSchema.optional(),
+  /**
+   * Bash tool family (hoist + rewrite + compress + background execution).
+   * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+   * Three shapes: `true`, `false`, or `{ rewrite?, compress?, background?, ... }`.
+   * Replaces `experimental.bash.*` (still accepted for backward compat).
+   */
+  bash: BashConfigSchema.optional(),
+  experimental: ExperimentalConfigSchema.optional(),
+  lsp: LspConfigSchema.optional(),
+  url_fetch_allow_private: z.boolean().optional(),
+  semantic: SemanticConfigSchema.optional(),
+  bridge: BridgeConfigSchema.optional(),
+  subc: SubcConfigSchema.optional(),
+  gh_shim: GhShimConfigSchema.optional(),
+  git: GitConfigSchema.optional(),
+});
+
+const HarnessOverrideSchema = z.preprocess((value) => {
+  if (!isConfigRecord(value) || !Object.hasOwn(value, "harnesses")) return value;
+  const { harnesses: _nestedHarnesses, ...override } = value;
+  return override;
+}, AftConfigFieldsSchema.strict());
+
 export const AftConfigSchema = z.preprocess(
-  (value) => stripHarnessSpecificConfigKeys(value, OPENCODE_ONLY_KEYS),
-  z
-    .object({
-      /**
-       * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
-       * runtime — only present so VS Code/Cursor/etc. pick up the published
-       * schema for autocomplete + validation. `aft setup` auto-inserts this.
-       */
-      $schema: z.string().optional(),
-      /** Master switch for AFT. Default true. Project config may set it because turning AFT off is not a privilege escalation. */
-      enabled: z.boolean().optional(),
-      /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
-      edit_mode: z.enum(["default", "hashline"]).optional(),
-      /**
-       * Whether to auto-format files after edits. Default: false — formatting can
-       * reflow the file under the agent and stale the next edit's context. Opt in
-       * with `true` if you want AFT to format after edits.
-       */
-      format_on_edit: z.boolean().optional(),
-      formatter_timeout_secs: z.number().int().min(1).max(600).optional(),
-      validate_on_edit: z.enum(["syntax", "full"]).optional(),
-      formatter: z.record(z.string(), FormatterEnum).optional(),
-      checker: z.record(z.string(), CheckerEnum).optional(),
-      configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
-      /**
-       * Replace Pi's native read/write/edit/grep/bash tools with AFT's
-       * implementations. Default: true. When false, AFT registers its
-       * equivalents under aft_ names and leaves Pi's native tools available.
-       */
-      hoist_builtin_tools: z.boolean().optional(),
-      tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
-      disabled_tools: z.array(z.string()).optional(),
-      restrict_to_project_root: z.boolean().optional(),
-      search_index: z.boolean().optional(),
-      index: IndexConfigSchema.optional(),
-      semantic_search: z.boolean().optional(),
-      callgraph_store: z.boolean().optional(),
-      callgraph_chunk_size: z.number().optional(),
-      inspect: InspectConfigSchema.optional(),
-      backup: BackupConfigSchema.optional(),
-      worktree: WorktreeConfigSchema.optional(),
-      sandbox: SandboxConfigSchema.optional(),
-      /**
-       * Bash tool family (hoist + rewrite + compress + background execution).
-       * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
-       * Three shapes: `true`, `false`, or `{ rewrite?, compress?, background?, ... }`.
-       * Replaces `experimental.bash.*` (still accepted for backward compat).
-       */
-      bash: BashConfigSchema.optional(),
-      experimental: ExperimentalConfigSchema.optional(),
-      lsp: LspConfigSchema.optional(),
-      url_fetch_allow_private: z.boolean().optional(),
-      semantic: SemanticConfigSchema.optional(),
-      bridge: BridgeConfigSchema.optional(),
-      subc: SubcConfigSchema.optional(),
-      gh_shim: GhShimConfigSchema.optional(),
-      git: GitConfigSchema.optional(),
-    })
-    .strict(),
+  normalizeConfigForActiveHarness,
+  AftConfigFieldsSchema.extend({
+    harnesses: z.record(z.string(), HarnessOverrideSchema).optional(),
+  }).strict(),
 );
+
+type AftConfigFields = z.infer<typeof AftConfigFieldsSchema>;
+
+function applyActiveHarnessOverride(config: AftConfig): AftConfig {
+  const { harnesses: _harnesses, ...base } = config;
+  return { ...base, ...config.harnesses?.[ACTIVE_HARNESS] } as AftConfigFields;
+}
 
 function normalizeLspExtension(extension: string): string {
   return extension.trim().replace(/^\.+/, "");
@@ -1156,16 +1208,17 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     // Validate against a symbol-free deep copy.
     const cleanConfig = stripJsoncSymbols(rawConfig);
     warnIgnoredHarnessSpecificConfigKeys(cleanConfig, configPath);
+    warnIgnoredNestedHarnesses(cleanConfig, configPath);
     const result = AftConfigSchema.safeParse(cleanConfig);
 
     if (result.success) {
       log(`Config loaded from ${configPath}`);
-      return result.data;
+      return applyActiveHarnessOverride(result.data);
     }
 
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
-    return parseConfigPartially(cleanConfig);
+    return applyActiveHarnessOverride(parseConfigPartially(cleanConfig));
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);

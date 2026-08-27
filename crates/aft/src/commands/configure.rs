@@ -1930,7 +1930,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(error) => return Response::error(&req.id, "invalid_request", error),
     };
     let config_diagnostics =
-        crate::config_resolve::resolve_config_onto_with_diagnostics(&tiers, &mut next_config);
+        crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
+            &tiers,
+            Some(&harness),
+            &mut next_config,
+        );
     let config_dropped_keys = config_diagnostics.dropped;
     let mut configure_warnings = config_diagnostics
         .warnings

@@ -2,16 +2,18 @@
   "experimental_bash_background": true,
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
+  "hashline_enabled": true,
   "hoist_builtin_tools": true,
-  "restrict_to_project_root": false,
+  "restrict_to_project_root": true,
   "sandbox": {
     "enabled": true,
-    "read_deny": [
-      "/tmp/aft-sandbox-user-secret",
-      "/tmp/aft-sandbox-project-secret"
-    ],
     "write_allow": [
-      "/tmp/aft-sandbox-write"
+      "/tmp/aft-user-write"
     ]
+  },
+  "semantic": {
+    "api_key_env": "USER_KEY",
+    "backend": "ollama",
+    "base_url": "http://localhost:11434"
   }
 }

@@ -25,11 +25,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::config_resolve::ConfigTier;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
 use crate::executor::{Executor, JobCancellation, Lane};
 use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
-use crate::jsonc::strip_jsonc;
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
 use crate::protocol::{ProgressKind, PushFrame, RawRequest, Response};
@@ -4185,17 +4183,10 @@ async fn handle_control_request(
                 consumer_elicitation_capable
             );
 
-            // Config is single-per-project, read by AFT directly from the
-            // CortexKit config files (user: ~/.config/cortexkit/aft.jsonc,
-            // project: <root>/.cortexkit/aft.jsonc). Wire-relayed config tiers are
-            // IGNORED entirely: a front (runner, mcp:*, or fed:*) cannot push config over
-            // the wire. This is what makes config harness-INDEPENDENT — every
-            // harness binding a project gets the identical on-disk config, so two
-            // trust domains sharing the per-root actor can never diverge or
-            // inherit each other's capabilities (the cross-bind escalation class).
-            // Wire-relayed config tiers (if the protocol still carries them) are
-            // ignored entirely; the per-tier trust boundary (user trusted, project
-            // privileged-dropped) is applied to the FILE tiers in handle_configure.
+            // Config is read directly from the CortexKit user and project files;
+            // wire-relayed tiers are ignored so a front cannot inject settings.
+            // The resolver selects only this bind's harness override before it
+            // applies the unchanged user/project trust boundary.
             let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
                 user_config_path,
                 Path::new(&bind_project_root),
@@ -4204,7 +4195,15 @@ async fn handle_control_request(
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
-            let diagnostics_on_edit = diagnostics_on_edit_from_tiers(&local_tiers);
+            // Let configure return its structured invalid-harness error rather
+            // than panicking while computing this optional registration setting.
+            let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
+            let diagnostics_on_edit = crate::config_resolve::resolve_config_for_harness(
+                &local_tiers,
+                active_harness.as_ref(),
+            )
+            .config
+            .diagnostics_on_edit;
             let configure_json = json!({
                 "id": request_id,
                 "command": "configure",
@@ -4380,26 +4379,6 @@ fn install_bash_compressor(ctx: &AppContext) {
             )
         },
     );
-}
-
-fn diagnostics_on_edit_from_tiers(tiers: &[ConfigTier]) -> bool {
-    let mut diagnostics_on_edit = false;
-    for tier in tiers {
-        if let Some(value) = diagnostics_on_edit_from_doc(&tier.doc) {
-            diagnostics_on_edit = value;
-        }
-    }
-    diagnostics_on_edit
-}
-
-fn diagnostics_on_edit_from_doc(doc: &str) -> Option<bool> {
-    let stripped = strip_jsonc(doc);
-    let value = serde_json::from_str::<Value>(&stripped).ok()?;
-    value
-        .get("lsp")
-        .and_then(Value::as_object)?
-        .get("diagnostics_on_edit")
-        .and_then(Value::as_bool)
 }
 
 async fn send_route_bind_error(

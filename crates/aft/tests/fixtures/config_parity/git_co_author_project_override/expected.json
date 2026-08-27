@@ -5,5 +5,6 @@
   "git": {
     "co_author": "AFT Pair <pair@example.test>"
   },
+  "hoist_builtin_tools": true,
   "restrict_to_project_root": false
 }

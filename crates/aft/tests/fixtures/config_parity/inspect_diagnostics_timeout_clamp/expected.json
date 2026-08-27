@@ -2,6 +2,7 @@
   "experimental_bash_background": true,
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
+  "hoist_builtin_tools": true,
   "inspect": {
     "diagnostics_timeout_ms": 600000
   },

@@ -3,6 +3,7 @@
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
   "format_on_edit": false,
+  "hoist_builtin_tools": true,
   "restrict_to_project_root": false,
   "search_index": true
 }
