@@ -253,6 +253,45 @@ describe("npmInvocation", () => {
     expect(signals).toEqual([undefined, "SIGKILL"]);
   });
 
+  it("does not invoke taskkill for an already-successful cmd shim", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: 0 },
+      signalCode: { value: null },
+    });
+
+    await expect(
+      terminateNpmProcessTree(
+        child,
+        { command: "cmd.exe", args: [], windowsCmdShim: true },
+        { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+        10,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accepts a successful cmd exit racing taskkill startup failure", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+    });
+
+    const termination = terminateNpmProcessTree(
+      child,
+      { command: "cmd.exe", args: [], windowsCmdShim: true },
+      { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+      100,
+    );
+    exitCode = 0;
+    child.emit("exit", 0, null);
+
+    await expect(termination).resolves.toBeUndefined();
+  });
+
   it("fails closed when taskkill cannot start", async () => {
     const child = new EventEmitter() as ChildProcess;
     const signals: Array<NodeJS.Signals | undefined> = [];
@@ -274,7 +313,7 @@ describe("npmInvocation", () => {
         child,
         { command: "cmd.exe", args: [], windowsCmdShim: true },
         { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
-        1_000,
+        10,
       );
     } catch (error) {
       caught = error;

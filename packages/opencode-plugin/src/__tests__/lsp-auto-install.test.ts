@@ -302,7 +302,7 @@ describe("runAutoInstall", () => {
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
     expect(source).toContain("quarantining retries for this session");
     expect(source).toContain("quarantinedNpmInstalls.has(spec.npm)");
-    expect(source).toContain("retainInstallLock(spec.npm)");
+    expect(source).toContain("installLock.retain()");
     expect(source).toContain("finish(false)");
     expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing

@@ -50,13 +50,13 @@ import {
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
+  type InstallLockLease,
   isInstalled,
   lspBinaryPath,
   lspBinDir,
   lspPackageDir,
   readInstalledMeta,
   readVersionCheck,
-  retainInstallLock,
   shouldRecheckVersion,
   withInstallLock,
   writeInstalledMeta,
@@ -291,6 +291,7 @@ function runInstall(
   spec: NpmServerSpec,
   version: string,
   cwd: string,
+  installLock: InstallLockLease,
   signal?: AbortSignal,
 ): Promise<boolean> {
   return new Promise((resolve) => {
@@ -354,7 +355,7 @@ function runInstall(
         terminationPromise ??= terminateNpmProcessTree(child, invocation);
         void terminationPromise.catch((terminationError) => {
           quarantinedNpmInstalls.add(spec.npm);
-          retainInstallLock(spec.npm);
+          installLock.retain();
           error(
             `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
           );
@@ -428,7 +429,7 @@ async function ensureServerInstalled(
   // which awaits the install — but the OUTER call site in index.ts uses
   // .catch on the whole runAutoInstall promise, so the plugin doesn't block
   // on it. The lock is still released when each install actually finishes.
-  const outcome = await withInstallLock(spec.npm, async () => {
+  const outcome = await withInstallLock(spec.npm, async (installLock) => {
     const { version, probe } = await resolveTargetVersion(spec, config, fetchImpl);
 
     // Grace blocked + nothing installed = skip with warning.
@@ -492,7 +493,13 @@ async function ensureServerInstalled(
     // Run the install AND wait for completion before releasing the lock.
     // Errors are logged but we still return { started: true } so the caller
     // counts the attempt. The next session will retry if installation failed.
-    const ok = await runInstall(spec, version, cachedPackageDir(spec.npm), signal).catch((err) => {
+    const ok = await runInstall(
+      spec,
+      version,
+      cachedPackageDir(spec.npm),
+      installLock,
+      signal,
+    ).catch((err) => {
       error(`[lsp] background install ${spec.npm} crashed: ${err}`);
       return false;
     });

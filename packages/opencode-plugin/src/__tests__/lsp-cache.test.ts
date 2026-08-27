@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,8 +22,6 @@ import {
   lspCacheRoot,
   lspPackageDir,
   readVersionCheck,
-  releaseInstallLock,
-  retainInstallLock,
   shouldRecheckVersion,
   withInstallLock,
   writeVersionCheck,
@@ -122,41 +121,55 @@ describe("lsp-cache layout", () => {
 
 describe("install lock", () => {
   test("first acquire succeeds, second fails while held", () => {
-    expect(acquireInstallLock("pkg-a")).toBe(true);
-    expect(acquireInstallLock("pkg-a")).toBe(false);
-    releaseInstallLock("pkg-a");
+    const lease = acquireInstallLock("pkg-a");
+    expect(lease).not.toBeNull();
+    expect(acquireInstallLock("pkg-a")).toBeNull();
+    lease?.release();
   });
 
   test("after release, acquire succeeds again", () => {
-    acquireInstallLock("pkg-b");
-    releaseInstallLock("pkg-b");
-    expect(acquireInstallLock("pkg-b")).toBe(true);
-    releaseInstallLock("pkg-b");
-  });
-
-  test("releaseInstallLock on a non-existent lock is safe", () => {
-    expect(() => releaseInstallLock("never-acquired")).not.toThrow();
+    acquireInstallLock("pkg-b")?.release();
+    const lease = acquireInstallLock("pkg-b");
+    expect(lease).not.toBeNull();
+    lease?.release();
   });
 
   test("retains the cross-process lock until stale recovery when requested", async () => {
     expect(
-      await withInstallLock("pkg-retained", async () => {
-        retainInstallLock("pkg-retained");
+      await withInstallLock("pkg-retained", async (lease) => {
+        lease.retain();
         return true;
       }),
     ).toBe(true);
 
     const lockFile = join(lspPackageDir("pkg-retained"), ".aft-installing");
     expect(existsSync(lockFile)).toBe(true);
-    expect(acquireInstallLock("pkg-retained")).toBe(false);
+    expect(acquireInstallLock("pkg-retained")).toBeNull();
     unlinkSync(lockFile);
   });
 
   test("locks for different packages are independent", () => {
-    expect(acquireInstallLock("pkg-c")).toBe(true);
-    expect(acquireInstallLock("pkg-d")).toBe(true);
-    releaseInstallLock("pkg-c");
-    releaseInstallLock("pkg-d");
+    const first = acquireInstallLock("pkg-c");
+    const second = acquireInstallLock("pkg-d");
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    first?.release();
+    second?.release();
+  });
+
+  test("an older same-process lease cannot release a reclaimed generation", () => {
+    const first = acquireInstallLock("pkg-generation");
+    expect(first).not.toBeNull();
+    const lockFile = join(lspPackageDir("pkg-generation"), ".aft-installing");
+    const stale = new Date(Date.now() - 31 * 60 * 1000);
+    utimesSync(lockFile, stale, stale);
+
+    const second = acquireInstallLock("pkg-generation");
+    expect(second).not.toBeNull();
+    first?.release();
+    expect(existsSync(lockFile)).toBe(true);
+    second?.release();
+    expect(existsSync(lockFile)).toBe(false);
   });
 
   // TOCTOU defense — a process must not delete another
@@ -165,15 +178,15 @@ describe("install lock", () => {
   // and A then runs releaseInstallLock in its finally block.
   test("releaseInstallLock leaves a lock owned by a different PID intact", () => {
     // Acquire as ourselves.
-    acquireInstallLock("pkg-toctou");
+    const lease = acquireInstallLock("pkg-toctou");
     const lockFile = join(lspPackageDir("pkg-toctou"), ".aft-installing");
 
     // Simulate "another process owns this lock" by overwriting the PID.
     const otherPid = process.pid + 99999;
-    writeFileSync(lockFile, `${otherPid}\n${new Date().toISOString()}\n`);
+    writeFileSync(lockFile, `${otherPid}\n${new Date().toISOString()}\nother-token\n`);
 
     // We must NOT delete it.
-    releaseInstallLock("pkg-toctou");
+    lease?.release();
     expect(existsSync(lockFile)).toBe(true);
     const raw = readFileSync(lockFile, "utf8");
     expect(raw.startsWith(String(otherPid))).toBe(true);
@@ -242,8 +255,8 @@ describe("version-check record", () => {
 describe("cache directory creation", () => {
   test("acquireInstallLock creates the package dir if missing", () => {
     expect(existsSync(lspPackageDir("created-by-lock"))).toBe(false);
-    acquireInstallLock("created-by-lock");
+    const lease = acquireInstallLock("created-by-lock");
     expect(existsSync(lspPackageDir("created-by-lock"))).toBe(true);
-    releaseInstallLock("created-by-lock");
+    lease?.release();
   });
 });

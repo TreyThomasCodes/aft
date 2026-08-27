@@ -297,6 +297,11 @@ export function terminateNpmProcessTree(
   gracePeriodMs = 5_000,
 ): Promise<void> {
   if (!invocation.windowsCmdShim) return terminateDirectNpmChild(child, gracePeriodMs);
+  const exitedSuccessfully = () => child.exitCode === 0 && child.signalCode === null;
+  // A shim that completed successfully before cancellation won the race: cmd.exe
+  // waited for npm.cmd, which waited for node, so there is no live tree to kill.
+  // Do not generalize this to nonzero or signal exits; those remain unknown.
+  if (exitedSuccessfully()) return Promise.resolve();
   if (child.pid === undefined) {
     return Promise.reject(new NpmTerminationUnknownError("cmd.exe child has no process ID"));
   }
@@ -305,6 +310,7 @@ export function terminateNpmProcessTree(
     let settled = false;
     let childExited = child.exitCode !== null || child.signalCode !== null;
     let treeKillConfirmed = false;
+    let treeKillFailure: string | null = null;
     let killer: ChildProcess | null = null;
     const timeout = setTimeout(() => {
       try {
@@ -312,7 +318,7 @@ export function terminateNpmProcessTree(
       } catch {
         // The taskkill process may already have exited.
       }
-      fail(`taskkill.exe did not finish within ${gracePeriodMs}ms`);
+      fail(treeKillFailure ?? `taskkill.exe did not finish within ${gracePeriodMs}ms`);
     }, gracePeriodMs);
     const cleanup = () => {
       clearTimeout(timeout);
@@ -332,8 +338,29 @@ export function terminateNpmProcessTree(
     };
     function onChildExit() {
       childExited = true;
+      if (treeKillFailure !== null) {
+        if (exitedSuccessfully()) {
+          settled = true;
+          cleanup();
+          resolve();
+        } else {
+          fail(treeKillFailure);
+        }
+        return;
+      }
       succeedIfConfirmed();
     }
+    const recordTreeKillFailure = (detail: string) => {
+      if (settled) return;
+      if (exitedSuccessfully()) {
+        settled = true;
+        cleanup();
+        resolve();
+        return;
+      }
+      treeKillFailure = detail;
+      if (childExited) fail(detail);
+    };
 
     child.once("exit", onChildExit);
     const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
@@ -343,17 +370,19 @@ export function terminateNpmProcessTree(
         stdio: "ignore",
         windowsHide: true,
       });
-      killer.once("error", (error) => fail(`taskkill.exe failed to start: ${String(error)}`));
+      killer.once("error", (error) =>
+        recordTreeKillFailure(`taskkill.exe failed to start: ${String(error)}`),
+      );
       killer.once("exit", (code) => {
         if (code !== 0) {
-          fail(`taskkill.exe exited with code ${code ?? "unknown"}`);
+          recordTreeKillFailure(`taskkill.exe exited with code ${code ?? "unknown"}`);
           return;
         }
         treeKillConfirmed = true;
         succeedIfConfirmed();
       });
     } catch (error) {
-      fail(`taskkill.exe failed to start: ${String(error)}`);
+      recordTreeKillFailure(`taskkill.exe failed to start: ${String(error)}`);
     }
   });
 }
