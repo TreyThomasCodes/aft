@@ -44,6 +44,7 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
+const V10_ADMIN_TUPLES: &[&str] = &["workflow run"];
 const READ_ONLY_ACTION_TUPLES: &[&str] = &[
     "run view",
     "run list",
@@ -1993,7 +1994,9 @@ enum Classification {
 }
 
 fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
-    V1_ADMIN_TUPLES.contains(&tuple) || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
+    V1_ADMIN_TUPLES.contains(&tuple)
+        || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
 }
 
 fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
@@ -3262,6 +3265,11 @@ mod tests {
             .expect("v9 manifest fixture")
     }
 
+    fn v10_fixture_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v10-manifest.json"))
+            .expect("v10 manifest fixture")
+    }
+
     fn signed_with(
         manifest: &Manifest,
         fetched_at_unix_secs: u64,
@@ -3628,6 +3636,48 @@ mod tests {
             classify(&get_control, &manifest, "macos"),
             Classification::Mechanical
         ));
+    }
+
+    #[test]
+    fn v10_workflow_run_admin_tuple_is_version_gated_and_raw_dispatch_stays_unclassified() {
+        let manifest = v10_fixture_manifest();
+        assert_eq!(manifest.manifest_version, 10);
+        manifest.validate().expect("valid v10 manifest");
+
+        let workflow_run = [
+            OsString::from("workflow"),
+            OsString::from("run"),
+            OsString::from("ci.yml"),
+            OsString::from("--ref"),
+            OsString::from("main"),
+        ];
+        assert!(matches!(
+            classify(&workflow_run, &manifest, "macos"),
+            Classification::Admin { tuple } if tuple == "workflow run"
+        ));
+
+        // Keep the v10 declaration fields but set its manifest version to 9,
+        // verifying that the classifier rejects v10-only declarations when the
+        // manifest version is unsupported.
+        let mut v9_manifest = manifest.clone();
+        v9_manifest.manifest_version = 9;
+        assert!(matches!(
+            classify(&workflow_run, &v9_manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        let raw_api_dispatch = [
+            OsString::from("api"),
+            OsString::from("-X"),
+            OsString::from("POST"),
+            OsString::from("repos/cortexkit/aft/actions/workflows/ci.yml/dispatches"),
+        ];
+        for manifest in [&manifest, &v9_manifest] {
+            assert!(matches!(
+                classify(&raw_api_dispatch, manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
     }
 
     #[test]
