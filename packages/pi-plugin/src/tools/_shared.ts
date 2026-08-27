@@ -187,8 +187,31 @@ export async function callToolCall(
   extCtx?: ExtensionContext,
   options?: ToolCallOptions,
 ): Promise<ToolCallResult> {
+  return callToolCallForSession(
+    bridge,
+    name,
+    rawArgs,
+    extCtx ? resolveSessionId(extCtx) : undefined,
+    extCtx,
+    options,
+  );
+}
+
+/**
+ * Dispatch one bridge call with a session identity captured by the surrounding
+ * logical tool operation. Multi-stage operations must not resolve Pi's mutable
+ * session manager again after an await, because another active session can
+ * become current between preflight, preview, and apply.
+ */
+export async function callToolCallForSession(
+  bridge: AftProjectTransport,
+  name: string,
+  rawArgs: Record<string, unknown>,
+  sessionId: string | undefined,
+  extCtx?: ExtensionContext,
+  options?: ToolCallOptions,
+): Promise<ToolCallResult> {
   const timeoutMs = timeoutForCommand(name);
-  const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: extCtx,

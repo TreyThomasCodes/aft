@@ -1393,6 +1393,97 @@ mod tests {
     }
 
     #[test]
+    fn failed_transaction_preserves_baseline_for_reread_then_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("after-failure.py");
+        let original = (1..=130)
+            .map(|line| format!("line_{line} = {line}\n"))
+            .collect::<String>();
+        write_file(&path, original.as_bytes());
+
+        let mut snapshots = SnapshotStore::new();
+        let publication = capture_taggable_read(
+            &mut snapshots,
+            &path,
+            "after-failure.py",
+            ReadSelection::WholeFile,
+        )
+        .unwrap();
+        let ReadPublication::Tagged { snapshot, .. } = publication else {
+            panic!("fixture read must publish a tagged snapshot");
+        };
+        let tag = snapshot.tag.clone();
+        let baseline = Baseline::from_bytes(original.as_bytes().to_vec());
+        let operations = vec![put_text("16", &["line_16 = 160"])];
+        let resolved = vec![resolve_one(&snapshot, &operations[0])];
+        let sections = [section_put(
+            &path,
+            "after-failure.py",
+            &baseline,
+            &snapshot,
+            &operations,
+            &resolved,
+        )];
+        let mut backups = backup_store(&temp.path().join("backups"));
+        let mut registers = RegisterStore::new();
+        let plan = plan_transaction(&sections, &registers, true).unwrap();
+        let failed = {
+            let mut execution = ctx(
+                &mut backups,
+                &mut snapshots,
+                &mut registers,
+                true,
+                Some(ExecuteFault::Write { step: 0 }),
+            );
+            execute_transaction(plan, &mut execution)
+        };
+        assert!(!failed.success);
+        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        assert!(snapshots
+            .lookup(&path, &tag)
+            .expect("failed apply must preserve the baseline snapshot")
+            .is_seen(16));
+
+        let reread = capture_taggable_read(
+            &mut snapshots,
+            &path,
+            "after-failure.py",
+            ReadSelection::WholeFile,
+        )
+        .unwrap();
+        let ReadPublication::Tagged {
+            snapshot: reread_snapshot,
+            ..
+        } = reread
+        else {
+            panic!("reread must publish a tagged snapshot");
+        };
+        assert_eq!(reread_snapshot.tag, tag);
+        let next_baseline = Baseline::from_bytes(original.as_bytes().to_vec());
+        let next_operations = vec![put_text("16", &["line_16 = 160"])];
+        let next_resolved = vec![resolve_one(&reread_snapshot, &next_operations[0])];
+        let next_sections = [section_put(
+            &path,
+            "after-failure.py",
+            &next_baseline,
+            &reread_snapshot,
+            &next_operations,
+            &next_resolved,
+        )];
+        let next_plan = plan_transaction(&next_sections, &registers, true).unwrap();
+        let applied = {
+            let mut execution = ctx(&mut backups, &mut snapshots, &mut registers, true, None);
+            execute_transaction(next_plan, &mut execution)
+        };
+        assert!(applied.success);
+        assert!(applied.complete);
+        assert_eq!(
+            fs::read_to_string(path).unwrap().lines().nth(15),
+            Some("line_16 = 160")
+        );
+    }
+
+    #[test]
     fn two_ranged_reads_of_one_version_then_put_applies() {
         let bytes = put_after_reads([ReadSelection::range(1, 2), ReadSelection::range(3, 4)])
             .expect("same-version ranged reads must resolve");

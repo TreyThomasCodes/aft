@@ -140,9 +140,10 @@ describe("hoisted tool adapters", () => {
     expect(calls[0].params.name).toBe("edit");
   });
 
-  test("hashline edit exposes patch and runs preflight, preview, then apply", async () => {
+  test("hashline edit pins one session across preflight, preview, and apply", async () => {
     const root = await tempRoot();
     let editCalls = 0;
+    let sessionReads = 0;
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((command) => {
       if (command === "hashline_preflight") {
@@ -199,10 +200,18 @@ describe("hoisted tool adapters", () => {
     ]) {
       expect(description).toContain(fragment);
     }
+    const extCtx = makeExtContext(root, "hashline-session");
+    const mutableSession = extCtx as unknown as {
+      sessionManager: { getSessionId: () => string };
+    };
+    mutableSession.sessionManager.getSessionId = () => {
+      sessionReads += 1;
+      return sessionReads === 1 ? "hashline-session" : "concurrent-session";
+    };
     const result = (await executeTool(
       tools.get("edit")!,
       { patch: "*** Begin Patch\n[src.ts#ABCD]\nPUT 1:\n+after\n*** End Patch" },
-      makeExtContext(root, "hashline-session"),
+      extCtx,
     )) as { content: Array<{ text: string }> };
 
     expect(calls.map((call) => [call.params.name, call.params.preview === true])).toEqual([
@@ -210,6 +219,12 @@ describe("hoisted tool adapters", () => {
       ["edit", true],
       ["edit", false],
     ]);
+    expect(calls.map((call) => call.params.session_id)).toEqual([
+      "hashline-session",
+      "hashline-session",
+      "hashline-session",
+    ]);
+    expect(sessionReads).toBe(1);
     expect(result.content[0].text).toContain("1 of 1 files applied");
   });
 

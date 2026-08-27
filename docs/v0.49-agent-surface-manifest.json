@@ -119,8 +119,8 @@
       ],
       "source_commit": "033b5f623b45fa6b72ee4c6a6796923d25f0649a",
       "encoding": "UTF-8",
-      "byte_length": 46169,
-      "sha256": "729c5b3e797d0e3d1ffbf6cb91dd2a437fc968494f06a512285c0b54e6336874"
+      "byte_length": 46410,
+      "sha256": "3ac0d49cd6e3130f8f40dbd31da8b92f0662e2a56d56323dc5c3fd269a2b3bcd"
     },
     {
       "id": "ART-V049-PI-READING-001-BYTES",
@@ -316,7 +316,7 @@
       "source_commit": "033b5f623b45fa6b72ee4c6a6796923d25f0649a",
       "encoding": "UTF-8",
       "byte_length": 223621,
-      "sha256": "aa73d824cebd28cabb9521042c8c8402df6e8977557b7a9b9bfbe6f4e459f145"
+      "sha256": "f4fc65bc09259540af3576a61a39e832c8e37cdcfe1f370e8f833c06f58566a4"
     },
     {
       "id": "ART-V049-S5-AUDIT-IMPLEMENTATION-001",

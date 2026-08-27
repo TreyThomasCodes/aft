@@ -262,7 +262,7 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
         (
             HashlineRejectionCode::UnknownTag | HashlineRejectionCode::EvictedTag,
             RejectionStage::Resolution,
-        ) => "re-read the current tagged content before editing",
+        ) => "re-read the file to mint a fresh tag, then retry the edit",
         (HashlineRejectionCode::AmbiguousTag, RejectionStage::Resolution) => {
             "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
         }
@@ -276,7 +276,7 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
             "re-address the current tagged content; the stale span no longer occurs verbatim"
         }
         (HashlineRejectionCode::UnseenLine | HashlineRejectionCode::BoundaryIneligible, _) => {
-            "read the addressed rows and their boundary context with the tagged read surface"
+            "re-read the file to mint a fresh tag that includes every addressed row and boundary, then retry the edit"
         }
         (HashlineRejectionCode::UntaggablePath, _) => {
             "choose a writable regular text file or use an available non-hashline surface"
@@ -290,7 +290,7 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
         (HashlineRejectionCode::ParseError, _) => {
             "submit only a hashline patch with tagged section headers and valid operations"
         }
-        _ => "re-read the current tagged content before editing",
+        _ => "re-read the file to mint a fresh tag, then retry the edit",
     }
 }
 
@@ -551,8 +551,9 @@ pub fn parse_hashline_patch(patch: &str) -> Result<Patch, HashlineRejection> {
                     source: PutSource::Text(_),
                     ..
                 }) => format!(
-                    "text PUT body rows must begin with `+` (`+` alone is a blank row); \
-                     unexpected content at line {line_number}"
+                    "invalid text PUT body row at patch line {line_number}; \
+                     expected `+<text>` for content or bare `+` for a blank row, \
+                     but the row does not begin with `+`"
                 ),
                 _ => format!(
                     "only `PUT <address>:` accepts body rows beginning with `+`; \
@@ -593,7 +594,8 @@ pub fn parse_hashline_patch(patch: &str) -> Result<Patch, HashlineRejection> {
             {
                 if lines.is_empty() {
                     return Err(HashlineRejection::parse(format!(
-                        "PUT at line {line} requires one or more + body rows"
+                        "PUT at patch line {line} requires one or more body rows; \
+                         expected `+<text>` for content or bare `+` for a blank row"
                     )));
                 }
             }
@@ -1453,6 +1455,43 @@ mod tests {
     }
 
     #[test]
+    fn text_put_body_rows_match_pinned_oracle_edges() {
+        for patch in [
+            "[a.py#CAFE]\nPUT 1:\n+",
+            "[a.py#CAFE]\nPUT 1:\n+\n",
+            "[a.py#CAFE]\r\nPUT 1:\r\n+\r\n++leading-plus\r\n+tail\r\n",
+        ] {
+            let parsed = parse_hashline_patch(patch).expect("pinned PUT body edge must parse");
+            let Operation::Put(PutOperation {
+                source: PutSource::Text(lines),
+                ..
+            }) = &parsed.sections[0].operations[0]
+            else {
+                panic!("expected text PUT");
+            };
+            assert_eq!(lines.first().map(String::as_str), Some(""));
+            if lines.len() > 1 {
+                assert_eq!(
+                    lines,
+                    &["".to_string(), "+leading-plus".into(), "tail".into()]
+                );
+            }
+        }
+
+        for patch in [
+            "[a.py#CAFE]\nPUT 1:\n",
+            "[a.py#CAFE]\nPUT 1:\n+content\n\nCUT 2",
+            "[a.py#CAFE]\r\nPUT 1:\r\ncontent\r\n",
+        ] {
+            let rejection = parse_hashline_patch(patch).expect_err("unmarked body row must fail");
+            assert_eq!(rejection.code, HashlineRejectionCode::ParseError);
+            assert!(rejection.message.contains("expected `+<text>`"));
+            assert!(rejection.message.contains("bare `+`"));
+            assert!(rejection.message.contains("patch line"));
+        }
+    }
+
+    #[test]
     fn parser_rejects_noncanonical_file_operations() {
         assert!(parse_hashline_patch("[a.rs#CAFE]\nREM 1").is_err());
         assert!(parse_hashline_patch("[a.rs#CAFE]\nMV 1 -> b.rs").is_err());
@@ -1553,6 +1592,27 @@ mod tests {
                 .expect_err("partial read cannot authorize whole-file deletion");
         assert_eq!(rejection.code, HashlineRejectionCode::UnseenLine);
         assert_eq!(rejection.stage, RejectionStage::Eligibility);
+    }
+
+    #[test]
+    fn unseen_line_rejection_names_fresh_tag_remedy() {
+        let contents = (1..=130)
+            .map(|line| format!("line_{line} = {line}\n"))
+            .collect::<String>();
+        let retained = snapshot(contents.as_bytes(), [1, 2]);
+        let address = resolve_address(&parse_address("16").unwrap(), &retained).unwrap();
+        let rejection =
+            check_eligibility(&retained, address).expect_err("line 16 was not retained");
+
+        assert_eq!(rejection.code, HashlineRejectionCode::UnseenLine);
+        assert_eq!(
+            rejection.message,
+            "line 16 was not retained by the tagged read"
+        );
+        assert_eq!(
+            rejection.steering,
+            "re-read the file to mint a fresh tag that includes every addressed row and boundary, then retry the edit"
+        );
     }
 
     #[test]

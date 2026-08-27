@@ -267,14 +267,23 @@ mod tests {
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
     use crate::hashline::integration::RegistrationRequest;
+    use crate::hashline::snapshot::{MAX_SNAPSHOT_PATHS, MAX_VERSIONS_PER_PATH};
     use crate::protocol::{RawRequest, DEFAULT_SESSION_ID};
 
     fn request(command: &str, params: Value) -> RawRequest {
+        request_in_session(command, params, None)
+    }
+
+    fn request_in_session(
+        command: &str,
+        params: Value,
+        session_id: impl Into<Option<String>>,
+    ) -> RawRequest {
         RawRequest {
             id: format!("hashline-{command}-test"),
             command: command.to_string(),
             lsp_hints: None,
-            session_id: None,
+            session_id: session_id.into(),
             params,
         }
     }
@@ -358,6 +367,120 @@ mod tests {
         assert_eq!(
             ctx.backup().lock().history(DEFAULT_SESSION_ID, &path).len(),
             1
+        );
+    }
+
+    #[test]
+    fn two_session_residency_churn_cannot_evict_another_sessions_fresh_baseline() {
+        const SESSION_A: &str = "session-a";
+        const SESSION_B: &str = "session-b";
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let primary = root.join("primary.py");
+        let primary_contents = (1..=130)
+            .map(|line| format!("line_{line} = {line}\n"))
+            .collect::<String>();
+        std::fs::write(&primary, &primary_contents).expect("primary fixture");
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        for session in [SESSION_A, SESSION_B] {
+            let registration = ctx.hashline_bindings().register(
+                &root,
+                session,
+                RegistrationRequest {
+                    configured_enabled: true,
+                    edit_slot_survives: true,
+                },
+            );
+            assert!(registration.effective);
+        }
+
+        let mut primary_read = request_in_session(
+            "read",
+            json!({ "file": primary.clone() }),
+            Some(SESSION_A.to_string()),
+        );
+        primary_read.params["_hashline_requested_path"] = Value::String("primary.py".into());
+        let primary_response = crate::commands::read::handle_read(&primary_read, &ctx);
+        let primary_tag = primary_response.data["hashline_tag"]
+            .as_str()
+            .expect("session A tagged read")
+            .to_string();
+        assert!(primary_response.data["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("16:line_16 = 16")));
+
+        for index in 0..=MAX_SNAPSHOT_PATHS {
+            let b_path = root.join(format!("b-{index}.py"));
+            std::fs::write(&b_path, format!("b_{index} = {index}\n")).expect("B fixture");
+            let b_read = request_in_session(
+                "read",
+                json!({ "file": b_path }),
+                Some(SESSION_B.to_string()),
+            );
+            assert!(crate::commands::read::handle_read(&b_read, &ctx).success);
+
+            if index < MAX_SNAPSHOT_PATHS - 1 {
+                let a_path = root.join(format!("a-{index}.py"));
+                std::fs::write(&a_path, format!("a_{index} = {index}\n")).expect("A fixture");
+                let a_read = request_in_session(
+                    "read",
+                    json!({ "file": a_path }),
+                    Some(SESSION_A.to_string()),
+                );
+                assert!(crate::commands::read::handle_read(&a_read, &ctx).success);
+            }
+        }
+
+        let churn_path = root.join("b-churn.py");
+        for version in 0..=MAX_VERSIONS_PER_PATH {
+            std::fs::write(&churn_path, format!("version = {version}\n")).expect("version fixture");
+            let churn_read = request_in_session(
+                "read",
+                json!({ "file": churn_path }),
+                Some(SESSION_B.to_string()),
+            );
+            assert!(crate::commands::read::handle_read(&churn_read, &ctx).success);
+        }
+
+        let a = ctx
+            .hashline_bindings()
+            .peek(&root, SESSION_A)
+            .expect("session A binding");
+        a.with_binding(|binding| {
+            assert_eq!(binding.snapshots().path_count(), MAX_SNAPSHOT_PATHS);
+            assert!(binding.snapshots().contains(&primary, &primary_tag));
+        });
+        let b = ctx
+            .hashline_bindings()
+            .peek(&root, SESSION_B)
+            .expect("session B binding");
+        b.with_binding(|binding| {
+            assert_eq!(binding.snapshots().path_count(), MAX_SNAPSHOT_PATHS);
+        });
+
+        let patch = format!("[primary.py#{primary_tag}]\nPUT 16:\n+line_16 = 160");
+        let response = handle_edit(
+            &request_in_session(
+                "hashline_edit",
+                json!({ "patch": patch }),
+                Some(SESSION_A.to_string()),
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+        assert_eq!(
+            std::fs::read_to_string(primary)
+                .expect("edited primary")
+                .lines()
+                .nth(15),
+            Some("line_16 = 160")
         );
     }
 

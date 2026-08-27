@@ -38,9 +38,11 @@ import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
   callToolCall,
+  callToolCallForSession,
   coerceOptionalInt,
   contentResult,
   optionalInt,
+  resolveSessionId,
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
@@ -665,8 +667,15 @@ export function registerHoistedTools(
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
+        const sessionId = resolveSessionId(extCtx);
         const rawArgs = { patch: params.patch };
-        const preflight = await callToolCall(bridge, "hashline_preflight", rawArgs, extCtx);
+        const preflight = await callToolCallForSession(
+          bridge,
+          "hashline_preflight",
+          rawArgs,
+          sessionId,
+          extCtx,
+        );
         if (preflight.success === false) throw toolErrorFromResponse("edit", preflight);
         for (const target of [
           ...stringList(preflight.affected_paths),
@@ -680,9 +689,11 @@ export function registerHoistedTools(
             },
           );
         }
-        const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
+        const preview = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx, {
+          preview: true,
+        });
         if (preview.success === false) throw toolErrorFromResponse("edit", preview);
-        const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+        const response = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx);
         if (response.success === false) throw toolErrorFromResponse("edit", response);
         return buildMutationResult(response);
       },

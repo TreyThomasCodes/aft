@@ -324,7 +324,7 @@ struct EvictionHistoryEntry {
 struct StoredSnapshot {
     snapshot: Snapshot,
     normalized_bytes: Vec<u8>,
-    inserted_at: u64,
+    published_at: u64,
     last_used: u64,
 }
 
@@ -389,7 +389,7 @@ impl SnapshotLookupError {
                 "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
             }
             Self::UnknownTag | Self::EvictedTag => {
-                "re-read the current tagged content before editing"
+                "re-read the file to mint a fresh tag, then retry the edit"
             }
         }
     }
@@ -520,6 +520,10 @@ impl SnapshotStore {
                 .get_mut(&path)
                 .expect("coalesced snapshot path remains resident")[index];
             version.snapshot = merged;
+            // A same-content re-read is a fresh retention claim. Refresh both
+            // clocks so the per-path version cap cannot evict the newly exposed
+            // tag using the age of the partial snapshot it coalesced into.
+            version.published_at = now;
             version.last_used = now;
             let merged_bytes = version.residency_bytes();
             self.total_bytes = self
@@ -552,7 +556,7 @@ impl SnapshotStore {
                 if let Some(index) = versions
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, version)| (version.inserted_at, version.last_used))
+                    .min_by_key(|(_, version)| (version.published_at, version.last_used))
                     .map(|(index, _)| index)
                 {
                     evicted.push(self.remove_version_for_eviction(&path, index));
@@ -571,7 +575,7 @@ impl SnapshotStore {
             .push(StoredSnapshot {
                 snapshot: published_snapshot.clone(),
                 normalized_bytes,
-                inserted_at: now,
+                published_at: now,
                 last_used: now,
             });
 
@@ -755,7 +759,7 @@ impl SnapshotStore {
                     .unwrap_or(0);
                 let inserted = versions
                     .iter()
-                    .map(|version| version.inserted_at)
+                    .map(|version| version.published_at)
                     .min()
                     .unwrap_or(0);
                 (last_used, inserted, path)
@@ -776,7 +780,7 @@ impl SnapshotStore {
                 versions.iter().enumerate().map(move |(index, version)| {
                     (
                         version.last_used,
-                        version.inserted_at,
+                        version.published_at,
                         path.clone(),
                         index,
                         fold_tag(&version.snapshot.tag),
@@ -1757,6 +1761,42 @@ mod tests {
         assert_eq!(
             resolved.coverage.seen_lines,
             BTreeSet::from([1, 2, 3, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn full_reread_refreshes_coalesced_version_age() {
+        let mut store = SnapshotStore::new();
+        let path = PathBuf::from("/tmp/coalesced-reread.py");
+        let original = (1..=130)
+            .map(|line| format!("line_{line} = {line}\n"))
+            .collect::<String>();
+        let mut first = snapshot(original.as_bytes(), [1, 2]);
+        first.tag = "A001".into();
+        let first_tag = first.tag.clone();
+        store.publish(&path, first);
+
+        let mut older_tags = Vec::new();
+        for version in 2..=MAX_VERSIONS_PER_PATH {
+            let bytes = format!("version_{version} = {version}\n");
+            let tag = format!("A{version:03}");
+            older_tags.push(tag.clone());
+            store.publish(&path, snapshot_with_forced_tag(bytes.as_bytes(), &tag));
+        }
+
+        let mut reread = snapshot(original.as_bytes(), 1..=130);
+        reread.tag = first_tag.clone();
+        store.publish(&path, reread);
+        store.publish(&path, snapshot_with_forced_tag(b"newest = 5\n", "A005"));
+
+        let retained = store
+            .lookup(&path, &first_tag)
+            .expect("the fresh full reread must survive the next version publication");
+        assert!(retained.is_seen(16));
+        assert_eq!(
+            store.lookup(&path, &older_tags[0]),
+            Err(SnapshotLookupError::EvictedTag),
+            "the least recently published version should be evicted instead"
         );
     }
 

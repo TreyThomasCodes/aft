@@ -698,12 +698,12 @@ pub fn rejection_transport_registry() -> Vec<RejectionTransportContract> {
         row(
             UnknownTag,
             Resolution,
-            "re-read the current tagged content before editing",
+            "re-read the file to mint a fresh tag, then retry the edit",
         ),
         row(
             EvictedTag,
             Resolution,
-            "re-read the current tagged content before editing",
+            "re-read the file to mint a fresh tag, then retry the edit",
         ),
         row(
             AmbiguousTag,
@@ -728,12 +728,12 @@ pub fn rejection_transport_registry() -> Vec<RejectionTransportContract> {
         row(
             UnseenLine,
             Eligibility,
-            "read the addressed rows and their boundary context with the tagged read surface",
+            "re-read the file to mint a fresh tag that includes every addressed row and boundary, then retry the edit",
         ),
         row(
             BoundaryIneligible,
             Eligibility,
-            "read the addressed rows and their boundary context with the tagged read surface",
+            "re-read the file to mint a fresh tag that includes every addressed row and boundary, then retry the edit",
         ),
         row(
             UntaggablePath,
