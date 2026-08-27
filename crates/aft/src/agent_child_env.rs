@@ -20,6 +20,7 @@ const PREPARE_COMMIT_MSG: &str = "prepare-commit-msg";
 const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
 const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
+const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 
 /// The generated hook is POSIX `sh`, including on Git for Windows. It appends
 /// AFT's attribution before handing control to a repository hook with the same
@@ -202,6 +203,13 @@ pub fn inject(
         return Ok(());
     }
 
+    // Hooks and shims can invoke the AFT binary after the daemon's configure
+    // request has completed. Preserve the resolved root so those child commands
+    // do not fall back to a different machine-wide storage universe.
+    environment.insert(
+        STORAGE_DIR_ENV.to_string(),
+        storage_root.to_string_lossy().into_owned(),
+    );
     maintain(config, storage_root)?;
 
     if gh_enabled {
@@ -708,6 +716,21 @@ mod tests {
         write_executable(
             path,
             "#!/bin/sh\nif [ \"${1:-}\" = \"gh-shim\" ] && [ \"${2:-}\" = \"--shim-version\" ]; then\n  printf '%s\\n' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}'\n  exit 0\nfi\nexit 1\n",
+        );
+    }
+
+    #[test]
+    fn active_child_environment_inherits_the_resolved_storage_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.git.co_author = "Pair Agent <pair@example.test>".to_string();
+        let mut environment = HashMap::new();
+
+        inject(&config, storage.path(), &mut environment).unwrap();
+
+        assert_eq!(
+            environment.get(STORAGE_DIR_ENV),
+            Some(&storage.path().to_string_lossy().into_owned())
         );
     }
 

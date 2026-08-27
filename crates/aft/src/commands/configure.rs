@@ -4090,6 +4090,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
             Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
         }
+        crate::search_index::sweep_orphaned_index_dirs(&job.storage_root);
 
         let db_path = job.storage_root.join("aft.db");
         match ctx.app().open_db(&db_path) {

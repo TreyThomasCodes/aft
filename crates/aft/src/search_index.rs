@@ -43,8 +43,11 @@ const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const INDEX_ORPHAN_SWEEP_LIMIT: usize = 200;
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
+static INDEX_ORPHAN_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -81,6 +84,19 @@ struct ArtifactCacheKeyMemoEntry {
 #[derive(Default)]
 struct ArtifactCacheKeyMemoState {
     by_storage_root: BTreeMap<PathBuf, BTreeMap<String, ArtifactCacheKeyMemoEntry>>,
+}
+
+#[derive(Default)]
+struct IndexOrphanSweepSummary {
+    scanned: usize,
+    removed: usize,
+    skipped_derived: usize,
+    skipped_memo: usize,
+    skipped_fresh: usize,
+    skipped_live: usize,
+    skipped_locked: usize,
+    skipped_unreadable: usize,
+    budget_exhausted: bool,
 }
 
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
@@ -4556,6 +4572,213 @@ fn artifact_key_looks_valid(key: &str) -> bool {
     key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Reclaim old index directories that no configured or in-process root can use.
+/// Each candidate holds both search and root-keyed writer leases until deletion,
+/// so a concurrent publisher leaves the directory for a later maintenance pass.
+pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
+    let index_root = storage_root.join("index");
+    let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
+        Ok(keys) => keys,
+        Err(error) => {
+            crate::slog_warn!(
+                "search index orphan sweep root={} scanned=0 removed=0 skipped_derived=0 skipped_memo=0 skipped_fresh=0 skipped_live=0 skipped_locked=0 skipped_unreadable=0 budget_exhausted=false memo_unreadable=true error={}",
+                index_root.display(),
+                error
+            );
+            return;
+        }
+    };
+    let derived_keys = derived_artifact_cache_keys();
+    let mut summary = IndexOrphanSweepSummary::default();
+    let mut entries = match fs::read_dir(&index_root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (file_type.is_dir() && artifact_key_looks_valid(&name))
+                    .then(|| (name, entry.path()))
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => {
+            crate::slog_warn!(
+                "search index orphan sweep root={} scanned=0 removed=0 skipped_derived=0 skipped_memo=0 skipped_fresh=0 skipped_live=0 skipped_locked=0 skipped_unreadable=1 budget_exhausted=false memo_unreadable=false",
+                index_root.display()
+            );
+            return;
+        }
+    };
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let cursor_store = INDEX_ORPHAN_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let last_name = cursor_store
+        .lock()
+        .ok()
+        .and_then(|cursors| cursors.get(&index_root).cloned());
+    if let Some(start) = last_name
+        .as_deref()
+        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
+    {
+        entries.rotate_left(start);
+    }
+
+    let mut cursor_name = last_name;
+    for (processed, (key, cache_dir)) in entries.into_iter().enumerate() {
+        if processed >= INDEX_ORPHAN_SWEEP_LIMIT {
+            summary.budget_exhausted = true;
+            break;
+        }
+        summary.scanned += 1;
+        cursor_name = Some(key.clone());
+        if derived_keys.contains(&key) {
+            summary.skipped_derived += 1;
+            continue;
+        }
+        if referenced_keys.contains(&key) {
+            summary.skipped_memo += 1;
+            continue;
+        }
+        let newest_file = match newest_index_cache_file_mtime(&cache_dir) {
+            Ok(Some(time)) => time,
+            Ok(None) | Err(()) => {
+                summary.skipped_unreadable += 1;
+                continue;
+            }
+        };
+        if SystemTime::now()
+            .duration_since(newest_file)
+            .unwrap_or(Duration::ZERO)
+            <= INDEX_ORPHAN_MIN_AGE
+        {
+            summary.skipped_fresh += 1;
+            continue;
+        }
+
+        let Some((_cache_lock, _writer_lease)) = try_acquire_index_orphan_sweep_locks(&cache_dir)
+        else {
+            summary.skipped_locked += 1;
+            continue;
+        };
+        if crate::root_cache::sweep_all_read_markers(&cache_dir).protected {
+            summary.skipped_live += 1;
+            continue;
+        }
+        match fs::remove_dir_all(&cache_dir) {
+            Ok(()) => summary.removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => summary.removed += 1,
+            Err(_) => summary.skipped_unreadable += 1,
+        }
+    }
+
+    if let Ok(mut cursors) = cursor_store.lock() {
+        if summary.budget_exhausted {
+            if let Some(cursor_name) = cursor_name {
+                cursors.insert(index_root.clone(), cursor_name);
+            }
+        } else {
+            cursors.remove(&index_root);
+        }
+    }
+    if summary.removed > 0 {
+        crate::fs_lock::sync_parent(&index_root);
+    }
+    crate::slog_info!(
+        "search index orphan sweep root={} scanned={} removed={} skipped_derived={} skipped_memo={} skipped_fresh={} skipped_live={} skipped_locked={} skipped_unreadable={} budget_exhausted={}",
+        index_root.display(),
+        summary.scanned,
+        summary.removed,
+        summary.skipped_derived,
+        summary.skipped_memo,
+        summary.skipped_fresh,
+        summary.skipped_live,
+        summary.skipped_locked,
+        summary.skipped_unreadable,
+        summary.budget_exhausted
+    );
+}
+
+fn referenced_artifact_cache_keys(storage_root: &Path) -> std::io::Result<HashSet<String>> {
+    let state = artifact_cache_key_memo_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entries = state
+        .by_storage_root
+        .get(storage_root)
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let path = artifact_cache_key_memo_path(storage_root);
+            match fs::read(path) {
+                Ok(bytes) => {
+                    serde_json::from_slice::<BTreeMap<String, ArtifactCacheKeyMemoEntry>>(&bytes)
+                        .map_err(std::io::Error::other)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+                Err(error) => Err(error),
+            }
+        })?;
+    Ok(entries
+        .into_values()
+        .filter_map(|entry| artifact_key_looks_valid(&entry.key).then_some(entry.key))
+        .collect())
+}
+
+fn derived_artifact_cache_keys() -> HashSet<String> {
+    DERIVED_CACHE_KEYS
+        .get()
+        .and_then(|keys| keys.try_read().ok())
+        .map(|keys| keys.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn try_acquire_index_orphan_sweep_locks(
+    cache_dir: &Path,
+) -> Option<(fs_lock::LockGuard, fs_lock::LockGuard)> {
+    let cache_lock = fs_lock::try_acquire(&cache_dir.join("cache.lock"), Duration::ZERO).ok()?;
+    let writer_lease = fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(cache_dir),
+        Duration::ZERO,
+    )
+    .ok()?;
+    Some((cache_lock, writer_lease))
+}
+
+fn newest_index_cache_file_mtime(cache_dir: &Path) -> Result<Option<SystemTime>, ()> {
+    let mut newest = None;
+    newest_index_cache_file_mtime_inner(cache_dir, &mut newest)?;
+    Ok(newest)
+}
+
+fn newest_index_cache_file_mtime_inner(
+    directory: &Path,
+    newest: &mut Option<SystemTime>,
+) -> Result<(), ()> {
+    for entry in fs::read_dir(directory).map_err(|_| ())? {
+        let entry = entry.map_err(|_| ())?;
+        let file_type = entry.file_type().map_err(|_| ())?;
+        if file_type.is_symlink() {
+            return Err(());
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            newest_index_cache_file_mtime_inner(&path, newest)?;
+        } else if file_type.is_file() {
+            let modified = entry
+                .metadata()
+                .map_err(|_| ())?
+                .modified()
+                .map_err(|_| ())?;
+            if newest.is_none_or(|current| modified > current) {
+                *newest = Some(modified);
+            }
+        } else {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 fn current_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6738,6 +6961,54 @@ mod tests {
         let root = dir.path().join(name);
         fs::create_dir_all(root.join(".git")).expect("create git marker");
         root
+    }
+
+    #[test]
+    fn index_orphan_sweep_reclaims_only_aged_unreferenced_dirs() {
+        let storage = tempfile::tempdir().expect("create storage root");
+        let index_root = storage.path().join("index");
+        let aged_orphan = index_root.join("1111111111111111");
+        let fresh_orphan = index_root.join("2222222222222222");
+        let memo_referenced = index_root.join("3333333333333333");
+        for directory in [&aged_orphan, &fresh_orphan, &memo_referenced] {
+            fs::create_dir_all(directory).expect("create index fixture directory");
+            fs::write(directory.join("cache.bin"), b"fixture cache").expect("write cache fixture");
+        }
+        let old_time = SystemTime::now()
+            .checked_sub(INDEX_ORPHAN_MIN_AGE + Duration::from_secs(1))
+            .expect("construct old fixture time");
+        filetime::set_file_mtime(
+            aged_orphan.join("cache.bin"),
+            filetime::FileTime::from_system_time(old_time),
+        )
+        .expect("age orphan cache");
+        filetime::set_file_mtime(
+            memo_referenced.join("cache.bin"),
+            filetime::FileTime::from_system_time(old_time),
+        )
+        .expect("age referenced cache");
+        let mut memo = BTreeMap::new();
+        memo.insert(
+            "fixture-root".to_string(),
+            ArtifactCacheKeyMemoEntry {
+                key: "3333333333333333".to_string(),
+                git_root_commit: "fixture-commit".to_string(),
+                recorded_at_ms: current_time_millis(),
+            },
+        );
+        write_cache_key_memo(storage.path(), &memo);
+
+        sweep_orphaned_index_dirs(storage.path());
+
+        assert!(
+            !aged_orphan.exists(),
+            "the aged orphan must be reclaimed by the index sweep"
+        );
+        assert!(fresh_orphan.exists(), "fresh index data must be retained");
+        assert!(
+            memo_referenced.exists(),
+            "cache-keys.json references must protect an aged index directory"
+        );
     }
 
     #[test]
