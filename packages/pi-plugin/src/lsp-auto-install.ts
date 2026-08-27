@@ -40,7 +40,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { type AftTransportPool, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import {
+  type AftTransportPool,
+  npmInvocation,
+  npmSpawnEnv,
+  resolveNpm,
+} from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   isInstalled,
@@ -281,9 +286,9 @@ function runInstall(
     // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
     // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
-    // resolveNpm() handles both, and npmSpawnEnv() makes npm's node sibling
-    // reachable. shell:true is avoided so a user-supplied `target` semver is
-    // never shell-parsed.
+    // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
+    // reachable, and npmInvocation() safely routes Windows shims through cmd.exe
+    // without enabling shell parsing on other platforms.
     const npm = resolveNpm();
     if (!npm) {
       warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
@@ -293,15 +298,19 @@ function runInstall(
 
     ensureInstallAnchor(cwd);
 
-    const child = spawn(
-      npm.command,
-      ["install", "--no-save", "--ignore-scripts", "--silent", target],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        cwd,
-        env: npmSpawnEnv(npm),
-      },
-    );
+    const invocation = npmInvocation(npm, [
+      "install",
+      "--no-save",
+      "--ignore-scripts",
+      "--silent",
+      target,
+    ]);
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      cwd,
+      env: npmSpawnEnv(npm),
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
     child.unref();
 
     let stderrBuf = "";

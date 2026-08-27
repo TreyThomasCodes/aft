@@ -15,18 +15,26 @@
  * its bin directory; `npmSpawnEnv()` prepends that directory to PATH for the
  * spawn so npm can find its own node.
  */
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 export interface ResolvedNpm {
-  /** Absolute path to the npm executable (or a bare name if only PATH-resolved). */
+  /** Absolute path to npm (or a bare name). Pass it through `npmInvocation()`. */
   command: string;
   /** Directory containing npm, prepended to PATH at spawn time so npm's
    * `#!/usr/bin/env node` shebang can find its sibling node. Null when the
    * command was found via the OS PATH resolver and no augmentation is needed. */
   binDir: string | null;
+}
+
+/** Executable and arguments suitable for Node's child-process APIs. */
+export interface NpmInvocation {
+  command: string;
+  args: string[];
+  /** Required when passing a fully quoted command line to cmd.exe. */
+  windowsVerbatimArguments?: boolean;
 }
 
 interface ResolveNpmDeps {
@@ -185,6 +193,51 @@ export function resolveNpm(deps: ResolveNpmDeps = defaultDeps()): ResolvedNpm | 
   return null;
 }
 
+function quoteCmdArgument(value: string): string {
+  // cmd.exe expands percent variables even inside quotes, while quotes and line
+  // breaks can terminate the argument and append another command. npm's current
+  // callers use fixed flags and validated package specs, so reject these unsafe
+  // forms rather than silently introducing shell parsing.
+  if (/[\0\r\n"%]/.test(value)) {
+    throw new Error(
+      `npm argument cannot be represented safely for cmd.exe: ${JSON.stringify(value)}`,
+    );
+  }
+  return `"${value}"`;
+}
+
+/**
+ * Build a cross-platform child-process invocation for a resolved npm command.
+ *
+ * Windows `.cmd`/`.bat` shims are scripts, not native executables, and direct
+ * `spawn()`/`execFileSync()` calls fail with EINVAL. Route only those shims
+ * through cmd.exe; native executables and Unix npm scripts remain direct.
+ */
+export function npmInvocation(
+  resolved: ResolvedNpm,
+  npmArgs: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): NpmInvocation {
+  if (platform !== "win32" || !/\.(?:cmd|bat)$/i.test(resolved.command)) {
+    return { command: resolved.command, args: [...npmArgs] };
+  }
+
+  if (/[\0\r\n"%]/.test(resolved.command)) {
+    throw new Error(
+      `npm command cannot be represented safely for cmd.exe: ${JSON.stringify(resolved.command)}`,
+    );
+  }
+
+  const quotedArgs = npmArgs.map(quoteCmdArgument);
+  const commandLine = `""${resolved.command}"${quotedArgs.length > 0 ? ` ${quotedArgs.join(" ")}` : ""}"`;
+  return {
+    command: env.ComSpec ?? env.COMSPEC ?? "cmd.exe",
+    args: ["/d", "/s", "/v:off", "/c", commandLine],
+    windowsVerbatimArguments: true,
+  };
+}
+
 /**
  * Build a spawn env that makes a resolved npm runnable: prepend its bin dir to
  * PATH so npm's `#!/usr/bin/env node` shebang finds its sibling node, even when
@@ -211,14 +264,17 @@ export function isNpmAvailable(deps: ResolveNpmDeps = defaultDeps()): boolean {
 /** Test seam: verify a resolved npm actually executes (used by diagnostics). */
 export function probeNpmVersion(resolved: ResolvedNpm): string | null {
   try {
-    const out = execFileSync(resolved.command, ["--version"], {
+    const invocation = npmInvocation(resolved, ["--version"]);
+    const result = spawnSync(invocation.command, invocation.args, {
       env: npmSpawnEnv(resolved),
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
-    const v = out.trim();
-    return /^\d+\.\d+\.\d+/.test(v) ? v : null;
+    if (result.error || result.status !== 0) return null;
+    const version = result.stdout.trim();
+    return /^\d+\.\d+\.\d+/.test(version) ? version : null;
   } catch {
     return null;
   }

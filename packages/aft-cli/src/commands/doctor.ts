@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import { npmInvocation, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
@@ -681,16 +681,28 @@ async function applyPluginUpdates(
       // `npm install` in the plugin's cache dir reinstalls against the
       // package.json dependency spec OpenCode wrote (pinned to @latest), pulling
       // the newest plugin. Mirrors the plugin auto-updater's install flags.
-      execFileSync(
-        npm.command,
-        ["install", "--no-audit", "--no-fund", "--no-progress", "--ignore-scripts"],
-        {
-          cwd: target.installDir,
-          env: npmSpawnEnv(npm),
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 120_000,
-        },
-      );
+      const invocation = npmInvocation(npm, [
+        "install",
+        "--no-audit",
+        "--no-fund",
+        "--no-progress",
+        "--ignore-scripts",
+      ]);
+      const result = spawnSync(invocation.command, invocation.args, {
+        cwd: target.installDir,
+        env: npmSpawnEnv(npm),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      });
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        const detail = result.stderr.trim();
+        throw new Error(
+          `npm install exited with code ${result.status}${detail ? `: ${detail}` : ""}`,
+        );
+      }
       updated += 1;
       log.success(
         `${target.adapter.displayName}: plugin updated ${target.cached} → ${target.latest} (restart ${target.adapter.displayName} to apply)`,

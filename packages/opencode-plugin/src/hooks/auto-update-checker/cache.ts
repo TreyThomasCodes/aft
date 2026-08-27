@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import { npmInvocation, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
@@ -264,15 +264,19 @@ export async function runNpmInstallSafe(
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason };
     }
-    const proc = spawn(
-      npm.command,
-      ["install", "--no-audit", "--no-fund", "--no-progress", "--ignore-scripts"],
-      {
-        cwd: installDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: npmSpawnEnv(npm),
-      },
-    );
+    const invocation = npmInvocation(npm, [
+      "install",
+      "--no-audit",
+      "--no-fund",
+      "--no-progress",
+      "--ignore-scripts",
+    ]);
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: installDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: npmSpawnEnv(npm),
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderrTail += chunk.toString("utf8");
       if (stderrTail.length > STDERR_TAIL_BYTES) {

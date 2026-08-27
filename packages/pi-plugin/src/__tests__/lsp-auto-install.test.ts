@@ -281,14 +281,14 @@ describe("runAutoInstall", () => {
 
   test("runInstall uses resolved npm for Pi and unreferences spawned children", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
-    // npm must be resolved via the shared resolver (handles npm.cmd on win32
-    // AND finds npm beyond a GUI-stripped PATH), then spawned by its resolved
-    // command with the spawn-env that makes its node sibling reachable.
+    // npm must be resolved beyond a GUI-stripped PATH, then converted to a
+    // platform-safe invocation (npm.cmd requires cmd.exe on Windows).
     expect(source).toMatch(/resolveNpm\(\)/);
-    expect(source).toMatch(/spawn\(\s*npm\.command\s*,/);
+    expect(source).toMatch(/npmInvocation\(npm,/);
+    expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toMatch(/env:\s*npmSpawnEnv\(npm\)/);
     expect(source).toMatch(
-      /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*\]/,
+      /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*,?\s*\]/,
     );
     expect(source).not.toContain('spawn("bun"');
     expect(source).toContain("child.unref()");

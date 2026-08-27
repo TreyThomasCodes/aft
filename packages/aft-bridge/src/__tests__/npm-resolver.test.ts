@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "../npm-resolver.js";
+import { npmInvocation, npmSpawnEnv, probeNpmVersion, resolveNpm } from "../npm-resolver.js";
 
 /**
  * The resolver is dependency-injected (platform/env/home/execPath) so we can
@@ -126,6 +127,89 @@ describe("resolveNpm", () => {
       systemNpmDirs: [], // hermetic: ignore real system npm on CI
     });
     expect(result).toBeNull();
+  });
+});
+
+describe("npmInvocation", () => {
+  it("leaves Unix npm invocations direct", () => {
+    expect(
+      npmInvocation({ command: "/usr/bin/npm", binDir: "/usr/bin" }, ["install", "pkg"], "linux"),
+    ).toEqual({
+      command: "/usr/bin/npm",
+      args: ["install", "pkg"],
+    });
+  });
+
+  it("leaves native Windows executables direct", () => {
+    expect(
+      npmInvocation({ command: "C:\\tools\\npm.exe", binDir: "C:\\tools" }, ["--version"], "win32"),
+    ).toEqual({
+      command: "C:\\tools\\npm.exe",
+      args: ["--version"],
+    });
+  });
+
+  it("routes Windows cmd shims through ComSpec with a quoted command line", () => {
+    const invocation = npmInvocation(
+      {
+        command: "C:\\Program Files\\nodejs\\npm.cmd",
+        binDir: "C:\\Program Files\\nodejs",
+      },
+      ["install", "@scope/pkg@1.2.3", "argument with spaces"],
+      "win32",
+      { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    );
+
+    expect(invocation).toEqual({
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/v:off",
+        "/c",
+        '""C:\\Program Files\\nodejs\\npm.cmd" "install" "@scope/pkg@1.2.3" "argument with spaces""',
+      ],
+      windowsVerbatimArguments: true,
+    });
+  });
+
+  it("rejects cmd arguments that would be expanded or terminate the command", () => {
+    expect(() =>
+      npmInvocation({ command: "C:\\nodejs\\npm.cmd", binDir: "C:\\nodejs" }, ["%PATH%"], "win32"),
+    ).toThrow("cannot be represented safely");
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "executes a cmd shim whose absolute path contains spaces",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "npm invocation "));
+      try {
+        const shim = join(root, "npm.cmd");
+        writeFileSync(shim, "@echo off\r\necho [%~1] [%~2]\r\n");
+        const invocation = npmInvocation({ command: shim, binDir: root }, ["hello world", "plain"]);
+        const result = spawnSync(invocation.command, invocation.args, {
+          encoding: "utf8",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(0);
+        expect(result.stdout.trim()).toBe("[hello world] [plain]");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")("probes npm.cmd versions through cmd.exe", () => {
+    const root = mkdtempSync(join(tmpdir(), "npm probe "));
+    try {
+      const shim = join(root, "npm.cmd");
+      writeFileSync(shim, "@echo off\r\necho 9.8.7\r\n");
+      expect(probeNpmVersion({ command: shim, binDir: root })).toBe("9.8.7");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

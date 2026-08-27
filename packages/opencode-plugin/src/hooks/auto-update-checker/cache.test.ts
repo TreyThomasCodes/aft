@@ -14,6 +14,10 @@ mock.module("../../logger.js", () => ({
 // environment having npm on PATH (the resolver now searches beyond PATH).
 mock.module("@cortexkit/aft-bridge", () => ({
   resolveNpm: () => ({ command: "/usr/bin/npm", binDir: "/usr/bin" }),
+  npmInvocation: (_npm: unknown, args: readonly string[]) => ({
+    command: "/usr/bin/npm",
+    args: [...args],
+  }),
   npmSpawnEnv: (_npm: unknown, base: NodeJS.ProcessEnv = process.env) => ({ ...base }),
 }));
 
