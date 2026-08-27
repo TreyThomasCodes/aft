@@ -130,6 +130,7 @@ export {
 export type { NpmInvocation, ResolvedNpm } from "./npm-resolver.js";
 export {
   isNpmAvailable,
+  NpmTerminationUnknownError,
   npmInvocation,
   npmSpawnEnv,
   probeNpmVersion,

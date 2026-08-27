@@ -300,6 +300,7 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
+    expect(source).toContain("retaining install lock");
     expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing
     // the old behavior are fine (they explain the historical bug); only a

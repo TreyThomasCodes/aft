@@ -261,6 +261,24 @@ describe("auto-update-checker/cache", () => {
       spawnMock.mockRestore();
     });
 
+    test("reports unknown outcome when process-tree termination is unconfirmed", async () => {
+      const proc = new EventEmitter() as childProcess.ChildProcess;
+      proc.stdout = new EventEmitter() as childProcess.ChildProcess["stdout"];
+      proc.stderr = new EventEmitter() as childProcess.ChildProcess["stderr"];
+      const spawnMock = spyOn(childProcess, "spawn").mockReturnValue(proc);
+      terminateNpmProcessTreeMock.mockRejectedValueOnce(new Error("taskkill failed"));
+      const { runNpmInstallSafe } = await freshCacheImport();
+
+      const result = await runNpmInstallSafe("/tmp/opencode", { timeoutMs: 1 });
+
+      expect(result).toMatchObject({
+        ok: false,
+        reason: expect.stringContaining("termination outcome unknown"),
+      });
+      expect(terminateNpmProcessTreeMock).toHaveBeenCalled();
+      spawnMock.mockRestore();
+    });
+
     test("captures stderr tail on npm install failure", async () => {
       const proc = new EventEmitter() as childProcess.ChildProcess;
       proc.stdout = new EventEmitter() as childProcess.ChildProcess["stdout"];

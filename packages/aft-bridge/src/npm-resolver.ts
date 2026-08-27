@@ -253,54 +253,108 @@ export function npmInvocation(
  * tree, so killing only the immediate child can leave npm writing in the
  * background after a rollback or install-lock release. Resolves only after the
  * immediate child exits; direct children escalate to SIGKILL after a grace period.
+ * Windows tree-kill failures reject as unknown outcomes instead of falling back
+ * to killing cmd.exe alone.
  */
-export function terminateNpmProcessTree(
-  child: ChildProcess,
-  invocation: NpmInvocation,
-  env: NodeJS.ProcessEnv = process.env,
-  gracePeriodMs = 5_000,
-): Promise<void> {
+export class NpmTerminationUnknownError extends Error {
+  readonly code = "npm_termination_unknown";
+
+  constructor(detail: string) {
+    super(`npm process-tree termination could not be confirmed: ${detail}`);
+    this.name = "NpmTerminationUnknownError";
+  }
+}
+
+function terminateDirectNpmChild(child: ChildProcess, gracePeriodMs: number): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
 
   return new Promise((resolve) => {
-    let settled = false;
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = () => {
-      if (settled) return;
-      settled = true;
       if (forceTimer) clearTimeout(forceTimer);
       child.removeListener("exit", finish);
       resolve();
     };
-    const killDirectChild = (signal?: NodeJS.Signals) => {
+    const signal = (value?: NodeJS.Signals) => {
       try {
-        child.kill(signal);
+        child.kill(value);
       } catch {
         // The process may have exited between the state check and signal.
       }
     };
 
     child.once("exit", finish);
-    forceTimer = setTimeout(() => killDirectChild("SIGKILL"), gracePeriodMs);
+    forceTimer = setTimeout(() => signal("SIGKILL"), gracePeriodMs);
+    signal();
+    if (child.exitCode !== null || child.signalCode !== null) finish();
+  });
+}
 
-    if (!invocation.windowsCmdShim || child.pid === undefined) {
-      killDirectChild();
-    } else {
-      const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
-      const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
-      const killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
+export function terminateNpmProcessTree(
+  child: ChildProcess,
+  invocation: NpmInvocation,
+  env: NodeJS.ProcessEnv = process.env,
+  gracePeriodMs = 5_000,
+): Promise<void> {
+  if (!invocation.windowsCmdShim) return terminateDirectNpmChild(child, gracePeriodMs);
+  if (child.pid === undefined) {
+    return Promise.reject(new NpmTerminationUnknownError("cmd.exe child has no process ID"));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let childExited = child.exitCode !== null || child.signalCode !== null;
+    let treeKillConfirmed = false;
+    let killer: ChildProcess | null = null;
+    const timeout = setTimeout(() => {
+      try {
+        killer?.kill();
+      } catch {
+        // The taskkill process may already have exited.
+      }
+      fail(`taskkill.exe did not finish within ${gracePeriodMs}ms`);
+    }, gracePeriodMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.removeListener("exit", onChildExit);
+    };
+    const succeedIfConfirmed = () => {
+      if (settled || !childExited || !treeKillConfirmed) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const fail = (detail: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new NpmTerminationUnknownError(detail));
+    };
+    function onChildExit() {
+      childExited = true;
+      succeedIfConfirmed();
+    }
+
+    child.once("exit", onChildExit);
+    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+    const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
+    try {
+      killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
         stdio: "ignore",
         windowsHide: true,
       });
-      const fallback = () => killDirectChild();
-      killer.once("error", fallback);
+      killer.once("error", (error) => fail(`taskkill.exe failed to start: ${String(error)}`));
       killer.once("exit", (code) => {
-        if (code !== 0) fallback();
+        if (code !== 0) {
+          fail(`taskkill.exe exited with code ${code ?? "unknown"}`);
+          return;
+        }
+        treeKillConfirmed = true;
+        succeedIfConfirmed();
       });
+    } catch (error) {
+      fail(`taskkill.exe failed to start: ${String(error)}`);
     }
-
-    // Cover a process that exited between the initial check and listener setup.
-    if (child.exitCode !== null || child.signalCode !== null) finish();
   });
 }
 

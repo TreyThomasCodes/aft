@@ -348,6 +348,11 @@ function runInstall(
       warn(`[lsp] install ${target} aborted during shutdown`);
       if (invocation.windowsCmdShim) {
         terminationPromise ??= terminateNpmProcessTree(child, invocation);
+        void terminationPromise.catch((terminationError) => {
+          error(
+            `[lsp] install ${target} termination outcome unknown; retaining install lock: ${String(terminationError)}`,
+          );
+        });
         return;
       }
       child.kill("SIGTERM");
@@ -374,17 +379,23 @@ function runInstall(
       finish(false);
     });
     child.on("exit", (code) => {
-      void (terminationPromise ?? Promise.resolve()).then(() => {
-        if (code === 0) {
-          log(`[lsp] installed ${target}`);
-          finish(true);
-        } else {
-          error(
-            `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
-          );
-          finish(false);
-        }
-      });
+      void (terminationPromise ?? Promise.resolve()).then(
+        () => {
+          if (code === 0) {
+            log(`[lsp] installed ${target}`);
+            finish(true);
+          } else {
+            error(
+              `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
+            );
+            finish(false);
+          }
+        },
+        () => {
+          // Keep withInstallLock pending: the npm descendant may still be
+          // mutating this target, so another install must not overlap it.
+        },
+      );
     });
   });
 }

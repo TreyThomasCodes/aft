@@ -288,6 +288,7 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
+    expect(source).toContain("retaining install lock");
     expect(source).toMatch(
       /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*,?\s*\]/,
     );

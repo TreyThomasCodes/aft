@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
+  NpmTerminationUnknownError,
   npmInvocation,
   npmSpawnEnv,
   probeNpmVersion,
@@ -250,6 +251,38 @@ describe("npmInvocation", () => {
       10,
     );
     expect(signals).toEqual([undefined, "SIGKILL"]);
+  });
+
+  it("fails closed when taskkill cannot start", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: null },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return true;
+        },
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await terminateNpmProcessTree(
+        child,
+        { command: "cmd.exe", args: [], windowsCmdShim: true },
+        { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+        1_000,
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(NpmTerminationUnknownError);
+    expect((caught as NpmTerminationUnknownError).code).toBe("npm_termination_unknown");
+    expect(signals).toEqual([]);
   });
 
   it.skipIf(process.platform !== "win32")(

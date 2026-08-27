@@ -709,9 +709,13 @@ async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promis
     timeout = setTimeout(() => {
       if (settled) return;
       terminating = true;
-      void terminateNpmProcessTree(child, invocation).then(() => {
-        finish(new Error("npm install timed out after 120000ms"));
-      });
+      void terminateNpmProcessTree(child, invocation).then(
+        () => finish(new Error("npm install timed out after 120000ms")),
+        (error) =>
+          finish(
+            new Error(`npm install timed out and termination outcome is unknown: ${String(error)}`),
+          ),
+      );
     }, 120_000);
   });
 }

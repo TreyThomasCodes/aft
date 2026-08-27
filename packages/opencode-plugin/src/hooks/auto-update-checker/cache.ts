@@ -298,7 +298,8 @@ export async function runNpmInstallSafe(
       return terminationPromise;
     };
     const onAbort = () => {
-      void abortProcess();
+      // The awaited timeout/abort branch below handles unknown termination.
+      void abortProcess().catch(() => {});
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -319,7 +320,16 @@ export async function runNpmInstallSafe(
     options.signal?.removeEventListener("abort", onAbort);
 
     if (result === "timeout" || options.signal?.aborted) {
-      await abortProcess();
+      try {
+        await abortProcess();
+      } catch (error) {
+        // Fail closed: restoring while an unobserved npm descendant may still
+        // write would turn a timeout into cache corruption. Keep the staged
+        // snapshot and report the unknown outcome for manual recovery/restart.
+        const reason = `termination outcome unknown: ${String(error)}`;
+        warnNpmInstallFailure(reason, stderrTail);
+        return { ok: false, reason, stderrTail: stderrTail || undefined };
+      }
       const snapshot = pendingSnapshots.get(installDir);
       if (snapshot) {
         pendingSnapshots.delete(installDir);
