@@ -1653,10 +1653,26 @@ struct ManifestTrustKey {
 // Slot layout: index 0 is the LIVE signing key, index 1 is the COLD STANDBY.
 // The first manifest signature verifying under a newly installed live key is
 // the stored-key-equals-published-half acceptance test for that installation.
+//
+// LIVE KEY PROVENANCE (2026-08-27 CKCRED ceremony): `signing:gh-manifest-root:1`,
+// minted in-vault via `ck auth mint-signing-key` (private half never exported;
+// extraction-refusal proven by a live `credential.get` attack against a bearer
+// handle, then the handle revoked). Public half read back over the route plane
+// and independently verified in Node's stdlib Ed25519 with a tamper control.
+const PROD_MANIFEST_KEY_ID: &str = "c9ad111282d1da10";
+const PROD_MANIFEST_PUBLIC_KEY: [u8; 32] = [
+    0x5f, 0x4c, 0x81, 0x90, 0x18, 0xe2, 0xb6, 0x8d, 0x18, 0xdb, 0xce, 0x6a, 0xc3, 0x6f, 0x9b, 0x84,
+    0x65, 0x28, 0x84, 0x14, 0x75, 0x55, 0xe8, 0x44, 0x2e, 0xf7, 0x6d, 0x7f, 0xb4, 0x7a, 0x42, 0xf4,
+];
+const PROD_MANIFEST_TRUST_KEY: ManifestTrustKey = ManifestTrustKey {
+    key_id: PROD_MANIFEST_KEY_ID,
+    public_key: &PROD_MANIFEST_PUBLIC_KEY,
+};
+
 #[cfg(not(debug_assertions))]
 const RELEASE_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
-    None, // live
-    None, // cold standby
+    Some(PROD_MANIFEST_TRUST_KEY), // live
+    None,                          // cold standby (filled by a future custody release)
 ];
 
 #[cfg(debug_assertions)]
@@ -1666,11 +1682,17 @@ const DEV_MANIFEST_PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
+// Debug images verify BOTH eras: the production root (so fleet manifests work
+// on dev builds) and the dev test key (so fixtures can exercise R3 without a
+// custody round-trip). The envelope's key_id selects at verify time.
 #[cfg(debug_assertions)]
-const DEV_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 1] = &[Some(ManifestTrustKey {
-    key_id: DEV_MANIFEST_KEY_ID,
-    public_key: &DEV_MANIFEST_PUBLIC_KEY,
-})];
+const DEV_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
+    Some(PROD_MANIFEST_TRUST_KEY),
+    Some(ManifestTrustKey {
+        key_id: DEV_MANIFEST_KEY_ID,
+        public_key: &DEV_MANIFEST_PUBLIC_KEY,
+    }),
+];
 
 fn compiled_manifest_trust_set() -> &'static [Option<ManifestTrustKey>] {
     #[cfg(debug_assertions)]
@@ -4557,18 +4579,26 @@ mod tests {
     #[test]
     fn compiled_trust_set_shape_matches_the_two_slot_design() {
         let slots = compiled_manifest_trust_set();
+        // Every profile trusts the production root minted in the 2026-08-27
+        // CKCRED ceremony (`signing:gh-manifest-root:1`); the bytes here are
+        // the published public half, re-asserted so a trust-slot edit cannot
+        // silently swap the live key.
+        let live = slots[0].expect("live slot carries the production root");
+        assert_eq!(live.key_id, PROD_MANIFEST_KEY_ID);
+        assert_eq!(live.public_key, &PROD_MANIFEST_PUBLIC_KEY);
         #[cfg(debug_assertions)]
         {
-            // The dev set keeps exactly one test key.
-            assert_eq!(slots.len(), 1);
-            assert_eq!(slots[0].unwrap().key_id, DEV_MANIFEST_KEY_ID);
+            // Debug images verify both eras: prod live + the dev test key so
+            // fixtures exercise R3 without a custody round-trip.
+            assert_eq!(slots.len(), 2);
+            assert_eq!(slots[1].unwrap().key_id, DEV_MANIFEST_KEY_ID);
         }
         #[cfg(not(debug_assertions))]
         {
-            // The release set ships two slots (live + cold standby), empty
-            // until the custody ceremony release fills them.
+            // The release set keeps two slots: prod live + a cold standby that
+            // stays empty until a future custody release fills it.
             assert_eq!(slots.len(), 2);
-            assert!(slots.iter().all(Option::is_none));
+            assert!(slots[1].is_none());
         }
     }
 
