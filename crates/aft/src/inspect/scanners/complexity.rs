@@ -17,7 +17,7 @@ use crate::parser::{detect_language, parse_source_with_cached_parser, LangId};
 pub(crate) const COMPLEXITY_THRESHOLD: u32 = 10;
 const DRILL_DOWN_LIMIT: usize = 100;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 struct FunctionComplexity {
     #[serde(rename = "function")]
     name: String,
@@ -434,42 +434,44 @@ fn skipped_contribution(file: String, language: &str) -> ComplexityContribution 
 
 fn collect_functions(root: Node<'_>, source: &str, spec: LanguageSpec) -> Vec<FunctionComplexity> {
     let mut functions = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        if is_function_node(node, spec) {
+    // Carry the innermost function with each pending node so nested functions take
+    // ownership of their subtree without forcing a second walk of every function.
+    let mut pending = vec![(root, None)];
+    while let Some((node, enclosing_function)) = pending.pop() {
+        let function = if is_function_node(node, spec) {
+            let function = functions.len();
             functions.push(FunctionComplexity {
                 name: function_name(node, source),
                 line: node.start_position().row as u32 + 1,
-                complexity: function_complexity(node, source, spec),
+                complexity: 1,
             });
+            Some(function)
+        } else {
+            enclosing_function
+        };
+
+        if let Some(function) = function {
+            let increment = decision_complexity(node, source, spec);
+            functions[function].complexity =
+                functions[function].complexity.saturating_add(increment);
         }
-        push_children(node, &mut pending);
+        push_children_with_state(node, function, &mut pending);
     }
     functions
 }
 
-fn function_complexity(function: Node<'_>, source: &str, spec: LanguageSpec) -> u32 {
-    let mut complexity = 1u32;
-    let mut pending = vec![function];
-    while let Some(node) = pending.pop() {
-        if !same_node(node, function) && is_function_node(node, spec) {
-            // A nested closure/function has its own base path and decisions.
-            continue;
-        }
-        let kind = node.kind();
-        if spec.decisions.if_nodes.contains(&kind) || spec.decisions.loop_nodes.contains(&kind) {
-            complexity = complexity.saturating_add(1);
-            complexity = complexity.saturating_add(short_circuits_in_condition(node, source, spec));
-        } else if spec.decisions.match_nodes.contains(&kind) {
-            complexity = complexity.saturating_add(match_arms_beyond_first(node, spec));
-        } else if spec.decisions.catch_nodes.contains(&kind)
-            || spec.decisions.ternary_nodes.contains(&kind)
-        {
-            complexity = complexity.saturating_add(1);
-        }
-        push_children(node, &mut pending);
+fn decision_complexity(node: Node<'_>, source: &str, spec: LanguageSpec) -> u32 {
+    let kind = node.kind();
+    if spec.decisions.if_nodes.contains(&kind) || spec.decisions.loop_nodes.contains(&kind) {
+        1u32.saturating_add(short_circuits_in_condition(node, source, spec))
+    } else if spec.decisions.match_nodes.contains(&kind) {
+        match_arms_beyond_first(node, spec)
+    } else {
+        u32::from(
+            spec.decisions.catch_nodes.contains(&kind)
+                || spec.decisions.ternary_nodes.contains(&kind),
+        )
     }
-    complexity
 }
 
 fn short_circuits_in_condition(node: Node<'_>, source: &str, spec: LanguageSpec) -> u32 {
@@ -649,9 +651,35 @@ fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
 }
 
 fn push_children<'tree>(node: Node<'tree>, pending: &mut Vec<Node<'tree>>) {
+    let first_child = pending.len();
     let mut cursor = node.walk();
-    let children = node.children(&mut cursor).collect::<Vec<_>>();
-    pending.extend(children.into_iter().rev());
+    if cursor.goto_first_child() {
+        loop {
+            pending.push(cursor.node());
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        pending[first_child..].reverse();
+    }
+}
+
+fn push_children_with_state<'tree, T: Copy>(
+    node: Node<'tree>,
+    state: T,
+    pending: &mut Vec<(Node<'tree>, T)>,
+) {
+    let first_child = pending.len();
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            pending.push((cursor.node(), state));
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        pending[first_child..].reverse();
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +689,80 @@ mod tests {
 
     fn fixture_scan(name: &str, source: &str) -> ComplexityContribution {
         scan_source(Path::new("fixtures"), Path::new(name), source)
+    }
+
+    fn collect_functions_two_pass_reference(
+        root: Node<'_>,
+        source: &str,
+        spec: LanguageSpec,
+    ) -> Vec<FunctionComplexity> {
+        let mut functions = Vec::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if is_function_node(node, spec) {
+                functions.push(FunctionComplexity {
+                    name: function_name(node, source),
+                    line: node.start_position().row as u32 + 1,
+                    complexity: function_complexity_reference(node, source, spec),
+                });
+            }
+            push_children(node, &mut pending);
+        }
+        functions
+    }
+
+    fn function_complexity_reference(function: Node<'_>, source: &str, spec: LanguageSpec) -> u32 {
+        let mut complexity = 1u32;
+        let mut pending = vec![function];
+        while let Some(node) = pending.pop() {
+            if !same_node(node, function) && is_function_node(node, spec) {
+                continue;
+            }
+            complexity = complexity.saturating_add(decision_complexity(node, source, spec));
+            push_children(node, &mut pending);
+        }
+        complexity
+    }
+
+    #[test]
+    fn single_pass_walk_is_byte_exact_with_two_pass_reference() {
+        let cases = [
+            (
+                "shaped.rs",
+                include_str!("../../../tests/fixtures/inspect_complexity/shaped.rs"),
+            ),
+            (
+                "shaped.ts",
+                include_str!("../../../tests/fixtures/inspect_complexity/shaped.ts"),
+            ),
+            (
+                "shaped.py",
+                include_str!("../../../tests/fixtures/inspect_complexity/shaped.py"),
+            ),
+            (
+                "shaped.go",
+                include_str!("../../../tests/fixtures/inspect_complexity/shaped.go"),
+            ),
+            (
+                "nested.ts",
+                "function outer(flag: boolean) { if (flag && ready()) { const inner = () => { while (flag) {} }; inner(); } return flag ? 1 : 0; }",
+            ),
+        ];
+
+        for (name, source) in cases {
+            let path = Path::new(name);
+            let language = detect_language(path).expect("fixture language");
+            let spec = language_spec(language).expect("fixture language spec");
+            let tree =
+                parse_source_with_cached_parser(path, source, language).expect("parse fixture");
+            let actual = collect_functions(tree.root_node(), source, spec);
+            let expected = collect_functions_two_pass_reference(tree.root_node(), source, spec);
+            assert_eq!(
+                serde_json::to_vec(&actual).expect("serialize optimized output"),
+                serde_json::to_vec(&expected).expect("serialize reference output"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
