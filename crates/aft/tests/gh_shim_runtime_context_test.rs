@@ -85,6 +85,27 @@ fn write_fresh_r3_cache(state_home: &Path, now: u64) {
     .expect("write R3 rung cache");
 }
 
+fn write_fresh_ambient_credentials_r2_cache(state_home: &Path, now: u64) {
+    let rung_path = state_home.join("cortexkit/aft/gh-shim/rung-cache.json");
+    fs::create_dir_all(rung_path.parent().expect("rung cache parent"))
+        .expect("create shim state directory");
+    fs::write(
+        rung_path,
+        serde_json::to_vec(&json!({
+            "rung": "R2",
+            "as_of_unix_secs": now,
+            "inputs": {
+                "connection_file": "ready",
+                "agent_credentials_present": "env:GH_TOKEN",
+                "catalog_holder": "prefrontal-core"
+            },
+            "manifest_version": 1
+        }))
+        .expect("serialize ambient-credential R2 rung cache"),
+    )
+    .expect("write ambient-credential R2 rung cache");
+}
+
 fn write_invalid_manifest(state_home: &Path, now: u64) {
     write_fresh_manifest(state_home, now);
     let manifest_path = state_home.join("cortexkit/aft/gh-shim/gh-routing-manifest.json");
@@ -477,6 +498,103 @@ fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
     assert_eq!(
         fs::read_to_string(&recorder).expect("read upstream invocation record"),
         "issue view 42\n"
+    );
+}
+
+#[test]
+fn gh_shim_bound_write_refuses_at_r1_without_reason_string_allowlisting() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+
+    let output = shim_command(
+        &["issue", "comment", "42", "--body", "hello"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn R1 governed gh shim invocation");
+    assert_eq!(output.status.code(), Some(86));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+    );
+    assert!(
+        !recorder.exists(),
+        "a bound governed write at R1 must not reach ambient gh credentials"
+    );
+
+    let admin = shim_command(
+        &["pr", "merge", "42"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .expect("spawn R1 admin gh shim invocation");
+    assert_eq!(admin.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&admin.stderr),
+        "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+    );
+    assert!(
+        !recorder.exists(),
+        "R1 must refuse admin actions before considering operator bypass"
+    );
+}
+
+#[test]
+fn gh_shim_bound_governed_write_refuses_ambient_credential_identity_ambiguity() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_fresh_ambient_credentials_r2_cache(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    let output = shim_command(
+        &["issue", "comment", "42", "--body", "hello"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_TOKEN", "ambient-operator-credential")
+    .output()
+    .expect("spawn identity-ambiguous governed gh shim invocation");
+    assert_eq!(output.status.code(), Some(86));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+    );
+    assert!(
+        !recorder.exists(),
+        "ambient credentials must not receive a bound governed invocation"
     );
 }
 

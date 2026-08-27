@@ -234,38 +234,45 @@ fn run(args: &[OsString]) -> i32 {
     // governed/admin tuples refuse while mechanical operations pass through.
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
-    if let ManifestResolution::Regressed { manifest, problem } = initial_manifest {
-        return match regressed_disposition(args, &manifest, current_platform()) {
+    if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
+        return match regressed_disposition(args, manifest, current_platform()) {
             RegressedDisposition::Passthrough => {
-                delegate_after_invalid_manifest_notice(args, &problem)
+                delegate_after_invalid_manifest_notice(args, problem)
             }
             RegressedDisposition::Refuse { code, text } => refuse(code, &text),
         };
     }
 
     let determination = determine_rung(&paths, &cwd, now);
-    if determination.rung != Rung::R3 {
-        return match sticky_governance_disposition(
-            &paths,
-            &cwd,
-            now,
-            &determination,
-            args,
-            current_platform(),
-        ) {
-            Some(StickyGovernanceDisposition::Unavailable(agent_binding)) => {
+    if determination.record.rung != Rung::R3 {
+        let disposition = match resolve_manifest(&paths, now) {
+            ManifestResolution::Active(manifest) => non_r3_governance_disposition(
+                &cwd,
+                &determination,
+                args,
+                &manifest,
+                current_platform(),
+            ),
+            ManifestResolution::Regressed { .. }
+            | ManifestResolution::Invalid(_)
+            | ManifestResolution::Dormant => GovernanceDisposition::Delegate,
+        };
+        return match disposition {
+            GovernanceDisposition::Unavailable(agent_binding) => {
                 refuse_governance_unavailable(&paths, &agent_binding, now)
             }
-            Some(StickyGovernanceDisposition::Unclassified { manifest_version }) => refuse(
+            GovernanceDisposition::Unclassified { manifest_version } => refuse(
                 RefusalCode::Unclassified,
                 &format!(
                     "no manifest declaration for this invocation (manifest {manifest_version})"
                 ),
             ),
-            None => match invalid_manifest_problem.as_ref() {
-                Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
-                None => delegate(args),
-            },
+            GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
+                match invalid_manifest_problem.as_ref() {
+                    Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
+                    None => delegate(args),
+                }
+            }
         };
     }
 
@@ -318,7 +325,8 @@ fn run(args: &[OsString]) -> i32 {
                     Ok(request) => request,
                     Err(error) => return refuse_governed_canonicalization(&error),
                 };
-            let outcome = route_governed(&paths, &determination, &agent_binding, request, now);
+            let outcome =
+                route_governed(&paths, &determination.record, &agent_binding, request, now);
             governed_outcome_status(&paths, &agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
@@ -429,108 +437,209 @@ struct RungRecord {
 }
 
 impl RungRecord {
-    fn r1(now: u64, reason: &str) -> Self {
+    fn fresh_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.as_of_unix_secs) < DISCOVERY_CACHE_TTL.as_secs()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum R1Reason {
+    DisabledByConfig,
+    AbsentOrUnparseable,
+    Unreachable,
+    DiscoveryBudgetExhausted,
+    #[cfg(test)]
+    Count,
+}
+
+impl R1Reason {
+    #[cfg(test)]
+    const ALL: [Self; Self::Count as usize] = [
+        Self::DisabledByConfig,
+        Self::AbsentOrUnparseable,
+        Self::Unreachable,
+        Self::DiscoveryBudgetExhausted,
+    ];
+
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::DisabledByConfig => "disabled_by_config",
+            Self::AbsentOrUnparseable => "absent_or_unparseable",
+            Self::Unreachable => "unreachable",
+            Self::DiscoveryBudgetExhausted => "discovery_budget_exhausted",
+            #[cfg(test)]
+            Self::Count => unreachable!(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum R2Reason {
+    ManifestUnavailable,
+    AgentBindingUnavailable,
+    AgentCredentialsPresent,
+    DaemonUnreachable,
+    CatalogGhRouteAbsent,
+    GhRouteHolderUnbound,
+    #[cfg(test)]
+    Count,
+}
+
+impl R2Reason {
+    #[cfg(test)]
+    const ALL: [Self; Self::Count as usize] = [
+        Self::ManifestUnavailable,
+        Self::AgentBindingUnavailable,
+        Self::AgentCredentialsPresent,
+        Self::DaemonUnreachable,
+        Self::CatalogGhRouteAbsent,
+        Self::GhRouteHolderUnbound,
+    ];
+
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::ManifestUnavailable => "manifest_unavailable",
+            Self::AgentBindingUnavailable => "agent_binding_unavailable",
+            Self::AgentCredentialsPresent => "agent_credentials_present",
+            Self::DaemonUnreachable => "daemon_unreachable",
+            Self::CatalogGhRouteAbsent => "catalog_gh_route_absent",
+            Self::GhRouteHolderUnbound => "gh_route_holder_unbound",
+            #[cfg(test)]
+            Self::Count => unreachable!(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RungDetermination {
+    record: RungRecord,
+    operator_disabled: bool,
+}
+
+impl RungDetermination {
+    fn r1(now: u64, reason: R1Reason) -> Self {
         Self {
-            rung: Rung::R1,
-            as_of_unix_secs: now,
-            inputs: BTreeMap::from([("connection_file".to_string(), reason.to_string())]),
-            manifest_version: None,
+            record: RungRecord {
+                rung: Rung::R1,
+                as_of_unix_secs: now,
+                inputs: BTreeMap::from([(
+                    "connection_file".to_string(),
+                    reason.diagnostic().to_string(),
+                )]),
+                manifest_version: None,
+            },
+            operator_disabled: reason == R1Reason::DisabledByConfig,
         }
     }
 
-    fn r2(now: u64, reason: &str, manifest_version: Option<u64>) -> Self {
+    fn r2(now: u64, reason: R2Reason, manifest_version: Option<u64>) -> Self {
         Self {
-            rung: Rung::R2,
-            as_of_unix_secs: now,
-            inputs: BTreeMap::from([
-                ("connection_file".to_string(), "ready".to_string()),
-                (reason.to_string(), "failed".to_string()),
-            ]),
-            manifest_version,
+            record: RungRecord {
+                rung: Rung::R2,
+                as_of_unix_secs: now,
+                inputs: BTreeMap::from([
+                    ("connection_file".to_string(), "ready".to_string()),
+                    (reason.diagnostic().to_string(), "failed".to_string()),
+                ]),
+                manifest_version,
+            },
+            operator_disabled: false,
         }
     }
 
     fn r3(now: u64, manifest_version: u64) -> Self {
         Self {
-            rung: Rung::R3,
-            as_of_unix_secs: now,
-            inputs: BTreeMap::from([
-                ("connection_file".to_string(), "ready".to_string()),
-                ("catalog_gh_route".to_string(), "ready".to_string()),
-                ("agent_binding".to_string(), "ready".to_string()),
-                ("manifest".to_string(), "ready".to_string()),
-                (
-                    "agent_credentials_present".to_string(),
-                    "absent".to_string(),
-                ),
-            ]),
-            manifest_version: Some(manifest_version),
+            record: RungRecord {
+                rung: Rung::R3,
+                as_of_unix_secs: now,
+                inputs: BTreeMap::from([
+                    ("connection_file".to_string(), "ready".to_string()),
+                    ("catalog_gh_route".to_string(), "ready".to_string()),
+                    ("agent_binding".to_string(), "ready".to_string()),
+                    ("manifest".to_string(), "ready".to_string()),
+                    (
+                        "agent_credentials_present".to_string(),
+                        "absent".to_string(),
+                    ),
+                ]),
+                manifest_version: Some(manifest_version),
+            },
+            operator_disabled: false,
         }
     }
 
-    fn fresh_at(&self, now: u64) -> bool {
-        now.saturating_sub(self.as_of_unix_secs) < DISCOVERY_CACHE_TTL.as_secs()
-    }
-
-    fn governance_infrastructure_unavailable(&self) -> bool {
-        matches!(
-            self.inputs.get("connection_file").map(String::as_str),
-            Some("unreachable" | "discovery_budget_exhausted")
-        ) || self.inputs.get("daemon_unreachable").map(String::as_str) == Some("failed")
-            || self
-                .inputs
-                .get("catalog_gh_route_absent")
-                .map(String::as_str)
-                == Some("failed")
-            || self
-                .inputs
-                .get("gh_route_holder_unbound")
-                .map(String::as_str)
-                == Some("failed")
+    fn cached(record: RungRecord) -> Self {
+        Self {
+            record,
+            operator_disabled: false,
+        }
     }
 }
 
-enum StickyGovernanceDisposition {
+#[derive(Debug)]
+enum GovernanceDisposition {
+    Delegate,
+    Ready,
     Unavailable(AgentBinding),
     Unclassified { manifest_version: u64 },
 }
 
-fn sticky_governance_disposition(
-    paths: &StatePaths,
-    cwd: &Path,
-    now: u64,
-    determination: &RungRecord,
-    args: &[OsString],
-    platform: &str,
-) -> Option<StickyGovernanceDisposition> {
-    if !determination.governance_infrastructure_unavailable() {
-        return None;
+fn structural_governance_disposition(
+    determination: &RungDetermination,
+    classification: &Classification,
+    agent_binding: Option<AgentBinding>,
+    manifest_version: u64,
+) -> GovernanceDisposition {
+    if determination.operator_disabled || matches!(classification, Classification::Mechanical) {
+        return GovernanceDisposition::Delegate;
     }
-    let manifest = match resolve_manifest(paths, now) {
-        ManifestResolution::Active(manifest) => manifest,
-        ManifestResolution::Regressed { .. }
-        | ManifestResolution::Invalid(_)
-        | ManifestResolution::Dormant => return None,
+    let Some(agent_binding) = agent_binding else {
+        return GovernanceDisposition::Delegate;
     };
-    let agent_binding = resolved_agent_binding(&manifest, cwd)?;
+    if determination.record.rung == Rung::R3 {
+        return GovernanceDisposition::Ready;
+    }
 
-    // Losing governance infrastructure must never make classification more
-    // permissive than when the daemon is reachable. Mechanical reads alone pass
-    // through because they neither write nor assert governed identity; known
-    // writes refuse when governance is unavailable, while unknown shapes remain
-    // fail-closed.
-    match classify(args, &manifest, platform) {
+    match classification {
         Classification::Governed { .. } | Classification::Admin { .. } => {
-            Some(StickyGovernanceDisposition::Unavailable(agent_binding))
+            GovernanceDisposition::Unavailable(agent_binding)
         }
-        Classification::Unclassified => Some(StickyGovernanceDisposition::Unclassified {
-            manifest_version: manifest.manifest_version,
-        }),
-        Classification::Mechanical => None,
+        Classification::Unclassified => GovernanceDisposition::Unclassified { manifest_version },
+        Classification::Mechanical => GovernanceDisposition::Delegate,
     }
 }
 
-fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungRecord {
+fn non_r3_governance_disposition(
+    cwd: &Path,
+    determination: &RungDetermination,
+    args: &[OsString],
+    manifest: &Manifest,
+    platform: &str,
+) -> GovernanceDisposition {
+    if determination.operator_disabled {
+        return GovernanceDisposition::Delegate;
+    }
+
+    let classification = classify(args, manifest, platform);
+    if matches!(classification, Classification::Mechanical) {
+        return GovernanceDisposition::Delegate;
+    }
+
+    // Binding resolution runs `git` to inspect the origin. Classify first so
+    // unmanifested public repositories keep the R1 fast path for mechanical
+    // reads; only a verb that could refuse pays the subprocess latency.
+    let agent_binding = resolved_agent_binding(manifest, cwd);
+    structural_governance_disposition(
+        determination,
+        &classification,
+        agent_binding,
+        manifest.manifest_version,
+    )
+}
+
+fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungDetermination {
     // The budget starts before the config read and connection-file stat. This
     // keeps a slow filesystem from silently extending discovery beyond 150ms.
     let deadline = std::time::Instant::now() + DISCOVERY_BUDGET;
@@ -549,28 +658,30 @@ fn determine_rung_from_doc(
     now: u64,
     deadline: std::time::Instant,
     config_doc: Option<&str>,
-) -> RungRecord {
+) -> RungDetermination {
     // Operator hard-off: when the user disables the shim, short-circuit to
     // byte-transparent passthrough (R1) before any daemon/catalog probing, so a
-    // disabled shim performs zero subc traffic. This is a structural gate for
-    // fleet rollout safety, not a rung the manifest can reach.
+    // disabled shim performs no governance-daemon or catalog traffic. Explicit
+    // operator intent beats manifest governance; this in-memory bit is deliberately
+    // not inferred from the diagnostic reason string later in dispatch.
     if gh_shim_enabled_from_config_doc(config_doc.unwrap_or("")) == Some(false) {
-        return RungRecord::r1(now, "disabled_by_config");
+        return RungDetermination::r1(now, R1Reason::DisabledByConfig);
     }
 
     let Some(connection_file) = connection_file_from_config_doc(config_doc.unwrap_or("")) else {
         // R1 has no daemon dial and no durable determination write.
-        return RungRecord::r1(now, "absent_or_unparseable");
+        return RungDetermination::r1(now, R1Reason::AbsentOrUnparseable);
     };
     if !connection_file.is_file() {
-        return RungRecord::r1(now, "unreachable");
+        return RungDetermination::r1(now, R1Reason::Unreachable);
     }
 
     let cached = load_rung_record(paths);
     if std::time::Instant::now() >= deadline {
         return cached
             .filter(|record| record.fresh_at(now))
-            .unwrap_or_else(|| RungRecord::r1(now, "discovery_budget_exhausted"));
+            .map(RungDetermination::cached)
+            .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
     }
     if let Some(record) = cached.as_ref().filter(|record| record.fresh_at(now)) {
         if record.rung != Rung::R3
@@ -579,7 +690,7 @@ fn determine_rung_from_doc(
                 .and_then(|manifest| resolved_agent_binding(manifest, cwd))
                 .is_some()
         {
-            return record.clone();
+            return RungDetermination::cached(record.clone());
         }
     }
 
@@ -588,18 +699,18 @@ fn determine_rung_from_doc(
     // A failed validation does not supply a manifest here because the regressed
     // arm itself is decided in `run` before any probe.
     let Some(manifest) = resolve_manifest(paths, now).into_manifest() else {
-        let record = RungRecord::r2(now, "manifest_unavailable", None);
-        write_rung_record_silently(paths, &record);
-        return record;
+        let determination = RungDetermination::r2(now, R2Reason::ManifestUnavailable, None);
+        write_rung_record_silently(paths, &determination.record);
+        return determination;
     };
     let Some(agent_binding) = resolved_agent_binding(&manifest, cwd) else {
-        let record = RungRecord::r2(
+        let determination = RungDetermination::r2(
             now,
-            "agent_binding_unavailable",
+            R2Reason::AgentBindingUnavailable,
             Some(manifest.manifest_version),
         );
-        write_rung_record_silently(paths, &record);
-        return record;
+        write_rung_record_silently(paths, &determination.record);
+        return determination;
     };
 
     let discovery = probe_governance(
@@ -609,45 +720,43 @@ fn determine_rung_from_doc(
         deadline,
         &agent_binding.agent_id,
     );
-    let record = match discovery {
+    let determination = match discovery {
         ProbeResult::Ready { module_id } => {
             match find_ambient_agent_credential(&manifest.detectors) {
                 Some(source) => {
-                    let mut record = RungRecord::r2(
+                    let mut determination = RungDetermination::r2(
                         now,
-                        "agent_credentials_present",
+                        R2Reason::AgentCredentialsPresent,
                         Some(manifest.manifest_version),
                     );
-                    record
+                    determination
+                        .record
                         .inputs
                         .insert("agent_credentials_present".to_string(), source);
-                    record
+                    determination
+                        .record
                         .inputs
                         .insert("catalog_holder".to_string(), module_id);
-                    record
+                    determination
                 }
-                None => RungRecord::r3(now, manifest.manifest_version),
+                None => RungDetermination::r3(now, manifest.manifest_version),
             }
         }
-        ProbeResult::Unreachable => RungRecord::r2(now, "daemon_unreachable", None),
-        ProbeResult::NoRoute => RungRecord::r2(now, "catalog_gh_route_absent", None),
-        // The holder module is registered but not bound (module restart or
-        // ceremony window). This is governance INFRASTRUCTURE unavailability,
-        // not an unmanifested repo: the reason string must stay distinct from
-        // "agent_binding_unavailable" so sticky no-degrade engages and governed
-        // verbs refuse instead of silently passing through under ambient
-        // credentials (four misattributed posts on 2026-08-27 came from this
-        // arm sharing the unmanifested-repo label).
-        ProbeResult::Unbound => RungRecord::r2(now, "gh_route_holder_unbound", None),
+        ProbeResult::Unreachable => RungDetermination::r2(now, R2Reason::DaemonUnreachable, None),
+        ProbeResult::NoRoute => RungDetermination::r2(now, R2Reason::CatalogGhRouteAbsent, None),
+        // Keep the holder-unbound status diagnostic distinct from an absent
+        // repository binding. Dispatch no longer consumes either reason.
+        ProbeResult::Unbound => RungDetermination::r2(now, R2Reason::GhRouteHolderUnbound, None),
         ProbeResult::TimedOut => cached
             .filter(|record| record.fresh_at(now))
-            .unwrap_or_else(|| RungRecord::r1(now, "discovery_budget_exhausted")),
+            .map(RungDetermination::cached)
+            .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted)),
     };
 
-    if record.rung != Rung::R1 {
-        write_rung_record_silently(paths, &record);
+    if determination.record.rung != Rung::R1 {
+        write_rung_record_silently(paths, &determination.record);
     }
-    record
+    determination
 }
 
 fn configured_connection_file() -> Option<PathBuf> {
@@ -3147,9 +3256,13 @@ mod tests {
             std::time::Instant::now() + DISCOVERY_BUDGET,
             Some(&doc),
         );
-        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(record.record.rung, Rung::R1);
         assert_eq!(
-            record.inputs.get("connection_file").map(String::as_str),
+            record
+                .record
+                .inputs
+                .get("connection_file")
+                .map(String::as_str),
             Some("disabled_by_config")
         );
         // R1 is never written durably.
@@ -3172,9 +3285,13 @@ mod tests {
             std::time::Instant::now() + DISCOVERY_BUDGET,
             Some(&doc),
         );
-        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(record.record.rung, Rung::R1);
         assert_eq!(
-            record.inputs.get("connection_file").map(String::as_str),
+            record
+                .record
+                .inputs
+                .get("connection_file")
+                .map(String::as_str),
             Some("unreachable")
         );
     }
@@ -3191,9 +3308,13 @@ mod tests {
             std::time::Instant::now() + DISCOVERY_BUDGET,
             Some("{}"),
         );
-        assert_eq!(record.rung, Rung::R1);
+        assert_eq!(record.record.rung, Rung::R1);
         assert_eq!(
-            record.inputs.get("connection_file").map(String::as_str),
+            record
+                .record
+                .inputs
+                .get("connection_file")
+                .map(String::as_str),
             Some("absent_or_unparseable")
         );
     }
@@ -3296,7 +3417,8 @@ mod tests {
             repository: Some("cortexkit/aft".to_string()),
             manifest_version: 1,
         };
-        let wire = governed_wire_request(&RungRecord::r3(7, 1), "alfonso-aft", request);
+        let determination = RungDetermination::r3(7, 1);
+        let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
         assert_eq!(wire["metadata"]["agent_id"], "alfonso-aft");
         assert_eq!(wire["metadata"]["pid"], std::process::id());
     }
@@ -3645,7 +3767,8 @@ mod tests {
                 ));
                 let request = canonicalize_governed(&args, expected_tuple, &canonical, 1)
                     .expect("body-file form should canonicalize");
-                let wire = governed_wire_request(&RungRecord::r3(1, 1), "agent-7", request);
+                let determination = RungDetermination::r3(1, 1);
+                let wire = governed_wire_request(&determination.record, "agent-7", request);
                 assert_eq!(wire["body"]["body"], expected_body);
             }
         }
@@ -3853,26 +3976,211 @@ mod tests {
     fn lower_rungs_are_cached_durably_but_r1_is_not_written() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let record = RungRecord::r2(123, "daemon_unreachable", None);
-        write_rung_record_silently(&paths, &record);
+        let determination = RungDetermination::r2(123, R2Reason::DaemonUnreachable, None);
+        write_rung_record_silently(&paths, &determination.record);
         assert_eq!(load_rung_record(&paths).unwrap().rung, Rung::R2);
         assert!(!paths.root.join("r1-cache.json").exists());
     }
 
     #[test]
-    fn governance_unavailable_is_per_determination_and_does_not_latch_r3() {
-        assert!(RungRecord::r1(1, "unreachable").governance_infrastructure_unavailable());
-        assert!(
-            RungRecord::r1(1, "discovery_budget_exhausted").governance_infrastructure_unavailable()
+    fn governed_bound_disposition_is_reason_independent_except_operator_hard_off() {
+        const EXPECTED_RUNG_SHAPE_COUNT: usize = 11;
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let connection_file = directory.path().join("connection.json");
+        fs::write(&connection_file, "present").unwrap();
+        let missing_connection = directory.path().join("missing-connection.json");
+        let disabled_doc = serde_json::json!({
+            "gh_shim": { "enabled": false },
+            "subc": { "connection_file": missing_connection }
+        })
+        .to_string();
+        let unreachable_doc = serde_json::json!({
+            "subc": { "connection_file": directory.path().join("still-missing.json") }
+        })
+        .to_string();
+        let budget_doc = serde_json::json!({
+            "subc": { "connection_file": connection_file }
+        })
+        .to_string();
+        let future_deadline = || std::time::Instant::now() + DISCOVERY_BUDGET;
+        let r1_cases = [
+            (
+                R1Reason::DisabledByConfig,
+                determine_rung_from_doc(
+                    &paths,
+                    directory.path(),
+                    1,
+                    future_deadline(),
+                    Some(&disabled_doc),
+                ),
+            ),
+            (
+                R1Reason::AbsentOrUnparseable,
+                determine_rung_from_doc(&paths, directory.path(), 1, future_deadline(), Some("{}")),
+            ),
+            (
+                R1Reason::Unreachable,
+                determine_rung_from_doc(
+                    &paths,
+                    directory.path(),
+                    1,
+                    future_deadline(),
+                    Some(&unreachable_doc),
+                ),
+            ),
+            (
+                R1Reason::DiscoveryBudgetExhausted,
+                determine_rung_from_doc(
+                    &paths,
+                    directory.path(),
+                    1,
+                    std::time::Instant::now() - Duration::from_millis(1),
+                    Some(&budget_doc),
+                ),
+            ),
+        ];
+        assert_eq!(r1_cases.len(), R1Reason::ALL.len());
+        for (reason, determination) in &r1_cases {
+            assert_eq!(determination.record.rung, Rung::R1);
+            assert_eq!(
+                determination
+                    .record
+                    .inputs
+                    .get("connection_file")
+                    .map(String::as_str),
+                Some(reason.diagnostic())
+            );
+        }
+
+        let mut determinations = r1_cases
+            .into_iter()
+            .map(|(_, determination)| determination)
+            .collect::<Vec<_>>();
+        determinations.extend(
+            R2Reason::ALL
+                .into_iter()
+                .map(|reason| RungDetermination::r2(1, reason, Some(1))),
         );
-        assert!(
-            RungRecord::r2(1, "daemon_unreachable", None).governance_infrastructure_unavailable()
+        determinations.push(RungDetermination::r3(1, 1));
+        assert_eq!(
+            R1Reason::ALL.len() + R2Reason::ALL.len() + 1,
+            EXPECTED_RUNG_SHAPE_COUNT,
+            "update the explicit disposition matrix when a rung shape is added"
         );
-        assert!(RungRecord::r2(1, "catalog_gh_route_absent", None)
-            .governance_infrastructure_unavailable());
-        assert!(!RungRecord::r2(1, "agent_credentials_present", Some(1))
-            .governance_infrastructure_unavailable());
-        assert!(!RungRecord::r3(2, 1).governance_infrastructure_unavailable());
+        assert_eq!(determinations.len(), EXPECTED_RUNG_SHAPE_COUNT);
+
+        let manifest = fixture_manifest();
+        let governed_args = [
+            OsString::from("issue"),
+            OsString::from("comment"),
+            OsString::from("42"),
+            OsString::from("--body"),
+            OsString::from("hello"),
+        ];
+        let admin_args = [
+            OsString::from("pr"),
+            OsString::from("merge"),
+            OsString::from("42"),
+        ];
+        let mechanical_args = [
+            OsString::from("issue"),
+            OsString::from("view"),
+            OsString::from("42"),
+        ];
+        let governed = classify(&governed_args, &manifest, "macos");
+        let admin = classify(&admin_args, &manifest, "macos");
+        let mechanical = classify(&mechanical_args, &manifest, "macos");
+        let binding = || AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+
+        for determination in &determinations {
+            let bound_governed = structural_governance_disposition(
+                determination,
+                &governed,
+                Some(binding()),
+                manifest.manifest_version,
+            );
+            if determination.operator_disabled {
+                assert!(matches!(bound_governed, GovernanceDisposition::Delegate));
+            } else if determination.record.rung == Rung::R3 {
+                assert!(matches!(bound_governed, GovernanceDisposition::Ready));
+            } else {
+                assert!(matches!(
+                    bound_governed,
+                    GovernanceDisposition::Unavailable(_)
+                ));
+            }
+
+            assert!(matches!(
+                structural_governance_disposition(
+                    determination,
+                    &governed,
+                    None,
+                    manifest.manifest_version,
+                ),
+                GovernanceDisposition::Delegate
+            ));
+            assert!(matches!(
+                structural_governance_disposition(
+                    determination,
+                    &mechanical,
+                    Some(binding()),
+                    manifest.manifest_version,
+                ),
+                GovernanceDisposition::Delegate
+            ));
+
+            if determination.record.rung != Rung::R3 && !determination.operator_disabled {
+                assert!(matches!(
+                    structural_governance_disposition(
+                        determination,
+                        &admin,
+                        Some(binding()),
+                        manifest.manifest_version,
+                    ),
+                    GovernanceDisposition::Unavailable(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_credentials_on_a_bound_governed_invocation_refuse_identity_ambiguity() {
+        let manifest = fixture_manifest();
+        let governed = classify(
+            &[
+                OsString::from("issue"),
+                OsString::from("comment"),
+                OsString::from("42"),
+                OsString::from("--body"),
+                OsString::from("hello"),
+            ],
+            &manifest,
+            "macos",
+        );
+        let determination = RungDetermination::r2(
+            1,
+            R2Reason::AgentCredentialsPresent,
+            Some(manifest.manifest_version),
+        );
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+
+        assert!(matches!(
+            structural_governance_disposition(
+                &determination,
+                &governed,
+                Some(binding),
+                manifest.manifest_version,
+            ),
+            GovernanceDisposition::Unavailable(_)
+        ));
     }
 
     #[cfg(unix)]
@@ -4577,48 +4885,6 @@ mod tests {
             assert_eq!(
                 disk, bytes,
                 "fixture {name} drifted from its generator; rerun with AFT_GH_SHIM_REGEN=1"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod holder_unbound_sticky_tests {
-    use super::*;
-
-    fn record_with(reason: &str) -> RungRecord {
-        RungRecord::r2(1_787_800_000, reason, None)
-    }
-
-    /// An unbound gh.route holder is governance infrastructure unavailability:
-    /// sticky no-degrade must see it, or governed verbs on manifest-bound
-    /// repos silently pass through under ambient operator credentials (the
-    /// 2026-08-27 misattribution class).
-    #[test]
-    fn holder_unbound_counts_as_infrastructure_unavailable() {
-        assert!(record_with("gh_route_holder_unbound").governance_infrastructure_unavailable());
-    }
-
-    /// Negative control: a genuinely unmanifested repo (no agent binding) is
-    /// NOT infrastructure unavailability - public users keep transparent
-    /// passthrough. If this starts passing for the wrong reason, the two arms
-    /// have been re-merged and the mislabel bug is back.
-    #[test]
-    fn unmanifested_repo_is_not_infrastructure_unavailable() {
-        assert!(!record_with("agent_binding_unavailable").governance_infrastructure_unavailable());
-    }
-
-    /// The remaining infra reasons stay covered alongside the new one.
-    #[test]
-    fn existing_infra_reasons_remain_covered() {
-        for reason in ["daemon_unreachable", "catalog_gh_route_absent"] {
-            let mut record = record_with(reason);
-            record
-                .inputs
-                .insert(reason.to_string(), "failed".to_string());
-            assert!(
-                record.governance_infrastructure_unavailable(),
-                "{reason} must remain infra-unavailable"
             );
         }
     }
