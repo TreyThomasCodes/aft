@@ -117,12 +117,15 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
     let root = project.path();
     let draft_relative = std::path::Path::new(".cortexkit/alfonso/drafts/spec.md");
     let draft = root.join(draft_relative);
-    let original = b"draft: original\n\x00byte-exact\n";
+    let mut original = b"draft: hand-edited decision\n\x00byte-exact\n".to_vec();
+    while original.len() < 90 * 1024 {
+        original.extend_from_slice(b"weeks of hand-edited specification detail\n");
+    }
     let mutated = b"draft: changed\n";
 
     fs::write(root.join(".gitignore"), ".cortexkit/\n").unwrap();
     fs::create_dir_all(draft.parent().unwrap()).unwrap();
-    fs::write(&draft, original).unwrap();
+    fs::write(&draft, &original).unwrap();
     assert!(
         Command::new("git")
             .args(["init", "--quiet"])
@@ -156,8 +159,14 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
         "fixture draft must be untracked"
     );
 
+    let storage = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();
-    configure_unrestricted(&mut aft, root, "cfg-gitignored-checkpoint");
+    configure_unrestricted_with_storage(
+        &mut aft,
+        root,
+        storage.path(),
+        "cfg-gitignored-checkpoint",
+    );
 
     let checkpoint = aft.send(
         &serde_json::to_string(&serde_json::json!({
@@ -179,13 +188,17 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
         checkpoint.get("skipped").is_none(),
         "checkpoint: {checkpoint:?}"
     );
+    let storage_path = checkpoint["storage_path"]
+        .as_str()
+        .expect("checkpoint storage path");
+    assert!(std::path::Path::new(storage_path).is_dir());
     assert_eq!(
         checkpoint["durability"],
-        "checkpoint is session-scoped; lost on restart"
+        format!("durable on disk at {storage_path}; survives restarts")
     );
     assert!(checkpoint["text"]
         .as_str()
-        .is_some_and(|text| text.contains("checkpoint is session-scoped; lost on restart")));
+        .is_some_and(|text| text.contains("durable on disk at")));
 
     let paths = aft.send(
         r#"{"id":"gitignored-paths","command":"checkpoint_paths","session_id":"gitignored-checkpoint-session","name":"gitignored-draft"}"#,
@@ -201,7 +214,25 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
     fs::write(&draft, mutated).unwrap();
     assert_eq!(fs::read(&draft).unwrap(), mutated, "mutation control");
 
-    let restore = aft.send(
+    assert!(aft.shutdown().success());
+
+    let mut restarted = AftProcess::spawn();
+    configure_unrestricted_with_storage(
+        &mut restarted,
+        root,
+        storage.path(),
+        "cfg-gitignored-checkpoint-restart",
+    );
+    let list = restarted.send(
+        r#"{"id":"gitignored-list","command":"tool_call","session_id":"gitignored-checkpoint-session","name":"safety","arguments":{"op":"list"}}"#,
+    );
+    assert_eq!(list["success"], true, "list: {list:?}");
+    assert_eq!(list["checkpoints"].as_array().unwrap().len(), 1);
+    assert!(list["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("hydrated from disk")));
+
+    let restore = restarted.send(
         r#"{"id":"gitignored-restore","command":"tool_call","session_id":"gitignored-checkpoint-session","name":"safety","arguments":{"op":"restore","name":"gitignored-draft"}}"#,
     );
     assert_eq!(restore["success"], true, "restore: {restore:?}");
@@ -209,23 +240,28 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
     assert_eq!(
         fs::read(&draft).unwrap(),
         original,
-        "restore must be byte-exact"
+        "restart restore must be byte-exact"
     );
 
-    let status = aft.shutdown();
-    assert!(status.success());
+    assert!(restarted.shutdown().success());
 }
 
 #[test]
-fn checkpoint_restart_reports_memory_only_durability() {
+fn checkpoint_restart_hydrates_durable_checkpoint_and_explains_empty_session() {
     let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
     let root = project.path();
     let file = root.join("checkpoint-target.txt");
     fs::write(&file, "original\n").unwrap();
 
     let session = "checkpoint-restart-session";
     let mut first = AftProcess::spawn();
-    configure_unrestricted(&mut first, root, "cfg-checkpoint-restart-first");
+    configure_unrestricted_with_storage(
+        &mut first,
+        root,
+        storage.path(),
+        "cfg-checkpoint-restart-first",
+    );
     let create = first.send(
         &serde_json::to_string(&serde_json::json!({
             "id": "checkpoint-restart-create",
@@ -237,14 +273,22 @@ fn checkpoint_restart_reports_memory_only_durability() {
         .unwrap(),
     );
     assert_eq!(create["success"], true, "create: {create:?}");
+    let storage_path = create["storage_path"].as_str().unwrap();
+    assert!(std::path::Path::new(storage_path).is_dir());
     assert_eq!(
         create["durability"],
-        "checkpoint is session-scoped; lost on restart"
+        format!("durable on disk at {storage_path}; survives restarts")
     );
     assert!(first.shutdown().success());
 
+    fs::write(&file, "mutated\n").unwrap();
     let mut restarted = AftProcess::spawn();
-    configure_unrestricted(&mut restarted, root, "cfg-checkpoint-restart-second");
+    configure_unrestricted_with_storage(
+        &mut restarted,
+        root,
+        storage.path(),
+        "cfg-checkpoint-restart-second",
+    );
     let list = restarted.send(
         &serde_json::to_string(&serde_json::json!({
             "id": "checkpoint-restart-list",
@@ -256,11 +300,11 @@ fn checkpoint_restart_reports_memory_only_durability() {
         .unwrap(),
     );
     assert_eq!(list["success"], true, "list: {list:?}");
-    assert_eq!(list["checkpoints"], serde_json::json!([]));
-    assert_eq!(list["durability"], "checkpoints do not survive restarts");
-    assert!(list["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("checkpoints do not survive restarts")));
+    assert_eq!(list["checkpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        list["durability"],
+        "durable checkpoints are hydrated from disk and survive restarts"
+    );
 
     let restore = restarted.send(
         &serde_json::to_string(&serde_json::json!({
@@ -272,14 +316,28 @@ fn checkpoint_restart_reports_memory_only_durability() {
         }))
         .unwrap(),
     );
-    assert_eq!(restore["success"], false, "restore: {restore:?}");
-    assert_eq!(restore["code"], "checkpoint_not_found");
-    assert!(restore["message"]
+    assert_eq!(restore["success"], true, "restore: {restore:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "original\n");
+
+    let empty = restarted.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "checkpoint-restart-empty-list",
+            "command": "tool_call",
+            "session_id": "empty-post-restart-session",
+            "name": "safety",
+            "arguments": { "op": "list" },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(empty["success"], true, "empty list: {empty:?}");
+    assert_eq!(empty["checkpoints"], serde_json::json!([]));
+    assert_eq!(
+        empty["durability"],
+        "no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
+    );
+    assert!(empty["text"]
         .as_str()
-        .is_some_and(|message| message.contains("checkpoints do not survive restarts")));
-    assert!(restore["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("checkpoints do not survive restarts")));
+        .is_some_and(|text| text.contains("in-memory checkpoints do not survive restarts")));
     assert!(restarted.shutdown().success());
 }
 
@@ -1799,6 +1857,25 @@ fn configure_unrestricted(aft: &mut AftProcess, root: &std::path::Path, request_
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(response["success"], true, "configure: {response:?}");
+}
+
+fn configure_unrestricted_with_storage(
+    aft: &mut AftProcess,
+    root: &std::path::Path,
+    storage: &std::path::Path,
+    request_id: &str,
+) {
+    let response = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": request_id,
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.display().to_string(),
+            "storage_dir": storage.display().to_string(),
         }))
         .unwrap(),
     );

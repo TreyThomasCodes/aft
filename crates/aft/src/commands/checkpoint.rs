@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::checkpoint::CHECKPOINT_DURABILITY;
+use crate::checkpoint::checkpoint_durability;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -11,8 +11,9 @@ use crate::protocol::{RawRequest, Response};
 /// - `files` (array of strings, optional) — files to include. If omitted, uses
 ///   all files tracked by the backup store.
 ///
-/// Returns: `{ name, file_count, created_at, durability }`. Explicit files are
-/// read directly, including untracked or gitignored files. When any requested
+/// Returns: `{ name, file_count, created_at, storage_path, durability }`.
+/// `storage_path` names the durable on-disk directory callers can inspect.
+/// Explicit files are read directly, including untracked or gitignored files. When any requested
 /// file cannot be read, `file_count` includes only restorable snapshots and the
 /// response adds `skipped: [{ file, error }, ...]` for every omitted path.
 pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -58,6 +59,11 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
 
     match checkpoint_store.create(req.session(), name, validated_files, &backup) {
         Ok(info) => {
+            let storage_path = info
+                .storage_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
             // Only surface `skipped` when we actually skipped something. Keeps
             // happy-path responses compact and backward-compatible for callers
             // that only read `name` / `file_count` / `created_at`.
@@ -65,8 +71,12 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
                 "name": info.name,
                 "file_count": info.file_count,
                 "created_at": info.created_at,
-                "durability": CHECKPOINT_DURABILITY,
+                "storage_path": storage_path,
+                "durability": checkpoint_durability(std::path::Path::new(&storage_path)),
             });
+            if !info.evicted.is_empty() {
+                payload["evicted"] = serde_json::json!(info.evicted);
+            }
             if !info.skipped.is_empty() {
                 let skipped: Vec<_> = info
                     .skipped
@@ -122,7 +132,7 @@ pub fn handle_checkpoint_paths(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let checkpoint_store = ctx.checkpoint().lock();
+    let mut checkpoint_store = ctx.checkpoint().lock();
     match checkpoint_store.absolute_file_paths(req.session(), name) {
         Ok(paths) => Response::success(
             &req.id,

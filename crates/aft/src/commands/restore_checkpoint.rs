@@ -1,4 +1,6 @@
-use crate::checkpoint::{CHECKPOINT_DURABILITY, CHECKPOINT_RESTART_NOTICE};
+use crate::checkpoint::{
+    checkpoint_durability, CHECKPOINT_HYDRATED_NOTICE, CHECKPOINT_RESTART_NOTICE,
+};
 use crate::context::AppContext;
 use crate::error::AftError;
 use crate::protocol::{RawRequest, Response};
@@ -6,8 +8,9 @@ use crate::protocol::{RawRequest, Response};
 /// Handle the `restore_checkpoint` command: restore files from a named checkpoint.
 ///
 /// Params: `name` (string, required) — checkpoint name to restore.
-/// Returns: `{ name, file_count, created_at, durability }` on success. A missing
-/// checkpoint explains that named checkpoints do not survive bridge or daemon restarts.
+/// Returns: `{ name, file_count, created_at, storage_path, durability }` on success.
+/// A missing checkpoint only cites restart loss when durable hydration found no
+/// checkpoints in the caller's session.
 pub fn handle_restore_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
     match handle_restore_checkpoint_impl(req, ctx) {
         Ok(resp) | Err(resp) => resp,
@@ -29,33 +32,58 @@ fn handle_restore_checkpoint_impl(
         }
     };
 
-    let checkpoint_store = ctx.checkpoint().lock();
+    let mut checkpoint_store = ctx.checkpoint().lock();
     let file_paths = checkpoint_store
         .file_paths(req.session(), name)
-        .map_err(|error| checkpoint_not_found_response(&req.id, error))?;
+        .map_err(|error| {
+            checkpoint_not_found_response(
+                &req.id,
+                error,
+                checkpoint_store.session_is_empty(req.session()),
+            )
+        })?;
     let validated_paths = validate_restore_paths(&req.id, ctx, &file_paths)?;
 
     match checkpoint_store.restore_validated(req.session(), name, &validated_paths) {
-        Ok(info) => Ok(Response::success(
-            &req.id,
-            serde_json::json!({
-                "name": info.name,
-                "file_count": info.file_count,
-                "created_at": info.created_at,
-                "durability": CHECKPOINT_DURABILITY,
-            }),
-        )),
+        Ok(info) => {
+            let storage_path = info
+                .storage_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            Ok(Response::success(
+                &req.id,
+                serde_json::json!({
+                    "name": info.name,
+                    "file_count": info.file_count,
+                    "created_at": info.created_at,
+                    "storage_path": storage_path,
+                    "durability": checkpoint_durability(std::path::Path::new(&storage_path)),
+                }),
+            ))
+        }
         Err(e) => Ok(Response::error(&req.id, e.code(), e.to_string())),
     }
 }
 
-fn checkpoint_not_found_response(request_id: &str, error: AftError) -> Response {
+fn checkpoint_not_found_response(
+    request_id: &str,
+    error: AftError,
+    session_is_empty: bool,
+) -> Response {
     match error {
-        AftError::CheckpointNotFound { name } => Response::error(
-            request_id,
-            "checkpoint_not_found",
-            format!("checkpoint not found: {name}; {CHECKPOINT_RESTART_NOTICE}"),
-        ),
+        AftError::CheckpointNotFound { name } => {
+            let notice = if session_is_empty {
+                CHECKPOINT_RESTART_NOTICE
+            } else {
+                CHECKPOINT_HYDRATED_NOTICE
+            };
+            Response::error(
+                request_id,
+                "checkpoint_not_found",
+                format!("checkpoint not found: {name}; {notice}"),
+            )
+        }
         other => Response::error(request_id, other.code(), other.to_string()),
     }
 }

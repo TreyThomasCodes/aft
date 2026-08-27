@@ -1,4 +1,4 @@
-use crate::checkpoint::CHECKPOINT_RESTART_NOTICE;
+use crate::checkpoint::{CHECKPOINT_HYDRATED_NOTICE, CHECKPOINT_RESTART_NOTICE};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -6,11 +6,14 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// No params required.
 /// Returns: `{ checkpoints: [{ name, file_count, created_at }, ...], durability }`.
-/// Checkpoints are memory-only, so the durability notice explains an empty list
-/// after the bridge or daemon has restarted.
+/// The list hydrates from the durable disk tree after a bridge or daemon restart.
+/// The restart notice is emitted only when that hydration finds no checkpoints.
 pub fn handle_list_checkpoints(req: &RawRequest, ctx: &AppContext) -> Response {
-    let checkpoint_store = ctx.checkpoint().lock();
-    let list = checkpoint_store.list(req.session());
+    let mut checkpoint_store = ctx.checkpoint().lock();
+    let list = match checkpoint_store.list(req.session()) {
+        Ok(list) => list,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
 
     let checkpoints: Vec<serde_json::Value> = list
         .iter()
@@ -27,7 +30,11 @@ pub fn handle_list_checkpoints(req: &RawRequest, ctx: &AppContext) -> Response {
         &req.id,
         serde_json::json!({
             "checkpoints": checkpoints,
-            "durability": CHECKPOINT_RESTART_NOTICE,
+            "durability": if checkpoints.is_empty() {
+                CHECKPOINT_RESTART_NOTICE
+            } else {
+                CHECKPOINT_HYDRATED_NOTICE
+            },
         }),
     )
 }

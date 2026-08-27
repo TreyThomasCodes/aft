@@ -787,6 +787,20 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 format!("files {files}"),
                 skipped_text,
             ];
+            let evicted = response
+                .get("evicted")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|names| !names.is_empty());
+            if let Some(evicted) = evicted {
+                lines.push(format!("evicted {evicted}"));
+            }
             if let Some(durability) = import_string_field(response, "durability") {
                 lines.push(durability);
             }

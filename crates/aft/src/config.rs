@@ -353,7 +353,9 @@ pub struct Config {
     pub project_root: Option<PathBuf>,
     /// How many levels of call-graph edges to follow during validation (default: 1).
     pub validation_depth: u32,
-    /// Hours before a checkpoint expires and is eligible for cleanup (default: 24).
+    /// Hours before legacy backup-session maintenance may collect inactive history
+    /// (default: 24). Named checkpoint retention is intentionally fixed at fourteen
+    /// days and is not controlled by configuration.
     pub checkpoint_ttl_hours: u32,
     /// Maximum depth for recursive symbol resolution (default: 10).
     pub max_symbol_depth: u32,

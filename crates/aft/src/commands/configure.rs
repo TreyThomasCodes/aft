@@ -4060,10 +4060,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                 );
             }
             ctx.backup().lock().set_storage_dir_for_harness(
-                storage_dir,
+                storage_dir.clone(),
                 job.harness.clone(),
                 ctx.config().checkpoint_ttl_hours,
             );
+            ctx.checkpoint()
+                .lock()
+                .set_storage_dir_for_harness(storage_dir, job.harness.clone());
         }
 
         if job.refresh_project_runtime {

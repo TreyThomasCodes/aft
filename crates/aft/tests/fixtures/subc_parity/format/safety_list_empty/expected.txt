@@ -1,3 +1,3 @@
 0 checkpoint(s)
 No checkpoints saved.
-checkpoints do not survive restarts
+no durable checkpoints found on disk; in-memory checkpoints do not survive restarts
