@@ -363,6 +363,12 @@ const StatusDialog = (props: StatusDialogProps) => {
               value={status()!.features.semantic_search ? "on" : "off"}
               tone={status()!.features.semantic_search ? "ok" : "muted"}
             />
+            <R
+              theme={t()}
+              label="callgraph_store"
+              value={status()!.features.callgraph_store ? "on" : "off"}
+              tone={status()!.features.callgraph_store ? "ok" : "muted"}
+            />
           </box>
 
           {/* Right column */}

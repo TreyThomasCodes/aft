@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, callers_result, store_error_response, unavailable_response,
+    building_response, callers_result, store_error_response, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -74,9 +74,7 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "callers", &suspension)
         }
-        CallgraphStoreAccess::Unavailable => {
-            return unavailable_response(&req.id, "callers", ctx.is_worktree_bridge())
-        }
+        CallgraphStoreAccess::Unavailable => return unavailable_for(&req.id, "callers", ctx),
         CallgraphStoreAccess::Error(error) => {
             return store_error_response(&req.id, "callers", error)
         }

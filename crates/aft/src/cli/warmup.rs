@@ -72,10 +72,10 @@ fn run_with_storage(
     // has no request loop, so it must release the artifact start gates itself.
     aft::commands::configure::drain_deferred_configure_maintenance(&ctx);
 
-    // The callgraph store has no configure flag; building is triggered by
-    // calling `callgraph_store_for_ops` once (warm-opens an existing store, or
-    // kicks a background cold build). `None` => poll for readiness; `Some(_)`
-    // => a terminal state captured at trigger (worktree/unavailable or error).
+    // Calling `callgraph_store_for_ops` warm-opens an existing store or kicks a
+    // background cold build. A configured-disabled store is terminal here, so a
+    // HOME root reports disabled instead of entering a retry loop. `None` means
+    // poll for readiness; `Some(_)` is a terminal state captured at trigger.
     let callgraph_override = if args.areas.callgraph {
         trigger_callgraph_warm(&ctx)
     } else {
@@ -317,9 +317,9 @@ fn configure(
     areas: WarmupAreas,
     force: bool,
 ) -> Result<(), WarmupError> {
-    // The callgraph store has no configure flag of its own (it builds lazily on
-    // first op); it's triggered separately after configure. search/semantic are
-    // configure-gated, so warm only the requested ones.
+    // Search, semantic, and callgraph are configure-gated. Callgraph warming is
+    // triggered separately after configure so a HOME root can disable it before
+    // any cold-build admission occurs.
     let params = build_warmup_configure_params(root, storage_dir, areas, force);
     let req = RawRequest {
         id: "warmup-configure".to_string(),
@@ -604,9 +604,14 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
 /// existing on-disk store synchronously, or starts a background cold build and
 /// returns `Building`. Returns `None` to mean "poll for readiness" (Ready or a
 /// cold build in flight), or `Some(state)` for a terminal outcome that won't
-/// change by polling (worktree/unconfigured = treated as ready/no-op, or a hard
-/// build error).
+/// change by polling (configured-disabled, worktree/unconfigured = terminal no-op,
+/// or a hard build error).
 fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
+    // A disabled subsystem is terminal. In particular, HOME is never a project
+    // root, so its disabled callgraph configuration must not be represented as a retryable miss.
+    if !ctx.config().callgraph_store {
+        return Some(SubsystemState::Disabled);
+    }
     match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(_) if ctx.callgraph_store_rx().lock().is_some() => None,
         CallgraphStoreAccess::Ready(_) => Some(SubsystemState::Ready),
@@ -741,6 +746,9 @@ fn callgraph_store_state(
     ctx: &AppContext,
     override_state: &Option<SubsystemState>,
 ) -> SubsystemState {
+    if !ctx.config().callgraph_store {
+        return SubsystemState::Disabled;
+    }
     if let Some(state) = override_state {
         return state.clone();
     }
@@ -924,11 +932,53 @@ mod tests {
     }
 
     #[test]
+    fn home_root_callgraph_warmup_is_terminally_disabled() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", root.path().as_os_str());
+
+        let result = run_with_storage(
+            vec![
+                OsString::from("--root"),
+                root.path().as_os_str().to_os_string(),
+                OsString::from("--only"),
+                OsString::from("callgraph"),
+                OsString::from("--timeout"),
+                OsString::from("5000"),
+                OsString::from("--quiet"),
+            ],
+            Some(storage.path().to_path_buf()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "HOME root callgraph warmup retried: {result:?}"
+        );
+    }
+
+    #[test]
     fn warmup_storage_root_matches_shared_resolver() {
         assert_eq!(
             warmup_storage_dir(),
             aft::bash_background::storage_dir(None)
         );
+    }
+
+    #[test]
+    fn disabled_callgraph_is_terminal_instead_of_retrying() {
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_store: false,
+                ..Config::default()
+            },
+        );
+
+        assert_eq!(trigger_callgraph_warm(&ctx), Some(SubsystemState::Disabled));
+        assert_eq!(callgraph_store_state(&ctx, &None), SubsystemState::Disabled);
     }
 
     #[test]
@@ -979,6 +1029,7 @@ mod tests {
             serde_json::from_str(tiers[0]["doc"].as_str().unwrap()).unwrap();
         assert_eq!(doc["search_index"], json!(true));
         assert_eq!(doc["semantic_search"], json!(true));
+        assert_eq!(doc["callgraph_store"], json!(true));
 
         // --only search → semantic disabled in the doc.
         let search_only = build_warmup_configure_params(

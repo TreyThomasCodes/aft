@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, call_tree_result, store_error_response, unavailable_response,
+    building_response, call_tree_result, store_error_response, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -72,9 +72,7 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "call_tree", &suspension)
         }
-        CallgraphStoreAccess::Unavailable => {
-            return unavailable_response(&req.id, "call_tree", ctx.is_worktree_bridge())
-        }
+        CallgraphStoreAccess::Unavailable => return unavailable_for(&req.id, "call_tree", ctx),
         CallgraphStoreAccess::Error(error) => {
             return store_error_response(&req.id, "call_tree", error)
         }

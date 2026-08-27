@@ -118,6 +118,9 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   // Default: false
   "semantic_search": false,
 
+  // When project_root is exactly $HOME, search_index, semantic_search, and callgraph_store
+  // are force-disabled because the home directory is not treated as a project root.
+
   // Optional embedding-backend configuration for aft_search. Omit this block to use
   // the local fastembed default. Three backends are supported: "fastembed" (default,
   // local ONNX), "openai_compatible" (any /v1/embeddings endpoint — OpenAI, Together,

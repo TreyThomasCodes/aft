@@ -79,6 +79,23 @@ describe("coerceAftStatus", () => {
     expect(status.status_bar?.tier2_stale).toBe(true);
   });
 
+  test("home-root degradation renders as disabled heavy indexes", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      degraded: true,
+      degraded_reasons: ["home_root"],
+      features: { ...baseResponse.features, callgraph_store: false },
+    } as unknown as Record<string, unknown>);
+
+    expect(formatStatusDialogMessage(status)).toContain(
+      "project root is your home directory; heavy indexes are disabled",
+    );
+    expect(formatStatusMarkdown(status)).toContain(
+      "project root is your home directory; heavy indexes are disabled",
+    );
+    expect(formatStatusDialogMessage(status)).toContain("callgraph_store: disabled");
+  });
+
   test("status_bar is undefined when null (Tier-2 not populated)", () => {
     const status = coerceAftStatus({
       ...baseResponse,

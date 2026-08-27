@@ -47,6 +47,7 @@ export interface AftStatusSnapshot {
     restrict_to_project_root: boolean;
     search_index: boolean;
     semantic_search: boolean;
+    callgraph_store: boolean;
   };
   search_index: {
     status: string;
@@ -262,6 +263,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       semantic_search: readBoolean(
         features.semantic_search ?? features.experimental_semantic_search,
       ),
+      callgraph_store: readBoolean(features.callgraph_store),
     },
     search_index: {
       status: readString(searchIndex.status, "unknown"),
@@ -322,11 +324,15 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `Project root: ${status.project_root ?? "(not configured)"}`,
     `Canonical root: ${status.canonical_root ?? "(not configured)"}`,
     `Cache role: ${formatCacheRoleLabel(status.cache_role)}`,
+  ];
+  appendDegradedStatus(lines, status, false);
+  lines.push(
     "",
     "Enabled features",
     `- format_on_edit: ${formatFlag(status.features.format_on_edit)}`,
     `- search_index: ${formatFlag(status.features.search_index)}`,
     `- semantic_search: ${formatFlag(status.features.semantic_search)}`,
+    `- callgraph_store: ${formatFlag(status.features.callgraph_store)}`,
     "",
     "Search index",
     `- status: ${status.search_index.status}`,
@@ -335,7 +341,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     "",
     "Semantic index",
     `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
-  ];
+  );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
     lines.push(`- ${refreshing}`);
@@ -409,6 +415,18 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   return lines.join("\n");
 }
 
+function appendDegradedStatus(lines: string[], status: AftStatusSnapshot, markdown: boolean): void {
+  if (!status.degraded || status.degraded_reasons.length === 0) return;
+  lines.push("", markdown ? "### Degraded mode" : "Degraded mode");
+  for (const reason of status.degraded_reasons) {
+    const detail =
+      reason === "home_root"
+        ? "project root is your home directory; heavy indexes are disabled"
+        : reason;
+    lines.push(`- ${detail}`);
+  }
+}
+
 export function formatStatusMarkdown(status: AftStatusSnapshot): string {
   const lines = [
     "## AFT Status",
@@ -417,11 +435,15 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Project root:** \`${status.project_root ?? "(not configured)"}\``,
     `- **Canonical root:** \`${status.canonical_root ?? "(not configured)"}\``,
     `- **Cache role:** \`${formatCacheRoleLabel(status.cache_role)}\``,
+  ];
+  appendDegradedStatus(lines, status, true);
+  lines.push(
     "",
     "### Enabled features",
     `- \`format_on_edit\`: ${formatFlag(status.features.format_on_edit)}`,
     `- \`search_index\`: ${formatFlag(status.features.search_index)}`,
     `- \`semantic_search\`: ${formatFlag(status.features.semantic_search)}`,
+    `- \`callgraph_store\`: ${formatFlag(status.features.callgraph_store)}`,
     "",
     "### Search index",
     `- **Status:** \`${status.search_index.status}\``,
@@ -430,7 +452,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "",
     "### Semantic index",
     `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
-  ];
+  );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
     lines.push(`- **Refresh:** ${refreshing}`);

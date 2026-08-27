@@ -2081,13 +2081,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
+    // HOME is a user container, never a project root; keep project-wide index
+    // options from causing a persistent configuration to scan the entire home directory.
     let search_disabled_for_home = home_match && next_config.search_index;
     let semantic_disabled_for_home = home_match && next_config.semantic_search;
+    let callgraph_disabled_for_home = home_match && next_config.callgraph_store;
     if search_disabled_for_home {
         next_config.search_index = false;
     }
     if semantic_disabled_for_home {
         next_config.semantic_search = false;
+    }
+    if callgraph_disabled_for_home {
+        next_config.callgraph_store = false;
     }
 
     let requested_fingerprint =
@@ -2234,6 +2240,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if semantic_disabled_for_home {
         slog_warn!(
             "semantic_search auto-disabled: project root is the user home directory \
+             ({}). Open a project subdirectory for full features.",
+            canonical_cache_root.display()
+        );
+    }
+    if callgraph_disabled_for_home {
+        slog_warn!(
+            "callgraph_store auto-disabled: project root is the user home directory \
              ({}). Open a project subdirectory for full features.",
             canonical_cache_root.display()
         );

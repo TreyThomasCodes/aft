@@ -267,7 +267,7 @@ function renderInner(
   // Features
   lines.push(theme.fg("muted", "Features"));
   lines.push(
-    `  ${featureBadge("format_on_edit", s.features.format_on_edit, theme)}  ${featureBadge("search_index", s.features.search_index, theme)}  ${featureBadge("semantic_search", s.features.semantic_search, theme)}`,
+    `  ${featureBadge("format_on_edit", s.features.format_on_edit, theme)}  ${featureBadge("search_index", s.features.search_index, theme)}  ${featureBadge("semantic_search", s.features.semantic_search, theme)}  ${featureBadge("callgraph_store", s.features.callgraph_store, theme)}`,
   );
 
   const compressionRows = formatCompressionStatusRows(s.compression);

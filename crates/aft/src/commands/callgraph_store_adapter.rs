@@ -8,6 +8,7 @@ use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
 };
+use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
@@ -1794,6 +1795,32 @@ pub(crate) fn suspended_response_at(
             suspension.reason,
         ),
     )
+}
+
+/// Return the terminal navigation response for a HOME-root callgraph store.
+///
+/// This is intentionally distinct from `callgraph_unavailable`: HOME is
+/// configured successfully, but it is not a project root and must never enter
+/// the cold-build/retry loop.
+pub fn home_root_disabled_response(req_id: &str, operation: &str) -> Response {
+    Response::error_with_data(
+        req_id,
+        "callgraph_disabled",
+        format!(
+            "{operation}: callgraph store is disabled for home roots; open a project subdirectory to enable it"
+        ),
+        serde_json::json!({
+            "status": "disabled",
+            "reason": "home_root",
+        }),
+    )
+}
+
+pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Response {
+    if ctx.is_home_root() {
+        return home_root_disabled_response(req_id, operation);
+    }
+    unavailable_response(req_id, operation, ctx.is_worktree_bridge())
 }
 
 pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Response {

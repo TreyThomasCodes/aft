@@ -35,6 +35,22 @@ describe("shared status helpers", () => {
     expect(status.symbol_cache.warm_entries).toBe(0);
   });
 
+  test("home-root degradation renders as disabled heavy indexes", () => {
+    const status = coerceAftStatus({
+      degraded: true,
+      degraded_reasons: ["home_root"],
+      features: { callgraph_store: false },
+    });
+
+    expect(formatStatusDialogMessage(status)).toContain(
+      "project root is your home directory; heavy indexes are disabled",
+    );
+    expect(formatStatusMarkdown(status)).toContain(
+      "project root is your home directory; heavy indexes are disabled",
+    );
+    expect(formatStatusDialogMessage(status)).toContain("callgraph_store: disabled");
+  });
+
   test("pi_status_snapshot_includes_compression_passthrough", () => {
     const status = coerceAftStatus({
       compression: {

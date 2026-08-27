@@ -3725,6 +3725,16 @@ impl AppContext {
         !self.degraded_reasons.lock().is_empty()
     }
 
+    /// True when configure identified the current root as exactly `$HOME`.
+    /// Home is a user container, never a project root, so callgraph queries
+    /// must report the intentional disabled state instead of a retryable miss.
+    pub fn is_home_root(&self) -> bool {
+        self.degraded_reasons
+            .lock()
+            .iter()
+            .any(|reason| reason == "home_root")
+    }
+
     pub fn cache_role(&self) -> &'static str {
         if self.canonical_cache_root.lock().is_none() {
             "not_initialized"
@@ -4575,6 +4585,11 @@ impl AppContext {
     {
         let paths = paths.into_iter().collect::<Vec<_>>();
         if paths.is_empty() {
+            return true;
+        }
+        // A disabled or degraded root must not create a refresh worker merely
+        // to discover later that it cannot write the callgraph store.
+        if !self.config().callgraph_store || !self.heavy_root_work_allowed() {
             return true;
         }
         self.run_if_subc_bound_generation(generation, || {
@@ -7580,6 +7595,29 @@ mod callgraph_store_for_ops_tests {
                 !ctx.heavy_root_work_allowed(),
                 "HOME root configure must close the heavy-root-work gate"
             );
+            assert!(
+                !ctx.config().callgraph_store,
+                "HOME root configure must force-disable the callgraph store"
+            );
+            assert!(ctx.is_home_root());
+            assert!(ctx
+                .degraded_reasons()
+                .iter()
+                .any(|reason| reason == "home_root"));
+            let status_request = RawRequest {
+                id: "home-status".to_string(),
+                command: "status".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({}),
+            };
+            let status = crate::commands::status::handle_status(&status_request, &ctx);
+            assert_eq!(status.data["features"]["callgraph_store"], false);
+            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+            assert!(
+                ctx.callgraph_store_rx().lock().is_none(),
+                "HOME root maintenance must not schedule a callgraph build"
+            );
             assert_eq!(
                 ctx.try_health_snapshot(home.path())
                     .callgraph_store
@@ -7605,6 +7643,25 @@ mod callgraph_store_for_ops_tests {
                 0,
                 "HOME root gate must not spawn a cold callgraph build"
             );
+
+            let navigation = RawRequest {
+                id: "home-callers".to_string(),
+                command: "callers".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({
+                    "file": source_dir.join("lib.rs"),
+                    "symbol": "caller",
+                }),
+            };
+            let response = crate::commands::callers::handle_callers(&navigation, &ctx);
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "callgraph_disabled");
+            assert_eq!(response.data["status"], "disabled");
+            assert_eq!(response.data["reason"], "home_root");
+            assert!(response.data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("disabled for home roots")));
         });
     }
 
