@@ -744,7 +744,14 @@ impl CheckpointStore {
             sweep_expired_durable_checkpoints(&checkpoints_dir, now);
         }
         if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
-            sweep_empty_scope_dirs(checkpoints_root);
+            // Fail-closed guard: the sweep root is DERIVED from lock_path depth, and a
+            // caller with a nonstandard (shallower) lock path would resolve this to an
+            // unrelated directory - in tests, the OS temp root itself, where removing
+            // "empty scope dirs" deletes other processes' freshly created temp dirs.
+            // Only a directory actually named `checkpoints` is a legitimate sweep root.
+            if checkpoints_root.file_name() == Some(std::ffi::OsStr::new("checkpoints")) {
+                sweep_empty_scope_dirs(checkpoints_root);
+            }
         }
         Ok(())
     }
@@ -1658,6 +1665,26 @@ mod tests {
             .join(hash_session(DEFAULT_SESSION_ID))
             .join("checkpoint-00");
         assert!(!old_dir.exists(), "evicted checkpoint must leave disk too");
+    }
+
+    #[test]
+    fn cleanup_refuses_to_sweep_scope_dirs_outside_a_checkpoints_root() {
+        // Regression: edit_match tests set lock_path = <TempDir>/checkpoint.lock, so
+        // lock_path.parent().parent() is the OS TEMP ROOT. Before the named-root guard,
+        // cleanup_locked swept empty sibling directories there and deleted other tests'
+        // freshly created TempDirs (observed live: read.rs fixture writes failing with
+        // NotFound under the parallel suite). Mutation control: drop the file_name()
+        // guard in cleanup_locked and this test fails.
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let victim = temp_root.path().join("innocent-empty-sibling");
+        fs::create_dir(&victim).expect("victim dir");
+        let lock_path = temp_root.path().join("checkpoint.lock");
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.cleanup_locked().expect("cleanup");
+        assert!(
+            victim.exists(),
+            "cleanup must not sweep empty dirs outside a `checkpoints` root"
+        );
     }
 
     #[test]
