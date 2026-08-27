@@ -53,6 +53,8 @@ const READ_ONLY_ACTION_TUPLES: &[&str] = &[
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
+const UNTRUSTED_MANIFEST_KEY_STEERING: &str = "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key";
+const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
 /// callers must parse these identifiers rather than human prose.
@@ -235,7 +237,7 @@ fn run(args: &[OsString]) -> i32 {
     let initial_manifest = resolve_manifest(&paths, now);
     let invalid_manifest_problem = initial_manifest.invalid_problem().cloned();
     if let ManifestResolution::Regressed { manifest, problem } = &initial_manifest {
-        return match regressed_disposition(args, manifest, current_platform()) {
+        return match regressed_disposition(args, manifest, current_platform(), problem) {
             RegressedDisposition::Passthrough => {
                 delegate_after_invalid_manifest_notice(args, problem)
             }
@@ -283,7 +285,7 @@ fn run(args: &[OsString]) -> i32 {
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
-            return match regressed_disposition(args, &manifest, current_platform()) {
+            return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
                     delegate_after_invalid_manifest_notice(args, &problem)
                 }
@@ -434,6 +436,31 @@ struct RungRecord {
     inputs: BTreeMap<String, String>,
     #[serde(default)]
     manifest_version: Option<u64>,
+    #[serde(default)]
+    recorded_by_image_path: Option<String>,
+    #[serde(default)]
+    recorded_by_version: Option<String>,
+    #[serde(default)]
+    recorded_by_repo_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RungRecordProvenance {
+    image_path: String,
+    version: String,
+    repo_key: String,
+}
+
+impl RungRecordProvenance {
+    fn for_cwd(cwd: &Path) -> Self {
+        let project_root = project_root_for(cwd);
+        Self {
+            image_path: executing_image().to_string_lossy().into_owned(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            repo_key: repository_key_from_origin(&project_root)
+                .unwrap_or_else(|| "unresolved (no GitHub origin)".to_string()),
+        }
+    }
 }
 
 impl RungRecord {
@@ -529,12 +556,20 @@ impl RungDetermination {
                     reason.diagnostic().to_string(),
                 )]),
                 manifest_version: None,
+                recorded_by_image_path: None,
+                recorded_by_version: None,
+                recorded_by_repo_key: None,
             },
             operator_disabled: reason == R1Reason::DisabledByConfig,
         }
     }
 
-    fn r2(now: u64, reason: R2Reason, manifest_version: Option<u64>) -> Self {
+    fn r2(
+        now: u64,
+        reason: R2Reason,
+        manifest_version: Option<u64>,
+        provenance: &RungRecordProvenance,
+    ) -> Self {
         Self {
             record: RungRecord {
                 rung: Rung::R2,
@@ -544,12 +579,15 @@ impl RungDetermination {
                     (reason.diagnostic().to_string(), "failed".to_string()),
                 ]),
                 manifest_version,
+                recorded_by_image_path: Some(provenance.image_path.clone()),
+                recorded_by_version: Some(provenance.version.clone()),
+                recorded_by_repo_key: Some(provenance.repo_key.clone()),
             },
             operator_disabled: false,
         }
     }
 
-    fn r3(now: u64, manifest_version: u64) -> Self {
+    fn r3(now: u64, manifest_version: u64, provenance: &RungRecordProvenance) -> Self {
         Self {
             record: RungRecord {
                 rung: Rung::R3,
@@ -565,6 +603,9 @@ impl RungDetermination {
                     ),
                 ]),
                 manifest_version: Some(manifest_version),
+                recorded_by_image_path: Some(provenance.image_path.clone()),
+                recorded_by_version: Some(provenance.version.clone()),
+                recorded_by_repo_key: Some(provenance.repo_key.clone()),
             },
             operator_disabled: false,
         }
@@ -694,12 +735,14 @@ fn determine_rung_from_doc(
         }
     }
 
+    let provenance = RungRecordProvenance::for_cwd(cwd);
     // The signed manifest supplies the binding before the probe opens a route, so
     // rate accounting and audit records use the same agent session on every run.
     // A failed validation does not supply a manifest here because the regressed
     // arm itself is decided in `run` before any probe.
     let Some(manifest) = resolve_manifest(paths, now).into_manifest() else {
-        let determination = RungDetermination::r2(now, R2Reason::ManifestUnavailable, None);
+        let determination =
+            RungDetermination::r2(now, R2Reason::ManifestUnavailable, None, &provenance);
         write_rung_record_silently(paths, &determination.record);
         return determination;
     };
@@ -708,6 +751,7 @@ fn determine_rung_from_doc(
             now,
             R2Reason::AgentBindingUnavailable,
             Some(manifest.manifest_version),
+            &provenance,
         );
         write_rung_record_silently(paths, &determination.record);
         return determination;
@@ -728,6 +772,7 @@ fn determine_rung_from_doc(
                         now,
                         R2Reason::AgentCredentialsPresent,
                         Some(manifest.manifest_version),
+                        &provenance,
                     );
                     determination
                         .record
@@ -739,14 +784,20 @@ fn determine_rung_from_doc(
                         .insert("catalog_holder".to_string(), module_id);
                     determination
                 }
-                None => RungDetermination::r3(now, manifest.manifest_version),
+                None => RungDetermination::r3(now, manifest.manifest_version, &provenance),
             }
         }
-        ProbeResult::Unreachable => RungDetermination::r2(now, R2Reason::DaemonUnreachable, None),
-        ProbeResult::NoRoute => RungDetermination::r2(now, R2Reason::CatalogGhRouteAbsent, None),
+        ProbeResult::Unreachable => {
+            RungDetermination::r2(now, R2Reason::DaemonUnreachable, None, &provenance)
+        }
+        ProbeResult::NoRoute => {
+            RungDetermination::r2(now, R2Reason::CatalogGhRouteAbsent, None, &provenance)
+        }
         // Keep the holder-unbound status diagnostic distinct from an absent
         // repository binding. Dispatch no longer consumes either reason.
-        ProbeResult::Unbound => RungDetermination::r2(now, R2Reason::GhRouteHolderUnbound, None),
+        ProbeResult::Unbound => {
+            RungDetermination::r2(now, R2Reason::GhRouteHolderUnbound, None, &provenance)
+        }
         ProbeResult::TimedOut => cached
             .filter(|record| record.fresh_at(now))
             .map(RungDetermination::cached)
@@ -1421,6 +1472,12 @@ struct SignedManifest {
 }
 
 #[derive(Clone, Debug)]
+struct VerifiedManifest {
+    manifest: Manifest,
+    verified_by_key_id: String,
+}
+
+#[derive(Clone, Debug)]
 enum ManifestProblem {
     Missing,
     Invalid(String),
@@ -1479,6 +1536,18 @@ impl ManifestProblem {
             }
         }
     }
+
+    fn untrusted_manifest_key_steering(&self) -> Option<&'static str> {
+        match self {
+            Self::Invalid(reason) if reason.starts_with("untrusted manifest key id ") => {
+                Some(UNTRUSTED_MANIFEST_KEY_STEERING)
+            }
+            Self::Missing
+            | Self::Invalid(_)
+            | Self::BelowFloor { .. }
+            | Self::RolledBack { .. } => None,
+        }
+    }
 }
 
 /// Verifier-site contract for the signed routing manifest.
@@ -1534,6 +1603,15 @@ impl ManifestProblem {
 /// classification over the routed request. The shim never holds any token in
 /// either direction.
 fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProblem> {
+    load_manifest_with_trust_set(paths, now, compiled_manifest_trust_set())
+        .map(|verified| verified.manifest)
+}
+
+fn load_manifest_with_trust_set(
+    paths: &StatePaths,
+    now: u64,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
     let bytes = fs::read(&paths.manifest).map_err(|_| ManifestProblem::Missing)?;
     let envelope: SignedManifest = serde_json::from_slice(&bytes)
         .map_err(|error| ManifestProblem::Invalid(error.to_string()))?;
@@ -1547,7 +1625,10 @@ fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProbl
         )));
     }
     // Verify the received bytes FIRST, parse SECOND (contract above).
-    let manifest = verify_manifest_signature(&envelope)?;
+    let VerifiedManifest {
+        manifest,
+        verified_by_key_id,
+    } = verify_manifest_signature_with_provenance(&envelope, trust_set)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -1578,24 +1659,36 @@ fn load_manifest(paths: &StatePaths, now: u64) -> Result<Manifest, ManifestProbl
         write_version_high_water(paths, manifest.manifest_version);
     }
     write_last_valid_manifest(paths, &manifest);
-    Ok(manifest)
+    Ok(VerifiedManifest {
+        manifest,
+        verified_by_key_id,
+    })
 }
 
 /// Verify the signature over the envelope's exact manifest bytes, then parse.
 /// No manifest content is interpreted before its bytes verify.
+#[cfg(test)]
 fn verify_manifest_signature(envelope: &SignedManifest) -> Result<Manifest, ManifestProblem> {
     verify_manifest_signature_with(envelope, compiled_manifest_trust_set())
 }
 
+#[cfg(test)]
 fn verify_manifest_signature_with(
     envelope: &SignedManifest,
     trust_set: &[Option<ManifestTrustKey>],
 ) -> Result<Manifest, ManifestProblem> {
+    verify_manifest_signature_with_provenance(envelope, trust_set).map(|verified| verified.manifest)
+}
+
+fn verify_manifest_signature_with_provenance(
+    envelope: &SignedManifest,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
     let Some(key) = trust_set
         .iter()
         .flatten()
         .find(|slot| slot.key_id == envelope.key_id)
-        .map(|slot| slot.public_key)
+        .copied()
     else {
         return Err(ManifestProblem::Invalid(format!(
             "untrusted manifest key id {}",
@@ -1605,13 +1698,17 @@ fn verify_manifest_signature_with(
     let signature = base64::engine::general_purpose::STANDARD
         .decode(&envelope.signature)
         .map_err(|_| ManifestProblem::Invalid("invalid detached signature encoding".to_string()))?;
-    UnparsedPublicKey::new(&ED25519, key)
+    UnparsedPublicKey::new(&ED25519, key.public_key)
         .verify(envelope.manifest_bytes.as_bytes(), &signature)
         .map_err(|_| {
             ManifestProblem::Invalid("detached signature verification failed".to_string())
         })?;
-    serde_json::from_str(&envelope.manifest_bytes).map_err(|error| {
+    let manifest = serde_json::from_str(&envelope.manifest_bytes).map_err(|error| {
         ManifestProblem::Invalid(format!("signed manifest bytes failed to parse: {error}"))
+    })?;
+    Ok(VerifiedManifest {
+        manifest,
+        verified_by_key_id: key.key_id.to_string(),
     })
 }
 
@@ -1705,6 +1802,10 @@ fn compiled_manifest_trust_set() -> &'static [Option<ManifestTrustKey>] {
     }
 }
 
+fn trust_set_key_ids(trust_set: &[Option<ManifestTrustKey>]) -> Vec<&'static str> {
+    trust_set.iter().flatten().map(|key| key.key_id).collect()
+}
+
 /// Outcome of resolving the installed manifest artifact for an invocation.
 ///
 /// The state is keyed on what is INSTALLED on disk, never on memory of past
@@ -1787,21 +1888,29 @@ fn regressed_disposition(
     args: &[OsString],
     manifest: &Manifest,
     platform: &str,
+    problem: &ManifestProblem,
 ) -> RegressedDisposition {
     match classify(args, manifest, platform) {
         Classification::Mechanical => RegressedDisposition::Passthrough,
         Classification::Governed { tuple, .. } | Classification::Admin { tuple } => {
-            RegressedDisposition::Refuse {
-                code: RefusalCode::ManifestRegressed,
-                text: format!(
+            let text = match problem.untrusted_manifest_key_steering() {
+                Some(steering) => {
+                    format!("the manifest artifact fails validation; {tuple} is refused; {steering}")
+                }
+                None => format!(
                     "the manifest artifact fails validation; {tuple} is refused until the manifest is repaired"
                 ),
+            };
+            RegressedDisposition::Refuse {
+                code: RefusalCode::ManifestRegressed,
+                text,
             }
         }
         Classification::Unclassified => RegressedDisposition::Refuse {
             code: RefusalCode::Unclassified,
-            text: "no manifest declaration for this invocation (manifest artifact fails validation)"
-                .to_string(),
+            text:
+                "no manifest declaration for this invocation (manifest artifact fails validation)"
+                    .to_string(),
         },
     }
 }
@@ -2645,10 +2754,15 @@ struct CachedManifestReport {
     /// Signed provenance metadata for the manifest used by this report; it does
     /// not control artifact validity after signature verification.
     issued_at_unix_secs: Option<u64>,
+    /// The compiled trust-set key that verified the installed envelope.
+    verified_by_key_id: Option<String>,
+    /// Key identifiers compiled into this executing image's manifest trust set.
+    compiled_trust_set_key_ids: Vec<&'static str>,
     version_error: Option<String>,
     state: Option<&'static str>,
     state_error: Option<String>,
     diagnostics: Vec<&'static str>,
+    diagnostic_guidance: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2659,6 +2773,9 @@ struct LastRungReport {
     as_of_unix_secs_error: Option<String>,
     determination_inputs: Option<BTreeMap<String, String>>,
     determination_inputs_error: Option<String>,
+    recorded_by_image_path: Option<String>,
+    recorded_by_version: Option<String>,
+    recorded_by_repo_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2744,10 +2861,13 @@ fn disabled_manifest_report() -> CachedManifestReport {
     CachedManifestReport {
         version: None,
         issued_at_unix_secs: None,
+        verified_by_key_id: None,
+        compiled_trust_set_key_ids: trust_set_key_ids(compiled_manifest_trust_set()),
         version_error: None,
         state: Some("disabled"),
         state_error: None,
         diagnostics: Vec::new(),
+        diagnostic_guidance: None,
     }
 }
 
@@ -2764,6 +2884,9 @@ fn disabled_last_rung_report() -> LastRungReport {
             "disabled_by_config".to_string(),
         )])),
         determination_inputs_error: None,
+        recorded_by_image_path: None,
+        recorded_by_version: None,
+        recorded_by_repo_key: None,
     }
 }
 
@@ -2772,34 +2895,52 @@ fn cached_manifest_report(paths: &StatePaths) -> CachedManifestReport {
 }
 
 fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestReport {
-    match load_manifest(paths, now) {
-        Ok(manifest) => CachedManifestReport {
-            version: Some(manifest.manifest_version),
-            issued_at_unix_secs: Some(manifest.issued_at_unix_secs),
+    cached_manifest_report_at_with(paths, now, compiled_manifest_trust_set())
+}
+
+fn cached_manifest_report_at_with(
+    paths: &StatePaths,
+    now: u64,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> CachedManifestReport {
+    let compiled_trust_set_key_ids = trust_set_key_ids(trust_set);
+    match load_manifest_with_trust_set(paths, now, trust_set) {
+        Ok(verified) => CachedManifestReport {
+            version: Some(verified.manifest.manifest_version),
+            issued_at_unix_secs: Some(verified.manifest.issued_at_unix_secs),
+            verified_by_key_id: Some(verified.verified_by_key_id),
+            compiled_trust_set_key_ids,
             version_error: None,
             state: Some("valid"),
             state_error: None,
             diagnostics: Vec::new(),
+            diagnostic_guidance: None,
         },
         Err(ManifestProblem::Missing) => {
             let error = ManifestProblem::Missing.status_label();
             CachedManifestReport {
                 version: None,
                 issued_at_unix_secs: None,
+                verified_by_key_id: None,
+                compiled_trust_set_key_ids,
                 version_error: Some(error.clone()),
                 state: None,
                 state_error: Some(error),
                 diagnostics: vec![SelfReportDiagnostic::ManifestUnavailable.as_str()],
+                diagnostic_guidance: None,
             }
         }
         Err(problem) => {
             // Artifact present but failing. The regressed-manifest arm is loud
             // in self-report: name the arm state first, then the artifact
             // fault that triggered it.
+            let diagnostic_guidance = problem.untrusted_manifest_key_steering();
             match read_last_valid_manifest(paths) {
                 Some(cache) => CachedManifestReport {
                     version: Some(cache.manifest.manifest_version),
                     issued_at_unix_secs: Some(cache.manifest.issued_at_unix_secs),
+                    verified_by_key_id: None,
+                    compiled_trust_set_key_ids,
                     version_error: None,
                     state: Some("regressed"),
                     state_error: None,
@@ -2807,16 +2948,20 @@ fn cached_manifest_report_at(paths: &StatePaths, now: u64) -> CachedManifestRepo
                         SelfReportDiagnostic::ManifestRegressed.as_str(),
                         problem.diagnostic().as_str(),
                     ],
+                    diagnostic_guidance,
                 },
                 None => {
                     let error = problem.status_label();
                     CachedManifestReport {
                         version: None,
                         issued_at_unix_secs: None,
+                        verified_by_key_id: None,
+                        compiled_trust_set_key_ids,
                         version_error: Some(error.clone()),
                         state: None,
                         state_error: Some(error),
                         diagnostics: vec![problem.diagnostic().as_str()],
+                        diagnostic_guidance,
                     }
                 }
             }
@@ -2834,6 +2979,21 @@ fn last_rung_report(paths: &StatePaths) -> LastRungReport {
                 as_of_unix_secs_error: None,
                 determination_inputs: Some(record.inputs),
                 determination_inputs_error: None,
+                recorded_by_image_path: Some(
+                    record
+                        .recorded_by_image_path
+                        .unwrap_or_else(|| PRE_PROVENANCE_RECORD.to_string()),
+                ),
+                recorded_by_version: Some(
+                    record
+                        .recorded_by_version
+                        .unwrap_or_else(|| PRE_PROVENANCE_RECORD.to_string()),
+                ),
+                recorded_by_repo_key: Some(
+                    record
+                        .recorded_by_repo_key
+                        .unwrap_or_else(|| PRE_PROVENANCE_RECORD.to_string()),
+                ),
             },
             Err(error) => unavailable_last_rung(format!("corrupt rung cache: {error}")),
         },
@@ -2852,6 +3012,9 @@ fn unavailable_last_rung(error: String) -> LastRungReport {
         as_of_unix_secs_error: Some(error.clone()),
         determination_inputs: None,
         determination_inputs_error: Some(error),
+        recorded_by_image_path: None,
+        recorded_by_version: None,
+        recorded_by_repo_key: None,
     }
 }
 
@@ -3129,6 +3292,14 @@ mod tests {
     fn write_envelope_fixture(paths: &StatePaths, envelope_json: &str) {
         fs::create_dir_all(&paths.root).expect("state root");
         fs::write(&paths.manifest, envelope_json.as_bytes()).expect("manifest cache");
+    }
+
+    fn test_rung_provenance() -> RungRecordProvenance {
+        RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "0.53.0-test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        }
     }
 
     #[test]
@@ -3439,7 +3610,7 @@ mod tests {
             repository: Some("cortexkit/aft".to_string()),
             manifest_version: 1,
         };
-        let determination = RungDetermination::r3(7, 1);
+        let determination = RungDetermination::r3(7, 1, &test_rung_provenance());
         let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
         assert_eq!(wire["metadata"]["agent_id"], "alfonso-aft");
         assert_eq!(wire["metadata"]["pid"], std::process::id());
@@ -3789,7 +3960,7 @@ mod tests {
                 ));
                 let request = canonicalize_governed(&args, expected_tuple, &canonical, 1)
                     .expect("body-file form should canonicalize");
-                let determination = RungDetermination::r3(1, 1);
+                let determination = RungDetermination::r3(1, 1, &test_rung_provenance());
                 let wire = governed_wire_request(&determination.record, "agent-7", request);
                 assert_eq!(wire["body"]["body"], expected_body);
             }
@@ -3998,7 +4169,12 @@ mod tests {
     fn lower_rungs_are_cached_durably_but_r1_is_not_written() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let determination = RungDetermination::r2(123, R2Reason::DaemonUnreachable, None);
+        let determination = RungDetermination::r2(
+            123,
+            R2Reason::DaemonUnreachable,
+            None,
+            &test_rung_provenance(),
+        );
         write_rung_record_silently(&paths, &determination.record);
         assert_eq!(load_rung_record(&paths).unwrap().rung, Rung::R2);
         assert!(!paths.root.join("r1-cache.json").exists());
@@ -4083,9 +4259,9 @@ mod tests {
         determinations.extend(
             R2Reason::ALL
                 .into_iter()
-                .map(|reason| RungDetermination::r2(1, reason, Some(1))),
+                .map(|reason| RungDetermination::r2(1, reason, Some(1), &test_rung_provenance())),
         );
-        determinations.push(RungDetermination::r3(1, 1));
+        determinations.push(RungDetermination::r3(1, 1, &test_rung_provenance()));
         assert_eq!(
             R1Reason::ALL.len() + R2Reason::ALL.len() + 1,
             EXPECTED_RUNG_SHAPE_COUNT,
@@ -4188,6 +4364,7 @@ mod tests {
             1,
             R2Reason::AgentCredentialsPresent,
             Some(manifest.manifest_version),
+            &test_rung_provenance(),
         );
         let binding = AgentBinding {
             repo: "cortexkit/aft".to_string(),
@@ -4684,7 +4861,8 @@ mod tests {
 
         // A failed validation immediately enters the regressed arm; time passing
         // does not participate in manifest validity.
-        let ManifestResolution::Regressed { manifest, .. } = resolve_manifest(&paths, now) else {
+        let ManifestResolution::Regressed { manifest, problem } = resolve_manifest(&paths, now)
+        else {
             panic!("expected the regressed arm");
         };
         let governed = [
@@ -4695,7 +4873,7 @@ mod tests {
             OsString::from("hello"),
         ];
         assert!(matches!(
-            regressed_disposition(&governed, &manifest, "macos"),
+            regressed_disposition(&governed, &manifest, "macos", &problem),
             RegressedDisposition::Refuse {
                 code: RefusalCode::ManifestRegressed,
                 ..
@@ -4707,7 +4885,7 @@ mod tests {
             OsString::from("1"),
         ];
         assert!(matches!(
-            regressed_disposition(&admin, &manifest, "macos"),
+            regressed_disposition(&admin, &manifest, "macos", &problem),
             RegressedDisposition::Refuse {
                 code: RefusalCode::ManifestRegressed,
                 ..
@@ -4715,12 +4893,12 @@ mod tests {
         ));
         let mechanical = [OsString::from("issue"), OsString::from("view")];
         assert!(matches!(
-            regressed_disposition(&mechanical, &manifest, "macos"),
+            regressed_disposition(&mechanical, &manifest, "macos", &problem),
             RegressedDisposition::Passthrough
         ));
         let undeclared = [OsString::from("alias"), OsString::from("set")];
         assert!(matches!(
-            regressed_disposition(&undeclared, &manifest, "macos"),
+            regressed_disposition(&undeclared, &manifest, "macos", &problem),
             RegressedDisposition::Refuse {
                 code: RefusalCode::Unclassified,
                 ..
@@ -4739,6 +4917,123 @@ mod tests {
                 SelfReportDiagnostic::ManifestInvalid.as_str(),
             ]
         );
+    }
+
+    #[test]
+    fn self_report_exposes_manifest_and_rung_record_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+
+        let manifest_report = cached_manifest_report_at(&paths, TEST_NOW);
+        assert_eq!(manifest_report.state, Some("valid"));
+        assert_eq!(
+            manifest_report.verified_by_key_id.as_deref(),
+            Some(DEV_MANIFEST_KEY_ID)
+        );
+        assert_eq!(
+            manifest_report.compiled_trust_set_key_ids,
+            trust_set_key_ids(compiled_manifest_trust_set())
+        );
+
+        let provenance = RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "0.53.0-test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        };
+        let determination =
+            RungDetermination::r2(TEST_NOW, R2Reason::DaemonUnreachable, Some(1), &provenance);
+        write_rung_record_silently(&paths, &determination.record);
+        let fresh_rung = last_rung_report(&paths);
+        assert_eq!(
+            fresh_rung.recorded_by_image_path.as_deref(),
+            Some("/opt/cortexkit/aft-gh-shim")
+        );
+        assert_eq!(
+            fresh_rung.recorded_by_version.as_deref(),
+            Some("0.53.0-test")
+        );
+        assert_eq!(
+            fresh_rung.recorded_by_repo_key.as_deref(),
+            Some("cortexkit/aft")
+        );
+
+        fs::write(
+            &paths.rung,
+            serde_json::to_vec(&json!({
+                "rung": "R2",
+                "as_of_unix_secs": TEST_NOW,
+                "inputs": { "daemon_unreachable": "failed" },
+                "manifest_version": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let legacy_rung = last_rung_report(&paths);
+        assert_eq!(
+            legacy_rung.recorded_by_image_path.as_deref(),
+            Some(PRE_PROVENANCE_RECORD)
+        );
+        assert_eq!(
+            legacy_rung.recorded_by_version.as_deref(),
+            Some(PRE_PROVENANCE_RECORD)
+        );
+        assert_eq!(
+            legacy_rung.recorded_by_repo_key.as_deref(),
+            Some(PRE_PROVENANCE_RECORD)
+        );
+    }
+
+    #[test]
+    fn trust_set_provenance_explains_image_level_untrusted_key_regression() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        let verifier_a = [Some(ManifestTrustKey {
+            key_id: DEV_MANIFEST_KEY_ID,
+            public_key: &DEV_MANIFEST_PUBLIC_KEY,
+        })];
+        let verifier_b = [Some(PROD_MANIFEST_TRUST_KEY)];
+
+        let report_a = cached_manifest_report_at_with(&paths, TEST_NOW, &verifier_a);
+        assert_eq!(report_a.state, Some("valid"));
+        assert_eq!(
+            report_a.verified_by_key_id.as_deref(),
+            Some(DEV_MANIFEST_KEY_ID)
+        );
+        assert_eq!(
+            report_a.compiled_trust_set_key_ids,
+            vec![DEV_MANIFEST_KEY_ID]
+        );
+
+        let report_b = cached_manifest_report_at_with(&paths, TEST_NOW, &verifier_b);
+        assert_eq!(report_b.state, Some("regressed"));
+        assert_eq!(report_b.verified_by_key_id, None);
+        assert_eq!(
+            report_b.compiled_trust_set_key_ids,
+            vec![PROD_MANIFEST_KEY_ID]
+        );
+        assert_eq!(
+            report_b.diagnostic_guidance,
+            Some(UNTRUSTED_MANIFEST_KEY_STEERING)
+        );
+
+        let cached = read_last_valid_manifest(&paths).expect("verifier A wrote last-valid cache");
+        let governed = [
+            OsString::from("issue"),
+            OsString::from("comment"),
+            OsString::from("42"),
+            OsString::from("--body"),
+            OsString::from("hello"),
+        ];
+        let untrusted =
+            ManifestProblem::Invalid(format!("untrusted manifest key id {DEV_MANIFEST_KEY_ID}"));
+        let RegressedDisposition::Refuse { text, .. } =
+            regressed_disposition(&governed, &cached.manifest, "macos", &untrusted)
+        else {
+            panic!("a governed command must refuse under verifier B");
+        };
+        assert!(text.ends_with(UNTRUSTED_MANIFEST_KEY_STEERING));
     }
 
     #[test]

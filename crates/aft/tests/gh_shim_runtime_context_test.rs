@@ -328,6 +328,21 @@ fn gh_shim_daemon_probe_from_sync_entry_is_r2_without_a_runtime_panic() {
         report["last_rung"]["determination_inputs"]["daemon_unreachable"],
         "failed"
     );
+    assert_eq!(
+        report["last_rung"]["recorded_by_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(report["last_rung"]["recorded_by_repo_key"], "cortexkit/aft");
+    assert!(report["last_rung"]["recorded_by_image_path"]
+        .as_str()
+        .is_some_and(|path| !path.is_empty()));
+    assert_eq!(
+        report["cached_manifest"]["verified_by_key_id"],
+        "gh-routing-dev-test-key-v1"
+    );
+    assert!(report["cached_manifest"]["compiled_trust_set_key_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == "gh-routing-dev-test-key-v1")));
 }
 
 #[test]
