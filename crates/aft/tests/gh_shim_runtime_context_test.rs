@@ -37,10 +37,8 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn write_fresh_manifest(state_home: &Path, now: u64) {
-    let mut manifest: Value =
-        serde_json::from_str(include_str!("fixtures/gh_shim/initial-manifest-v1.json"))
-            .expect("parse manifest fixture");
+fn write_fresh_manifest_from_fixture(state_home: &Path, now: u64, fixture: &str) {
+    let mut manifest: Value = serde_json::from_str(fixture).expect("parse manifest fixture");
     manifest["issued_at_unix_secs"] = json!(now);
     let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize fresh manifest");
     let key = Ed25519KeyPair::from_seed_unchecked(&DEV_MANIFEST_SEED).expect("build test key");
@@ -60,6 +58,22 @@ fn write_fresh_manifest(state_home: &Path, now: u64) {
         serde_json::to_vec(&envelope).expect("serialize manifest envelope"),
     )
     .expect("write manifest envelope");
+}
+
+fn write_fresh_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/initial-manifest-v1.json"),
+    );
+}
+
+fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/s2-manifest-v1.json"),
+    );
 }
 
 fn write_fresh_r3_cache(state_home: &Path, now: u64) {
@@ -146,7 +160,11 @@ fn write_dead_connection_file(root: &Path) -> PathBuf {
 }
 
 fn write_project_repo(root: &Path) -> PathBuf {
-    let project = root.join("project");
+    write_project_repo_for(root, "project", "cortexkit/aft")
+}
+
+fn write_project_repo_for(root: &Path, name: &str, repository: &str) -> PathBuf {
+    let project = root.join(name);
     fs::create_dir_all(&project).expect("create project directory");
     let initialized = Command::new("git")
         .args(["init", "--quiet"])
@@ -159,7 +177,7 @@ fn write_project_repo(root: &Path) -> PathBuf {
             "remote",
             "add",
             "origin",
-            "https://github.com/cortexkit/aft.git",
+            &format!("https://github.com/{repository}.git"),
         ])
         .current_dir(&project)
         .status()
@@ -228,6 +246,45 @@ fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option
     .expect("write user config");
 }
 
+fn shim_status(
+    project: &Path,
+    config_home: &Path,
+    state_home: &Path,
+    home: &Path,
+    upstream_bin: &Path,
+    recorder: &Path,
+) -> Value {
+    let output = shim_command(
+        &["--status"],
+        project,
+        config_home,
+        state_home,
+        home,
+        upstream_bin,
+        recorder,
+    )
+    .output()
+    .expect("spawn gh shim status");
+    assert!(
+        output.status.success(),
+        "status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse gh shim status JSON")
+}
+
+fn assert_status_provenance(report: &Value) {
+    assert!(report["executing_image"]
+        .as_str()
+        .is_some_and(|image| !image.is_empty()));
+    assert!(report["cached_manifest"]
+        .get("verified_by_key_id")
+        .is_some());
+    assert!(report["cached_manifest"]["compiled_trust_set_key_ids"]
+        .as_array()
+        .is_some_and(|ids| ids.iter().any(|id| id == "gh-routing-dev-test-key-v1")));
+}
+
 fn shim_command(
     args: &[&str],
     project: &Path,
@@ -256,6 +313,191 @@ fn shim_command(
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GH_SHIM_BYPASS");
     shim
+}
+
+#[test]
+fn gh_shim_s2_one_agent_many_repos_exercises_binding_and_failure_arms() {
+    const AGENT_ID: &str = "agent_d444250e2d503c07";
+    const BOUND_REPOS: [&str; 3] = [
+        "cortexkit/cortexkit-e2e",
+        "cortexkit/cortexkit-account",
+        "cortexkit/aft",
+    ];
+
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/gh_shim/s2-manifest-v1.json"))
+        .expect("parse S2 manifest fixture");
+    let bindings = fixture["bindings"].as_object().expect("S2 bindings object");
+    assert_eq!(bindings.len(), BOUND_REPOS.len());
+    assert!(bindings.values().all(|agent| agent == AGENT_ID));
+
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let home = temp.path().join("home");
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    write_upstream_gh(&upstream_bin);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Each repository gets an independent state universe so a persisted binding
+    // from one invocation cannot satisfy another repository's assertion.
+    for (index, repository) in BOUND_REPOS.into_iter().enumerate() {
+        let state_home = temp.path().join(format!("bound-state-{index}"));
+        let project =
+            write_project_repo_for(temp.path(), &format!("bound-project-{index}"), repository);
+        let recorder = temp.path().join(format!("bound-recorder-{index}.txt"));
+        write_fresh_s2_manifest(&state_home, unix_seconds());
+
+        let output = shim_command(
+            &["issue", "comment", "42", "--body", "S2 fixture"],
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn bound S2 governed invocation");
+        assert_eq!(output.status.code(), Some(86));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+        );
+        assert!(
+            !recorder.exists(),
+            "a bound governed invocation must never reach ambient gh"
+        );
+
+        let status = shim_status(
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        );
+        assert_eq!(status["agent_binding"]["repo"], repository);
+        assert_eq!(status["agent_binding"]["agent_id"], AGENT_ID);
+        assert_eq!(
+            status["last_seam_refusal"]["code"],
+            "gh_shim_governance_unavailable"
+        );
+        assert_eq!(status["cached_manifest"]["state"], "valid");
+        assert_status_provenance(&status);
+    }
+
+    let unbound_state = temp.path().join("unbound-state");
+    let unbound_project = write_project_repo_for(
+        temp.path(),
+        "unbound-project",
+        "cortexkit/unmanifested-repository",
+    );
+    let unbound_recorder = temp.path().join("unbound-recorder.txt");
+    write_fresh_s2_manifest(&unbound_state, unix_seconds());
+    let unbound = shim_command(
+        &["issue", "comment", "42", "--body", "S2 fixture"],
+        &unbound_project,
+        &config_home,
+        &unbound_state,
+        &home,
+        &upstream_bin,
+        &unbound_recorder,
+    )
+    .output()
+    .expect("spawn unbound S2 governed invocation");
+    assert_eq!(unbound.status.code(), Some(73));
+    assert_eq!(String::from_utf8_lossy(&unbound.stdout), "r2-passthrough\n");
+    assert!(unbound.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&unbound_recorder).expect("read unbound upstream invocation"),
+        "issue comment 42 --body S2 fixture\n"
+    );
+    let unbound_status = shim_status(
+        &unbound_project,
+        &config_home,
+        &unbound_state,
+        &home,
+        &upstream_bin,
+        &unbound_recorder,
+    );
+    assert!(unbound_status["agent_binding"].is_null());
+    assert!(unbound_status["last_seam_refusal"].is_null());
+    assert_eq!(unbound_status["cached_manifest"]["state"], "valid");
+    assert_status_provenance(&unbound_status);
+
+    let regressed_state = temp.path().join("regressed-state");
+    let regressed_project =
+        write_project_repo_for(temp.path(), "regressed-project", BOUND_REPOS[0]);
+    let regressed_recorder = temp.path().join("regressed-recorder.txt");
+    write_fresh_s2_manifest(&regressed_state, unix_seconds());
+    let happy_status = shim_status(
+        &regressed_project,
+        &config_home,
+        &regressed_state,
+        &home,
+        &upstream_bin,
+        &regressed_recorder,
+    );
+    assert_eq!(happy_status["cached_manifest"]["state"], "valid");
+    assert_status_provenance(&happy_status);
+
+    let manifest_path = regressed_state.join("cortexkit/aft/gh-shim/gh-routing-manifest.json");
+    let mut envelope: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read S2 manifest envelope"))
+            .expect("parse S2 manifest envelope");
+    envelope["key_id"] = json!("unknown-s2-test-key");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&envelope).expect("serialize untrusted S2 envelope"),
+    )
+    .expect("write untrusted S2 envelope");
+
+    let regressed = shim_command(
+        &["issue", "comment", "42", "--body", "S2 fixture"],
+        &regressed_project,
+        &config_home,
+        &regressed_state,
+        &home,
+        &upstream_bin,
+        &regressed_recorder,
+    )
+    .output()
+    .expect("spawn untrusted S2 governed invocation");
+    assert_eq!(regressed.status.code(), Some(86));
+    let regressed_stderr = String::from_utf8_lossy(&regressed.stderr);
+    assert!(regressed_stderr.contains("gh_shim_manifest_regressed"));
+    assert!(regressed_stderr.contains("update aft, or install a manifest signed by a trusted key"));
+    assert!(
+        !regressed_recorder.exists(),
+        "a regressed governed invocation must not reach ambient gh"
+    );
+
+    let regressed_status = shim_status(
+        &regressed_project,
+        &config_home,
+        &regressed_state,
+        &home,
+        &upstream_bin,
+        &regressed_recorder,
+    );
+    assert_eq!(regressed_status["cached_manifest"]["state"], "regressed");
+    assert_ne!(
+        regressed_status["cached_manifest"]["state"], happy_status["cached_manifest"]["state"],
+        "the broken S2 fixture's status must disagree with its valid twin"
+    );
+    assert_eq!(
+        regressed_status["cached_manifest"]["diagnostics"],
+        json!([
+            "gh_shim_status_manifest_regressed",
+            "gh_shim_status_manifest_invalid"
+        ])
+    );
+    assert_eq!(
+        regressed_status["cached_manifest"]["diagnostic_guidance"],
+        "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key"
+    );
+    assert!(regressed_status["cached_manifest"]["verified_by_key_id"].is_null());
+    assert_status_provenance(&regressed_status);
 }
 
 #[test]
