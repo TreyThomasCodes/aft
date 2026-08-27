@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
+import { resolveCortexKitStorageRoot, resolveStoragePath } from "./storage-paths.js";
 
 export const BASH_HOST_FALLBACK_BANNER =
   "[AFT host fallback - module transport down; no rewrites/compression/background]";
@@ -20,6 +23,29 @@ export interface BashHostFallbackResult extends Record<string, unknown> {
   output: string;
   exit_code: number;
   truncated: boolean;
+}
+
+/**
+ * Host fallback spawns with the raw host environment, which would put the
+ * REAL `gh` in front of any governed repository's speech commands (the shim
+ * normally rides the daemon-injected child PATH that fallback bypasses). Keep
+ * the shims directory in front here too: the shim passes mechanical reads
+ * through to the real gh without a daemon, and fails governed verbs closed
+ * while the transport is down - exactly the fallback state. Without this, a
+ * transport outage silently converts bot speech into ambient-credential posts.
+ */
+export function hostFallbackPathWithShims(env: NodeJS.ProcessEnv): string | undefined {
+  // Honor the caller-visible AFT_STORAGE_DIR override from the SAME env the
+  // child will receive, falling back to the shared storage root.
+  const storageRoot = env.AFT_STORAGE_DIR
+    ? resolveStoragePath(env.AFT_STORAGE_DIR)
+    : resolveCortexKitStorageRoot();
+  const shimsDir = join(storageRoot, "shims");
+  if (!existsSync(join(shimsDir, "gh"))) return env.PATH;
+  const inherited = env.PATH ?? "";
+  const entries = inherited.split(delimiter).filter((entry) => entry.length > 0);
+  if (entries[0] === shimsDir) return inherited;
+  return [shimsDir, ...entries.filter((entry) => entry !== shimsDir)].join(delimiter);
 }
 
 export function bashHostFallbackAskPattern(command: string, cwd: string): string {
@@ -60,7 +86,12 @@ export async function runBashHostFallback(
     const child = spawn(options.command, {
       cwd: options.projectRoot,
       shell: true,
-      env: { ...process.env, ...options.env },
+      env: (() => {
+        const merged = { ...process.env, ...options.env };
+        const path = hostFallbackPathWithShims(merged);
+        if (path !== undefined) merged.PATH = path;
+        return merged;
+      })(),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

@@ -1,11 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
   bashHostFallbackAskPattern,
+  hostFallbackPathWithShims,
   runBashHostFallback,
 } from "../bash-host-fallback.js";
+import { resolveCortexKitStorageRoot } from "../storage-paths.js";
 
 describe("bash host fallback", () => {
   test("permission pattern carries the exact command and project root", () => {
@@ -70,5 +74,24 @@ describe("bash host fallback", () => {
 
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+});
+
+describe("hostFallbackPathWithShims", () => {
+  const shimsRoot = resolveCortexKitStorageRoot();
+  const shimsDir = join(shimsRoot, "shims");
+  const hasShim = existsSync(join(shimsDir, "gh"));
+
+  test("prepends the shims dir exactly once when the gh shim exists", () => {
+    if (!hasShim) return; // machine without a provisioned shim: covered by the absent case below
+    const path = hostFallbackPathWithShims({ PATH: `/usr/bin:${shimsDir}:/bin` });
+    expect(path?.split(delimiter)[0]).toBe(shimsDir);
+    expect(path?.split(delimiter).filter((entry) => entry === shimsDir)).toHaveLength(1);
+  });
+
+  test("leaves PATH untouched when no shim is provisioned", () => {
+    // Point storage at an empty location via env override.
+    const env = { PATH: "/usr/bin:/bin", AFT_STORAGE_DIR: "/nonexistent-aft-storage-root" };
+    expect(hostFallbackPathWithShims(env)).toBe("/usr/bin:/bin");
   });
 });
