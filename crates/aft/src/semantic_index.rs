@@ -7,6 +7,7 @@ use crate::fs_lock;
 use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
 use crate::search_index::{cache_relative_path, cached_path_under_root};
 use crate::symbols::{Symbol, SymbolKind};
+use crate::synapse_embed::SynapseEmbeddingClient;
 use crate::{slog_info, slog_warn};
 
 use crate::local_embed::LocalEmbedder;
@@ -153,7 +154,7 @@ impl SemanticIndexLock {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SemanticIndexFingerprint {
     pub backend: String,
     pub model: String,
@@ -162,6 +163,16 @@ pub struct SemanticIndexFingerprint {
     pub dimension: usize,
     #[serde(default = "default_chunking_version")]
     pub chunking_version: u32,
+    /// The Synapse fingerprint and table epoch identify the served vector space
+    /// so indexes built against incompatible embeddings are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synapse_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synapse_table_epoch: Option<u64>,
+    /// Alternative fingerprints that Synapse explicitly declares equivalent to
+    /// this index's fingerprint, allowing those versions to pass compatibility checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synapse_equivalent_to: Vec<String>,
 }
 
 fn default_chunking_version() -> u32 {
@@ -183,6 +194,9 @@ impl SemanticIndexFingerprint {
             base_url,
             dimension,
             chunking_version: default_chunking_version(),
+            synapse_fingerprint: None,
+            synapse_table_epoch: None,
+            synapse_equivalent_to: Vec::new(),
         }
     }
 
@@ -195,8 +209,37 @@ impl SemanticIndexFingerprint {
     }
 
     fn matches_expected(&self, expected: &str) -> bool {
-        let encoded = self.as_string();
-        !encoded.is_empty() && encoded == expected
+        let Ok(current) = serde_json::from_str::<Self>(expected) else {
+            return false;
+        };
+        self.matches(&current)
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        if self.backend != current.backend
+            || self.model != current.model
+            || self.base_url != current.base_url
+            || self.dimension != current.dimension
+            || self.chunking_version != current.chunking_version
+            || self.synapse_table_epoch != current.synapse_table_epoch
+        {
+            return false;
+        }
+        match (&self.synapse_fingerprint, &current.synapse_fingerprint) {
+            (None, None) => true,
+            (Some(cached), Some(served)) => {
+                cached == served
+                    || current
+                        .synapse_equivalent_to
+                        .iter()
+                        .any(|alias| alias == cached)
+                    || self
+                        .synapse_equivalent_to
+                        .iter()
+                        .any(|alias| alias == served)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -275,6 +318,24 @@ fn format_fingerprint_mismatch_details(
             cached.chunking_version, current.chunking_version
         ));
     }
+    if cached.synapse_table_epoch != current.synapse_table_epoch {
+        diffs.push(format!(
+            "synapse table_epoch cached={:?} current={:?}",
+            cached.synapse_table_epoch, current.synapse_table_epoch
+        ));
+    }
+    if !cached.matches(current)
+        && (cached.synapse_fingerprint.is_some() || current.synapse_fingerprint.is_some())
+    {
+        diffs.push(format!(
+            "synapse fingerprint cached={} current={} (equivalence class checked)",
+            cached.synapse_fingerprint.as_deref().unwrap_or("<missing>"),
+            current
+                .synapse_fingerprint
+                .as_deref()
+                .unwrap_or("<missing>")
+        ));
+    }
 
     if diffs.is_empty() {
         "fingerprint strings differ but parsed fields match".to_string()
@@ -311,6 +372,7 @@ enum SemanticEmbeddingEngine {
         model: String,
         base_url: String,
     },
+    Synapse(SynapseEmbeddingClient),
 }
 
 pub struct SemanticEmbeddingModel {
@@ -893,6 +955,13 @@ impl SemanticEmbeddingModel {
                     base_url,
                 }
             }
+            SemanticBackend::Synapse => SemanticEmbeddingEngine::Synapse(
+                SynapseEmbeddingClient::from_config(config).map_err(|error| error.to_string())?,
+            ),
+        };
+        let max_batch_size = match &engine {
+            SemanticEmbeddingEngine::Synapse(client) => client.metadata().recommended_rows,
+            _ => max_batch_size,
         };
 
         Ok(Self {
@@ -935,7 +1004,14 @@ impl SemanticEmbeddingModel {
         config: &SemanticBackendConfig,
     ) -> Result<SemanticIndexFingerprint, String> {
         let dimension = self.dimension()?;
-        Ok(SemanticIndexFingerprint::from_config(config, dimension))
+        let mut fingerprint = SemanticIndexFingerprint::from_config(config, dimension);
+        if let SemanticEmbeddingEngine::Synapse(client) = &self.engine {
+            let identity = client.identity();
+            fingerprint.synapse_fingerprint = Some(identity.fingerprint.clone());
+            fingerprint.synapse_table_epoch = Some(identity.table_epoch);
+            fingerprint.synapse_equivalent_to = identity.equivalent_to.clone();
+        }
+        Ok(fingerprint)
     }
 
     pub fn dimension(&mut self) -> Result<usize, String> {
@@ -971,6 +1047,9 @@ impl SemanticEmbeddingModel {
                     .map(|v| v.len())
                     .ok_or_else(|| "embedding backend returned no vectors".to_string())?
             }
+            SemanticEmbeddingEngine::Synapse(client) => client
+                .probe_dimension(Duration::from_millis(self.timeout_ms))
+                .map_err(|error| error.to_string())?,
         };
 
         self.dimension = Some(dimension);
@@ -1166,6 +1245,23 @@ impl SemanticEmbeddingModel {
                     }
                 }
 
+                self.dimension = vectors.first().map(Vec::len);
+                Ok(vectors)
+            }
+            SemanticEmbeddingEngine::Synapse(client) => {
+                let vectors = match policy {
+                    EmbeddingRequestPolicy::Build => client
+                        .embed_batch(&texts)
+                        .map_err(|error| error.to_string())?,
+                    EmbeddingRequestPolicy::Query(budget) => {
+                        let timeout = Duration::from_millis(budget.timeout_ms);
+                        texts
+                            .iter()
+                            .map(|text| client.embed_query(text, timeout))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| error.to_string())?
+                    }
+                };
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
@@ -5764,6 +5860,7 @@ Connection: close
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         });
         assert!(index.shared_base.is_none(), "owner indexes stay private");
 
@@ -5871,6 +5968,7 @@ Connection: close
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 2,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         });
         let project_key = format!(
             "hash-fallback-{}",
@@ -6420,6 +6518,7 @@ Connection: close
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 4,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         });
 
         let bytes = index.to_bytes();
@@ -6490,6 +6589,7 @@ Connection: close
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         };
         let fingerprint_before = fingerprint.as_string();
         index.set_fingerprint(fingerprint.clone());
@@ -7186,6 +7286,7 @@ public class Greeter {
             query_timeout_ms: 0,
             max_batch_size: 64,
             max_files: 20_000,
+            ..Default::default()
         };
 
         let build_model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7229,6 +7330,7 @@ public class Greeter {
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
+            ..Default::default()
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
 
@@ -7262,6 +7364,7 @@ public class Greeter {
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
+            ..Default::default()
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7337,6 +7440,7 @@ public class Greeter {
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
+            ..Default::default()
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         let _ = model.embed(vec!["probe".to_string()]).unwrap();
@@ -7384,6 +7488,7 @@ public class Greeter {
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
+            ..Default::default()
         };
 
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
@@ -7429,6 +7534,7 @@ public class Greeter {
             base_url: "http://127.0.0.1:1234/v1".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         });
         index.write_to_disk(storage.path(), project_key);
 
@@ -7455,6 +7561,7 @@ public class Greeter {
             base_url: "http://127.0.0.1:11434".to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         }
         .as_string();
         assert!(SemanticIndex::read_from_disk(
@@ -7469,6 +7576,26 @@ public class Greeter {
     }
 
     #[test]
+    fn synapse_fingerprint_pin_matches_only_equivalent_alias_at_same_epoch() {
+        let cached = SemanticIndexFingerprint {
+            backend: "synapse".to_string(),
+            model: "configured-model".to_string(),
+            dimension: 768,
+            chunking_version: 2,
+            synapse_fingerprint: Some("fp-old".to_string()),
+            synapse_table_epoch: Some(9),
+            ..Default::default()
+        };
+        let mut served = cached.clone();
+        served.synapse_fingerprint = Some("fp-current".to_string());
+        served.synapse_equivalent_to = vec!["fp-old".to_string()];
+        assert!(cached.matches_expected(&served.as_string()));
+
+        served.synapse_table_epoch = Some(10);
+        assert!(!cached.matches_expected(&served.as_string()));
+    }
+
+    #[test]
     fn fingerprint_mismatch_details_redact_base_url_and_list_changed_fields() {
         let cached = SemanticIndexFingerprint {
             backend: "openai_compatible".to_string(),
@@ -7476,6 +7603,7 @@ public class Greeter {
             base_url: "https://user:secret@example.com/v1/embeddings".to_string(),
             dimension: 3,
             chunking_version: 2,
+            ..Default::default()
         };
         let current = SemanticIndexFingerprint {
             backend: "ollama".to_string(),
@@ -7483,6 +7611,7 @@ public class Greeter {
             base_url: "https://example.org/api/embed".to_string(),
             dimension: 4,
             chunking_version: 3,
+            ..Default::default()
         };
 
         let details = format_fingerprint_mismatch_details(Some(&cached), &current);
@@ -7531,6 +7660,7 @@ public class Greeter {
             base_url: FALLBACK_BACKEND.to_string(),
             dimension: 3,
             chunking_version: default_chunking_version(),
+            ..Default::default()
         };
         index.set_fingerprint(fingerprint.clone());
 

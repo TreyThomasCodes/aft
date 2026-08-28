@@ -4185,6 +4185,7 @@ mod tests {
                     query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
+                    ..Default::default()
                 },
                 ..Config::default()
             },
@@ -5691,6 +5692,7 @@ mod tests {
                     query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
+                    ..Default::default()
                 },
                 ..Config::default()
             },

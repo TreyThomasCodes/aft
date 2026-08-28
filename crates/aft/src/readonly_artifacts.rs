@@ -545,6 +545,7 @@ mod tests {
             base_url: "http://127.0.0.1".to_string(),
             dimension: 3,
             chunking_version: 1,
+            ..Default::default()
         };
         let mut embed =
             |texts: Vec<String>| Ok::<_, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);

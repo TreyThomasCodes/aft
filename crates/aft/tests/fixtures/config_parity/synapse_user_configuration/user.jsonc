@@ -1,0 +1,9 @@
+{
+  "semantic": {
+    "backend": "synapse",
+    "model": "gte-modernbert-base-ane-fp16"
+  },
+  "subc": {
+    "connection_file": "/tmp/subc-connection.json"
+  }
+}

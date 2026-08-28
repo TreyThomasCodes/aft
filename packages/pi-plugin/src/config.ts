@@ -81,7 +81,7 @@ export type Checker =
 /** How configure-time missing-tool warnings are delivered by the Pi plugin. */
 export type ConfigureWarningsDelivery = "toast" | "log" | "chat";
 
-export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama";
+export type SemanticBackend = "fastembed" | "openai_compatible" | "ollama" | "synapse";
 
 export interface BridgeConfig {
   request_timeout_ms?: number;

@@ -500,15 +500,16 @@
           "enum": [
             "fastembed",
             "openai_compatible",
-            "ollama"
+            "ollama",
+            "synapse"
           ],
           "default": "fastembed",
-          "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint."
+          "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC."
         },
         "model": {
           "type": "string",
           "minLength": 1,
-          "description": "Model identifier passed to the backend. Defaults vary by backend (fastembed default: all-MiniLM-L6-v2)."
+          "description": "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2."
         },
         "base_url": {
           "type": "string",
@@ -1112,15 +1113,16 @@
                 "enum": [
                   "fastembed",
                   "openai_compatible",
-                  "ollama"
+                  "ollama",
+                  "synapse"
                 ],
                 "default": "fastembed",
-                "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint."
+                "description": "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC."
               },
               "model": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Model identifier passed to the backend. Defaults vary by backend (fastembed default: all-MiniLM-L6-v2)."
+                "description": "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2."
               },
               "base_url": {
                 "type": "string",

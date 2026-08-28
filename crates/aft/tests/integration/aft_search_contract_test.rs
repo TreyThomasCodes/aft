@@ -277,6 +277,7 @@ fn persist_matching_semantic_index(
             base_url: base_url.to_string(),
             dimension: 3,
             chunking_version: 2,
+            ..Default::default()
         },
     );
 }
@@ -292,6 +293,7 @@ fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_di
             base_url: "http://127.0.0.1".to_string(),
             dimension: 3,
             chunking_version: 2,
+            ..Default::default()
         },
     );
 }
@@ -310,6 +312,7 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
                 query_timeout_ms: 3_000,
                 max_batch_size: 64,
                 max_files: 20_000,
+                ..Default::default()
             },
             ..Config::default()
         },
@@ -335,6 +338,7 @@ fn openai_context_with_storage(
                 query_timeout_ms: 3_000,
                 max_batch_size: 64,
                 max_files: 20_000,
+                ..Default::default()
             },
             ..Config::default()
         },

@@ -84,7 +84,7 @@ const CheckerEnum = z.enum([
 export const ConfigureWarningsDeliveryEnum = z.enum(["toast", "log", "chat"]);
 export type ConfigureWarningsDelivery = z.infer<typeof ConfigureWarningsDeliveryEnum>;
 
-const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama"]);
+const SemanticBackendEnum = z.enum(["fastembed", "openai_compatible", "ollama", "synapse"]);
 const IndexKindSchema = z.enum(["search", "semantic", "callgraph"]);
 
 function isSupportedAbsoluteIndexPath(path: string): boolean {
@@ -121,7 +121,7 @@ const IndexConfigSchema = z.object({
 });
 
 const SemanticConfigSchema = z.object({
-  /** Semantic backend type: local fastembed, OpenAI-compatible API, or Ollama. */
+  /** Semantic backend type: local fastembed, OpenAI-compatible API, Ollama, or Synapse over SubC. */
   backend: SemanticBackendEnum.optional(),
   /** Model identifier passed to the selected semantic backend. */
   model: z.string().trim().min(1).optional(),

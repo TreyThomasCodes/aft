@@ -152,6 +152,16 @@ const CASES: ParityCase[] = [
     },
   },
   {
+    name: "synapse_user_configuration",
+    user: {
+      semantic: {
+        backend: "synapse",
+        model: "gte-modernbert-base-ane-fp16",
+      },
+      subc: { connection_file: "/tmp/subc-connection.json" },
+    },
+  },
+  {
     name: "project_overrides_allowed",
     user: { search_index: false },
     project: { search_index: true, format_on_edit: false },

@@ -220,6 +220,7 @@ fn mismatched_load_preserves_cache_until_replacement_is_written() {
         base_url: "http://127.0.0.1:1234/v1".to_string(),
         dimension: index.dimension(),
         chunking_version: 2,
+        ..Default::default()
     });
     index.write_to_disk(storage.path(), project_key);
     let original_bytes = fs::read(&semantic_file).expect("read original semantic cache");
@@ -230,6 +231,7 @@ fn mismatched_load_preserves_cache_until_replacement_is_written() {
         base_url: "http://127.0.0.1:11434".to_string(),
         dimension: index.dimension(),
         chunking_version: 3,
+        ..Default::default()
     };
     assert!(SemanticIndex::read_from_disk(
         storage.path(),
@@ -297,6 +299,7 @@ fn read_only_mismatch_returns_none_without_touching_shared_cache() {
         base_url: "http://127.0.0.1:1234/v1".to_string(),
         dimension: index.dimension(),
         chunking_version: 2,
+        ..Default::default()
     });
     index.write_to_disk(storage.path(), project_key);
     let original_bytes = fs::read(&semantic_file).expect("read original semantic cache");
@@ -307,6 +310,7 @@ fn read_only_mismatch_returns_none_without_touching_shared_cache() {
         base_url: "http://127.0.0.1:11434".to_string(),
         dimension: index.dimension(),
         chunking_version: 3,
+        ..Default::default()
     };
     assert!(SemanticIndex::read_from_disk(
         storage.path(),
@@ -536,6 +540,7 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
         base_url: "none".to_string(),
         dimension: 3,
         chunking_version: 2,
+        ..Default::default()
     }
     .as_string();
 
@@ -631,6 +636,7 @@ fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
         base_url: "none".to_string(),
         dimension: 4,
         chunking_version: 2,
+        ..Default::default()
     };
     let fp_str = fingerprint.as_string();
     let fp_bytes = fp_str.as_bytes();
@@ -714,6 +720,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
             base_url: "none".to_string(),
             dimension: 4,
             chunking_version: 2,
+            ..Default::default()
         };
         let fp_bytes = fingerprint.as_string().into_bytes();
         let mut bytes = Vec::new();

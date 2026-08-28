@@ -122,6 +122,7 @@ pub mod subc_translate;
 pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
+pub mod synapse_embed;
 pub mod tool_path;
 pub mod url_fetch;
 pub(crate) mod walk_boundary;

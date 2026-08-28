@@ -834,6 +834,7 @@ fn semantic_fingerprint_config_changed(
     previous.backend != next.backend
         || previous.model != next.model
         || previous.base_url != next.base_url
+        || previous.subc_connection_file != next.subc_connection_file
 }
 
 fn should_clear_failed_spawns(
@@ -1968,6 +1969,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Some(&harness),
             &mut next_config,
         );
+    next_config.semantic.route_project_root = Some(canonical_cache_root.clone());
+    next_config.semantic.route_harness = Some(harness.wire_label());
     let config_dropped_keys = config_diagnostics.dropped;
     let mut configure_warnings = config_diagnostics
         .warnings
@@ -4935,6 +4938,7 @@ mod tests {
             query_timeout_ms: 5_000,
             max_batch_size: 64,
             max_files: 1_000,
+            ..Default::default()
         }
     }
 
