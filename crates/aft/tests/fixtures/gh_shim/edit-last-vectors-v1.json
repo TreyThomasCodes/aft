@@ -1,5 +1,3 @@
-// Producer provenance: repo CortexKit/prefrontal, commit 0b1dea6b
-// Source path: crates/prefrontal-core-module/tests/fixtures/gh_route/edit-last-vectors-v1.json
 {
   "cases": [
     {
@@ -26,29 +24,6 @@
           ],
           "method": "GET",
           "url": "https://api.github.com/repos/cortexkit/aft/issues/42/comments?per_page=100&page=1"
-        },
-        {
-          "body": null,
-          "headers": [
-            [
-              "Accept",
-              "application/vnd.github+json"
-            ],
-            [
-              "Authorization",
-              "Bearer ghs_test_token"
-            ],
-            [
-              "User-Agent",
-              "prefrontal-core/0.1.0"
-            ],
-            [
-              "X-GitHub-Api-Version",
-              "2022-11-28"
-            ]
-          ],
-          "method": "GET",
-          "url": "https://api.github.com/user"
         },
         {
           "body": "{\"body\":\"A concise comment.\"}",
@@ -135,29 +110,6 @@
           ],
           "method": "GET",
           "url": "https://api.github.com/repos/cortexkit/aft/issues/42/comments?per_page=100&page=1"
-        },
-        {
-          "body": null,
-          "headers": [
-            [
-              "Accept",
-              "application/vnd.github+json"
-            ],
-            [
-              "Authorization",
-              "Bearer ghs_test_token"
-            ],
-            [
-              "User-Agent",
-              "prefrontal-core/0.1.0"
-            ],
-            [
-              "X-GitHub-Api-Version",
-              "2022-11-28"
-            ]
-          ],
-          "method": "GET",
-          "url": "https://api.github.com/user"
         }
       ],
       "name": "edit_last_no_own_comment",

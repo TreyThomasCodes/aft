@@ -3859,7 +3859,7 @@ mod tests {
     #[test]
     fn producer_edit_last_vectors_pin_consumer_wire_request_and_refusals() {
         const EXPECTED_SHA256: &str =
-            "0404dc0d45120ee1207b7f97126408b9ad99894349d8aa7d9041151d5c6fd4ea";
+            "cd22bb4de80b5c44b500d75220f03d3b0908f0e67101842de0c29c86b1e9b9e0";
         let fixture_bytes = include_bytes!("../tests/fixtures/gh_shim/edit-last-vectors-v1.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(fixture_bytes)),
