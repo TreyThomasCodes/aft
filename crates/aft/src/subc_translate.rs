@@ -3195,10 +3195,15 @@ mod tests {
             translated.args.get("shell"),
             Some(&Value::String("powershell".into()))
         );
-        let workdir = translated.args["workdir"]
-            .as_str()
-            .expect("translated workdir");
-        assert_eq!(Path::new(workdir), Path::new("/project").join("scripts"));
+        // Join through PathBuf so the expected string carries the platform's
+        // native separator (Windows resolves this as /project\scripts).
+        let expected_workdir = Path::new("/project").join("scripts");
+        assert_eq!(
+            translated.args.get("workdir"),
+            Some(&Value::String(
+                expected_workdir.to_string_lossy().into_owned()
+            ))
+        );
     }
 
     #[test]

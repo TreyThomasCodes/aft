@@ -2233,6 +2233,16 @@ impl InspectManager {
             && aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
+            if let Some(reason) = callgraph_path_identity_gap(job) {
+                return Ok(InspectScanSuccess {
+                    scanned_files: scan_files,
+                    contributions: Vec::new(),
+                    aggregate: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
+                        job.scope_files.len(),
+                        Some(&reason),
+                    ),
+                });
+            }
             return Err(format!(
                 "tier2 dead_code aggregate did not complete; builder_state={}",
                 self.builder_state_detail_for_job(job)
@@ -2884,6 +2894,26 @@ fn refresh_writable_dead_code_store(
             }
         }
     }
+}
+
+fn callgraph_path_identity_gap(job: &InspectJob) -> Option<String> {
+    for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
+    {
+        let Ok(Some(store)) =
+            CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone())
+        else {
+            continue;
+        };
+        let Err(CallGraphStoreError::Unavailable(reason)) =
+            project_dead_code_snapshot_with_revision(store.sqlite_path())
+        else {
+            continue;
+        };
+        if reason.starts_with("callgraph_path_identity_mismatch ") {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 fn open_writable_dead_code_store(
@@ -5502,6 +5532,44 @@ export function bannerUnused() {}
 
         assert_eq!(snapshot.files.len(), 3);
         assert_eq!(snapshot.exported_symbols.len(), 3);
+    }
+
+    #[test]
+    fn path_identity_mismatch_is_a_named_dead_code_terminal_gap() {
+        let dir = write_ts_project(1);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let source = root.join("mod0.ts");
+        let foreign_dir = tempfile::tempdir().expect("foreign tempdir");
+        let foreign = foreign_dir.path().join("foreign.ts");
+        std::fs::write(&foreign, "export function foreign() {}\n").expect("write foreign source");
+        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
+        store.cold_build(&[source]).expect("cold build store");
+        let error = store
+            .refresh_files(&[foreign.clone()])
+            .expect_err("foreign watcher path cannot be assigned a store-relative key");
+        assert!(matches!(
+            error,
+            CallGraphStoreError::PathIdentityMismatch { .. }
+        ));
+        drop(store);
+
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let reason = callgraph_path_identity_gap(&job).expect("durable path identity gap");
+        assert!(reason.contains("callgraph_path_identity_mismatch"));
+        assert!(reason.contains(&foreign.display().to_string()));
+        let aggregate =
+            crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
+                1,
+                Some(&reason),
+            );
+        assert_eq!(
+            aggregate["notes"],
+            serde_json::json!(["callgraph_unavailable", "callgraph_path_identity_mismatch"])
+        );
+        assert_eq!(aggregate["callgraph_unavailable_reason"], reason);
     }
 
     #[test]

@@ -1296,9 +1296,14 @@ mod tests {
             !collection_truncated,
             "a known foreign mount is not an I/O failure"
         );
-        assert!(files.iter().any(|path| path.ends_with("local/keep.rs")));
+        // Component-based comparison: `files` holds native path strings, so a
+        // str::ends_with("local/keep.rs") literal would never match Windows
+        // backslash separators.
+        let keep = Path::new("local").join("keep.rs");
+        let skip = Path::new("foreign").join("skip.rs");
+        assert!(files.iter().any(|path| Path::new(path).ends_with(&keep)));
         assert!(
-            !files.iter().any(|path| path.ends_with("foreign/skip.rs")),
+            !files.iter().any(|path| Path::new(path).ends_with(&skip)),
             "foreign-mount contents must not be traversed"
         );
     }

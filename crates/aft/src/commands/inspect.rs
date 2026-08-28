@@ -1089,7 +1089,16 @@ fn finish_tier2_phases(
     match outcome {
         JobOutcome::Fresh { payload } => {
             if let Some(callgraph_phase) = callgraph_phase {
-                if payload.get("callgraph_available").and_then(Value::as_bool) == Some(true) {
+                if payload.get("callgraph_available").and_then(Value::as_bool) == Some(true)
+                    || payload
+                        .get("notes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|notes| {
+                            notes.iter().any(|note| {
+                                note.as_str() == Some("callgraph_path_identity_mismatch")
+                            })
+                        })
+                {
                     callgraph_phase.complete();
                 } else {
                     callgraph_phase.fail("dead_code aggregate has no ready callgraph snapshot");
@@ -1643,7 +1652,11 @@ fn render_symbol_category(
     if key == "dead_code"
         && section.get("callgraph_available").and_then(Value::as_bool) == Some(false)
     {
-        lines.push("Dead code analysis unavailable (no callgraph)".to_string());
+        let reason = section
+            .get("callgraph_unavailable_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no callgraph");
+        lines.push(format!("Dead code analysis unavailable ({reason})"));
         return;
     }
     if let Some(status) = section.get("status").and_then(Value::as_str) {
@@ -1908,7 +1921,10 @@ fn render_duplicates_category(
             render_generated_duplicate_usage(lines, summary, details, key);
             return;
         }
-        lines.push(format!("{label}: {count}{generated_suffix} (top by cost):"));
+        lines.push(format!(
+            "{label}: {count}{}{generated_suffix} (top by cost):",
+            duplicate_suppression_clause(section)
+        ));
         render_duplicate_rows(lines, summary, details, key);
         render_generated_duplicate_usage(lines, summary, details, key);
         return;
@@ -1927,6 +1943,7 @@ fn render_duplicates_category(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let group_count = count;
+    let suppression_clause = duplicate_suppression_clause(section);
     let suffix = if count > 0 { " (top by cost):" } else { "" };
     // A zero denominator means analyzed-line counts are missing (pre-v0.44
     // cached contributions); print no percentage rather than a false "0.0%".
@@ -1939,10 +1956,9 @@ fn render_duplicates_category(
         String::new()
     };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{generated_suffix}{suffix}",
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{suffix}",
         plural_group(group_count),
     ));
-    render_duplicate_suppression(lines, section);
     if count > 0 {
         render_duplicate_rows(lines, summary, details, key);
     }
@@ -2000,26 +2016,29 @@ fn render_generated_duplicate_usage(
     }
 }
 
-fn render_duplicate_suppression(lines: &mut Vec<String>, section: &Value) {
+/// Suppression counts as a headline clause (e.g. " (238 suppressed by
+/// expected_mirrors, 8 by aft:expected-duplicate)"), so they read as summary
+/// stats instead of items inside the top-groups list.
+fn duplicate_suppression_clause(section: &Value) -> String {
     let mirror = section
         .get("mirror_suppressed_groups")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if mirror > 0 {
-        lines.push(format!(
-            "  {mirror} mirror {} suppressed by expected_mirrors",
-            plural_group(mirror)
-        ));
-    }
     let marker = section
         .get("marker_suppressed_groups")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let mut parts = Vec::new();
+    if mirror > 0 {
+        parts.push(format!("{mirror} suppressed by expected_mirrors"));
+    }
     if marker > 0 {
-        lines.push(format!(
-            "  {marker} marker {} suppressed by aft:expected-duplicate",
-            plural_group(marker)
-        ));
+        parts.push(format!("{marker} by aft:expected-duplicate"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
     }
 }
 
@@ -2135,7 +2154,10 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         {
             // This is a terminal capability result, not a partial scan: dead-code
             // analysis cannot run without the callgraph, so it must not claim zero.
-            serde_json::json!({ "callgraph_available": false })
+            serde_json::json!({
+                "callgraph_available": false,
+                "reason": payload.get("callgraph_unavailable_reason"),
+            })
         }
         InspectCategory::DeadCode => serde_json::json!({
             "count": count_from_payload(Some(payload)),
@@ -2824,17 +2846,13 @@ mod render_text_tests {
 
         assert!(
             text.contains(
-                "Duplicates: 42 duplicated lines (10.4% of 404 analyzed lines) across 3 files, 1 group (top by cost):"
+                "Duplicates: 42 duplicated lines (10.4% of 404 analyzed lines) across 3 files, 1 group (2 suppressed by expected_mirrors, 1 by aft:expected-duplicate) (top by cost):"
             ),
             "{text}"
         );
         assert!(
-            text.contains("2 mirror groups suppressed by expected_mirrors"),
-            "{text}"
-        );
-        assert!(
-            text.contains("1 marker group suppressed by aft:expected-duplicate"),
-            "{text}"
+            !text.contains("  2 mirror groups suppressed"),
+            "suppression stats must not render as list items: {text}"
         );
         assert!(
             text.contains("suggestion: consider extracting into a shared module"),

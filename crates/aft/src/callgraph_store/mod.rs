@@ -478,6 +478,80 @@ mod write_amplification_tests {
         assert_eq!(shifted_stats.refreshed_own_files, 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deleted_symlink_alias_refresh_removes_the_original_stale_row() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let source = root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export function live() {}\n").unwrap();
+        let alias = temp.path().join("project-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        store
+            .mark_files_stale(std::slice::from_ref(&source))
+            .unwrap();
+
+        fs::remove_file(&source).unwrap();
+        let stats = store
+            .refresh_files(&[alias.join("src/lib.ts")])
+            .expect("deleted alias path must resolve through its existing parent");
+
+        assert_eq!(stats.deleted_files, vec!["src/lib.ts"]);
+        assert!(store.stale_files().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_refresh_preserves_real_mutation_detection() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let source = root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export function before() {}\n").unwrap();
+        let alias = temp.path().join("project-alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+
+        fs::write(&source, "export function after() {}\n").unwrap();
+        let stats = store.refresh_files(&[alias.join("src/lib.ts")]).unwrap();
+
+        assert_eq!(stats.changed_files, vec!["src/lib.ts"]);
+        assert_eq!(stats.refreshed_own_files, 1);
+        assert!(store.node_for(Path::new("src/lib.ts"), "after").is_ok());
+    }
+
+    #[test]
+    fn unresolvable_refresh_path_records_a_path_identity_gap() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let source = root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export function live() {}\n").unwrap();
+        let foreign = temp.path().join("foreign.ts");
+        fs::write(&foreign, "export function foreign() {}\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+
+        let error = store.refresh_files(&[foreign.clone()]).unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::PathIdentityMismatch { .. }
+        ));
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            path_identity_mismatch_reason(&conn).unwrap(),
+            Some(format!(
+                "callgraph_path_identity_mismatch path={} project_root={}",
+                foreign.display(),
+                root.display()
+            ))
+        );
+    }
+
     #[test]
     fn idle_checkpoint_interval_prevents_checkpoint_storms() {
         let now = Instant::now();
@@ -664,8 +738,14 @@ pub enum CallGraphStoreError {
     Json(serde_json::Error),
     Aft(AftError),
     Lock(crate::fs_lock::AcquireError),
-    MissingCallerData { file: String },
+    MissingCallerData {
+        file: String,
+    },
     Unavailable(String),
+    PathIdentityMismatch {
+        path: PathBuf,
+        project_root: PathBuf,
+    },
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
     StaleFiles(Vec<String>),
@@ -698,6 +778,12 @@ impl fmt::Display for CallGraphStoreError {
             Self::Unavailable(message) => {
                 write!(formatter, "callgraph store unavailable: {message}")
             }
+            Self::PathIdentityMismatch { path, project_root } => write!(
+                formatter,
+                "callgraph path identity mismatch: {} is not under project root {}",
+                path.display(),
+                project_root.display()
+            ),
             Self::Suspended(suspension) => write!(
                 formatter,
                 "callgraph build suspended for {} after {} deaths ({})",
@@ -3626,8 +3712,14 @@ impl CallGraphStore {
         let mut fresh_metadata = BTreeMap::new();
 
         for input in changed_files {
-            let abs_path = normalize_file_path(&self.project_root, input)?;
-            let rel_path = relative_path(&self.project_root, &abs_path);
+            let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    record_path_identity_mismatch(&conn, &error)?;
+                    return Err(error);
+                }
+            };
             changed.push(rel_path.clone());
             let old_row = load_file_row(&conn, &rel_path)?;
             if !abs_path.exists() {
@@ -3887,8 +3979,14 @@ impl CallGraphStore {
         let tx = conn.transaction()?;
         let mut marked = Vec::new();
         for path in files {
-            let abs_path = normalize_file_path(&self.project_root, path)?;
-            let rel_path = relative_path(&self.project_root, &abs_path);
+            let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, path) {
+                Ok(path) => path,
+                Err(error) => {
+                    drop(tx);
+                    record_path_identity_mismatch(&conn, &error)?;
+                    return Err(error);
+                }
+            };
             let freshness = cache_freshness::collect(&abs_path).ok();
             mark_backend_state(
                 &tx,
@@ -6794,6 +6892,36 @@ fn insert_meta(conn: &Connection) -> Result<()> {
 /// Return the durable revision paired atomically with graph mutations. Stores
 /// created by older binaries lack the revision row, so callers cannot detect
 /// in-place graph changes and must not cache their snapshots.
+const PATH_IDENTITY_MISMATCH_META_KEY: &str = "path_identity_mismatch";
+
+fn record_path_identity_mismatch(conn: &Connection, error: &CallGraphStoreError) -> Result<()> {
+    let CallGraphStoreError::PathIdentityMismatch { path, project_root } = error else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+        params![
+            PATH_IDENTITY_MISMATCH_META_KEY,
+            format!(
+                "callgraph_path_identity_mismatch path={} project_root={}",
+                path.display(),
+                project_root.display()
+            )
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn path_identity_mismatch_reason(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT v FROM meta WHERE k = ?1",
+        [PATH_IDENTITY_MISMATCH_META_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 fn projection_write_revision(conn: &Connection) -> Result<Option<u64>> {
     let revision: Option<String> = conn
         .query_row(
@@ -12890,8 +13018,68 @@ fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     Ok(canonicalize_path(&full_path))
 }
 
+/// Normalize a refresh path against the store root before assigning its durable
+/// relative key. Deleted watcher paths need lenient canonicalization: their
+/// parent can still reveal an alias such as a symlinked project root.
+fn normalize_project_file_path(project_root: &Path, path: &Path) -> Result<(PathBuf, String)> {
+    let abs_path = normalize_file_path(project_root, path)?;
+    let rel_path = relative_path(project_root, &abs_path);
+    if Path::new(&rel_path).is_absolute() {
+        return Err(CallGraphStoreError::PathIdentityMismatch {
+            path: path.to_path_buf(),
+            project_root: project_root.to_path_buf(),
+        });
+    }
+    Ok((abs_path, rel_path))
+}
+
+/// Canonicalize an existing path or the deepest existing ancestor of a deleted
+/// one. This keeps watcher deletion events in the same identity domain as the
+/// files indexed before the deletion.
 fn canonicalize_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut resolved = PathBuf::new();
+    let mut missing = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                resolved.push(component.as_os_str());
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if missing.pop().is_none() {
+                    if !resolved.as_os_str().is_empty() && !resolved.is_dir() {
+                        return path.to_path_buf();
+                    }
+                    resolved.pop();
+                }
+            }
+            std::path::Component::Normal(name) => {
+                if missing.is_empty() {
+                    let candidate = resolved.join(name);
+                    match std::fs::canonicalize(&candidate) {
+                        Ok(canonical) => resolved = canonical,
+                        Err(_) => match std::fs::symlink_metadata(&candidate) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                missing.push(name.to_owned());
+                            }
+                            _ => return path.to_path_buf(),
+                        },
+                    }
+                } else {
+                    missing.push(name.to_owned());
+                }
+            }
+        }
+    }
+    resolved.extend(missing);
+    resolved
 }
 
 fn relative_path(project_root: &Path, path: &Path) -> String {
