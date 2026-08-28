@@ -44,7 +44,13 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
-const V10_ADMIN_TUPLES: &[&str] = &["workflow run"];
+// These v10 tuples are explicitly reviewed for the operator-only bypass and
+// still require a matching signed manifest declaration. A rerun is
+// administration rather than governed bot speech: it has no public attribution
+// surface, while granting speech Apps actions:write would widen the compromise
+// surface. `run cancel` remains deliberately absent because it is destructive
+// and rarely needed, so the operator bypass cannot enable it by accident.
+const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
 // The v10 manifest version is the first version whose code-side allowlist
 // permits these native comment mutations. The allowlist covers only the exact
 // flag variants below and does not broaden raw API writes.
@@ -3744,6 +3750,70 @@ mod tests {
                 Classification::Unclassified
             ));
         }
+    }
+
+    #[test]
+    fn v10_run_rerun_is_flag_tolerant_and_run_cancel_stays_out_of_bypass_set() {
+        let mut manifest = v10_fixture_manifest();
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v10 admin tier");
+        for tuple in ["run rerun", "run cancel"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
+        manifest.validate().expect("valid v10 admin extensions");
+
+        for args in [
+            vec![
+                OsString::from("run"),
+                OsString::from("rerun"),
+                OsString::from("123"),
+                OsString::from("--failed"),
+            ],
+            vec![
+                OsString::from("run"),
+                OsString::from("rerun"),
+                OsString::from("123"),
+                OsString::from("--job"),
+                OsString::from("17"),
+            ],
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { tuple } if tuple == "run rerun"
+            ));
+        }
+        assert!(is_reviewed_admin_tuple(10, "run rerun"));
+        assert!(!is_reviewed_admin_tuple(9, "run rerun"));
+        let mut v9_manifest = manifest.clone();
+        v9_manifest.manifest_version = 9;
+        let v9_rerun = [
+            OsString::from("run"),
+            OsString::from("rerun"),
+            OsString::from("123"),
+            OsString::from("--failed"),
+        ];
+        assert!(matches!(
+            classify(&v9_rerun, &v9_manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        let run_cancel = [
+            OsString::from("run"),
+            OsString::from("cancel"),
+            OsString::from("123"),
+        ];
+        assert!(!is_reviewed_admin_tuple(10, "run cancel"));
+        assert!(matches!(
+            classify(&run_cancel, &manifest, "macos"),
+            Classification::Unclassified
+        ));
     }
 
     #[test]

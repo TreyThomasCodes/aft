@@ -37,13 +37,7 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn write_fresh_manifest_from_fixture(
-    state_home: &Path,
-    now: u64,
-    fixture: &str,
-    manifest_version: u64,
-) {
-    let mut manifest: Value = serde_json::from_str(fixture).expect("parse manifest fixture");
+fn write_manifest_value(state_home: &Path, now: u64, mut manifest: Value, manifest_version: u64) {
     manifest["manifest_version"] = json!(manifest_version);
     manifest["issued_at_unix_secs"] = json!(now);
     let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize fresh manifest");
@@ -64,6 +58,32 @@ fn write_fresh_manifest_from_fixture(
         serde_json::to_vec(&envelope).expect("serialize manifest envelope"),
     )
     .expect("write manifest envelope");
+}
+
+fn write_fresh_manifest_from_fixture(
+    state_home: &Path,
+    now: u64,
+    fixture: &str,
+    manifest_version: u64,
+) {
+    let manifest: Value = serde_json::from_str(fixture).expect("parse manifest fixture");
+    write_manifest_value(state_home, now, manifest, manifest_version);
+}
+
+fn write_fresh_v10_admin_manifest(state_home: &Path, now: u64) {
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v10-manifest.json"))
+            .expect("parse v10 manifest fixture");
+    let admin = manifest["tiers"]["admin"]
+        .as_array_mut()
+        .expect("v10 admin tier");
+    for tuple in ["run rerun", "run cancel"] {
+        admin.push(json!({
+            "tuple": tuple,
+            "platform": ["macos", "linux"]
+        }));
+    }
+    write_manifest_value(state_home, now, manifest, 10);
 }
 
 fn write_fresh_manifest(state_home: &Path, now: u64) {
@@ -1048,6 +1068,118 @@ fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassifi
     assert!(
         !recorder.exists(),
         "refused or governed writes must not reach gh"
+    );
+}
+
+#[test]
+fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_refused() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    // The signed test manifest includes `run rerun` and `run cancel`, so this
+    // test reaches the code-side review decision instead of failing earlier
+    // because either action is absent from the manifest.
+    write_fresh_v10_admin_manifest(&state_home, now);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 10);
+    write_user_config(&config_home, &connection_file, None);
+
+    let expected_admin_refusal =
+        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    let rerun_without_bypass = shim_command(
+        &["run", "rerun", "123", "--failed"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn non-bypassed rerun");
+    assert_eq!(rerun_without_bypass.status.code(), Some(86));
+    assert!(rerun_without_bypass.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&rerun_without_bypass.stderr),
+        expected_admin_refusal
+    );
+
+    let rerun_with_bypass = shim_command(
+        &["run", "rerun", "123", "--job", "17"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .expect("spawn operator-bypassed rerun");
+    assert_eq!(rerun_with_bypass.status.code(), Some(73));
+    assert_eq!(
+        String::from_utf8_lossy(&rerun_with_bypass.stdout),
+        "r2-passthrough\n"
+    );
+    assert!(rerun_with_bypass.stderr.is_empty());
+
+    let audit_path = state_home.join("cortexkit/aft/gh-shim/operator-bypass.jsonl");
+    let audit_records = fs::read_to_string(audit_path)
+        .expect("read rerun bypass audit")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse rerun bypass audit row"))
+        .collect::<Vec<_>>();
+    assert_eq!(audit_records.len(), 1);
+    assert_eq!(audit_records[0]["tuple"], "run rerun");
+    assert_eq!(audit_records[0]["repository"], "cortexkit/aft");
+
+    for args in [&["run", "view", "123"][..], &["run", "watch", "123"][..]] {
+        let read = shim_command(
+            args,
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn mechanical Actions read");
+        assert_eq!(read.status.code(), Some(73), "read passthrough: {args:?}");
+        assert_eq!(String::from_utf8_lossy(&read.stdout), "r2-passthrough\n");
+        assert!(read.stderr.is_empty());
+    }
+
+    let cancel = shim_command(
+        &["run", "cancel", "123"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .expect("spawn operator-bypassed cancel");
+    assert_eq!(cancel.status.code(), Some(86));
+    assert!(cancel.stdout.is_empty());
+    let cancel_refusal = String::from_utf8_lossy(&cancel.stderr);
+    assert_eq!(cancel_refusal, unclassified_refusal(10));
+    assert_ne!(
+        expected_admin_refusal, cancel_refusal,
+        "rerun's reviewed admin refusal and cancel's unclassified refusal must differ"
+    );
+
+    assert_eq!(
+        fs::read_to_string(recorder).expect("read upstream invocation record"),
+        "run rerun 123 --job 17\nrun view 123\nrun watch 123\n"
     );
 }
 
