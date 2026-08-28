@@ -479,7 +479,9 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
     let mut resolvable_files = Vec::new();
     let config = ctx.config();
 
+    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     let walker = ignore::WalkBuilder::new(dir)
+        .same_file_system(true)
         .standard_filters(true) // honors .gitignore + hidden-file rules
         .add_custom_ignore_filename(".aftignore")
         .filter_entry(|e| {

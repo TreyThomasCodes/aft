@@ -72,4 +72,8 @@ AGE_MIN=$(( (NOW_EPOCH - HEAD_EPOCH) / 60 ))
 
 # --- 4. Merge (gh enforces its own check-state gate) -----------------------
 echo "merge-pr: gates green (threads=0, newer-findings=0, head ${AGE_MIN}m settled) - merging #$PR at $HEAD_SHA"
-gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
+# Admin-tier action under the gh shim: merges sign as the OPERATOR by doctrine
+# (authority is the agent's per the identity-room fold; identity is never a
+# bot's - the Apps deliberately lack contents:write). The explicit bypass is
+# the audit-visible deliberate act; without it a bound repo refuses the merge.
+GH_SHIM_BYPASS=operator gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# An ambient AFT_STORAGE_DIR (e.g. injected into agent bash lanes) outranks
+# the XDG isolation test fixtures rely on and silently points the suite at the
+# real shared store. Gates always run with default resolution.
+unset AFT_STORAGE_DIR
+
 # Run the entire gate at reduced scheduling priority so saturated test
 # windows cannot starve the supervised ck-* modules into missing health
 # probes (three health-kills on 2026-08-08 traced to gate-window load).

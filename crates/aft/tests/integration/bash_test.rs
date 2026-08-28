@@ -28,6 +28,38 @@ fn aft_binary() -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+struct TestPty {
+    master: std::fs::File,
+    slave: std::fs::File,
+}
+
+#[cfg(unix)]
+impl TestPty {
+    fn open() -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+
+        let mut master = -1;
+        let mut slave = -1;
+        if unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            master: unsafe { std::fs::File::from_raw_fd(master) },
+            slave: unsafe { std::fs::File::from_raw_fd(slave) },
+        })
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::Value {
     let started = std::time::Instant::now();
     loop {
@@ -454,6 +486,182 @@ fn bash_piped_runner_exit_status_is_not_hidden() {
             "{id} should report the shell pipeline exit code: {status:?}"
         );
     }
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_pty_foreground_and_deferred_bash_children_get_isolated_sessions() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-non-pty-session",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let bridge_session = unsafe { libc::getsid(aft.pid() as libc::pid_t) };
+    assert_ne!(bridge_session, -1, "could not read bridge session id");
+    for (id, background) in [
+        ("foreground-non-pty-session", false),
+        ("deferred-non-pty-session", true),
+    ] {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "method": "bash",
+                "params": {
+                    "command": "ps -o sid= -o pgid= -p $$",
+                    "background": background,
+                    "pty": false,
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "bash failed: {response:?}");
+        let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+        assert_eq!(status["status"], "completed", "bash failed: {status:?}");
+        let ids = status["output_preview"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .map(|id| id.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2, "unexpected process ids: {status:?}");
+        assert_ne!(
+            ids[0], bridge_session,
+            "{id} inherited the bridge session instead of starting an isolated session"
+        );
+        assert_eq!(
+            ids[0], ids[1],
+            "{id} child session and process group must share their leader"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_interactive_zsh_cannot_take_over_the_bridge_terminal() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if which::which("zsh").is_err() {
+        eprintln!("skipping interactive zsh terminal test: zsh is unavailable");
+        return;
+    }
+    let terminal = TestPty::open().expect("create terminal for Pi-shape probe");
+    let master_fd = terminal.master.as_raw_fd();
+    let slave_fd = terminal.slave.as_raw_fd();
+    let mut probe = Command::new(std::env::current_exe().expect("current integration test binary"));
+    probe
+        .args([
+            "--exact",
+            "bash_test::interactive_zsh_terminal_probe_child",
+            "--nocapture",
+        ])
+        .env("AFT_INTERACTIVE_ZSH_TERMINAL_PROBE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        probe.pre_exec(move || {
+            if libc::setsid() == -1
+                || libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                || libc::close(master_fd) == -1
+                || libc::close(slave_fd) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = probe.output().expect("run Pi-shape terminal probe");
+    assert!(
+        output.status.success(),
+        "interactive zsh terminal probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Runs in a subprocess because it owns the pseudo-terminal used to simulate
+/// Pi's interactive terminal; the parent test process cannot inspect that terminal.
+#[cfg(unix)]
+#[test]
+fn interactive_zsh_terminal_probe_child() {
+    use std::os::fd::AsRawFd;
+
+    if std::env::var_os("AFT_INTERACTIVE_ZSH_TERMINAL_PROBE").is_none() {
+        return;
+    }
+    let zsh = which::which("zsh").expect("parent skips this probe when zsh is unavailable");
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-interactive-zsh-terminal",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "interactive-zsh-without-pty",
+            "method": "bash",
+            "params": {
+                "command": format!("{} -fic 'exit'", shell_quote_path(&zsh)),
+                "background": false,
+                "pty": false,
+                "compressed": false,
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "bash failed: {response:?}");
+    let status = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+    assert_eq!(
+        status["status"], "completed",
+        "interactive zsh failed: {status:?}"
+    );
+    assert_eq!(status["exit_code"], 0, "interactive zsh failed: {status:?}");
+
+    let tty = std::fs::File::open("/dev/tty").expect("open simulated Pi terminal");
+    let foreground_group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    assert_ne!(
+        foreground_group, -1,
+        "read terminal foreground process group"
+    );
+    assert_eq!(
+        foreground_group,
+        unsafe { libc::getpgrp() },
+        "interactive zsh changed the simulated Pi terminal foreground process group"
+    );
 
     assert!(aft.shutdown().success());
 }

@@ -999,6 +999,13 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
                 "callgraph_pages_or_bytes_written_60s",
                 "callgraph_repair_entries_60s_total",
                 "callgraph_repair_entries_60s",
+                // Semantic embedding advances independently in each parity
+                // process. Preserve the progress schema while masking sampled
+                // counts that may differ at the same status snapshot.
+                "embedded_chunks",
+                "total_chunks",
+                "current_batch",
+                "total_batches",
             ] {
                 if map.contains_key(key) {
                     map.insert(key.to_string(), Value::String(format!("<{key}>")));

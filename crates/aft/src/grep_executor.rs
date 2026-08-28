@@ -30,7 +30,15 @@ pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 pub struct FallbackWalkOutcome {
     pub files: Vec<PathBuf>,
     pub walk_truncated: bool,
+    /// Foreign filesystem mounts skipped before a recursive fallback could open them.
+    pub skipped_foreign_mounts: usize,
     pub entries_visited: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FallbackWalkProgress {
+    walk_truncated: bool,
+    skipped_foreign_mounts: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -406,6 +414,7 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         fully_degraded,
         engine_capped: false,
         walk_truncated: false,
+        skipped_foreign_mounts: 0,
     }
 }
 
@@ -453,6 +462,7 @@ fn grep_explicit_file(
         fully_degraded: false,
         engine_capped: engine_capped.load(Ordering::Relaxed),
         walk_truncated: false,
+        skipped_foreign_mounts: 0,
     }
 }
 
@@ -470,6 +480,7 @@ pub fn merge_grep_results(
     let mut fully_degraded = false;
     let mut engine_capped = false;
     let mut walk_truncated = false;
+    let mut skipped_foreign_mounts = 0usize;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -481,6 +492,7 @@ pub fn merge_grep_results(
         fully_degraded |= result.fully_degraded;
         engine_capped |= result.engine_capped;
         walk_truncated |= result.walk_truncated;
+        skipped_foreign_mounts += result.skipped_foreign_mounts;
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -506,18 +518,39 @@ pub fn merge_grep_results(
         fully_degraded,
         engine_capped,
         walk_truncated,
+        skipped_foreign_mounts,
     }
 }
 
-fn fallback_project_walk_builder(search_root: &Path) -> WalkBuilder {
+fn fallback_project_walk_builder(
+    search_root: &Path,
+    skipped_foreign_mounts: Arc<AtomicUsize>,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
+    // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
+    // the daemon, so never open directories outside this walk root's filesystem.
     builder
+        .same_file_system(true)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if entry.depth() > 0 && entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                match boundary
+                    .as_ref()
+                    .map(|boundary| boundary.should_descend(entry.path()))
+                {
+                    Some(Ok(false)) => {
+                        skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    Some(Err(_)) => return false,
+                    _ => {}
+                }
+            }
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                 return !matches!(
@@ -564,7 +597,8 @@ fn bounded_fallback_walk_files_with_limits(
     let mut files = Vec::new();
     let mut walk_truncated = false;
     let mut entries_visited = 0usize;
-    let builder = fallback_project_walk_builder(search_root);
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let builder = fallback_project_walk_builder(search_root, Arc::clone(&skipped_foreign_mounts));
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         entries_visited += 1;
@@ -593,18 +627,19 @@ fn bounded_fallback_walk_files_with_limits(
     FallbackWalkOutcome {
         files,
         walk_truncated,
+        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
     }
 }
 
-pub(crate) fn for_each_bounded_fallback_walk_file<F>(
+fn for_each_bounded_fallback_walk_file<F>(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
     project_root: &Path,
     path_exclusion: Option<GrepPathExclusion>,
     mut on_file: F,
-) -> bool
+) -> FallbackWalkProgress
 where
     F: FnMut(&PathBuf),
 {
@@ -629,20 +664,27 @@ fn for_each_bounded_fallback_walk_file_with_limits<F>(
     max_files: usize,
     budget: Duration,
     on_file: &mut F,
-) -> bool
+) -> FallbackWalkProgress
 where
     F: FnMut(&PathBuf),
 {
     let started = Instant::now();
     let mut files_seen = 0usize;
-    let builder = fallback_project_walk_builder(search_root);
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let builder = fallback_project_walk_builder(search_root, Arc::clone(&skipped_foreign_mounts));
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if crate::executor::current_job_cancelled() {
-            return true;
+            return FallbackWalkProgress {
+                walk_truncated: true,
+                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+            };
         }
         if started.elapsed() >= budget {
-            return true;
+            return FallbackWalkProgress {
+                walk_truncated: true,
+                skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+            };
         }
         if !entry
             .file_type()
@@ -657,12 +699,18 @@ where
         if filters.matches(filter_root, &path) {
             files_seen += 1;
             if files_seen > max_files {
-                return true;
+                return FallbackWalkProgress {
+                    walk_truncated: true,
+                    skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+                };
             }
             on_file(&path);
         }
     }
-    false
+    FallbackWalkProgress {
+        walk_truncated: false,
+        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+    }
 }
 
 pub fn weakest_index_status(left: IndexStatus, right: IndexStatus) -> IndexStatus {
@@ -762,7 +810,7 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    let mut walk_truncated = for_each_bounded_fallback_walk_file(
+    let progress = for_each_bounded_fallback_walk_file(
         filter_root,
         search_root,
         filters,
@@ -779,6 +827,7 @@ fn fallback_grep(
         },
     );
     flush_batch(&mut batch, &mut matches);
+    let mut walk_truncated = progress.walk_truncated;
     if Instant::now() >= scan_deadline {
         walk_truncated = true;
         engine_capped.store(true, Ordering::Relaxed);
@@ -796,6 +845,7 @@ fn fallback_grep(
         fully_degraded: true,
         engine_capped: engine_capped.load(Ordering::Relaxed),
         walk_truncated,
+        skipped_foreign_mounts: progress.skipped_foreign_mounts,
     }
 }
 
@@ -1061,6 +1111,7 @@ mod tests {
             fully_degraded: false,
             engine_capped: false,
             walk_truncated: false,
+            skipped_foreign_mounts: 0,
         }
     }
 

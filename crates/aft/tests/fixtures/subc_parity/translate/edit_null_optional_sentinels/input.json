@@ -1,0 +1,18 @@
+{
+  "agent_args": {
+    "edits": [
+      {
+        "content": null,
+        "endLine": null,
+        "newString": "GAMMA line three",
+        "occurrence": null,
+        "oldString": "gamma line three",
+        "replaceAll": false,
+        "startLine": null
+      }
+    ],
+    "filePath": "src/main.ts"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "edit"
+}

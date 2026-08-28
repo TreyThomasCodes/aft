@@ -64,6 +64,24 @@ pub(crate) fn pipeline_shell_kind(shell: &Path) -> Option<&'static str> {
     }
 }
 
+/// Start a non-PTY child in a new session before exec. The bridge can inherit a
+/// harness's controlling terminal even though the child uses pipe-backed stdio;
+/// an interactive shell could otherwise perform job control against that terminal.
+#[cfg(unix)]
+pub(crate) fn start_new_session(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 #[cfg(unix)]
 pub fn terminate_process(child: &mut Child) {
     let pgid = child.id() as i32;
@@ -221,6 +239,24 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "1\n0\n");
             assert_eq!(std::fs::read_to_string(&exit_path).unwrap(), "0");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_pty_child_starts_as_its_own_session_and_process_group_leader() {
+        use std::process::Command;
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        start_new_session(&mut command);
+        let mut child = command.spawn().expect("spawn isolated child");
+        let pid = child.id() as libc::pid_t;
+
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+
+        terminate_process(&mut child);
+        let _ = child.wait();
     }
 
     #[test]

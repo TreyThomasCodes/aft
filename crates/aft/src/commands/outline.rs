@@ -101,9 +101,12 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             serde_json::json!({
                 "text": text,
-                "complete": !discovery.walk_truncated && !discovery.collection_truncated,
+                "complete": !discovery.walk_truncated
+                    && !discovery.collection_truncated
+                    && discovery.skipped_foreign_mounts == 0,
                 "walk_truncated": discovery.walk_truncated,
                 "collection_truncated": discovery.collection_truncated,
+                "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
                 "skipped_files": skipped_files,
             }),
         );
@@ -389,6 +392,7 @@ struct OutlineFileDiscovery {
     files: Vec<String>,
     walk_truncated: bool,
     collection_truncated: bool,
+    skipped_foreign_mounts: usize,
 }
 
 fn handle_outline_files_mode(
@@ -407,6 +411,7 @@ fn handle_outline_files_mode(
     let mut file_entries = Vec::new();
     let mut walk_truncated = false;
     let mut collection_truncated = false;
+    let mut skipped_foreign_mounts = 0usize;
 
     for target in targets {
         let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
@@ -437,6 +442,7 @@ fn handle_outline_files_mode(
         let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
+        skipped_foreign_mounts += discovery.skipped_foreign_mounts;
 
         for file in discovery.files {
             let file_path = PathBuf::from(file);
@@ -457,15 +463,24 @@ fn handle_outline_files_mode(
         unchecked_files
             .push("<additional files not discovered: collection safety limit reached>".to_string());
     }
+    if skipped_foreign_mounts > 0 {
+        unchecked_files.push(format!(
+            "<{skipped_foreign_mounts} foreign filesystem mount(s) not traversed>"
+        ));
+    }
 
     Response::success(
         &req.id,
         serde_json::json!({
             "text": text,
             "files": file_entries,
-            "complete": !walk_truncated && !collection_truncated && !text_truncated,
+            "complete": !walk_truncated
+                && !collection_truncated
+                && skipped_foreign_mounts == 0
+                && !text_truncated,
             "walk_truncated": walk_truncated,
             "collection_truncated": collection_truncated,
+            "skipped_foreign_mounts": skipped_foreign_mounts,
             "unchecked_files": unchecked_files,
         }),
     )
@@ -801,7 +816,25 @@ fn discover_outline_files_with_options(
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut collection_truncated = false;
-    collect_outline_files(directory, &mut files, &mut collection_truncated, options);
+    let mut skipped_foreign_mounts = 0usize;
+    // A vanished mounted child can make std::fs::ReadDir::drop panic after
+    // closedir returns ENXIO, aborting the daemon. Fence recursion before opening
+    // such a child instead of trying to catch the uncatchable destructor panic.
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(directory);
+    if let Ok(boundary) = boundary {
+        let mut device_lookup = crate::walk_boundary::filesystem_device_id;
+        collect_outline_files_with_device_lookup(
+            directory,
+            &mut files,
+            &mut collection_truncated,
+            &mut skipped_foreign_mounts,
+            options,
+            &boundary,
+            &mut device_lookup,
+        );
+    } else {
+        collection_truncated = true;
+    }
     files.sort();
 
     let walk_truncated = files.len() > OUTLINE_FILE_WALK_CAP;
@@ -813,15 +846,21 @@ fn discover_outline_files_with_options(
         files,
         walk_truncated,
         collection_truncated,
+        skipped_foreign_mounts,
     }
 }
 
-fn collect_outline_files(
+fn collect_outline_files_with_device_lookup<F>(
     directory: &Path,
     files: &mut Vec<String>,
     collection_truncated: &mut bool,
+    skipped_foreign_mounts: &mut usize,
     options: Option<&OutlineWalkOptions>,
-) {
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    device_lookup: &mut F,
+) where
+    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
+{
     if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
         *collection_truncated = true;
         return;
@@ -846,7 +885,26 @@ fn collect_outline_files(
             if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
                 continue;
             }
-            collect_outline_files(&path, files, collection_truncated, options);
+            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    *skipped_foreign_mounts += 1;
+                    continue;
+                }
+                Err(_) => {
+                    *collection_truncated = true;
+                    return;
+                }
+            }
+            collect_outline_files_with_device_lookup(
+                &path,
+                files,
+                collection_truncated,
+                skipped_foreign_mounts,
+                options,
+                boundary,
+                device_lookup,
+            );
             if *collection_truncated {
                 return;
             }
@@ -1197,6 +1255,53 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    #[test]
+    fn outline_walk_skips_and_reports_injected_foreign_mount() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let local = root.join("local");
+        let foreign = root.join("foreign");
+        std::fs::create_dir_all(&local).expect("create local directory");
+        std::fs::create_dir_all(&foreign).expect("create foreign directory");
+        std::fs::write(local.join("keep.rs"), "pub fn keep() {}\n").expect("write local file");
+        std::fs::write(foreign.join("skip.rs"), "pub fn skip() {}\n").expect("write foreign file");
+
+        let boundary = crate::walk_boundary::DeviceBoundary::from_device_for_test(41);
+        let mut files = Vec::new();
+        let mut collection_truncated = false;
+        let mut skipped_foreign_mounts = 0usize;
+        let mut lookup = |path: &Path| {
+            Ok(Some(
+                if path.file_name().is_some_and(|name| name == "foreign") {
+                    99
+                } else {
+                    41
+                },
+            ))
+        };
+
+        collect_outline_files_with_device_lookup(
+            &root,
+            &mut files,
+            &mut collection_truncated,
+            &mut skipped_foreign_mounts,
+            None,
+            &boundary,
+            &mut lookup,
+        );
+
+        assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");
+        assert!(
+            !collection_truncated,
+            "a known foreign mount is not an I/O failure"
+        );
+        assert!(files.iter().any(|path| path.ends_with("local/keep.rs")));
+        assert!(
+            !files.iter().any(|path| path.ends_with("foreign/skip.rs")),
+            "foreign-mount contents must not be traversed"
+        );
+    }
 
     fn make_symbol(
         name: &str,

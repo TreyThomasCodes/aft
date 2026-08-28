@@ -106,6 +106,7 @@ pub enum SemanticBackend {
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     Ollama,
+    Synapse,
 }
 
 impl SemanticBackend {
@@ -114,6 +115,7 @@ impl SemanticBackend {
             Self::Fastembed => "fastembed",
             Self::OpenAiCompatible => "openai_compatible",
             Self::Ollama => "ollama",
+            Self::Synapse => "synapse",
         }
     }
 
@@ -122,6 +124,7 @@ impl SemanticBackend {
             "fastembed" => Some(Self::Fastembed),
             "openai_compatible" => Some(Self::OpenAiCompatible),
             "ollama" => Some(Self::Ollama),
+            "synapse" => Some(Self::Synapse),
             _ => None,
         }
     }
@@ -143,6 +146,15 @@ pub struct SemanticBackendConfig {
     /// fastembed memory (model + embeddings + batch buffers) on huge project
     /// roots; remote backends that embed server-side can raise it freely.
     pub max_files: usize,
+    /// User-tier SubC connection file used only by the Synapse embedding backend.
+    #[serde(skip)]
+    pub subc_connection_file: Option<PathBuf>,
+    /// Project-root and harness identity used to route Synapse management calls
+    /// to the correct project and execution environment.
+    #[serde(skip)]
+    pub route_project_root: Option<PathBuf>,
+    #[serde(skip)]
+    pub route_harness: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +182,9 @@ impl Default for SemanticBackendConfig {
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
+            subc_connection_file: None,
+            route_project_root: None,
+            route_harness: None,
         }
     }
 }

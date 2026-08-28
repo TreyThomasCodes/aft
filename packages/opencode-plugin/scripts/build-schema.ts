@@ -552,16 +552,16 @@ function buildSchema(): Record<string, unknown> {
         properties: {
           backend: {
             type: "string",
-            enum: ["fastembed", "openai_compatible", "ollama"],
+            enum: ["fastembed", "openai_compatible", "ollama", "synapse"],
             default: "fastembed",
             description:
-              "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint.",
+              "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint, and 'synapse' dials CortexKit Synapse over SubC.",
           },
           model: {
             type: "string",
             minLength: 1,
             description:
-              "Model identifier passed to the backend. Defaults vary by backend (fastembed default: all-MiniLM-L6-v2).",
+              "Model identifier passed to the backend. Required for synapse; fastembed defaults to all-MiniLM-L6-v2.",
           },
           base_url: {
             type: "string",

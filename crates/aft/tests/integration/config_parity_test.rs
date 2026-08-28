@@ -137,8 +137,8 @@ fn config_resolver_matches_typescript_golden_fixtures() {
     cases.sort();
 
     assert!(
-        cases.len() >= 51,
-        "expected at least 51 parity fixtures after capture regeneration, found {}",
+        cases.len() >= 52,
+        "expected at least 52 parity fixtures after capture regeneration, found {}",
         cases.len()
     );
 

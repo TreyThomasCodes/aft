@@ -37,8 +37,14 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-fn write_fresh_manifest_from_fixture(state_home: &Path, now: u64, fixture: &str) {
+fn write_fresh_manifest_from_fixture(
+    state_home: &Path,
+    now: u64,
+    fixture: &str,
+    manifest_version: u64,
+) {
     let mut manifest: Value = serde_json::from_str(fixture).expect("parse manifest fixture");
+    manifest["manifest_version"] = json!(manifest_version);
     manifest["issued_at_unix_secs"] = json!(now);
     let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize fresh manifest");
     let key = Ed25519KeyPair::from_seed_unchecked(&DEV_MANIFEST_SEED).expect("build test key");
@@ -65,6 +71,7 @@ fn write_fresh_manifest(state_home: &Path, now: u64) {
         state_home,
         now,
         include_str!("fixtures/gh_shim/initial-manifest-v1.json"),
+        1,
     );
 }
 
@@ -73,6 +80,16 @@ fn write_fresh_v9_manifest(state_home: &Path, now: u64) {
         state_home,
         now,
         include_str!("fixtures/gh_shim/v9-manifest.json"),
+        9,
+    );
+}
+
+fn write_fresh_v10_manifest(state_home: &Path, now: u64, manifest_version: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/v10-manifest.json"),
+        manifest_version,
     );
 }
 
@@ -81,6 +98,7 @@ fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
         state_home,
         now,
         include_str!("fixtures/gh_shim/s2-manifest-v1.json"),
+        1,
     );
 }
 
@@ -256,6 +274,12 @@ fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option
         serde_json::to_vec_pretty(&config).expect("serialize user config"),
     )
     .expect("write user config");
+}
+
+fn unclassified_refusal(manifest_version: u64) -> String {
+    format!(
+        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest {manifest_version})\n"
+    )
 }
 
 fn shim_status(
@@ -664,7 +688,7 @@ fn gh_shim_governed_manifest_passthroughs_no_verb_and_help_invocations() {
     assert!(undeclared_write.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&undeclared_write.stderr),
-        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest 1)\n"
+        unclassified_refusal(1)
     );
 
     assert_eq!(
@@ -740,10 +764,7 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     assert_eq!(raw_api_delete.status.code(), Some(86));
     assert!(raw_api_delete.stdout.is_empty());
     let raw_api_refusal = String::from_utf8_lossy(&raw_api_delete.stderr);
-    assert_eq!(
-        raw_api_refusal,
-        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest 9)\n"
-    );
+    assert_eq!(raw_api_refusal, unclassified_refusal(9));
     assert_ne!(
         expected_admin_refusal, raw_api_refusal,
         "native admin and raw API delete refusals must remain distinguishable"
@@ -769,6 +790,264 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     assert_eq!(
         fs::read_to_string(&recorder).expect("read mechanical GET invocation record"),
         "api repos/cortexkit/insula --jq .name\n"
+    );
+}
+
+#[test]
+fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version_gated() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let home = temp.path().join("home");
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let v10_state = temp.path().join("v10-state");
+    let v10_recorder = temp.path().join("v10-upstream-invocations.txt");
+    let project = write_project_repo(temp.path());
+    write_upstream_gh(&upstream_bin);
+    write_user_config(&config_home, &connection_file, None);
+    let now = unix_seconds();
+    write_fresh_v10_manifest(&v10_state, now, 10);
+    write_fresh_r3_cache_for_manifest(&v10_state, now, 10);
+
+    let expected_admin_refusal =
+        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    let workflow_run = ["workflow", "run", "ci.yml", "--ref", "main"];
+    let admin = shim_command(
+        &workflow_run,
+        &project,
+        &config_home,
+        &v10_state,
+        &home,
+        &upstream_bin,
+        &v10_recorder,
+    )
+    .output()
+    .expect("spawn v10 admin workflow invocation");
+    assert_eq!(admin.status.code(), Some(86));
+    assert!(admin.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&admin.stderr),
+        expected_admin_refusal
+    );
+
+    let operator = shim_command(
+        &workflow_run,
+        &project,
+        &config_home,
+        &v10_state,
+        &home,
+        &upstream_bin,
+        &v10_recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .expect("spawn operator-bypassed v10 workflow invocation");
+    assert_eq!(operator.status.code(), Some(73));
+    assert_eq!(
+        String::from_utf8_lossy(&operator.stdout),
+        "r2-passthrough\n"
+    );
+    assert!(operator.stderr.is_empty());
+
+    let raw_api_dispatch = [
+        "api",
+        "-X",
+        "POST",
+        "repos/cortexkit/aft/actions/workflows/ci.yml/dispatches",
+    ];
+    let raw_v10 = shim_command(
+        &raw_api_dispatch,
+        &project,
+        &config_home,
+        &v10_state,
+        &home,
+        &upstream_bin,
+        &v10_recorder,
+    )
+    .output()
+    .expect("spawn raw v10 API dispatch invocation");
+    assert_eq!(raw_v10.status.code(), Some(86));
+    assert!(raw_v10.stdout.is_empty());
+    let raw_v10_refusal = String::from_utf8_lossy(&raw_v10.stderr);
+    assert_eq!(raw_v10_refusal, unclassified_refusal(10));
+    assert_ne!(
+        expected_admin_refusal, raw_v10_refusal,
+        "native workflow admin and raw API dispatch refusals must remain distinguishable"
+    );
+    assert_eq!(
+        fs::read_to_string(&v10_recorder).expect("read v10 upstream invocation record"),
+        "workflow run ci.yml --ref main\n"
+    );
+
+    // Reuse the v10-style declaration contents with manifest version 9 to
+    // verify that classification is controlled by the manifest version, not by
+    // the declaration contents.
+    let v9_state = temp.path().join("v9-shaped-state");
+    let v9_recorder = temp.path().join("v9-shaped-upstream-invocations.txt");
+    write_fresh_v10_manifest(&v9_state, now, 9);
+    write_fresh_r3_cache_for_manifest(&v9_state, now, 9);
+
+    let workflow_v9 = shim_command(
+        &workflow_run,
+        &project,
+        &config_home,
+        &v9_state,
+        &home,
+        &upstream_bin,
+        &v9_recorder,
+    )
+    .output()
+    .expect("spawn manifest 9 workflow invocation");
+    assert_eq!(workflow_v9.status.code(), Some(86));
+    assert!(workflow_v9.stdout.is_empty());
+    let workflow_v9_refusal = String::from_utf8_lossy(&workflow_v9.stderr);
+    assert_eq!(workflow_v9_refusal, unclassified_refusal(9));
+    assert_ne!(expected_admin_refusal, workflow_v9_refusal);
+
+    let raw_v9 = shim_command(
+        &raw_api_dispatch,
+        &project,
+        &config_home,
+        &v9_state,
+        &home,
+        &upstream_bin,
+        &v9_recorder,
+    )
+    .output()
+    .expect("spawn raw manifest 9 API dispatch invocation");
+    assert_eq!(raw_v9.status.code(), Some(86));
+    assert!(raw_v9.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&raw_v9.stderr),
+        unclassified_refusal(9)
+    );
+    assert!(!v9_recorder.exists());
+}
+
+#[test]
+fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassified() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_v10_manifest(&state_home, now, 10);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 10);
+    write_user_config(&config_home, &connection_file, None);
+
+    let governed_stderr = "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n";
+    let bare_create = shim_command(
+        &["issue", "comment", "42", "--body", "new comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn bare governed comment invocation");
+    assert_eq!(bare_create.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&bare_create.stderr),
+        governed_stderr
+    );
+
+    for args in [
+        &[
+            "issue",
+            "comment",
+            "42",
+            "--body",
+            "replace the draft",
+            "--edit-last",
+        ][..],
+        &[
+            "pr",
+            "comment",
+            "7",
+            "--body",
+            "replace the draft",
+            "--edit-last",
+        ][..],
+    ] {
+        let output = shim_command(
+            args,
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn governed edit-last invocation");
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "edit-last must stay governed"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), governed_stderr);
+        assert!(output.stdout.is_empty());
+    }
+
+    // Raw PATCH is deliberately outside the GET-only API seam: an issue-comment
+    // id is repository-scoped and can identify a human contributor's comment.
+    let raw_patch = shim_command(
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn raw comment PATCH invocation");
+    assert_eq!(raw_patch.status.code(), Some(86));
+    let raw_patch_refusal = String::from_utf8_lossy(&raw_patch.stderr);
+    assert_eq!(raw_patch_refusal, unclassified_refusal(10));
+    assert_ne!(raw_patch_refusal, governed_stderr);
+    assert!(raw_patch.stdout.is_empty());
+
+    // --delete-last performs a different mutation and is not an alias for the
+    // authenticated-user-only edit operation performed by --edit-last.
+    let delete_last = shim_command(
+        &[
+            "pr",
+            "comment",
+            "7",
+            "--body",
+            "replace the draft",
+            "--delete-last",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn unclassified delete-last invocation");
+    assert_eq!(delete_last.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&delete_last.stderr),
+        unclassified_refusal(10)
+    );
+    assert!(
+        !recorder.exists(),
+        "refused or governed writes must not reach gh"
     );
 }
 
@@ -826,7 +1105,7 @@ fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
     assert!(unclassified.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&unclassified.stderr),
-        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest 1)\n"
+        unclassified_refusal(1)
     );
     assert!(
         !recorder.exists(),

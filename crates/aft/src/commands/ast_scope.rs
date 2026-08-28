@@ -218,7 +218,9 @@ fn walk_root(
     let overrides = build_overrides(filter_root, globs);
 
     let mut builder = WalkBuilder::new(&root.path);
+    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     builder
+        .same_file_system(true)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)

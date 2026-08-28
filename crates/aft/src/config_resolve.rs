@@ -1340,7 +1340,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     if let Some(value) = raw.url_fetch_allow_private {
         config.url_fetch_allow_private = value;
     }
-    config.semantic = resolve_semantic_config(raw.semantic.as_ref());
+    config.semantic = resolve_semantic_config(raw.semantic.as_ref(), raw.subc.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
@@ -1444,14 +1444,27 @@ fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning
     }
 }
 
-fn resolve_semantic_config(raw: Option<&RawSemantic>) -> SemanticBackendConfig {
+fn resolve_semantic_config(
+    raw: Option<&RawSemantic>,
+    subc: Option<&RawSubc>,
+) -> SemanticBackendConfig {
     let mut semantic = SemanticBackendConfig::default();
+    semantic.subc_connection_file = subc
+        .and_then(|subc| subc.connection_file.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
     let Some(raw) = raw else {
         return semantic;
     };
 
     if let Some(value) = raw.backend {
         semantic.backend = value;
+        if value == SemanticBackend::Synapse && raw.model.is_none() {
+            // Synapse has no implicit vector space. Leaving this empty lets backend
+            // initialization return an honest missing-model configuration error.
+            semantic.model.clear();
+        }
     }
     if let Some(value) = &raw.model {
         semantic.model = value.clone();
@@ -2318,6 +2331,35 @@ mod tests {
         assert_eq!(result.warnings[0].key, "edit_mode");
         assert_eq!(result.warnings[0].tier, "project");
         assert_eq!(result.warnings[0].value, "future");
+    }
+
+    #[test]
+    fn synapse_requires_explicit_model_and_receives_user_subc_connection_file() {
+        let without_model = resolve_config(&[tier(
+            "user",
+            r#"{
+                "semantic": { "backend": "synapse" },
+                "subc": { "connection_file": "/tmp/subc-connection.json" }
+            }"#,
+        )]);
+        assert_eq!(
+            without_model.config.semantic.backend,
+            SemanticBackend::Synapse
+        );
+        assert!(without_model.config.semantic.model.is_empty());
+        assert_eq!(
+            without_model.config.semantic.subc_connection_file,
+            Some(PathBuf::from("/tmp/subc-connection.json"))
+        );
+
+        let with_model = resolve_config(&[tier(
+            "user",
+            r#"{
+                "semantic": { "backend": "synapse", "model": "configured-model" },
+                "subc": { "connection_file": "/tmp/subc-connection.json" }
+            }"#,
+        )]);
+        assert_eq!(with_model.config.semantic.model, "configured-model");
     }
 
     #[test]

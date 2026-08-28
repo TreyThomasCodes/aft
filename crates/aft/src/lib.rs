@@ -122,8 +122,10 @@ pub mod subc_translate;
 pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
+pub mod synapse_embed;
 pub mod tool_path;
 pub mod url_fetch;
+pub(crate) mod walk_boundary;
 pub mod watcher_filter;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry

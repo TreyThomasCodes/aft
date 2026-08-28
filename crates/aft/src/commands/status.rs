@@ -148,17 +148,31 @@ impl AppContext {
                                 files,
                                 entries_done,
                                 entries_total,
-                            } => serde_json::json!({
-                                "status": "loading",
-                                "state": "loading",
-                                "refreshing_count": 0,
-                                "stage": stage,
-                                "files": files,
-                                "entries_done": entries_done,
-                                "entries_total": entries_total,
-                                "backend": config.semantic_backend_label(),
-                                "model": config.semantic.model.as_str(),
-                            }),
+                            } => {
+                                let mut snapshot = serde_json::json!({
+                                    "status": "loading",
+                                    "state": "loading",
+                                    "refreshing_count": 0,
+                                    "stage": stage,
+                                    "files": files,
+                                    "entries_done": entries_done,
+                                    "entries_total": entries_total,
+                                    "backend": config.semantic_backend_label(),
+                                    "model": config.semantic.model.as_str(),
+                                });
+                                if let Some(progress) = self.semantic_build_progress() {
+                                    let progress = progress.snapshot();
+                                    snapshot["embedded_chunks"] =
+                                        serde_json::json!(progress.embedded_chunks);
+                                    snapshot["total_chunks"] =
+                                        serde_json::json!(progress.total_chunks);
+                                    snapshot["current_batch"] =
+                                        serde_json::json!(progress.current_batch);
+                                    snapshot["total_batches"] =
+                                        serde_json::json!(progress.total_batches);
+                                }
+                                snapshot
+                            }
                             SemanticIndexStatus::Ready { refreshing, .. } => serde_json::json!({
                                 "status": "ready",
                                 "state": "ready",
@@ -503,6 +517,36 @@ mod tests {
         assert!(status["memory"]["process"]["allocator"]
             .get("retained_slack_bytes")
             .is_some());
+    }
+
+    #[test]
+    fn status_exposes_live_semantic_build_progress_only_while_building() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let progress = crate::context::SemanticBuildProgress::default();
+        progress.report(3, 10, 2);
+        ctx.set_semantic_build_progress(Some(progress));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Building {
+                stage: "embedding_symbols".to_string(),
+                files: Some(1),
+                entries_done: Some(3),
+                entries_total: Some(10),
+            };
+
+        let building = ctx.build_status_snapshot();
+        let semantic = &building["semantic_index"];
+        assert_eq!(semantic["stage"], "embedding_symbols");
+        assert_eq!(semantic["embedded_chunks"], 3);
+        assert_eq!(semantic["total_chunks"], 10);
+        assert_eq!(semantic["current_batch"], 2);
+        assert_eq!(semantic["total_batches"], 5);
+
+        ctx.set_semantic_build_progress(None);
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+        let ready = ctx.build_status_snapshot();
+        assert!(ready["semantic_index"].get("embedded_chunks").is_none());
+        assert!(ready["semantic_index"].get("total_chunks").is_none());
     }
 
     #[test]

@@ -403,7 +403,7 @@ function editModesPresent(record: Record<string, unknown>): string[] {
   const hasSymbol = isNonEmptyString(record.symbol);
   if (!hasSymbol) {
     delete record.symbol;
-    if (record.content === null || record.content === "") delete record.content;
+    if (isNullOrEmptyString(record.content)) delete record.content;
   } else if (record.content === null) {
     delete record.content;
   }
@@ -429,6 +429,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+function isNullOrEmptyString(value: unknown): boolean {
+  return value === null || value === "";
+}
+
 const OMIT_OPTIONAL_FIELDS_STEERING =
   "Omit unused optional fields entirely; do not send empty strings or empty arrays for them.";
 
@@ -438,21 +442,30 @@ const OMIT_OPTIONAL_FIELDS_STEERING =
  * sibling field. Such an item carries no real edit intent and must not claim
  * the `edits` mode.
  *
- * A pure line-range item ({startLine,endLine,content}) has no `oldString` key,
- * so it is never a sentinel even when `content` is "" (deleting lines is real
- * intent). A real replacement has a non-empty `oldString`, so it is never a
- * sentinel. `{oldString:"", newString:"non-empty"}` is deliberately NOT a
+ * A pure line-range item ({startLine,endLine,content}) is never a sentinel,
+ * even when `content` is "", because deleting lines is real edit intent. A
+ * null `oldString` with a non-null range boundary is treated the same way. A
+ * real replacement has a non-empty `oldString`, so it is never a sentinel.
+ * `{oldString:"", newString:"non-empty"}` is deliberately NOT a
  * sentinel: it is kept so the batch parser reports its specific empty-match
  * error instead of silently discarding a broken but intentional edit.
  */
 function isEditSentinelItem(item: unknown): boolean {
   if (!item || typeof item !== "object" || Array.isArray(item)) return false;
   const record = item as Record<string, unknown>;
-  if (record.oldString !== "") return false;
-  const newStringEmpty =
-    !hasOwn(record, "newString") || record.newString === "" || record.newString === null;
+  const oldStringEmpty = hasOwn(record, "oldString") && isNullOrEmptyString(record.oldString);
+  if (!oldStringEmpty) return false;
+  // A non-null range boundary proves that a null oldString belongs to a
+  // line-range item, not an all-null serialization sentinel.
+  if (
+    record.oldString === null &&
+    ["startLine", "endLine"].some((key) => hasOwn(record, key) && record[key] !== null)
+  ) {
+    return false;
+  }
+  const newStringEmpty = !hasOwn(record, "newString") || isNullOrEmptyString(record.newString);
   if (!newStringEmpty) return false;
-  return !hasOwn(record, "content") || record.content === "" || record.content === null;
+  return !hasOwn(record, "content") || isNullOrEmptyString(record.content);
 }
 
 /**
@@ -515,14 +528,29 @@ function parseEditArray(value: unknown): unknown[] {
 }
 
 /**
- * Strip default values from the find/replace arm of a line-range edit.
+ * Strip default values from an edit item before selecting its family.
  *
- * Some hosts serialize all optional fields. These values cannot affect a
- * line-range edit, while non-default values remain to surface a mixed-mode
- * request instead of being discarded.
+ * Some hosts serialize all optional fields. Null values are absent fields, and
+ * the default find/replace values cannot affect a line-range edit. Non-default
+ * values remain to surface a mixed-mode request instead of being discarded.
  */
 function stripLineRangeSentinels(item: Record<string, unknown>): void {
   const hasRangeField = ["startLine", "endLine", "content"].some((key) => hasOwn(item, key));
+
+  // Null is how some hosts serialize an omitted optional property. Remove it
+  // before counting either edit family so it cannot create a false conflict.
+  for (const key of [
+    "oldString",
+    "newString",
+    "replaceAll",
+    "occurrence",
+    "startLine",
+    "endLine",
+    "content",
+  ]) {
+    if (item[key] === null) delete item[key];
+  }
+
   if (!hasRangeField) return;
 
   if (item.oldString === "") delete item.oldString;

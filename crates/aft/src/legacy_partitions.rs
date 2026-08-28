@@ -200,6 +200,13 @@ pub fn inventory_legacy_partitions(
     storage_root: &Path,
 ) -> io::Result<Vec<LegacyPartitionInventoryEntry>> {
     let storage_root = lexical_normalize(storage_root);
+    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(&storage_root) {
+        Ok(boundary) => boundary,
+        // Keep the existing empty-inventory behavior for a storage root that has
+        // not been created yet; no recursive walk has started in that case.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     let mut entries = Vec::new();
     for harness_entry in sorted_read_dir(&storage_root)? {
         if !harness_entry.file_type()?.is_dir() {
@@ -207,14 +214,31 @@ pub fn inventory_legacy_partitions(
         }
         let harness = harness_entry.file_name().to_string_lossy().to_string();
         let harness_path = harness_entry.path();
-        entries.extend(scan_legacy_callgraph_partitions(
-            &harness,
-            &harness_path.join(LegacyPartitionKind::Callgraph.as_str()),
-        )?);
-        entries.extend(scan_legacy_inspect_partitions(
-            &harness,
-            &harness_path.join(LegacyPartitionKind::Inspect.as_str()),
-        )?);
+        // A mounted child can disappear while recursive inventory holds its
+        // ReadDir, causing closedir ENXIO to abort in Drop. Do not enter it.
+        if !boundary.should_descend(&harness_path)? {
+            crate::slog_warn!(
+                "legacy partition inventory skipped foreign filesystem mount {}",
+                harness_path.display()
+            );
+            continue;
+        }
+        let callgraph_path = harness_path.join(LegacyPartitionKind::Callgraph.as_str());
+        if callgraph_path.is_dir() && boundary.should_descend(&callgraph_path)? {
+            entries.extend(scan_legacy_callgraph_partitions(
+                &harness,
+                &callgraph_path,
+                &boundary,
+            )?);
+        }
+        let inspect_path = harness_path.join(LegacyPartitionKind::Inspect.as_str());
+        if inspect_path.is_dir() && boundary.should_descend(&inspect_path)? {
+            entries.extend(scan_legacy_inspect_partitions(
+                &harness,
+                &inspect_path,
+                &boundary,
+            )?);
+        }
     }
     entries.sort_by(|left, right| {
         left.harness
@@ -254,6 +278,7 @@ struct PartitionAccumulator {
 fn scan_legacy_callgraph_partitions(
     harness: &str,
     callgraph_dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
 ) -> io::Result<Vec<LegacyPartitionInventoryEntry>> {
     let mut partitions = BTreeMap::<String, PartitionAccumulator>::new();
     for entry in sorted_read_dir(callgraph_dir)? {
@@ -264,7 +289,9 @@ fn scan_legacy_callgraph_partitions(
                 continue;
             }
             let partition = partitions.entry(name.clone()).or_default();
-            partition.bytes = partition.bytes.saturating_add(tree_size(&entry.path())?);
+            partition.bytes = partition
+                .bytes
+                .saturating_add(tree_size(&entry.path(), boundary)?);
             if partition.callgraph_pointer_mtime.is_none() {
                 partition.callgraph_pointer_mtime = callgraph_pointer_mtime(callgraph_dir, &name);
             }
@@ -299,6 +326,7 @@ fn scan_legacy_callgraph_partitions(
 fn scan_legacy_inspect_partitions(
     harness: &str,
     inspect_dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
 ) -> io::Result<Vec<LegacyPartitionInventoryEntry>> {
     let mut partitions = BTreeMap::<String, PartitionAccumulator>::new();
     for entry in sorted_read_dir(inspect_dir)? {
@@ -309,7 +337,9 @@ fn scan_legacy_inspect_partitions(
                 continue;
             }
             let partition = partitions.entry(name.clone()).or_default();
-            partition.bytes = partition.bytes.saturating_add(tree_size(&entry.path())?);
+            partition.bytes = partition
+                .bytes
+                .saturating_add(tree_size(&entry.path(), boundary)?);
             if partition.inspect_tier2_last_full_run.is_none() {
                 partition.inspect_tier2_last_full_run =
                     inspect_tier2_last_full_run(inspect_dir, &name);
@@ -414,7 +444,7 @@ fn file_size(path: &Path) -> io::Result<u64> {
     Ok(fs::metadata(path)?.len())
 }
 
-fn tree_size(path: &Path) -> io::Result<u64> {
+fn tree_size(path: &Path, boundary: &crate::walk_boundary::DeviceBoundary) -> io::Result<u64> {
     if !path.exists() {
         return Ok(0);
     }
@@ -425,10 +455,17 @@ fn tree_size(path: &Path) -> io::Result<u64> {
     if !metadata.is_dir() {
         return Ok(0);
     }
+    if !boundary.should_descend(path)? {
+        crate::slog_warn!(
+            "legacy partition inventory skipped foreign filesystem mount {}",
+            path.display()
+        );
+        return Ok(0);
+    }
 
     let mut total = 0_u64;
     for entry in fs::read_dir(path)? {
-        total = total.saturating_add(tree_size(&entry?.path())?);
+        total = total.saturating_add(tree_size(&entry?.path(), boundary)?);
     }
     Ok(total)
 }

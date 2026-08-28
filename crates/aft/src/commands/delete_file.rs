@@ -286,16 +286,30 @@ fn delete_directory(
     original: &str,
     op_id: &str,
 ) -> Result<serde_json::Value, Response> {
-    let unsupported_paths = validate_directory_for_recursive_delete(path).map_err(|e| {
+    // A vanished mounted child can make std::fs::ReadDir::drop panic after
+    // closedir returns ENXIO, aborting the daemon. Capture the root device before
+    // either recursive pass so neither validation nor backup collection crosses it.
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(path).map_err(|e| {
         Response::error(
             &req.id,
             "io_error",
             format!(
-                "delete_file: failed to validate directory '{}': {}",
+                "delete_file: failed to establish filesystem boundary for '{}': {}",
                 original, e
             ),
         )
     })?;
+    let unsupported_paths =
+        validate_directory_for_recursive_delete(path, &boundary).map_err(|e| {
+            Response::error(
+                &req.id,
+                "io_error",
+                format!(
+                    "delete_file: failed to validate directory '{}': {}",
+                    original, e
+                ),
+            )
+        })?;
     if !unsupported_paths.is_empty() {
         return Err(Response::error(
             &req.id,
@@ -305,7 +319,7 @@ fn delete_directory(
     }
 
     let mut files_to_backup: Vec<PathBuf> = Vec::new();
-    if let Err(e) = collect_files(path, &mut files_to_backup) {
+    if let Err(e) = collect_files(path, &boundary, &mut files_to_backup) {
         return Err(Response::error(
             &req.id,
             "io_error",
@@ -400,18 +414,22 @@ fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &
 /// only file contents. Reject directory trees that contain entries undo cannot
 /// restore atomically (symlinks and empty directories) before taking backups or
 /// deleting anything.
-fn validate_directory_for_recursive_delete(dir: &Path) -> std::io::Result<Vec<String>> {
+fn validate_directory_for_recursive_delete(
+    dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+) -> std::io::Result<Vec<String>> {
     let mut unsupported_paths = Vec::new();
     if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
         unsupported_paths.push(dir.display().to_string());
         return Ok(unsupported_paths);
     }
-    validate_directory_entries(dir, &mut unsupported_paths)?;
+    validate_directory_entries(dir, boundary, &mut unsupported_paths)?;
     Ok(unsupported_paths)
 }
 
 fn validate_directory_entries(
     dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
     unsupported_paths: &mut Vec<String>,
 ) -> std::io::Result<()> {
     let mut entries = Vec::new();
@@ -430,7 +448,13 @@ fn validate_directory_entries(
         if file_type.is_symlink() {
             unsupported_paths.push(path.display().to_string());
         } else if file_type.is_dir() {
-            validate_directory_entries(&path, unsupported_paths)?;
+            if !boundary.should_descend(&path)? {
+                // Report this as unsupported before mutation. Silently skipping it
+                // would leave the mounted directory behind after partial deletion.
+                unsupported_paths.push(path.display().to_string());
+                continue;
+            }
+            validate_directory_entries(&path, boundary, unsupported_paths)?;
         } else if file_type.is_file() {
             if has_multiple_hard_links(&path)? {
                 unsupported_paths.push(path.display().to_string());
@@ -447,7 +471,7 @@ fn unsupported_directory_contents_message(paths: &[String]) -> String {
     const MAX_PATHS: usize = 5;
 
     let mut message = String::from(
-        "aft_delete with recursive: true does not yet support directory trees containing symlinks, empty directories, hard links, sockets, device nodes, or other non-regular files. Restore would not recover these entries atomically.",
+        "aft_delete with recursive: true does not yet support directory trees containing symlinks, empty directories, hard links, mounted directories from another filesystem, sockets, device nodes, or other non-regular files. Restore would not recover these entries atomically.",
     );
     message.push_str(" Offending path(s): ");
     message.push_str(
@@ -467,7 +491,11 @@ fn unsupported_directory_contents_message(paths: &[String]) -> String {
 /// Walk a directory recursively, collecting all regular file paths.
 /// Skips symlinked directories to avoid following loops; symlinked files
 /// are included.
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_files(
+    dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -475,7 +503,13 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         if file_type.is_file() {
             out.push(path);
         } else if file_type.is_dir() {
-            collect_files(&path, out)?;
+            if !boundary.should_descend(&path)? {
+                return Err(std::io::Error::other(format!(
+                    "refusing to cross foreign filesystem mount {} while collecting delete backups",
+                    path.display()
+                )));
+            }
+            collect_files(&path, boundary, out)?;
         }
     }
     Ok(())

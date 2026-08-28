@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2278,12 +2278,19 @@ fn semantic_unavailable_grep_fallback_response(
     let more_available = result.truncated
         || result.total_matches > result.matches.len()
         || fallback.file_cap_reached
-        || fallback.walk_budget_reached;
+        || fallback.walk_budget_reached
+        || result.skipped_foreign_mounts > 0;
     let mut extras = semantic_unavailable_extras(true);
     if fallback.file_cap_reached || fallback.walk_budget_reached {
         extras.insert(
             "degraded_grep_walk_truncated".to_string(),
             serde_json::json!(true),
+        );
+    }
+    if result.skipped_foreign_mounts > 0 {
+        extras.insert(
+            "degraded_grep_skipped_foreign_mounts".to_string(),
+            serde_json::json!(result.skipped_foreign_mounts),
         );
     }
     if fallback.file_cap_reached {
@@ -2362,7 +2369,7 @@ fn execute_degraded_grep_fallback(
 
     let max_results = top_k.clamp(1, DEGRADED_GREP_RESULT_LIMIT);
     let started = Instant::now();
-    let (files, file_cap_reached, walk_budget_reached) =
+    let (files, file_cap_reached, walk_budget_reached, skipped_foreign_mounts) =
         collect_degraded_grep_files(project_root, include_tests, started);
     if search_cancellation_requested() {
         return Err(cancelled_search_response_from_id(request_id));
@@ -2443,6 +2450,7 @@ fn execute_degraded_grep_fallback(
             fully_degraded: true,
             engine_capped,
             walk_truncated: walk_budget_reached,
+            skipped_foreign_mounts,
         },
         file_cap_reached,
         file_limit: DEGRADED_GREP_FILE_LIMIT,
@@ -2455,43 +2463,75 @@ fn collect_degraded_grep_files(
     project_root: &Path,
     include_tests: bool,
     started: Instant,
-) -> (Vec<PathBuf>, bool, bool) {
+) -> (Vec<PathBuf>, bool, bool, usize) {
+    // Keep degraded semantic search on the root filesystem: ReadDir::drop can
+    // abort the daemon if a disappearing child mount reports ENXIO.
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(project_root).ok();
     let walker = ignore::WalkBuilder::new(project_root)
+        .same_file_system(true)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir())
-            {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
+        .filter_entry({
+            let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
+            move |entry| {
+                if entry.depth() > 0
+                    && entry
+                        .file_type()
+                        .is_some_and(|file_type| file_type.is_dir())
+                    && matches!(
+                        boundary
+                            .as_ref()
+                            .map(|boundary| boundary.should_descend(entry.path())),
+                        Some(Ok(false))
+                    )
+                {
+                    skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if entry
+                    .file_type()
+                    .is_some_and(|file_type| file_type.is_dir())
+                {
+                    return !matches!(
+                        name.as_ref(),
+                        "node_modules"
+                            | "target"
+                            | "venv"
+                            | ".venv"
+                            | ".git"
+                            | "__pycache__"
+                            | ".tox"
+                            | "dist"
+                            | "build"
+                    );
+                }
+                true
             }
-            true
         })
         .build();
 
     let mut files = Vec::new();
     for entry in walker.filter_map(Result::ok) {
         if search_cancellation_requested() {
-            return (files, false, true);
+            return (
+                files,
+                false,
+                true,
+                skipped_foreign_mounts.load(Ordering::Relaxed),
+            );
         }
         if started.elapsed() >= DEGRADED_GREP_WALK_BUDGET {
-            return (files, false, true);
+            return (
+                files,
+                false,
+                true,
+                skipped_foreign_mounts.load(Ordering::Relaxed),
+            );
         }
         if !entry
             .file_type()
@@ -2504,12 +2544,22 @@ fn collect_degraded_grep_files(
             continue;
         }
         if files.len() >= DEGRADED_GREP_FILE_LIMIT {
-            return (files, true, false);
+            return (
+                files,
+                true,
+                false,
+                skipped_foreign_mounts.load(Ordering::Relaxed),
+            );
         }
         files.push(path);
     }
 
-    (files, false, false)
+    (
+        files,
+        false,
+        false,
+        skipped_foreign_mounts.load(Ordering::Relaxed),
+    )
 }
 
 fn search_degraded_grep_file(
@@ -4135,6 +4185,7 @@ mod tests {
                     query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
+                    ..Default::default()
                 },
                 ..Config::default()
             },
@@ -4363,6 +4414,7 @@ mod tests {
             fully_degraded: true,
             engine_capped: false,
             walk_truncated: false,
+            skipped_foreign_mounts: 0,
         };
         let text = format_grep_lexical_unavailable_text(
             "Semantic index is loading.",
@@ -5640,6 +5692,7 @@ mod tests {
                     query_timeout_ms: 3_000,
                     max_batch_size: 64,
                     max_files: 20_000,
+                    ..Default::default()
                 },
                 ..Config::default()
             },

@@ -401,3 +401,18 @@ occurred in production within one hour of fleet rollout. Riders confirmed:
   one scratch write ceremony, proving the whole governed path under one-App
   shape. Holder needs ZERO changes (row-shape agnostic, resolves per
   agent_id at call time) — S2 is rows on every seat.
+
+## Errata
+
+### Authority vs identity on admin verbs (2026-08-27, from SUBC's first bound-seat merge)
+
+The identity-room fold ("all Alfonsos merge their own PRs") and the admin tier
+("merges require GH_SHIM_BYPASS=operator") read as contradictory until split:
+the fold governs AUTHORITY (the agent decides and executes, no human gate);
+the tier governs IDENTITY (a merge signs as the operator - the Apps lack
+contents:write by design). Pre-binding merges already obeyed both: passthrough
+executed them under ambient operator credentials. The sanctioned autonomous
+path on a bound seat is the agent setting GH_SHIM_BYPASS=operator itself -
+the deliberate, audit-visible identity switch. Verification inverts for admin:
+assert the OPERATOR is the actor (a bot merger would be the bug), the mirror
+of bot-author verification on speech.

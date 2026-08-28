@@ -962,11 +962,29 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
         return;
     }
 
+    // A vanished mounted child can make ReadDir::drop panic after closedir
+    // returns ENXIO, aborting the daemon. Keep namespace migration on its root
+    // filesystem before opening session directories.
+    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(&source) else {
+        crate::slog_warn!(
+            "cannot establish filesystem boundary for checkpoint migration {}",
+            source.display()
+        );
+        return;
+    };
+    let mut skipped_foreign_mounts = 0usize;
     let Ok(session_entries) = fs::read_dir(&source) else {
         return;
     };
     for session_entry in session_entries.flatten() {
         let source_session = session_entry.path();
+        if !source_session.is_dir() {
+            continue;
+        }
+        if !boundary.should_descend(&source_session).unwrap_or(false) {
+            skipped_foreign_mounts += 1;
+            continue;
+        }
         let target_session = target.join(session_entry.file_name());
         if !target_session.exists() {
             let _ = fs::rename(&source_session, &target_session);
@@ -985,6 +1003,13 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
         let _ = fs::remove_dir(&source_session);
     }
     let _ = fs::remove_dir(&source);
+    if skipped_foreign_mounts > 0 {
+        crate::slog_warn!(
+            "checkpoint migration skipped {} foreign filesystem mount(s) below {}",
+            skipped_foreign_mounts,
+            source.display()
+        );
+    }
 }
 
 fn validate_checkpoint_name(name: &str) -> Result<(), AftError> {
@@ -1152,6 +1177,17 @@ fn prune_unreferenced_checkpoint_blobs(
 }
 
 fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
+    // A vanished mounted child can make ReadDir::drop panic after closedir
+    // returns ENXIO, aborting the daemon. This background sweep must not open
+    // checkpoint directories on a different filesystem.
+    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) else {
+        crate::slog_warn!(
+            "cannot establish filesystem boundary for checkpoint sweep {}",
+            checkpoints_dir.display()
+        );
+        return;
+    };
+    let mut skipped_foreign_mounts = 0usize;
     let Ok(session_entries) = fs::read_dir(checkpoints_dir) else {
         return;
     };
@@ -1160,12 +1196,20 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
         if !session_dir.is_dir() {
             continue;
         }
+        if !boundary.should_descend(&session_dir).unwrap_or(false) {
+            skipped_foreign_mounts += 1;
+            continue;
+        }
         let Ok(checkpoint_entries) = fs::read_dir(&session_dir) else {
             continue;
         };
         for checkpoint_entry in checkpoint_entries.flatten() {
             let checkpoint_dir = checkpoint_entry.path();
             if !checkpoint_dir.is_dir() {
+                continue;
+            }
+            if !boundary.should_descend(&checkpoint_dir).unwrap_or(false) {
+                skipped_foreign_mounts += 1;
                 continue;
             }
             let meta_path = checkpoint_dir.join("meta.json");
@@ -1187,6 +1231,13 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
             }
         }
         let _ = fs::remove_dir(&session_dir);
+    }
+    if skipped_foreign_mounts > 0 {
+        crate::slog_warn!(
+            "checkpoint sweep skipped {} foreign filesystem mount(s) below {}",
+            skipped_foreign_mounts,
+            checkpoints_dir.display()
+        );
     }
 }
 

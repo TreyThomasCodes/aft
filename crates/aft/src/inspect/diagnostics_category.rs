@@ -245,7 +245,9 @@ fn scoped_coverage_candidates(
             continue;
         }
 
+        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
         let walker = ignore::WalkBuilder::new(&root)
+            .same_file_system(true)
             .standard_filters(true)
             .add_custom_ignore_filename(".aftignore")
             .filter_entry(|entry| {

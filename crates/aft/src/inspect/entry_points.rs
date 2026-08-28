@@ -152,7 +152,9 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
 
 fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
     let mut builder = ignore::WalkBuilder::new(project_root);
+    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     builder
+        .same_file_system(true)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
@@ -457,9 +459,11 @@ fn collect_framework_route_files(
 
 fn framework_route_walk_files(package_dir: &Path) -> Vec<PathBuf> {
     let package_dir = snapshot_path(package_dir);
+    // A vanished framework mount could otherwise make ReadDir::drop abort on ENXIO.
     let mut builder = ignore::WalkBuilder::new(&package_dir);
     let package_root = package_dir.clone();
     builder
+        .same_file_system(true)
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
