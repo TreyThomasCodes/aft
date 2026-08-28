@@ -483,15 +483,7 @@ impl CheckpointStore {
             .or_default()
             .insert(name.to_string(), checkpoint);
 
-        let evicted = self.evicted_checkpoint_names(session);
-        for evicted_name in &evicted {
-            self.remove_checkpoint_from_disk_locked(session, evicted_name)?;
-        }
-        if let Some(session_checkpoints) = self.checkpoints.get_mut(session) {
-            for evicted_name in &evicted {
-                session_checkpoints.remove(evicted_name);
-            }
-        }
+        let evicted = self.evict_excess_checkpoints_locked(session)?;
 
         if skipped.is_empty() {
             crate::slog_info!("checkpoint created: {} ({} files)", name, file_count);
@@ -801,6 +793,7 @@ impl CheckpointStore {
             self.checkpoints.remove(session);
         } else {
             self.checkpoints.insert(session.to_string(), hydrated);
+            self.evict_excess_checkpoints_locked(session)?;
         }
         Ok(())
     }
@@ -909,9 +902,9 @@ impl CheckpointStore {
         }
     }
 
-    fn evicted_checkpoint_names(&self, session: &str) -> Vec<String> {
+    fn evict_excess_checkpoints_locked(&mut self, session: &str) -> Result<Vec<String>, AftError> {
         let Some(checkpoints) = self.checkpoints.get(session) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let overflow = checkpoints
             .len()
@@ -921,11 +914,21 @@ impl CheckpointStore {
             .map(|checkpoint| (checkpoint.created_order, checkpoint.name.clone()))
             .collect::<Vec<_>>();
         checkpoints.sort();
-        checkpoints
+        let evicted = checkpoints
             .into_iter()
             .take(overflow)
             .map(|(_, name)| name)
-            .collect()
+            .collect::<Vec<_>>();
+
+        for name in &evicted {
+            self.remove_checkpoint_from_disk_locked(session, name)?;
+        }
+        if let Some(checkpoints) = self.checkpoints.get_mut(session) {
+            for name in &evicted {
+                checkpoints.remove(name);
+            }
+        }
+        Ok(evicted)
     }
 
     pub fn session_is_empty(&self, session: &str) -> bool {
@@ -1716,6 +1719,57 @@ mod tests {
             .join(hash_session(DEFAULT_SESSION_ID))
             .join("checkpoint-00");
         assert!(!old_dir.exists(), "evicted checkpoint must leave disk too");
+    }
+
+    #[test]
+    fn hydration_finishes_retention_after_interrupted_create() {
+        let (path, _files) = temp_file("interrupted-retention.txt", "checkpoint content");
+        let backup_store = BackupStore::new();
+        let (mut first, storage) = checkpoint_store();
+
+        for index in 0..MAX_NAMED_CHECKPOINTS_PER_SESSION {
+            first
+                .create(
+                    DEFAULT_SESSION_ID,
+                    &format!("checkpoint-{index:02}"),
+                    vec![path.clone()],
+                    &backup_store,
+                )
+                .unwrap();
+        }
+
+        // The create path persists the new checkpoint before evicting older
+        // checkpoints. Write only the durable checkpoint here to simulate the
+        // process exiting after persistence but before retention eviction.
+        let checkpoint = Checkpoint {
+            name: "checkpoint-20".to_string(),
+            file_contents: HashMap::from([(path, checkpoint_file("newest"))]),
+            created_at: current_timestamp(),
+            created_order: u64::MAX,
+        };
+        {
+            let _lock = first.acquire_mutation_lock().unwrap();
+            first
+                .persist_checkpoint_locked(DEFAULT_SESSION_ID, &checkpoint)
+                .unwrap();
+        }
+        drop(first);
+
+        let session_dir = storage
+            .path()
+            .join("opencode")
+            .join("checkpoints")
+            .join(hash_session(DEFAULT_SESSION_ID));
+        assert_eq!(fs::read_dir(&session_dir).unwrap().count(), 21);
+
+        let mut restarted = fresh_checkpoint_store(storage.path());
+        let listed = restarted.list(DEFAULT_SESSION_ID).unwrap();
+        assert_eq!(listed.len(), MAX_NAMED_CHECKPOINTS_PER_SESSION);
+        assert!(listed.iter().all(|info| info.name != "checkpoint-00"));
+        assert!(
+            !session_dir.join("checkpoint-00").exists(),
+            "hydration must finish interrupted retention on disk"
+        );
     }
 
     #[test]
