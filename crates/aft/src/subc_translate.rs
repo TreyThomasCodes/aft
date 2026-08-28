@@ -3195,10 +3195,10 @@ mod tests {
             translated.args.get("shell"),
             Some(&Value::String("powershell".into()))
         );
-        assert_eq!(
-            translated.args.get("workdir"),
-            Some(&Value::String("/project/scripts".into()))
-        );
+        let workdir = translated.args["workdir"]
+            .as_str()
+            .expect("translated workdir");
+        assert_eq!(Path::new(workdir), Path::new("/project").join("scripts"));
     }
 
     #[test]
