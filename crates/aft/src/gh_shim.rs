@@ -1185,11 +1185,16 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         .map(PathBuf::from);
     for raw_pattern in &detectors.wrapper_config_dirs {
         let pattern = expand_home_pattern(raw_pattern, home.as_deref());
-        if let Ok(paths) = glob::glob(&pattern) {
-            for path in paths.flatten() {
-                if path.is_dir() {
-                    return Some(format!("path:{}", path.display()));
-                }
+        let paths = if pattern.contains(['*', '?', '[', '{']) {
+            // Never let an ambient home-directory glob cross a mount: a vanished
+            // child ReadDir can panic in Drop after closedir reports ENXIO.
+            crate::walk_boundary::expand_glob_same_file_system(&pattern).unwrap_or_default()
+        } else {
+            vec![PathBuf::from(pattern)]
+        };
+        for path in paths {
+            if path.is_dir() {
+                return Some(format!("path:{}", path.display()));
             }
         }
     }

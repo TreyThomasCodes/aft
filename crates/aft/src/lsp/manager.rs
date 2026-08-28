@@ -513,7 +513,9 @@ impl LspManager {
 
         let mut candidates = HashMap::<ServerKey, ApplicableServerCandidate>::new();
         let mut producer_failures = HashMap::<ServerKey, ApplicableServerFailure>::new();
+        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
         let walker = ignore::WalkBuilder::new(project_root)
+            .same_file_system(true)
             .standard_filters(true)
             .add_custom_ignore_filename(".aftignore")
             .filter_entry(|entry| {

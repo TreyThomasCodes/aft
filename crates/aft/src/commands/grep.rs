@@ -123,8 +123,9 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let mut body = serde_json::json!({
         "text": text,
-        "complete": !result.walk_truncated,
+        "complete": !result.walk_truncated && result.skipped_foreign_mounts == 0,
         "no_files_matched_scope": !scope_has_files,
+        "skipped_foreign_mounts": result.skipped_foreign_mounts,
         "matches": result.matches.iter().map(match_to_json).collect::<Vec<_>>(),
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
@@ -138,6 +139,13 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
             text
+        ));
+    }
+    if result.skipped_foreign_mounts > 0 {
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Fallback directory walk skipped {} foreign filesystem mount(s); results may be incomplete.)",
+            body["text"].as_str().unwrap_or_default(),
+            result.skipped_foreign_mounts
         ));
     }
 
@@ -354,6 +362,7 @@ mod tests {
             fully_degraded: false,
             engine_capped: false,
             walk_truncated: false,
+            skipped_foreign_mounts: 0,
         }
     }
 
@@ -531,6 +540,7 @@ mod tests {
             "fully_degraded": result.fully_degraded,
             "engine_capped": result.engine_capped,
             "walk_truncated": result.walk_truncated,
+            "skipped_foreign_mounts": result.skipped_foreign_mounts,
         }))
         .expect("serialize grep result projection")
     }

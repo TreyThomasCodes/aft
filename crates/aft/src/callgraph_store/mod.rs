@@ -7585,24 +7585,66 @@ fn sweep_orphaned_build_temps_store_wide(callgraph_dir: &Path) {
         return;
     };
     let domain = crate::root_cache::RootCacheDomain::Callgraph.as_str();
+    // A vanished mounted child can make ReadDir::drop panic after closedir
+    // returns ENXIO, aborting the daemon. Keep the store-wide background sweep
+    // on the storage root's filesystem before opening child directories.
+    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(&storage_root) else {
+        crate::slog_warn!(
+            "cannot establish filesystem boundary for callgraph sweep {}",
+            storage_root.display()
+        );
+        return;
+    };
+    let mut skipped_foreign_mounts = 0usize;
 
     // Root-keyed layout: every `<storage>/callgraph/<key>` directory.
-    if let Ok(entries) = std::fs::read_dir(storage_root.join(domain)) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                sweep_orphaned_build_temps(&entry.path());
+    let root_keyed_dir = storage_root.join(domain);
+    if root_keyed_dir.is_dir() {
+        if boundary.should_descend(&root_keyed_dir).unwrap_or(false) {
+            if let Ok(entries) = std::fs::read_dir(&root_keyed_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if boundary.should_descend(&path).unwrap_or(false) {
+                            sweep_orphaned_build_temps(&path);
+                        } else {
+                            skipped_foreign_mounts += 1;
+                        }
+                    }
+                }
             }
+        } else {
+            skipped_foreign_mounts += 1;
         }
     }
 
     // Legacy per-harness layout: every `<storage>/<harness>/callgraph` directory.
     if let Ok(entries) = std::fs::read_dir(&storage_root) {
         for entry in entries.flatten() {
-            let legacy_dir = entry.path().join(domain);
+            let harness_dir = entry.path();
+            if !harness_dir.is_dir() {
+                continue;
+            }
+            if !boundary.should_descend(&harness_dir).unwrap_or(false) {
+                skipped_foreign_mounts += 1;
+                continue;
+            }
+            let legacy_dir = harness_dir.join(domain);
             if legacy_dir.is_dir() {
-                sweep_orphaned_build_temps(&legacy_dir);
+                if boundary.should_descend(&legacy_dir).unwrap_or(false) {
+                    sweep_orphaned_build_temps(&legacy_dir);
+                } else {
+                    skipped_foreign_mounts += 1;
+                }
             }
         }
+    }
+    if skipped_foreign_mounts > 0 {
+        crate::slog_warn!(
+            "callgraph sweep skipped {} foreign filesystem mount(s) below {}",
+            skipped_foreign_mounts,
+            storage_root.display()
+        );
     }
 }
 

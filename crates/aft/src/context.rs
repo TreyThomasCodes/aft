@@ -2727,7 +2727,9 @@ impl AppContext {
         // files, so the watcher matcher must do the same or live invalidation
         // can disagree with startup indexing. Skip obvious infra dirs so we
         // don't accidentally load a vendored repo's ignore file as ours.
+        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
         let walker = ignore::WalkBuilder::new(&root)
+            .same_file_system(true)
             .standard_filters(true)
             // Hidden files are filtered by default, but `.gitignore` starts with
             // `.` so we need to traverse "hidden" entries to find nested ones.

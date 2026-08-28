@@ -2013,11 +2013,9 @@ fn expand_rust_workspace_member(workspace_root: &Path, member: &str) -> Vec<Path
 
     if member.contains('*') || member.contains('?') || member.contains('[') {
         let pattern = workspace_root.join(member).to_string_lossy().to_string();
-        return glob::glob(&pattern)
-            .ok()
+        return crate::walk_boundary::expand_glob_same_file_system(&pattern)
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
             .filter(|path| path.join("Cargo.toml").is_file())
             .map(|path| canonicalize_path(&path))
             .collect();
@@ -2268,10 +2266,14 @@ fn expand_workspace_patterns(workspace_root: &Path, patterns: &[String]) -> Vec<
         .collect();
     let negatives = build_glob_set(&negative_patterns);
 
+    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(workspace_root) else {
+        return Vec::new();
+    };
     let mut members = Vec::new();
     collect_workspace_member_dirs(
         workspace_root,
         workspace_root,
+        &boundary,
         &positives,
         &negatives,
         &mut members,
@@ -2294,6 +2296,7 @@ fn build_glob_set(patterns: &[&str]) -> GlobSet {
 fn collect_workspace_member_dirs(
     workspace_root: &Path,
     dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
     positives: &GlobSet,
     negatives: &GlobSet,
     members: &mut Vec<PathBuf>,
@@ -2308,6 +2311,15 @@ fn collect_workspace_member_dirs(
             continue;
         };
         if !file_type.is_dir() {
+            continue;
+        }
+        // Do not open a mounted child: its ReadDir destructor can abort on ENXIO
+        // when the mount disappears while callgraph discovery is running.
+        if !boundary.should_descend(&path).unwrap_or(false) {
+            crate::slog_warn!(
+                "callgraph workspace-member walk skipped foreign filesystem mount {}",
+                path.display()
+            );
             continue;
         }
         let name = entry.file_name();
@@ -2328,7 +2340,14 @@ fn collect_workspace_member_dirs(
             }
         }
 
-        collect_workspace_member_dirs(workspace_root, &path, positives, negatives, members);
+        collect_workspace_member_dirs(
+            workspace_root,
+            &path,
+            boundary,
+            positives,
+            negatives,
+            members,
+        );
     }
 }
 
@@ -2745,7 +2764,10 @@ fn find_alias_original(raw_import: &str, local_name: &str) -> Option<String> {
 pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
     use ignore::WalkBuilder;
 
+    // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
+    // the daemon, so never open directories outside this walk root's filesystem.
     let walker = WalkBuilder::new(root)
+        .same_file_system(true)
         .hidden(true)         // skip hidden files/dirs
         .git_ignore(true)     // respect .gitignore
         .git_global(true)     // respect global gitignore

@@ -1062,7 +1062,9 @@ fn append_symbol_to_dest(dest_content: &str, symbol_text: &str) -> String {
 fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, dest_path: &Path) {
     use ignore::WalkBuilder;
 
+    // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     let walker = WalkBuilder::new(root)
+        .same_file_system(true)
         .hidden(false) // include .storybook/, .config/, etc. (tracked consumers)
         .git_ignore(true)
         .git_global(true)

@@ -42,6 +42,10 @@ where
     };
 
     let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    // Do not walk upward out of a mounted start directory. This keeps an explicit
+    // file on that mount usable while preventing root discovery from crossing it;
+    // recursive descendants avoid ReadDir::drop's ENXIO daemon-abort failure too.
+    let device_boundary = crate::walk_boundary::DeviceBoundary::for_root(&start_dir).ok();
     if project_root
         .as_ref()
         .is_some_and(|boundary| !start_dir.starts_with(boundary))
@@ -51,6 +55,12 @@ where
 
     let mut current = Some(start_dir.as_path());
     while let Some(dir) = current {
+        if device_boundary
+            .as_ref()
+            .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
+        {
+            break;
+        }
         if project_root
             .as_ref()
             .is_some_and(|boundary| !dir.starts_with(boundary))
@@ -88,6 +98,9 @@ pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -
         resolved_path.parent()?.to_path_buf()
     };
     let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    // See `find_workspace_root_within`: stay on the start filesystem while
+    // discovering an LSP root, but permit the explicitly named mount itself.
+    let device_boundary = crate::walk_boundary::DeviceBoundary::for_root(&start_dir).ok();
 
     if project_root
         .as_ref()
@@ -99,6 +112,12 @@ pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -
     let crate_root = nearest_cargo_manifest_dir(&start_dir, project_root.as_deref())?;
     let mut current = Some(crate_root.as_path());
     while let Some(dir) = current {
+        if device_boundary
+            .as_ref()
+            .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
+        {
+            break;
+        }
         if project_root
             .as_ref()
             .is_some_and(|boundary| !dir.starts_with(boundary))
@@ -118,8 +137,15 @@ pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -
 }
 
 fn nearest_cargo_manifest_dir(start_dir: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    let device_boundary = crate::walk_boundary::DeviceBoundary::for_root(start_dir).ok();
     let mut current = Some(start_dir);
     while let Some(dir) = current {
+        if device_boundary
+            .as_ref()
+            .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
+        {
+            break;
+        }
         if project_root.is_some_and(|boundary| !dir.starts_with(boundary)) {
             break;
         }

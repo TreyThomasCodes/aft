@@ -21,6 +21,7 @@ struct GlobDiscovery {
     walk_time: Duration,
     scope_has_files: bool,
     scope_probe: Duration,
+    skipped_foreign_mounts: usize,
 }
 
 const MAX_GLOB_RESULTS: usize = 100;
@@ -92,6 +93,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         walk_time,
         scope_has_files,
         scope_probe,
+        skipped_foreign_mounts,
     ) = if search_roots.len() == 1 {
         let discovery = glob_root(
             ctx,
@@ -108,6 +110,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             discovery.walk_time,
             discovery.scope_has_files,
             discovery.scope_probe,
+            discovery.skipped_foreign_mounts,
         )
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
@@ -119,6 +122,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         let walk_time = discoveries.iter().map(|d| d.walk_time).sum();
         let scope_has_files = discoveries.iter().any(|d| d.scope_has_files);
         let scope_probe = discoveries.iter().map(|d| d.scope_probe).sum();
+        let skipped_foreign_mounts = discoveries.iter().map(|d| d.skipped_foreign_mounts).sum();
         let source = if discoveries.iter().all(|d| d.source == "index") {
             "index"
         } else {
@@ -133,6 +137,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             walk_time,
             scope_has_files,
             scope_probe,
+            skipped_foreign_mounts,
         )
     };
     crate::slog_debug!(
@@ -154,8 +159,9 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
-        "complete": !walk_truncated,
+        "complete": !walk_truncated && skipped_foreign_mounts == 0,
         "no_files_matched_scope": !scope_has_files,
+        "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "total": total,
         "truncated": result_truncated,
@@ -167,6 +173,12 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             "{}\n\n{}",
             body["text"].as_str().unwrap_or_default(),
             note
+        ));
+    }
+    if skipped_foreign_mounts > 0 {
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Fallback directory walk skipped {skipped_foreign_mounts} foreign filesystem mount(s); results may be incomplete.)",
+            body["text"].as_str().unwrap_or_default(),
         ));
     }
 
@@ -208,6 +220,7 @@ fn glob_root(
             walk_time: Duration::ZERO,
             scope_has_files,
             scope_probe: Duration::ZERO,
+            skipped_foreign_mounts: 0,
         }
     });
 
@@ -233,6 +246,7 @@ fn glob_root(
                         walk_time,
                         scope_has_files,
                         scope_probe: scope_started.elapsed(),
+                        skipped_foreign_mounts: 0,
                     };
                 }
             }
@@ -276,6 +290,7 @@ fn fallback_glob(
         walk_time,
         scope_has_files,
         scope_probe: scope_started.elapsed(),
+        skipped_foreign_mounts: outcome.skipped_foreign_mounts,
     }
 }
 

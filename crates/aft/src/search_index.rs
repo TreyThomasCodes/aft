@@ -669,6 +669,8 @@ pub struct GrepResult {
     pub engine_capped: bool,
     /// True when a fallback directory walk stopped early due to file-count or time budget.
     pub walk_truncated: bool,
+    /// Foreign filesystem mounts skipped by a fallback walk before they were opened.
+    pub skipped_foreign_mounts: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2067,6 +2069,7 @@ impl SearchIndexSnapshot {
             fully_degraded,
             engine_capped: engine_capped.load(Ordering::Relaxed),
             walk_truncated: false,
+            skipped_foreign_mounts: 0,
         };
         let post_filter = candidate_filter + post_filter_started.elapsed();
         let phases = GrepQueryPhaseTimings {
@@ -2094,6 +2097,7 @@ impl SearchIndexSnapshot {
             fully_degraded: false,
             engine_capped: false,
             walk_truncated: false,
+            skipped_foreign_mounts: 0,
         }
     }
 
@@ -3268,13 +3272,27 @@ fn create_spill_dir(cache_dir: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn sweep_stale_search_build_dirs(cache_dir: &Path) {
+    // A vanished mounted child can make ReadDir::drop panic after closedir
+    // returns ENXIO, aborting the daemon. Do not recurse through a foreign
+    // temporary directory while cleaning stale search-index builds.
+    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(cache_dir) else {
+        return;
+    };
     let Ok(entries) = fs::read_dir(cache_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let file_name = entry.file_name();
+        let path = entry.path();
         if file_name.to_string_lossy().starts_with("search-build.tmp.") {
-            let _ = fs::remove_dir_all(entry.path());
+            if boundary.should_descend(&path).unwrap_or(false) {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                crate::slog_warn!(
+                    "search-index sweep skipped foreign filesystem mount {}",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -3865,7 +3883,10 @@ fn walk_project_files_from_inner(
 
 fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
+    // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
+    // the daemon, so never open directories outside this walk root's filesystem.
     builder
+        .same_file_system(true)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
@@ -4745,13 +4766,15 @@ fn try_acquire_index_orphan_sweep_locks(
 }
 
 fn newest_index_cache_file_mtime(cache_dir: &Path) -> Result<Option<SystemTime>, ()> {
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(cache_dir).map_err(|_| ())?;
     let mut newest = None;
-    newest_index_cache_file_mtime_inner(cache_dir, &mut newest)?;
+    newest_index_cache_file_mtime_inner(cache_dir, &boundary, &mut newest)?;
     Ok(newest)
 }
 
 fn newest_index_cache_file_mtime_inner(
     directory: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
     newest: &mut Option<SystemTime>,
 ) -> Result<(), ()> {
     for entry in fs::read_dir(directory).map_err(|_| ())? {
@@ -4762,7 +4785,16 @@ fn newest_index_cache_file_mtime_inner(
         }
         let path = entry.path();
         if file_type.is_dir() {
-            newest_index_cache_file_mtime_inner(&path, newest)?;
+            // A mounted child can disappear while this background cache scan owns
+            // its ReadDir; skip it before opening it to avoid ENXIO Drop aborts.
+            if !boundary.should_descend(&path).map_err(|_| ())? {
+                crate::slog_warn!(
+                    "search-index cache scan skipped foreign filesystem mount {}",
+                    path.display()
+                );
+                continue;
+            }
+            newest_index_cache_file_mtime_inner(&path, boundary, newest)?;
         } else if file_type.is_file() {
             let modified = entry
                 .metadata()
@@ -5108,7 +5140,10 @@ fn git_info_exclude_path(root: &Path) -> PathBuf {
 
 fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
     let mut builder = WalkBuilder::new(root);
+    // Nested ignore discovery is a background recursive walk; a disappearing
+    // mount must not turn ReadDir::drop's ENXIO into a daemon abort.
     builder
+        .same_file_system(true)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
@@ -5153,6 +5188,7 @@ pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
     builder
+        .same_file_system(true)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
