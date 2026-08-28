@@ -251,8 +251,9 @@ export function npmInvocation(
 /**
  * Terminate an npm child safely. Windows cmd shims create a cmd.exe -> node.exe
  * tree, so killing only the immediate child can leave npm writing in the
- * background after a rollback or install-lock release. Resolves only after the
- * immediate child exits; direct children escalate to SIGKILL after a grace period.
+ * background after a rollback or install-lock release. Resolves after the
+ * immediate child exits, or once Windows tree termination is confirmed at the
+ * grace deadline. Direct children escalate to SIGKILL after a grace period.
  * Windows tree-kill failures reject as unknown outcomes instead of falling back
  * to killing cmd.exe alone.
  */
@@ -318,7 +319,7 @@ export function terminateNpmProcessTree(
       } catch {
         // The taskkill process may already have exited.
       }
-      if (exitedSuccessfully()) {
+      if (treeKillConfirmed || exitedSuccessfully()) {
         settled = true;
         cleanup();
         resolve();

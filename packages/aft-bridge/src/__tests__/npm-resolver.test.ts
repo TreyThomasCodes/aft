@@ -327,6 +327,38 @@ describe("npmInvocation", () => {
     },
   );
 
+  it.skipIf(process.platform === "win32")(
+    "accepts confirmed taskkill when the child exit event lags past grace",
+    async () => {
+      const systemRoot = mkdtempSync(join(tmpdir(), "aft-successful-taskkill-"));
+      try {
+        const system32 = join(systemRoot, "System32");
+        const taskkill = join(system32, "taskkill.exe");
+        mkdirSync(system32, { recursive: true });
+        writeFileSync(taskkill, "#!/bin/sh\nexit 0\n");
+        chmodSync(taskkill, 0o755);
+
+        const child = new EventEmitter() as ChildProcess;
+        Object.defineProperties(child, {
+          pid: { value: 123 },
+          exitCode: { value: null },
+          signalCode: { value: null },
+        });
+
+        await expect(
+          terminateNpmProcessTree(
+            child,
+            { command: "cmd.exe", args: [], windowsCmdShim: true },
+            { SystemRoot: systemRoot },
+            25,
+          ),
+        ).resolves.toBeUndefined();
+      } finally {
+        rmSync(systemRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("fails closed when taskkill cannot start", async () => {
     const child = new EventEmitter() as ChildProcess;
     const signals: Array<NodeJS.Signals | undefined> = [];
