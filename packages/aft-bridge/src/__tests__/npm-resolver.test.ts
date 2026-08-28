@@ -350,6 +350,8 @@ describe("npmInvocation", () => {
             child,
             { command: "cmd.exe", args: [], windowsCmdShim: true },
             { SystemRoot: systemRoot },
+            1_000,
+          ),
             25,
           ),
         ).resolves.toBeUndefined();
