@@ -300,6 +300,8 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
+    expect(source).toMatch(/terminationPromise\.then\(\s*\(\) => finish\(false\),/);
+    expect(source).toContain("if (terminationPromise) return;");
     expect(source).toContain("quarantining retries for this session");
     expect(source).toContain("quarantinedNpmInstalls.has(spec.npm)");
     expect(source).toContain("installLock.retain()");

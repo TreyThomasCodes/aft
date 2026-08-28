@@ -338,14 +338,17 @@ function runInstall(
       warn(`[lsp] install ${target} aborted during shutdown`);
       if (invocation.windowsCmdShim) {
         terminationPromise ??= terminateNpmProcessTree(child, invocation);
-        void terminationPromise.catch((terminationError) => {
-          quarantinedNpmInstalls.add(spec.npm);
-          installLock.retain();
-          error(
-            `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
-          );
-          finish(false);
-        });
+        void terminationPromise.then(
+          () => finish(false),
+          (terminationError) => {
+            quarantinedNpmInstalls.add(spec.npm);
+            installLock.retain();
+            error(
+              `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
+            );
+            finish(false);
+          },
+        );
         return;
       }
       child.kill("SIGTERM");
@@ -372,20 +375,18 @@ function runInstall(
       finish(false);
     });
     child.on("exit", (code) => {
-      void (terminationPromise ?? Promise.resolve()).then(
-        () => {
-          if (code === 0) {
-            log(`[lsp] installed ${target}`);
-            finish(true);
-          } else {
-            error(
-              `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
-            );
-            finish(false);
-          }
-        },
-        () => finish(false),
-      );
+      // A Windows abort is settled by the process-tree termination promise;
+      // do not report a raced wrapper exit as a successful install.
+      if (terminationPromise) return;
+      if (code === 0) {
+        log(`[lsp] installed ${target}`);
+        finish(true);
+      } else {
+        error(
+          `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
+        );
+        finish(false);
+      }
     });
   });
 }
