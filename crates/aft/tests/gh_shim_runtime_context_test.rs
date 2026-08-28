@@ -925,6 +925,133 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
 }
 
 #[test]
+fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassified() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_v10_manifest(&state_home, now, 10);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 10);
+    write_user_config(&config_home, &connection_file, None);
+
+    let governed_stderr = "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n";
+    let bare_create = shim_command(
+        &["issue", "comment", "42", "--body", "new comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn bare governed comment invocation");
+    assert_eq!(bare_create.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&bare_create.stderr),
+        governed_stderr
+    );
+
+    for args in [
+        &[
+            "issue",
+            "comment",
+            "42",
+            "--body",
+            "replace the draft",
+            "--edit-last",
+        ][..],
+        &[
+            "pr",
+            "comment",
+            "7",
+            "--body",
+            "replace the draft",
+            "--edit-last",
+        ][..],
+    ] {
+        let output = shim_command(
+            args,
+            &project,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn governed edit-last invocation");
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "edit-last must stay governed"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), governed_stderr);
+        assert!(output.stdout.is_empty());
+    }
+
+    // Raw PATCH is deliberately outside the GET-only API seam: an issue-comment
+    // id is repository-scoped and can identify a human contributor's comment.
+    let raw_patch = shim_command(
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn raw comment PATCH invocation");
+    assert_eq!(raw_patch.status.code(), Some(86));
+    let raw_patch_refusal = String::from_utf8_lossy(&raw_patch.stderr);
+    assert_eq!(raw_patch_refusal, unclassified_refusal(10));
+    assert_ne!(raw_patch_refusal, governed_stderr);
+    assert!(raw_patch.stdout.is_empty());
+
+    // --delete-last performs a different mutation and is not an alias for the
+    // authenticated-user-only edit operation performed by --edit-last.
+    let delete_last = shim_command(
+        &[
+            "pr",
+            "comment",
+            "7",
+            "--body",
+            "replace the draft",
+            "--delete-last",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn unclassified delete-last invocation");
+    assert_eq!(delete_last.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&delete_last.stderr),
+        unclassified_refusal(10)
+    );
+    assert!(
+        !recorder.exists(),
+        "refused or governed writes must not reach gh"
+    );
+}
+
+#[test]
 fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
     let temp = tempfile::tempdir().expect("create test root");
     let config_home = temp.path().join("config");

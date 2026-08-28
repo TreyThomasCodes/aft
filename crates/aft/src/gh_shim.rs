@@ -45,6 +45,10 @@ const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review"
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
 const V10_ADMIN_TUPLES: &[&str] = &["workflow run"];
+// The v10 manifest version is the first version whose code-side allowlist
+// permits these native comment mutations. The allowlist covers only the exact
+// flag variants below and does not broaden raw API writes.
+const V10_EDIT_LAST_TUPLES: &[&str] = &["issue comment", "pr comment"];
 const READ_ONLY_ACTION_TUPLES: &[&str] = &[
     "run view",
     "run list",
@@ -1999,6 +2003,14 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
 }
 
+fn is_reviewed_edit_last_tuple(manifest_version: u64, tuple: &str) -> bool {
+    manifest_version >= 10 && V10_EDIT_LAST_TUPLES.contains(&tuple)
+}
+
+fn has_exact_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg.to_str() == Some(flag))
+}
+
 fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
     let Some((verb, subcommand, _)) = command_head(args) else {
         // Keep malformed argument vectors fail-closed; a valid no-subcommand
@@ -2022,6 +2034,22 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         Some(subcommand) => format!("{verb} {subcommand}"),
         None => verb,
     };
+    // `--edit-last` is the native gh operation that edits the authenticated
+    // user's own last comment. Keep this exact author-scoped form limited to
+    // the explicitly allowed comment tuples. An id-addressed API PATCH remains
+    // unclassified because it can edit a comment selected by ID rather than the
+    // authenticated user's own last comment.
+    if has_exact_flag(args, "--edit-last")
+        && !is_reviewed_edit_last_tuple(manifest.manifest_version, &tuple)
+    {
+        return Classification::Unclassified;
+    }
+    // Deletion and create-if-none perform different mutations from editing the
+    // authenticated user's last comment, so they must not inherit the narrowly
+    // scoped --edit-last allowance.
+    if has_exact_flag(args, "--delete-last") || has_exact_flag(args, "--create-if-none") {
+        return Classification::Unclassified;
+    }
     if READ_ONLY_ACTION_TUPLES.contains(&tuple.as_str()) {
         return Classification::Mechanical;
     }
@@ -2091,9 +2119,10 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     if matches.len() != 1 {
         return Classification::Unclassified;
     }
-    // The v1 manifest declares only mechanical API passthrough. API writes are
-    // not normalized into governed or ADMIN equivalents before their exact argv
-    // forms have an audited, reviewed parser contract.
+    // API writes are not normalized into governed or ADMIN equivalents until a
+    // parser accepts and validates their exact argv forms. An id-addressed
+    // comment PATCH can target any contributor's comment, unlike native
+    // `--edit-last`, which is scoped to the caller.
     match matches[0].tier {
         Tier::Mechanical => Classification::Mechanical,
         Tier::Governed | Tier::Admin => Classification::Unclassified,
@@ -2152,6 +2181,7 @@ struct GovernedRequest {
     body: Map<String, Value>,
     repository: Option<String>,
     manifest_version: u64,
+    edit_last: bool,
 }
 
 fn canonicalize_governed(
@@ -2171,6 +2201,7 @@ fn canonicalize_governed(
     let mut body = Map::new();
     let mut review_event = None;
     let mut explicit_repository = None;
+    let mut edit_last = false;
     let mut index = subcommand_index + 1;
     while index < args.len() {
         let value = args[index]
@@ -2188,7 +2219,15 @@ fn canonicalize_governed(
                 continue;
             }
         }
-        if value == "--repo" || value == "-R" {
+        if value == "--edit-last" {
+            if !is_reviewed_edit_last_tuple(manifest_version, tuple) {
+                return Err("undeclared flag --edit-last".to_string());
+            }
+            if edit_last {
+                return Err("--edit-last may be provided only once".to_string());
+            }
+            edit_last = true;
+        } else if value == "--repo" || value == "-R" {
             index += 1;
             let repository = args
                 .get(index)
@@ -2262,6 +2301,7 @@ fn canonicalize_governed(
         body,
         repository,
         manifest_version,
+        edit_last,
     })
 }
 
@@ -2559,7 +2599,8 @@ fn governed_wire_request(
     agent_id: &str,
     request: GovernedRequest,
 ) -> Value {
-    json!({
+    let edit_last = request.edit_last;
+    let mut wire = json!({
         "operation": ROUTING_OPERATION,
         "gh_route_schema": 1,
         "action": request.action,
@@ -2572,7 +2613,14 @@ fn governed_wire_request(
             "agent_id": agent_id,
             "pid": std::process::id(),
         },
-    })
+    });
+    // Keep the create wire shape byte-for-byte compatible. The explicit marker
+    // lets the route holder perform the same authenticated-user-only mutation
+    // that gh's native --edit-last flag requests.
+    if edit_last {
+        wire["edit_last"] = Value::Bool(true);
+    }
+    wire
 }
 
 fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
@@ -3681,6 +3729,116 @@ mod tests {
     }
 
     #[test]
+    fn v10_edit_last_comment_variants_are_exactly_governed_and_author_scoped() {
+        let manifest = v10_fixture_manifest();
+        manifest.validate().expect("valid v10 manifest");
+
+        for (verb, number) in [("issue", "42"), ("pr", "7")] {
+            let args = [
+                OsString::from(verb),
+                OsString::from("comment"),
+                OsString::from(number),
+                OsString::from("--body"),
+                OsString::from("replace the draft"),
+                OsString::from("--edit-last"),
+            ];
+            let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+            else {
+                panic!("native edit-last should use the governed comment tuple: {args:?}");
+            };
+            assert_eq!(tuple, format!("{verb} comment"));
+
+            let request =
+                canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+                    .expect("reviewed edit-last form should canonicalize");
+            assert!(request.edit_last);
+            assert_eq!(request.target["number"], number);
+            assert_eq!(request.body["body"], "replace the draft");
+
+            let wire = governed_wire_request(
+                &(RungDetermination::r3(1, manifest.manifest_version, &test_rung_provenance())
+                    .record),
+                "alfonso-aft",
+                request,
+            );
+            assert_eq!(wire["edit_last"], true);
+        }
+
+        let bare_create = [
+            OsString::from("issue"),
+            OsString::from("comment"),
+            OsString::from("42"),
+            OsString::from("--body"),
+            OsString::from("new comment"),
+        ];
+        let Classification::Governed { tuple, canonical } =
+            classify(&bare_create, &manifest, "macos")
+        else {
+            panic!("bare comment creation must remain governed");
+        };
+        let request =
+            canonicalize_governed(&bare_create, &tuple, &canonical, manifest.manifest_version)
+                .expect("bare comment creation should remain canonicalizable");
+        assert!(!request.edit_last);
+        let wire = governed_wire_request(
+            &(RungDetermination::r3(1, manifest.manifest_version, &test_rung_provenance()).record),
+            "alfonso-aft",
+            request,
+        );
+        assert!(wire.get("edit_last").is_none());
+
+        // The edit-last allowlist is enforced starting with manifest version 10;
+        // older signed manifests do not gain this mutation merely because they
+        // contain the same tuple.
+        let mut v9_manifest = manifest.clone();
+        v9_manifest.manifest_version = 9;
+        let v9_edit = [
+            OsString::from("pr"),
+            OsString::from("comment"),
+            OsString::from("7"),
+            OsString::from("--body"),
+            OsString::from("replace the draft"),
+            OsString::from("--edit-last"),
+        ];
+        assert!(matches!(
+            classify(&v9_edit, &v9_manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        // gh also exposes --delete-last, but deletion is not the
+        // authenticated-user-only edit operation allowed by --edit-last, so this
+        // flag must fail closed.
+        let delete_last = [
+            OsString::from("pr"),
+            OsString::from("comment"),
+            OsString::from("7"),
+            OsString::from("--body"),
+            OsString::from("replace the draft"),
+            OsString::from("--delete-last"),
+        ];
+        assert!(matches!(
+            classify(&delete_last, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        // The edit-last allowance applies only to the explicitly supported issue
+        // and pull-request comment tuples; another governed tuple must remain
+        // unclassified when it carries this flag.
+        let reaction_edit = [
+            OsString::from("issue"),
+            OsString::from("reaction"),
+            OsString::from("42"),
+            OsString::from("--reaction"),
+            OsString::from("+1"),
+            OsString::from("--edit-last"),
+        ];
+        assert!(matches!(
+            classify(&reaction_edit, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
     fn manifest_rejects_duplicate_tiers_and_empty_api_rationales() {
         let mut duplicate = fixture_manifest();
         duplicate
@@ -3737,6 +3895,7 @@ mod tests {
             body: Map::new(),
             repository: Some("cortexkit/aft".to_string()),
             manifest_version: 1,
+            edit_last: false,
         };
         let determination = RungDetermination::r3(7, 1, &test_rung_provenance());
         let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
