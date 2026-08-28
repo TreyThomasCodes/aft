@@ -3277,6 +3277,7 @@ fn unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+    use sha2::{Digest, Sha256};
 
     const TEST_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
@@ -3316,6 +3317,18 @@ mod tests {
     fn v10_fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v10-manifest.json"))
             .expect("v10 manifest fixture")
+    }
+
+    fn edit_last_vectors_fixture() -> Value {
+        // JSON has no comment syntax, so strip the human-readable provenance
+        // header before parsing the copied producer fixture.
+        let fixture = include_str!("../tests/fixtures/gh_shim/edit-last-vectors-v1.json");
+        let json = fixture
+            .lines()
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::from_str(&json).expect("producer edit-last vectors fixture")
     }
 
     fn signed_with(
@@ -3836,6 +3849,115 @@ mod tests {
             classify(&reaction_edit, &manifest, "macos"),
             Classification::Unclassified
         ));
+    }
+
+    #[test]
+    fn producer_edit_last_vectors_pin_consumer_wire_request_and_refusals() {
+        const EXPECTED_SHA256: &str =
+            "0404dc0d45120ee1207b7f97126408b9ad99894349d8aa7d9041151d5c6fd4ea";
+        let fixture_bytes = include_bytes!("../tests/fixtures/gh_shim/edit-last-vectors-v1.json");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fixture_bytes)),
+            EXPECTED_SHA256,
+            "producer edit-last vectors changed; re-pin by copying the fixture from repo CortexKit/prefrontal at commit 0b1dea6b, then update this consumer fixture and digest"
+        );
+
+        let vectors = edit_last_vectors_fixture();
+        let vector_case = |name: &str| {
+            vectors["cases"]
+                .as_array()
+                .expect("producer vector cases")
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("producer vector case {name} is missing"))
+        };
+        let happy_request = vector_case("edit_last_happy")["request"].clone();
+        let happy_body_fields = happy_request["body"]
+            .as_object()
+            .expect("producer happy request body")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(vector_case("absent_edit_last_create")["request"]
+            .get("edit_last")
+            .is_none());
+
+        let manifest = v10_fixture_manifest();
+        let args = [
+            OsString::from("pr"),
+            OsString::from("comment"),
+            OsString::from("372"),
+            OsString::from("--edit-last"),
+            OsString::from("--body-file"),
+            OsString::from("-"),
+        ];
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("the native edit-last command must remain governed");
+        };
+        assert_eq!(tuple, "pr comment");
+        let request = canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .expect("native edit-last command should canonicalize");
+        let determination =
+            RungDetermination::r3(1, manifest.manifest_version, &test_rung_provenance());
+        let wire = governed_wire_request(&determination.record, "consumer-agent", request);
+
+        // Compare the complete request shape after replacing values that are
+        // intentionally different for this consumer command or process.
+        let mut expected = happy_request;
+        expected["action"] = json!("pr comment");
+        expected["target"] = json!({"number": "372"});
+        expected["body"] = wire["body"].clone();
+        expected["manifest_version"] = json!(manifest.manifest_version);
+        expected["rung_as_of_unix_secs"] = json!(determination.record.as_of_unix_secs);
+        expected["metadata"]["pid"] = json!(std::process::id());
+        expected["metadata"]
+            .as_object_mut()
+            .expect("expected metadata object")
+            .remove("agent_id");
+        let mut actual = wire;
+        actual["metadata"]
+            .as_object_mut()
+            .expect("actual metadata object")
+            .remove("agent_id");
+        assert_eq!(
+            actual["body"]
+                .as_object()
+                .expect("actual request body")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            happy_body_fields,
+            "consumer body fields drifted from producer shape"
+        );
+        assert_eq!(
+            actual, expected,
+            "consumer request drifted from producer shape"
+        );
+        assert_eq!(
+            actual["edit_last"], true,
+            "edit_last marker must be present"
+        );
+
+        for case_name in ["edit_last_no_own_comment", "edit_last_unsupported_action"] {
+            let code = vector_case(case_name)["response"]["refusal_code"]
+                .as_str()
+                .expect("producer refusal code");
+            let response = json!({"outcome": "refusal", "refusal_code": code});
+            let outcome = parse_governed_response(&serde_json::to_vec(&response).unwrap())
+                .expect("producer refusal should parse");
+            assert!(matches!(outcome, RouteOutcome::Refusal(ref actual) if actual == code));
+            assert_eq!(
+                RefusalCode::SeamRefusal.as_str(),
+                "gh_shim_seam_refusal",
+                "open-world holder refusal codes must use the seam refusal classification"
+            );
+            assert_eq!(
+                seam_refusal_text(code),
+                format!("governance seam refused the action: {code}"),
+                "holder refusal code must pass through without remapping"
+            );
+        }
     }
 
     #[test]
