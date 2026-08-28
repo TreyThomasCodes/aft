@@ -1301,18 +1301,33 @@ pub fn task_bundle_files(paths: &TaskPaths) -> Vec<PathBuf> {
 }
 
 pub fn write_kill_marker_if_absent(paths: &TaskPaths) -> io::Result<()> {
-    match open_task_artifact(paths, TaskArtifact::Exit) {
-        Ok(file) if file.len()? > 0 => Ok(()),
-        Ok(mut file) => file.replace_contents(b"killed"),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
-            randomized_atomic_replace(
-                &resolved.dirs.io,
-                &resolved.paths.artifact_name(TaskArtifact::Exit),
-                b"killed",
-            )
+    // A concurrent replace (child exit write racing this kill marker) shows up
+    // as a zero-link validated open; the replacement file is the child's real
+    // exit marker, so re-opening resolves the race in either direction. Bounded
+    // retries: the race is a single rename, not a sustained condition.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let result = match open_task_artifact(paths, TaskArtifact::Exit) {
+            Ok(file) if file.len()? > 0 => Ok(()),
+            Ok(mut file) => file.replace_contents(b"killed"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+                randomized_atomic_replace(
+                    &resolved.dirs.io,
+                    &resolved.paths.artifact_name(TaskArtifact::Exit),
+                    b"killed",
+                )
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Err(error)
+                if attempts < 3
+                    && error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) => {}
+            other => return other,
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -1764,17 +1779,37 @@ fn validate_regular_handle(file: &File) -> io::Result<()> {
             "task artifact is not a regular file",
         ));
     }
+    // Link-count semantics: >1 means the artifact is aliased somewhere else on
+    // disk (tamper suspicion, refuse); exactly 0 means the file was unlinked or
+    // atomically replaced AFTER we opened it — on Windows the child's own
+    // temp+rename exit write races a daemon kill-marker write and leaves the
+    // superseded handle at zero links. That is a benign concurrent replace, not
+    // an attack; report it distinctly so callers can re-open the replacement.
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "task artifact has multiple hard links",
-        ));
+    match metadata.nlink() {
+        1 => {}
+        0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                ARTIFACT_CONCURRENTLY_REPLACED,
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "task artifact has multiple hard links",
+            ));
+        }
     }
     #[cfg(windows)]
     validate_windows_handle(file, false)?;
     Ok(())
 }
+
+/// Marker message for a validated-open that lost a race against an atomic
+/// replacement of the same artifact (see link-count semantics above).
+pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str =
+    "task artifact was concurrently replaced";
 
 #[cfg(unix)]
 pub fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
@@ -1830,7 +1865,16 @@ fn validate_windows_handle(file: &File, directory: bool) -> io::Result<()> {
         ));
     }
     let information = windows_file_information(file)?;
-    if !directory && information.number_of_links != 1 {
+    if !directory && information.number_of_links == 0 {
+        // Zero links = this handle points at a file that was unlinked or
+        // rename-replaced after open (e.g. the child's temp+rename exit write
+        // racing a daemon kill-marker write). Benign; caller may re-open.
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            ARTIFACT_CONCURRENTLY_REPLACED,
+        ));
+    }
+    if !directory && information.number_of_links > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "task artifact has multiple hard links",

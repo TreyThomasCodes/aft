@@ -1921,7 +1921,10 @@ fn render_duplicates_category(
             render_generated_duplicate_usage(lines, summary, details, key);
             return;
         }
-        lines.push(format!("{label}: {count}{generated_suffix} (top by cost):"));
+        lines.push(format!(
+            "{label}: {count}{}{generated_suffix} (top by cost):",
+            duplicate_suppression_clause(section)
+        ));
         render_duplicate_rows(lines, summary, details, key);
         render_generated_duplicate_usage(lines, summary, details, key);
         return;
@@ -1940,6 +1943,7 @@ fn render_duplicates_category(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let group_count = count;
+    let suppression_clause = duplicate_suppression_clause(section);
     let suffix = if count > 0 { " (top by cost):" } else { "" };
     // A zero denominator means analyzed-line counts are missing (pre-v0.44
     // cached contributions); print no percentage rather than a false "0.0%".
@@ -1952,10 +1956,9 @@ fn render_duplicates_category(
         String::new()
     };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{generated_suffix}{suffix}",
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{suffix}",
         plural_group(group_count),
     ));
-    render_duplicate_suppression(lines, section);
     if count > 0 {
         render_duplicate_rows(lines, summary, details, key);
     }

@@ -205,9 +205,18 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
     );
     assert_eq!(paths["success"], true, "checkpoint paths: {paths:?}");
     assert_eq!(paths["file_count"], 1);
+    // Compare as paths, not strings: the fixture's `draft` was joined from a
+    // forward-slash literal, which `display()` preserves on Windows while the
+    // product re-joins components with native separators.
+    let reported_paths = paths["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|value| std::path::PathBuf::from(value.as_str().expect("path string")))
+        .collect::<Vec<_>>();
     assert_eq!(
-        paths["paths"],
-        serde_json::json!([draft.display().to_string()]),
+        reported_paths,
+        vec![draft.clone()],
         "reported success must name the stored restore target"
     );
 
