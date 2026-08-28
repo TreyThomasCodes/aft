@@ -354,6 +354,64 @@ pub struct HealthComponentSnapshot {
     pub status: &'static str,
 }
 
+/// Live counters for an in-progress semantic embedding build. The worker updates
+/// only atomics at batch boundaries, so progress reporting never contends with
+/// embedding requests.
+#[derive(Debug, Clone, Default)]
+pub struct SemanticBuildProgress {
+    embedded_chunks: Arc<AtomicUsize>,
+    total_chunks: Arc<AtomicUsize>,
+    current_batch: Arc<AtomicUsize>,
+    total_batches: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SemanticBuildProgressSnapshot {
+    pub embedded_chunks: usize,
+    pub total_chunks: usize,
+    pub current_batch: usize,
+    pub total_batches: usize,
+}
+
+impl SemanticBuildProgress {
+    pub fn report(&self, embedded_chunks: usize, total_chunks: usize, batch_size: usize) {
+        let batch_size = batch_size.max(1);
+        let total_batches = total_chunks.div_ceil(batch_size);
+        self.total_chunks.store(total_chunks, Ordering::Relaxed);
+        self.embedded_chunks
+            .store(embedded_chunks.min(total_chunks), Ordering::Relaxed);
+        self.current_batch.store(
+            embedded_chunks.min(total_chunks).div_ceil(batch_size),
+            Ordering::Relaxed,
+        );
+        self.total_batches.store(total_batches, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> SemanticBuildProgressSnapshot {
+        SemanticBuildProgressSnapshot {
+            embedded_chunks: self.embedded_chunks.load(Ordering::Relaxed),
+            total_chunks: self.total_chunks.load(Ordering::Relaxed),
+            current_batch: self.current_batch.load(Ordering::Relaxed),
+            total_batches: self.total_batches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SemanticHealthComponentSnapshot {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_chunks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_batch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_batches: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Tier2HealthSnapshot {
     pub status: &'static str,
@@ -375,7 +433,7 @@ pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<HealthComponentSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_index: Option<HealthComponentSnapshot>,
+    pub semantic_index: Option<SemanticHealthComponentSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_store: Option<HealthComponentSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -396,7 +454,7 @@ pub struct RootHealthSnapshot {
 pub(crate) struct RootHealthSummary {
     state: RootHealthState,
     search_index_status: Option<&'static str>,
-    semantic_index_status: Option<&'static str>,
+    semantic_index: Option<SemanticHealthComponentSnapshot>,
     callgraph_store_status: Option<&'static str>,
     tier2_status: Option<&'static str>,
     bash: Option<BgTaskHealthCounts>,
@@ -408,7 +466,7 @@ impl RootHealthSummary {
         Self {
             state: RootHealthState::Busy,
             search_index_status: None,
-            semantic_index_status: None,
+            semantic_index: None,
             callgraph_store_status: None,
             tier2_status: None,
             bash: None,
@@ -425,8 +483,9 @@ impl RootHealthSummary {
         matches!(self.state, RootHealthState::Ready)
             && self.search_index_status.is_some_and(component_is_satisfied)
             && self
-                .semantic_index_status
-                .is_some_and(component_is_satisfied)
+                .semantic_index
+                .as_ref()
+                .is_some_and(|semantic| component_is_satisfied(semantic.status))
             && self
                 .callgraph_store_status
                 .is_some_and(component_is_satisfied)
@@ -462,9 +521,7 @@ impl RootHealthSummary {
             search_index: self
                 .search_index_status
                 .map(|status| HealthComponentSnapshot { status }),
-            semantic_index: self
-                .semantic_index_status
-                .map(|status| HealthComponentSnapshot { status }),
+            semantic_index: self.semantic_index,
             callgraph_store: self
                 .callgraph_store_status
                 .map(|status| HealthComponentSnapshot { status }),
@@ -512,7 +569,7 @@ impl RootHealthSnapshot {
             && self
                 .semantic_index
                 .as_ref()
-                .is_some_and(component_is_satisfied)
+                .is_some_and(|semantic| matches!(semantic.status, "ready" | "disabled"))
             && self
                 .callgraph_store
                 .as_ref()
@@ -715,6 +772,10 @@ pub(crate) struct ConfigureMaintenanceJob {
     /// Advance disk-publication epochs in the post-ack configure tail. This can
     /// wait for an already-committing writer, so it must never run on bind.
     pub(crate) supersede_artifact_persistence: bool,
+    /// Keep the adopted semantic worker's artifact-publication epoch valid so it
+    /// can still publish its result while unrelated configure work replaces the
+    /// other artifact lanes.
+    pub(crate) supersede_semantic_artifact_persistence: bool,
     /// One-shot gates for artifact workers created during configure. The
     /// configure tail opens them only after the bind response has been produced.
     pub(crate) artifact_load_starts: Vec<crossbeam_channel::Sender<()>>,
@@ -1638,6 +1699,12 @@ pub struct AppContext {
     semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
     semantic_index_status: RwLock<SemanticIndexStatus>,
+    /// Present only while a cold semantic build is running. Its counters are
+    /// read by status and health without taking the worker's batch-loop locks.
+    semantic_build_progress: RwLock<Option<SemanticBuildProgress>>,
+    /// Advances when the inputs that determine a semantic corpus build change.
+    /// Unrelated configure changes adopt the existing worker instead.
+    semantic_build_epoch: Arc<AtomicU64>,
     /// Serializes missing-artifact checks with receiver installation so
     /// concurrent fallback queries cannot start duplicate reload workers.
     artifact_reload_lock: parking_lot::Mutex<()>,
@@ -2071,6 +2138,8 @@ impl AppContext {
             semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
             semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            semantic_build_progress: RwLock::new(None),
+            semantic_build_epoch: Arc::new(AtomicU64::new(0)),
             artifact_reload_lock: parking_lot::Mutex::new(()),
             semantic_cold_seed_active,
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
@@ -2254,6 +2323,10 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
+        let semantic_build_progress = match self.semantic_build_progress.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return RootHealthSummary::busy(),
+        };
         let callgraph_store = match self.callgraph_store.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -2302,11 +2375,44 @@ impl AppContext {
         } else {
             "disabled"
         };
-        let semantic_index_status = match &*semantic_status {
-            SemanticIndexStatus::Ready { .. } => "ready",
-            SemanticIndexStatus::Building { .. } => "building",
-            SemanticIndexStatus::Disabled => "disabled",
-            SemanticIndexStatus::Failed(_) => "degraded",
+        let semantic_index = match &*semantic_status {
+            SemanticIndexStatus::Ready { .. } => SemanticHealthComponentSnapshot {
+                status: "ready",
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            },
+            SemanticIndexStatus::Building { stage, .. } => {
+                let progress = semantic_build_progress
+                    .as_ref()
+                    .map(SemanticBuildProgress::snapshot);
+                SemanticHealthComponentSnapshot {
+                    status: "building",
+                    stage: Some(stage.clone()),
+                    embedded_chunks: progress.as_ref().map(|progress| progress.embedded_chunks),
+                    total_chunks: progress.as_ref().map(|progress| progress.total_chunks),
+                    current_batch: progress.as_ref().map(|progress| progress.current_batch),
+                    total_batches: progress.as_ref().map(|progress| progress.total_batches),
+                }
+            }
+            SemanticIndexStatus::Disabled => SemanticHealthComponentSnapshot {
+                status: "disabled",
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            },
+            SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
+                status: "degraded",
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            },
         };
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         let callgraph_store_status = if !heavy_root_work_allowed {
@@ -2355,7 +2461,7 @@ impl AppContext {
         RootHealthSummary {
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
-            semantic_index_status: Some(semantic_index_status),
+            semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
             tier2_status: Some(tier2_status),
             bash: Some(bash),
@@ -3317,6 +3423,23 @@ impl AppContext {
 
     pub fn semantic_fingerprint_generation_flag(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.semantic_fingerprint_generation)
+    }
+
+    /// Invalidate an in-flight semantic builder when its corpus inputs change.
+    /// This is intentionally independent from the broad configure generation so
+    /// unrelated configuration changes can adopt a costly live embedding build.
+    pub(crate) fn advance_semantic_build_epoch(&self) -> u64 {
+        self.semantic_build_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn semantic_build_epoch(&self) -> u64 {
+        self.semantic_build_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn semantic_build_epoch_flag(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.semantic_build_epoch)
     }
 
     pub fn configure_warnings_sender(
@@ -4923,6 +5046,7 @@ impl AppContext {
                     SemanticIndexStatus::Disabled
                 };
             }
+            self.set_semantic_build_progress(None);
         }
     }
 
@@ -5398,6 +5522,18 @@ impl AppContext {
         self.next_semantic_index_rx_epoch();
     }
 
+    /// Rebind a live semantic build to a newer configure generation when the
+    /// semantic corpus inputs are unchanged. Its receiver keeps the completed
+    /// result while the worker's dedicated build epoch remains valid.
+    pub(crate) fn adopt_semantic_index_rx_generation(&self, generation: u64) -> bool {
+        let receiver = self.semantic_index_rx.lock();
+        if receiver.is_none() {
+            return false;
+        }
+        self.note_semantic_index_rx_generation(generation);
+        true
+    }
+
     /// Retire a build receiver only if no replacement changed its epoch after
     /// the caller inspected it. `None` means a newer receiver won the race;
     /// `Some(false)` means the inspected epoch is still current but empty.
@@ -5446,6 +5582,20 @@ impl AppContext {
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
         &self.semantic_index_status
+    }
+
+    pub(crate) fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
+        *self
+            .semantic_build_progress
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = progress;
+    }
+
+    pub(crate) fn semantic_build_progress(&self) -> Option<SemanticBuildProgress> {
+        self.semantic_build_progress
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn artifact_reload_guard(&self) -> parking_lot::MutexGuard<'_, ()> {

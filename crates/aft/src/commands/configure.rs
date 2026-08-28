@@ -16,9 +16,9 @@ use std::collections::{HashMap, HashSet};
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
-    AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticIndexEvent,
-    SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
-    SubcLifecycleAdmission,
+    AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticBuildProgress,
+    SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
+    SemanticRefreshWorkerSlot, SubcLifecycleAdmission,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -178,6 +178,7 @@ fn semantic_refresh_quiet_window() -> Duration {
 }
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
+const SUPERSEDED_SEMANTIC_BUILD: &str = "semantic build superseded";
 
 #[derive(Clone)]
 struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
@@ -587,8 +588,23 @@ fn spawn_semantic_refresh_worker(
                         break;
                     }
 
-                    let mut embed = |texts: Vec<String>| model.embed(texts);
-                    let mut progress = |_done: usize, _total: usize| {};
+                    let progress_state = SemanticBuildProgress::default();
+                    let progress_for_embed = progress_state.clone();
+                    let mut embed = |texts: Vec<String>| {
+                        if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                            let snapshot = progress_for_embed.snapshot();
+                            slog_info!(
+                                "semantic refresh superseded, stopping after {}/{} batches",
+                                snapshot.current_batch,
+                                snapshot.total_batches
+                            );
+                            return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
+                        }
+                        model.embed(texts)
+                    };
+                    let mut progress = |done: usize, total: usize| {
+                        progress_state.report(done, total, max_batch_size);
+                    };
                     match index.refresh_stale_files(
                         &project_root,
                         &current_files,
@@ -619,6 +635,7 @@ fn spawn_semantic_refresh_worker(
                                 break;
                             }
                         }
+                        Err(error) if error == SUPERSEDED_SEMANTIC_BUILD => return,
                         Err(error) => {
                             slog_warn!("semantic corpus refresh failed: {}", error);
                             if event_tx
@@ -647,8 +664,23 @@ fn spawn_semantic_refresh_worker(
                     break;
                 }
 
-                let mut embed = |texts: Vec<String>| model.embed(texts);
-                let mut progress = |_done: usize, _total: usize| {};
+                let progress_state = SemanticBuildProgress::default();
+                let progress_for_embed = progress_state.clone();
+                let mut embed = |texts: Vec<String>| {
+                    if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                        let snapshot = progress_for_embed.snapshot();
+                        slog_info!(
+                            "semantic refresh superseded, stopping after {}/{} batches",
+                            snapshot.current_batch,
+                            snapshot.total_batches
+                        );
+                        return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
+                    }
+                    model.embed(texts)
+                };
+                let mut progress = |done: usize, total: usize| {
+                    progress_state.report(done, total, max_batch_size);
+                };
                 match index.refresh_invalidated_files(
                     &project_root,
                     &paths,
@@ -678,6 +710,7 @@ fn spawn_semantic_refresh_worker(
                             break;
                         }
                     }
+                    Err(error) if error == SUPERSEDED_SEMANTIC_BUILD => return,
                     Err(error) => {
                         slog_warn!(
                             "semantic refresh failed for {} file(s): {}",
@@ -2189,6 +2222,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 clear_failed_spawns: false,
                 warm_callgraph_store: false,
                 supersede_artifact_persistence: false,
+                supersede_semantic_artifact_persistence: false,
                 artifact_load_starts: Vec::new(),
             });
             if enqueue_result.is_err() {
@@ -2436,13 +2470,25 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         workspace_manifests.as_deref(),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
+    let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
+    let semantic_build_inputs_changed = project_root_changed
+        || previous_config.semantic_search != next_config.semantic_search
+        || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
+        || previous_config.semantic.max_files != next_config.semantic.max_files;
+    let semantic_build_adopted =
+        !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
+    if semantic_build_inputs_changed {
+        ctx.advance_semantic_build_epoch();
+    }
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
     if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
-        ctx.reset_semantic_cold_seed_gate_for_configure();
-        if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
-            ctx.schedule_semantic_cold_seed_gate_for_configure();
+        if !semantic_build_adopted {
+            ctx.reset_semantic_cold_seed_gate_for_configure();
+            if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
+                ctx.schedule_semantic_cold_seed_gate_for_configure();
+            }
         }
     }
     // Project root (and thus tsconfig resolution) may have changed; drop the
@@ -2470,7 +2516,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some();
-    let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let mut artifact_load_starts = Vec::new();
     if equivalent_warm_config {
         // The zero-work rebind path keeps the live index serving; report that
@@ -2505,11 +2550,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_search,
         ));
     } else {
-        // We intentionally only warn on rapid reconfigure rather than joining old
-        // workers. Generation gates discard their in-memory results, while
-        // content/fingerprint generations, per-worker persistence epochs, and
-        // artifact-specific disk locks prevent a superseded worker from overwriting a
-        // newer artifact. The remaining cost is bounded duplicate CPU work.
+        // A semantic worker whose corpus inputs are unchanged keeps its receiver
+        // and build epoch. Other artifact lanes are replaced normally, while a
+        // semantic input change invalidates the old worker before its next batch.
         if search_build_in_progress {
             slog_warn!(
                 "search index build cancelled (superseded by generation {})",
@@ -2517,10 +2560,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
         if semantic_build_in_progress {
-            slog_warn!(
-                "semantic index build cancelled (superseded by generation {})",
-                configure_generation
-            );
+            if semantic_build_adopted {
+                slog_info!(
+                    "semantic index build adopted by matching semantic configuration (generation {})",
+                    configure_generation
+                );
+            } else {
+                slog_warn!(
+                    "semantic index build cancelled (semantic build inputs changed at generation {})",
+                    configure_generation
+                );
+            }
         }
         if ctx.callgraph_store_rx().lock().is_some() {
             slog_warn!(
@@ -2533,10 +2583,19 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         ctx.retire_search_index_rx();
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        ctx.retire_semantic_index_rx();
+        if semantic_build_adopted {
+            let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
+            debug_assert!(
+                adopted,
+                "semantic build receiver disappeared before adoption"
+            );
+        } else {
+            *ctx.semantic_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            ctx.retire_semantic_index_rx();
+            ctx.set_semantic_build_progress(None);
+        }
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -2544,11 +2603,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         if previous_project_root.as_ref() == Some(&root_path) {
             ctx.mark_callgraph_store_force_rebuild();
         }
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-        ctx.clear_semantic_refresh_worker();
-        *ctx.semantic_embedding_model().lock() = None;
+        if !semantic_build_adopted {
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+            ctx.clear_semantic_refresh_worker();
+            *ctx.semantic_embedding_model().lock() = None;
+        }
         ctx.clear_pending_index_updates();
 
         artifact_load_starts.extend(schedule_missing_artifact_loads(
@@ -2586,6 +2647,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         clear_failed_spawns,
         warm_callgraph_store: next_config.callgraph_store && !home_match && !equivalent_warm_config,
         supersede_artifact_persistence: !equivalent_warm_config,
+        supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
         artifact_load_starts,
     });
     if enqueue_result.is_err() {
@@ -3293,6 +3355,8 @@ fn schedule_artifact_loads(
             });
         });
     } else if load_semantic {
+        let semantic_build_progress = SemanticBuildProgress::default();
+        ctx.set_semantic_build_progress(Some(semantic_build_progress.clone()));
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
@@ -3333,6 +3397,8 @@ fn schedule_artifact_loads(
         let semantic_cold_seed_generation_for_worker = semantic_cold_seed_generation;
         let semantic_generation = configure_generation;
         let semantic_generation_flag = ctx.configure_generation_flag();
+        let semantic_build_epoch = ctx.semantic_build_epoch();
+        let semantic_build_epoch_flag = ctx.semantic_build_epoch_flag();
         let semantic_lifecycle = subc_lifecycle.clone();
         let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
         let session_id_for_bg2 = log_ctx::current_session();
@@ -3486,14 +3552,30 @@ fn schedule_artifact_loads(
                             };
 
                             let mut cached = cached;
-                            let mut embed = |texts: Vec<String>| model.embed(texts);
+                            let progress_for_embed = semantic_build_progress.clone();
+                            let mut embed = |texts: Vec<String>| {
+                                if semantic_build_epoch_flag.load(Ordering::SeqCst)
+                                    != semantic_build_epoch
+                                {
+                                    let snapshot = progress_for_embed.snapshot();
+                                    slog_info!(
+                                        "semantic refresh superseded, stopping after {}/{} batches",
+                                        snapshot.current_batch,
+                                        snapshot.total_batches
+                                    );
+                                    return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
+                                }
+                                model.embed(texts)
+                            };
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                 stage: "refreshing_stale_files".to_string(),
                                 files: None,
                                 entries_done: None,
                                 entries_total: None,
                             });
+                            let batch_size = semantic_config.max_batch_size.max(1);
                             let mut progress = |done: usize, total: usize| {
+                                semantic_build_progress.report(done, total, batch_size);
                                 let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                     stage: "embedding_stale_symbols".to_string(),
                                     files: None,
@@ -3567,6 +3649,9 @@ fn schedule_artifact_loads(
                                         record_verify_completion: true,
                                         verified_artifact_generation,
                                     });
+                                }
+                                Err(error) if error == SUPERSEDED_SEMANTIC_BUILD => {
+                                    return Err(error);
                                 }
                                 Err(error) => {
                                     if crate::semantic_index::embedding_failure_is_transient(&error)
@@ -3653,7 +3738,9 @@ fn schedule_artifact_loads(
                         entries_done: None,
                         entries_total: None,
                     });
+                    let batch_size = semantic_config.max_batch_size.max(1);
                     let mut progress = |done: usize, total: usize| {
+                        semantic_build_progress.report(done, total, batch_size);
                         let _ = tx_progress.send(SemanticIndexEvent::Progress {
                             stage: "embedding_symbols".to_string(),
                             files: Some(files.len()),
@@ -3661,12 +3748,15 @@ fn schedule_artifact_loads(
                             entries_total: Some(total),
                         });
                     };
-                    let index = SemanticIndex::build_with_progress(
+                    let mut build_is_current =
+                        || semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch;
+                    let index = SemanticIndex::build_with_progress_and_cancellation(
                         &root_clone,
                         &files,
                         &mut embed,
-                        semantic_config.max_batch_size.max(1),
+                        batch_size,
                         &mut progress,
+                        &mut build_is_current,
                     )?;
                     let mut index = index;
                     index.set_fingerprint(fingerprint);
@@ -3708,9 +3798,7 @@ fn schedule_artifact_loads(
                 // Err (receiver dropped) and this thread exits without competing
                 // with the fresh build.
                 let build_result = loop {
-                    if !semantic_lifecycle
-                        .is_current(semantic_generation_flag.as_ref(), semantic_generation)
-                    {
+                    if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
                         clear_cold_seed_active();
                         return;
                     }
@@ -3786,6 +3874,12 @@ fn schedule_artifact_loads(
                     cache_freshness::ArtifactGeneration,
                 >|
                  -> bool {
+                    if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
+                        slog_info!(
+                            "semantic index persistence skipped for {reason}: build inputs changed"
+                        );
+                        return false;
+                    }
                     if is_worktree_bridge_for_semantic {
                         return false;
                     }
@@ -3798,6 +3892,12 @@ fn schedule_artifact_loads(
                         return false;
                     };
                     let _persist_order = semantic_persist_lock.lock();
+                    if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
+                        slog_info!(
+                            "semantic index persistence skipped for {reason}: build inputs changed"
+                        );
+                        return false;
+                    }
                     let Ok(_cache_lock) =
                         SemanticIndexLock::acquire(dir, &semantic_project_key, &root_clone)
                     else {
@@ -3853,29 +3953,20 @@ fn schedule_artifact_loads(
                     true
                 };
 
-                if !semantic_lifecycle
-                    .is_current(semantic_generation_flag.as_ref(), semantic_generation)
-                {
-                    if let SemanticBuildOutcome::Ready(ready) = &outcome {
-                        if ready.persist_to_disk {
-                            persist_completed_index(
-                                &ready.index,
-                                "stale generation discard",
-                                true,
-                                false,
-                                ready.verified_artifact_generation,
-                            );
-                        }
-                    }
+                if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
                     note_semantic_stale_generation_discard();
                     slog_info!(
-                        "semantic index build result discarded for stale generation {}",
-                        semantic_generation
+                        "semantic index build result discarded for superseded build epoch {}",
+                        semantic_build_epoch
                     );
                     clear_cold_seed_active();
                     return;
                 }
 
+                // A matching semantic build can be adopted by a newer configure
+                // generation. Publish against the receiver's current generation
+                // instead of the generation captured when the thread started.
+                let publish_generation = semantic_generation_flag.load(Ordering::SeqCst);
                 let event = match outcome {
                     SemanticBuildOutcome::Ready(ready) => {
                         let SemanticBuildReady {
@@ -3896,7 +3987,7 @@ fn schedule_artifact_loads(
                         }
                         semantic_lifecycle.run_if_current(
                             semantic_generation_flag.as_ref(),
-                            semantic_generation,
+                            publish_generation,
                             || {
                                 let worker_index = index.clone();
                                 let worker_handle = spawn_semantic_refresh_worker(
@@ -3909,7 +4000,7 @@ fn schedule_artifact_loads(
                                     refresh_event_tx,
                                     semantic_lifecycle.clone(),
                                     Arc::clone(&semantic_generation_flag),
-                                    semantic_generation,
+                                    publish_generation,
                                     SemanticRefreshLimiter(Arc::clone(
                                         &semantic_cold_build_limiter,
                                     )),
@@ -3924,7 +4015,7 @@ fn schedule_artifact_loads(
                     }
                     SemanticBuildOutcome::Failed(error) => semantic_lifecycle.run_if_current(
                         semantic_generation_flag.as_ref(),
-                        semantic_generation,
+                        publish_generation,
                         || SemanticIndexEvent::Failed(error),
                     ),
                 };
@@ -4025,7 +4116,9 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             .run_if_subc_bound_generation(job.generation, || {
                 if job.supersede_artifact_persistence {
                     ctx.next_search_persist_epoch();
-                    ctx.next_semantic_persist_epoch();
+                    if job.supersede_semantic_artifact_persistence {
+                        ctx.next_semantic_persist_epoch();
+                    }
                     ctx.next_callgraph_persist_epoch();
                 }
                 for start in &job.artifact_load_starts {
@@ -4780,6 +4873,17 @@ mod tests {
         base_url: &str,
         semantic_search: bool,
     ) -> RawRequest {
+        configure_semantic_with_options(root, storage, base_url, semantic_search, 64, false)
+    }
+
+    fn configure_semantic_with_options(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+        semantic_search: bool,
+        max_batch_size: usize,
+        callgraph_store: bool,
+    ) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
             "harness": "opencode",
@@ -4787,13 +4891,13 @@ mod tests {
             "config": [user_tier(json!({
                 "search_index": false,
                 "semantic_search": semantic_search,
-                "callgraph_store": false,
+                "callgraph_store": callgraph_store,
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
                     "base_url": base_url,
                     "timeout_ms": 5_000,
-                    "max_batch_size": 64,
+                    "max_batch_size": max_batch_size,
                     "max_files": 1_000
                 }
             }))],
@@ -4879,7 +4983,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
-        response_release: Arc<(Mutex<bool>, Condvar)>,
+        response_release: Arc<(Mutex<usize>, Condvar)>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -4893,7 +4997,7 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let request_changed = Arc::new(Condvar::new());
-            let response_release = Arc::new((Mutex::new(false), Condvar::new()));
+            let response_release = Arc::new((Mutex::new(0usize), Condvar::new()));
             let stop_for_thread = Arc::clone(&stop);
             let requests_for_thread = Arc::clone(&requests);
             let request_changed_for_thread = Arc::clone(&request_changed);
@@ -5002,11 +5106,20 @@ mod tests {
                     >= expected
         }
 
-        fn release_responses(&self) {
-            let (released, changed) = &*self.response_release;
-            *released
+        fn release_response(&self) {
+            let (remaining, changed) = &*self.response_release;
+            let mut remaining = remaining
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *remaining = remaining.saturating_add(1);
+            changed.notify_one();
+        }
+
+        fn release_responses(&self) {
+            let (remaining, changed) = &*self.response_release;
+            *remaining
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = usize::MAX;
             changed.notify_all();
         }
     }
@@ -5026,7 +5139,7 @@ mod tests {
         mut stream: std::net::TcpStream,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
-        response_release: Arc<(Mutex<bool>, Condvar)>,
+        response_release: Arc<(Mutex<usize>, Condvar)>,
     ) {
         stream
             .set_nonblocking(false)
@@ -5065,15 +5178,18 @@ mod tests {
             .iter()
             .any(|text| text != "semantic index fingerprint probe")
         {
-            let (released, changed) = &*response_release;
-            let guard = released
+            let (remaining, changed) = &*response_release;
+            let mut remaining = remaining
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            drop(
-                changed
-                    .wait_while(guard, |released| !*released)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            while *remaining == 0 {
+                remaining = changed
+                    .wait(remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if *remaining != usize::MAX {
+                *remaining -= 1;
+            }
         }
         let data = inputs
             .iter()
@@ -6018,7 +6134,122 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_semantic_build_persists_and_followup_refreshes_incrementally() {
+    fn matching_semantic_reconfigure_adopts_the_live_builder() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn adopted_semantic_builder() {}\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        let first =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, false);
+        assert!(handle_configure_for_test(&first, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let first_request_arrived =
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(5));
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert!(
+            first_request_arrived,
+            "initial semantic builder did not reach the mock backend"
+        );
+
+        let unrelated_reconfigure =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, true);
+        assert!(handle_configure_for_test(&unrelated_reconfigure, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            server.non_probe_request_count(),
+            1,
+            "a matching semantic corpus must adopt the blocked builder instead of starting another"
+        );
+
+        server.release_responses();
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn semantic_build_progress_is_monotonic_and_visible_while_embedding() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        for index in 0..8 {
+            std::fs::write(
+                project.join("src").join(format!("progress_{index}.rs")),
+                format!("pub fn progress_symbol_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let ctx = test_context();
+        let request =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 1, false);
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(5)),
+            "semantic builder did not begin its first mocked batch"
+        );
+        crate::runtime_drain::drain_build_completions(&ctx);
+        let first = ctx.build_status_snapshot()["semantic_index"].clone();
+        assert_eq!(first["embedded_chunks"], 0);
+        let total = first["total_chunks"]
+            .as_u64()
+            .expect("total chunks present");
+        assert!(total > 1, "fixture needs multiple semantic batches");
+        assert_eq!(first["current_batch"], 0);
+        assert!(first["total_batches"].as_u64().unwrap() > 1);
+
+        server.release_response();
+        assert!(
+            server.wait_for_non_probe_request_count(2, Duration::from_secs(5)),
+            "semantic builder did not advance to the second mocked batch"
+        );
+        crate::runtime_drain::drain_build_completions(&ctx);
+        let second = ctx.build_status_snapshot()["semantic_index"].clone();
+        assert_eq!(second["total_chunks"].as_u64(), Some(total));
+        assert!(
+            second["embedded_chunks"].as_u64() > first["embedded_chunks"].as_u64(),
+            "embedded chunk count must advance after a completed batch"
+        );
+        assert!(second["current_batch"].as_u64() > first["current_batch"].as_u64());
+
+        let health = ctx.try_health_snapshot(&project);
+        let semantic_health = health.semantic_index.expect("semantic health component");
+        assert_eq!(semantic_health.status, "building");
+        assert_eq!(
+            semantic_health.total_chunks.map(|value| value as u64),
+            Some(total)
+        );
+        assert_eq!(
+            semantic_health.embedded_chunks.map(|value| value as u64),
+            second["embedded_chunks"].as_u64()
+        );
+
+        server.release_responses();
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(5));
+        assert!(
+            ctx.build_status_snapshot()["semantic_index"]
+                .get("embedded_chunks")
+                .is_none(),
+            "completed builds must omit volatile progress rather than report zero"
+        );
+    }
+
+    #[test]
+    fn superseded_semantic_build_stops_after_its_current_batch() {
         let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
         let _env_lock = home_env_mutex();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6036,78 +6267,34 @@ mod tests {
             .unwrap();
         }
         let semantic_file = semantic_cache_file(&storage, &project);
+        let ctx = test_context();
+        let enabled =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 1, false);
+        assert!(handle_configure_for_test(&enabled, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(5)),
+            "semantic builder did not begin its first corpus batch"
+        );
 
-        let first_ctx = test_context();
-        let first_response = handle_configure_for_test(
-            &configure_semantic_with_storage(&project, &storage, &server.base_url, true),
-            &first_ctx,
-        );
-        assert!(
-            first_response.success,
-            "configure failed: {:?}",
-            first_response.data
-        );
-        super::drain_deferred_configure_maintenance(&first_ctx);
-        // Opening the maintenance gate only makes the worker runnable. Hold its
-        // first corpus response so the next configure deterministically fences
-        // an in-flight build rather than racing thread scheduling.
-        assert!(
-            server.wait_for_non_probe_input(Duration::from_secs(5)),
-            "post-ack semantic loader did not begin its corpus request"
-        );
-        let disabled_response = handle_configure_for_test(
-            &configure_semantic_with_storage(&project, &storage, &server.base_url, false),
-            &first_ctx,
-        );
-        assert!(
-            disabled_response.success,
-            "disable configure failed: {:?}",
-            disabled_response.data
-        );
+        let disabled =
+            configure_semantic_with_options(&project, &storage, &server.base_url, false, 1, false);
+        assert!(handle_configure_for_test(&disabled, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
         server.release_responses();
 
         assert!(
             super::wait_for_semantic_stale_generation_discard_for_test(Duration::from_secs(5)),
-            "timed out waiting for stale semantic build to persist"
+            "superseded semantic builder did not report its discard"
+        );
+        assert_eq!(
+            server.non_probe_request_count(),
+            1,
+            "the old builder must stop before it sends a second batch"
         );
         assert!(
-            semantic_file.is_file(),
-            "stale semantic build was not persisted"
-        );
-        let initial_non_probe_inputs = server.non_probe_input_count();
-        assert!(
-            initial_non_probe_inputs >= 4,
-            "initial build should embed the corpus, saw {initial_non_probe_inputs} inputs"
-        );
-
-        std::fs::write(
-            project.join("src").join("epsilon.rs"),
-            "pub fn epsilon_symbol() -> usize { 5 }\n",
-        )
-        .unwrap();
-
-        let before_followup_inputs = server.non_probe_input_count();
-        let second_ctx = test_context();
-        let second_response = handle_configure_for_test(
-            &configure_semantic_with_storage(&project, &storage, &server.base_url, true),
-            &second_ctx,
-        );
-        assert!(
-            second_response.success,
-            "second configure failed: {:?}",
-            second_response.data
-        );
-        wait_for_semantic_build_ready(&second_ctx, Duration::from_secs(5));
-        let followup_inputs = server
-            .non_probe_input_count()
-            .saturating_sub(before_followup_inputs);
-        assert!(
-            followup_inputs < initial_non_probe_inputs,
-            "follow-up build should use the persisted index and embed only the delta; initial={initial_non_probe_inputs}, followup={followup_inputs}"
-        );
-        assert!(
-            followup_inputs <= 2,
-            "expected only the new file's semantic chunks to be embedded, got {followup_inputs}"
+            !semantic_file.exists(),
+            "a superseded partial build must not persist an incomplete corpus"
         );
         super::reset_semantic_stale_generation_discards_for_test();
     }

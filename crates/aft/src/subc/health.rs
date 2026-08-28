@@ -1686,6 +1686,52 @@ mod tests {
     }
 
     #[test]
+    fn health_payload_carries_live_semantic_build_progress_only_while_running() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("semantic-build-progress-health");
+        let ctx = test_ctx();
+        let progress = crate::context::SemanticBuildProgress::default();
+        progress.report(6, 12, 3);
+        ctx.set_semantic_build_progress(Some(progress));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Building {
+                stage: "embedding_symbols".to_string(),
+                files: Some(1),
+                entries_done: Some(6),
+                entries_total: Some(12),
+            };
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let building = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        let semantic = &building["roots"][0]["semantic_index"];
+        assert_eq!(semantic["status"], "building");
+        assert_eq!(semantic["stage"], "embedding_symbols");
+        assert_eq!(semantic["embedded_chunks"], 6);
+        assert_eq!(semantic["total_chunks"], 12);
+        assert_eq!(semantic["current_batch"], 2);
+        assert_eq!(semantic["total_batches"], 4);
+
+        ctx.set_semantic_build_progress(None);
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let ready = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        assert!(ready["roots"][0]["semantic_index"]
+            .get("embedded_chunks")
+            .is_none());
+        assert!(ready["roots"][0]["semantic_index"]
+            .get("total_chunks")
+            .is_none());
+    }
+
+    #[test]
     fn cached_health_reply_exposes_snapshot_age_and_counter_coverage() {
         let executor = Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 1,

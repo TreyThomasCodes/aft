@@ -835,6 +835,10 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         status_changed = true;
     }
 
+    if terminal || disconnected {
+        ctx.set_semantic_build_progress(None);
+    }
+
     for resume in cold_seed_resumes {
         ctx.apply_semantic_cold_seed_resume(resume);
     }
@@ -2715,6 +2719,7 @@ pub(crate) fn configure_search_order_context_for_test(
         clear_failed_spawns: false,
         warm_callgraph_store: false,
         supersede_artifact_persistence: false,
+        supersede_semantic_artifact_persistence: false,
         artifact_load_starts: Vec::new(),
     })
     .expect("test configure maintenance queue has capacity");

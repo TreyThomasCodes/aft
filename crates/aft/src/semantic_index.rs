@@ -2407,17 +2407,19 @@ impl SemanticIndex {
         Ok((entries, observed_dimension))
     }
 
-    fn build_from_chunks<F, P>(
+    fn build_from_chunks<F, P, C>(
         project_root: &Path,
         chunks: Vec<SemanticChunk>,
         file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
         embed_fn: &mut F,
         max_batch_size: usize,
         mut progress: Option<&mut P>,
+        should_continue: &mut C,
     ) -> Result<Self, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
+        C: FnMut() -> bool,
     {
         debug_assert!(project_root.is_absolute());
         let total_chunks = chunks.len();
@@ -2454,7 +2456,17 @@ impl SemanticIndex {
         let batch_size = max_batch_size.max(1);
         let embed_started = std::time::Instant::now();
         let batch_count = total_chunks.div_ceil(batch_size);
-        for batch_start in (0..chunks.len()).step_by(batch_size) {
+        for (batch_index, batch_start) in (0..chunks.len()).step_by(batch_size).enumerate() {
+            if !should_continue() {
+                slog_info!(
+                    "semantic embed superseded, stopping after {}/{} batches",
+                    batch_index,
+                    batch_count
+                );
+                return Err(format!(
+                    "semantic build superseded after {batch_index}/{batch_count} batches"
+                ));
+            }
             let batch_end = (batch_start + batch_size).min(chunks.len());
             let batch_texts: Vec<String> = chunks[batch_start..batch_end]
                 .iter()
@@ -2484,6 +2496,15 @@ impl SemanticIndex {
 
             if let Some(callback) = progress.as_mut() {
                 callback(entries.len(), total_chunks);
+            }
+            if (batch_index + 1) % 25 == 0 {
+                slog_info!(
+                    "semantic embed progress: batch {}/{} ({} / {} chunks)",
+                    batch_index + 1,
+                    batch_count,
+                    entries.len(),
+                    total_chunks
+                );
             }
         }
 
@@ -2541,6 +2562,7 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let mut should_continue = || true;
         Self::build_from_chunks(
             project_root,
             chunks,
@@ -2548,6 +2570,7 @@ impl SemanticIndex {
             embed_fn,
             max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
+            &mut should_continue,
         )
     }
 
@@ -2566,6 +2589,7 @@ impl SemanticIndex {
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
+        let mut should_continue = || true;
         Self::build_from_chunks(
             project_root,
             chunks,
@@ -2573,6 +2597,37 @@ impl SemanticIndex {
             embed_fn,
             max_batch_size,
             Some(progress),
+            &mut should_continue,
+        )
+    }
+
+    /// Build the semantic index while checking cancellation before every embed
+    /// batch. A batch already in flight is allowed to finish, then the partial
+    /// result is discarded before the next request can start.
+    pub fn build_with_progress_and_cancellation<F, P, C>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        should_continue: &mut C,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        C: FnMut() -> bool,
+    {
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let total_chunks = chunks.len();
+        progress(0, total_chunks);
+        Self::build_from_chunks(
+            project_root,
+            chunks,
+            file_mtimes,
+            embed_fn,
+            max_batch_size,
+            Some(progress),
+            should_continue,
         )
     }
 
@@ -7928,6 +7983,53 @@ public class Greeter {
             MANAGED_ORT_PROBE_READS.load(Ordering::Relaxed),
             before,
             "resolver must not read the storage tree when ORT_DYLIB_PATH is pre-set"
+        );
+    }
+
+    #[test]
+    fn cancelled_build_stops_before_the_next_embed_batch() {
+        let project = tempfile::tempdir().expect("project directory");
+        let files = (0..16)
+            .map(|index| {
+                let path = project.path().join(format!("batch_{index}.rs"));
+                std::fs::write(&path, format!("pub fn batch_symbol_{index}() {{}}\n"))
+                    .expect("write source");
+                path
+            })
+            .collect::<Vec<_>>();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let embed_calls = AtomicUsize::new(0);
+        let total_chunks = AtomicUsize::new(0);
+        let mut embed = |texts: Vec<String>| {
+            let call = embed_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            assert_eq!(texts.len(), 1, "one chunk per mocked batch");
+            if call == 1 {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(vec![vec![1.0, 2.0, 3.0]])
+        };
+        let mut progress = |done: usize, total: usize| {
+            assert!(done <= total);
+            total_chunks.store(total, Ordering::SeqCst);
+        };
+        let mut should_continue = || !cancelled.load(Ordering::SeqCst);
+
+        let error = SemanticIndex::build_with_progress_and_cancellation(
+            project.path(),
+            &files,
+            &mut embed,
+            1,
+            &mut progress,
+            &mut should_continue,
+        )
+        .expect_err("the second batch boundary observes cancellation");
+
+        let total_chunks = total_chunks.load(Ordering::SeqCst);
+        assert!(error.contains("semantic build superseded"));
+        assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            total_chunks > 4,
+            "fixture must contain enough chunks to demonstrate an early stop, got {total_chunks}"
         );
     }
 
