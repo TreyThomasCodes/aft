@@ -300,11 +300,16 @@ describe("runAutoInstall", () => {
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
-    expect(source).toMatch(/terminationPromise\.then\(\s*\(\) => finish\(false\),/);
-    expect(source).toContain("if (terminationPromise) return;");
+    expect(source).toMatch(/terminationPromise\.then\(\s*finishAfterConfirmedTermination,/);
+    expect(source).toContain("const completedSuccessfully = childCompletedSuccessfully()");
+    expect(source).toContain("finish(completedSuccessfully)");
+    expect(source).toContain("if (settled || terminationPromise) return;");
     expect(source).toContain("quarantining retries for this session");
     expect(source).toContain("quarantinedNpmInstalls.has(spec.npm)");
     expect(source).toContain("installLock.retain()");
+    expect(source).toContain("if (child.pid === undefined)");
+    expect(source).toContain("if (terminationPromise && child.pid !== undefined) return;");
+    expect(source).not.toContain('child.kill("SIGTERM")');
     expect(source).toContain("finish(false)");
     expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing

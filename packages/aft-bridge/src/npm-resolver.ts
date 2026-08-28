@@ -269,23 +269,56 @@ export class NpmTerminationUnknownError extends Error {
 function terminateDirectNpmChild(child: ChildProcess, gracePeriodMs: number): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    let settled = false;
     let forceTimer: ReturnType<typeof setTimeout> | null = null;
-    const finish = () => {
+    let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
+    let signalFailure: string | null = null;
+    const cleanup = () => {
       if (forceTimer) clearTimeout(forceTimer);
+      if (confirmationTimer) clearTimeout(confirmationTimer);
       child.removeListener("exit", finish);
+      child.removeListener("error", onChildError);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve();
+    };
+    const fail = () => {
+      if (settled) return;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(
+        new NpmTerminationUnknownError(
+          signalFailure ?? `direct npm child did not exit after SIGKILL within ${gracePeriodMs}ms`,
+        ),
+      );
+    };
+    const onChildError = (error: Error) => {
+      signalFailure = `direct npm child error during termination: ${String(error)}`;
     };
     const signal = (value?: NodeJS.Signals) => {
       try {
-        child.kill(value);
-      } catch {
-        // The process may have exited between the state check and signal.
+        if (!child.kill(value)) {
+          signalFailure = `direct npm child rejected ${value ?? "SIGTERM"}`;
+        }
+      } catch (error) {
+        signalFailure = `direct npm child ${value ?? "SIGTERM"} failed: ${String(error)}`;
       }
     };
 
     child.once("exit", finish);
-    forceTimer = setTimeout(() => signal("SIGKILL"), gracePeriodMs);
+    child.on("error", onChildError);
+    forceTimer = setTimeout(() => {
+      signal("SIGKILL");
+      confirmationTimer = setTimeout(fail, gracePeriodMs);
+    }, gracePeriodMs);
     signal();
     if (child.exitCode !== null || child.signalCode !== null) finish();
   });

@@ -321,12 +321,10 @@ function runInstall(
 
     let stderrBuf = "";
     let settled = false;
-    let killTimer: ReturnType<typeof setTimeout> | null = null;
     let terminationPromise: Promise<void> | null = null;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
-      if (killTimer) clearTimeout(killTimer);
     };
     const finish = (ok: boolean) => {
       if (settled) return;
@@ -334,28 +332,34 @@ function runInstall(
       cleanup();
       resolve(ok);
     };
+    const childCompletedSuccessfully = () => child.exitCode === 0 && child.signalCode === null;
+    const finishAfterConfirmedTermination = () => {
+      const completedSuccessfully = childCompletedSuccessfully();
+      if (completedSuccessfully) log(`[lsp] installed ${target}`);
+      finish(completedSuccessfully);
+    };
     const onAbort = () => {
-      warn(`[lsp] install ${target} aborted during shutdown`);
-      if (invocation.windowsCmdShim) {
-        terminationPromise ??= terminateNpmProcessTree(child, invocation);
-        void terminationPromise.then(
-          () => finish(false),
-          (terminationError) => {
-            quarantinedNpmInstalls.add(spec.npm);
-            installLock.retain();
-            error(
-              `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
-            );
-            finish(false);
-          },
-        );
+      if (childCompletedSuccessfully()) {
+        finishAfterConfirmedTermination();
         return;
       }
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => {
-        if (!settled) child.kill("SIGKILL");
-      }, 5_000);
-      killTimer.unref?.();
+      warn(`[lsp] install ${target} aborted during shutdown`);
+      terminationPromise ??= terminateNpmProcessTree(child, invocation);
+      void terminationPromise.then(finishAfterConfirmedTermination, (terminationError) => {
+        // A child with no PID never spawned, so it cannot still be mutating the
+        // cache and does not need cross-process quarantine.
+        if (child.pid === undefined) {
+          error(`[lsp] install ${target} failed to spawn during shutdown: ${terminationError}`);
+          finish(false);
+          return;
+        }
+        quarantinedNpmInstalls.add(spec.npm);
+        installLock.retain();
+        error(
+          `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
+        );
+        finish(false);
+      });
     };
 
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -371,13 +375,17 @@ function runInstall(
       }
     });
     child.on("error", (err) => {
-      error(`[lsp] install ${target} failed to spawn: ${err}`);
+      if (settled) return;
+      error(`[lsp] install ${target} child-process error: ${err}`);
+      // Once abort termination owns settlement, a post-spawn error must not
+      // release the install lock before the terminator confirms process exit.
+      if (terminationPromise && child.pid !== undefined) return;
       finish(false);
     });
     child.on("exit", (code) => {
-      // A Windows abort is settled by the process-tree termination promise;
-      // do not report a raced wrapper exit as a successful install.
-      if (terminationPromise) return;
+      // Abort settlement is owned by the awaited terminator on every platform;
+      // do not report a raced wrapper exit independently.
+      if (settled || terminationPromise) return;
       if (code === 0) {
         log(`[lsp] installed ${target}`);
         finish(true);

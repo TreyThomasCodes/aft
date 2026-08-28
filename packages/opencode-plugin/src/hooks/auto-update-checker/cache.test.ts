@@ -263,6 +263,49 @@ describe("auto-update-checker/cache", () => {
       spawnMock.mockRestore();
     });
 
+    test("awaits termination immediately when an in-flight install is aborted", async () => {
+      terminateNpmProcessTreeMock.mockClear();
+      const proc = new EventEmitter() as childProcess.ChildProcess;
+      proc.stdout = new EventEmitter() as childProcess.ChildProcess["stdout"];
+      proc.stderr = new EventEmitter() as childProcess.ChildProcess["stderr"];
+      proc.kill = mock(() => true);
+      const spawnMock = spyOn(childProcess, "spawn").mockReturnValue(proc);
+      terminateNpmProcessTreeMock.mockRejectedValueOnce(new Error("termination unknown"));
+      const { runNpmInstallSafe } = await freshCacheImport();
+      const controller = new AbortController();
+
+      const install = runNpmInstallSafe("/tmp/opencode", {
+        timeoutMs: 60_000,
+        signal: controller.signal,
+      });
+      controller.abort();
+
+      const result = await install;
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("termination outcome unknown");
+      expect(terminateNpmProcessTreeMock).toHaveBeenCalledTimes(1);
+      spawnMock.mockRestore();
+    });
+
+    test("preserves a successful exit that wins a shutdown abort race", async () => {
+      terminateNpmProcessTreeMock.mockClear();
+      const proc = new EventEmitter() as childProcess.ChildProcess;
+      proc.stdout = new EventEmitter() as childProcess.ChildProcess["stdout"];
+      proc.stderr = new EventEmitter() as childProcess.ChildProcess["stderr"];
+      proc.kill = mock(() => true);
+      const spawnMock = spyOn(childProcess, "spawn").mockReturnValue(proc);
+      const { runNpmInstallSafe } = await freshCacheImport();
+      const controller = new AbortController();
+
+      const install = runNpmInstallSafe("/tmp/opencode", { signal: controller.signal });
+      proc.emit("exit", 0);
+      controller.abort();
+
+      expect(await install).toEqual({ ok: true, stderrTail: undefined });
+      expect(terminateNpmProcessTreeMock).not.toHaveBeenCalled();
+      spawnMock.mockRestore();
+    });
+
     test("restores a staged snapshot when cancellation happens before spawn", async () => {
       const root = join(tmpdir(), "aft-auto-update-pre-spawn-abort");
       const packageJsonPath = join(root, "package.json");

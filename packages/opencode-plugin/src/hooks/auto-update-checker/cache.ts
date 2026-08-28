@@ -321,11 +321,6 @@ export async function runNpmInstallSafe(
       terminationPromise ??= terminateNpmProcessTree(proc, invocation);
       return terminationPromise;
     };
-    const onAbort = () => {
-      // The awaited timeout/abort branch below handles unknown termination.
-      void abortProcess().catch(() => {});
-    };
-    options.signal?.addEventListener("abort", onAbort, { once: true });
 
     const exitPromise = new Promise<{ ok: boolean; reason?: string }>((resolveExit) => {
       proc.on("error", (err) => resolveExit({ ok: false, reason: `spawn error: ${String(err)}` }));
@@ -340,10 +335,19 @@ export async function runNpmInstallSafe(
     const timeoutPromise = new Promise<"timeout">((resolveTimeout) => {
       timeout = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs ?? 60_000);
     });
-    const result = await Promise.race([exitPromise, timeoutPromise]);
+    let resolveAbort!: (result: "abort") => void;
+    const abortPromise = new Promise<"abort">((resolve) => {
+      resolveAbort = resolve;
+    });
+    const onAbort = () => resolveAbort("abort");
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    // Close the registration race for signals aborted before the listener was attached.
+    if (options.signal?.aborted) onAbort();
+
+    const result = await Promise.race([exitPromise, timeoutPromise, abortPromise]);
     options.signal?.removeEventListener("abort", onAbort);
 
-    if (result === "timeout" || options.signal?.aborted) {
+    if (result === "timeout" || result === "abort") {
       try {
         await abortProcess();
       } catch (error) {
@@ -360,7 +364,7 @@ export async function runNpmInstallSafe(
         return { ok: false, reason, stderrTail: stderrTail || undefined };
       }
       restorePendingSnapshot(installDir);
-      const reason = options.signal?.aborted ? "aborted" : "timeout";
+      const reason = result === "abort" ? "aborted" : "timeout";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason, stderrTail: stderrTail || undefined };
     }

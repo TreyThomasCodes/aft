@@ -253,6 +253,32 @@ describe("npmInvocation", () => {
     expect(signals).toEqual([undefined, "SIGKILL"]);
   });
 
+  it("fails closed when a direct child never reports exit after SIGKILL", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: null },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return false;
+        },
+      },
+    });
+
+    await expect(
+      terminateNpmProcessTree(
+        child,
+        { command: "/usr/bin/npm", args: ["install"] },
+        process.env,
+        10,
+      ),
+    ).rejects.toBeInstanceOf(NpmTerminationUnknownError);
+    expect(signals).toEqual([undefined, "SIGKILL"]);
+  });
+
   it("does not invoke taskkill for an already-successful cmd shim", async () => {
     const child = new EventEmitter() as ChildProcess;
     Object.defineProperties(child, {

@@ -696,7 +696,10 @@ async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promis
       stderr += chunk.toString("utf8");
       if (stderr.length > 16 * 1024) stderr = stderr.slice(-16 * 1024);
     });
-    child.once("error", (error) => finish(error));
+    child.once("error", (error) => {
+      if (terminating) return;
+      finish(error);
+    });
     child.once("exit", (code) => {
       if (terminating) return;
       const detail = stderr.trim();
