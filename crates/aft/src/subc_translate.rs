@@ -286,9 +286,7 @@ fn edit_modes_present(map: &mut Map<String, Value>) -> Vec<&'static str> {
     let has_symbol = is_non_empty_string(map.get("symbol"));
     if !has_symbol {
         map.remove("symbol");
-        if map.get("content").is_some_and(|value| {
-            value.is_null() || matches!(value, Value::String(value) if value.is_empty())
-        }) {
+        if is_null_or_empty_string(map.get("content")) {
             map.remove("content");
         }
     } else if matches!(map.get("content"), Some(Value::Null)) {
@@ -328,14 +326,23 @@ fn is_non_empty_string(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::String(value)) if !value.is_empty())
 }
 
+fn is_null_or_empty_string(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.is_empty(),
+        Some(_) => false,
+    }
+}
+
 /// An edits item is a serialization sentinel when the host emitted every
 /// optional field with a type-default value and put the real payload in a
 /// sibling field. Such an item carries no real edit intent and must not claim
 /// the `edits` mode.
 ///
-/// A pure line-range item ({startLine,endLine,content}) has no `oldString`
-/// key, so it is never a sentinel even when `content` is "" (deleting lines is
-/// real intent). A real replacement has a non-empty `oldString`, so it is
+/// A pure line-range item ({startLine,endLine,content}) is never a sentinel,
+/// even when `content` is "", because deleting lines is real edit intent. A
+/// null `oldString` with a non-null range boundary is treated the same way. A
+/// real replacement has a non-empty `oldString`, so it is
 /// never a sentinel. `{oldString:"", newString:"non-empty"}` is deliberately
 /// NOT a sentinel: it is kept so the batch parser reports its specific
 /// empty-match error instead of us silently discarding a broken but
@@ -344,26 +351,28 @@ fn is_edit_sentinel_item(item: &Value) -> bool {
     let Some(obj) = item.as_object() else {
         return false;
     };
-    // `oldString` must be present with an empty-string value.
-    let old_string_empty = matches!(obj.get("oldString"), Some(Value::String(s)) if s.is_empty());
+    // `oldString` must be present with an empty-string or null value.
+    let old_string_empty =
+        obj.contains_key("oldString") && is_null_or_empty_string(obj.get("oldString"));
     if !old_string_empty {
         return false;
     }
-    // `newString` must be empty or absent.
-    let new_string_empty = match obj.get("newString") {
-        None => true,
-        Some(Value::String(s)) => s.is_empty(),
-        Some(_) => false,
-    };
+    // A non-null range boundary proves that a null oldString belongs to a
+    // line-range item, not an all-null serialization sentinel.
+    if matches!(obj.get("oldString"), Some(Value::Null))
+        && ["startLine", "endLine"]
+            .iter()
+            .any(|key| !matches!(obj.get(*key), None | Some(Value::Null)))
+    {
+        return false;
+    }
+    // `newString` must be empty, null, or absent.
+    let new_string_empty = is_null_or_empty_string(obj.get("newString"));
     if !new_string_empty {
         return false;
     }
-    // `content` must be empty or absent.
-    match obj.get("content") {
-        None => true,
-        Some(Value::String(s)) => s.is_empty(),
-        Some(_) => false,
-    }
+    // `content` must be empty, null, or absent.
+    is_null_or_empty_string(obj.get("content"))
 }
 
 /// Filter serialization-sentinel items out of the `edits` array (or its
@@ -447,15 +456,32 @@ fn parse_edit_array(value: Option<Value>) -> Result<Vec<Value>, TranslateError> 
     Ok(items)
 }
 
-/// Strip default values from the find/replace arm of a line-range edit.
+/// Strip default values from an edit item before selecting its family.
 ///
-/// Some hosts serialize all optional fields. These values cannot affect a
-/// line-range edit, while non-default values remain to surface a mixed-mode
-/// request instead of being discarded.
+/// Some hosts serialize all optional fields. Null values are absent fields, and
+/// the default find/replace values cannot affect a line-range edit. Non-default
+/// values remain to surface a mixed-mode request instead of being discarded.
 fn strip_line_range_sentinels(item: &mut Map<String, Value>) {
     let has_range = ["startLine", "endLine", "content"]
         .iter()
         .any(|key| item.contains_key(*key));
+
+    // Null is how some hosts serialize an omitted optional property. Remove it
+    // before counting either edit family so it cannot create a false conflict.
+    for key in [
+        "oldString",
+        "newString",
+        "replaceAll",
+        "occurrence",
+        "startLine",
+        "endLine",
+        "content",
+    ] {
+        if matches!(item.get(key), Some(Value::Null)) {
+            item.remove(key);
+        }
+    }
+
     if !has_range {
         return;
     }
@@ -2880,6 +2906,214 @@ mod tests {
             empty_find.args["edits"][0]["match"],
             Value::String(String::new())
         );
+    }
+
+    #[test]
+    fn edit_null_sentinels_are_absent_at_both_edit_boundaries() {
+        let project = Path::new("/project");
+
+        // Null optional range fields must not turn an otherwise valid
+        // find/replace item into a mixed-family request.
+        let issue_payload = serde_json::json!({
+            "path": "src/example.ts",
+            "edits": [{
+                "oldString": "gamma line three",
+                "newString": "GAMMA line three",
+                "replaceAll": false,
+                "occurrence": null,
+                "startLine": null,
+                "endLine": null,
+                "content": null,
+            }],
+        });
+        let translated = subc_translate_owned("edit", issue_payload, project)
+            .expect("null range sentinels must not create a mode conflict");
+        assert_eq!(
+            translated.args["edits"],
+            serde_json::json!([{
+                "match": "gamma line three",
+                "replacement": "GAMMA line three",
+            }]),
+        );
+
+        // Cover every nullable item field so a change to one stripping branch
+        // cannot silently restore the false mixed-mode rejection.
+        for field in [
+            "newString",
+            "replaceAll",
+            "occurrence",
+            "startLine",
+            "endLine",
+            "content",
+        ] {
+            let mut item = serde_json::json!({
+                "oldString": "before",
+                "newString": "after",
+            });
+            item.as_object_mut()
+                .expect("edit item object")
+                .insert(field.to_string(), Value::Null);
+            let translated = subc_translate_owned(
+                "edit",
+                serde_json::json!({ "path": "src/example.ts", "edits": [item] }),
+                project,
+            )
+            .unwrap_or_else(|error| panic!("null {field} sentinel: {}", error.message));
+            let expected = if field == "newString" {
+                serde_json::json!([{ "match": "before" }])
+            } else {
+                serde_json::json!([{ "match": "before", "replacement": "after" }])
+            };
+            assert_eq!(
+                translated.args["edits"], expected,
+                "null {field} must be absent",
+            );
+        }
+
+        // A pure line-range delete remains real intent even when the host
+        // emits nulls for all of the unrelated find/replace fields.
+        let line_delete = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{
+                    "startLine": 1,
+                    "endLine": 1,
+                    "content": "",
+                    "oldString": null,
+                    "newString": null,
+                    "replaceAll": null,
+                    "occurrence": null,
+                }],
+            }),
+            project,
+        )
+        .expect("null find fields must not hide a line-range delete");
+        assert_eq!(
+            line_delete.args["edits"],
+            serde_json::json!([{
+                "content": "",
+                "line_start": 1,
+                "line_end": 1,
+            }]),
+        );
+
+        // An item containing only null sentinels has no edit intent and is
+        // dropped, while a non-null malformed match still reports its own
+        // missing required field.
+        let null_item = serde_json::json!({
+            "oldString": null,
+            "newString": null,
+            "replaceAll": null,
+            "occurrence": null,
+            "startLine": null,
+            "endLine": null,
+            "content": null,
+        });
+        let no_mode = subc_translate_owned(
+            "edit",
+            serde_json::json!({ "path": "src/example.ts", "edits": [null_item] }),
+            project,
+        )
+        .expect_err("all-null edit item must be dropped as a sentinel");
+        assert!(no_mode.message.contains("exactly one of"));
+
+        let mixed = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [
+                    {
+                        "oldString": null,
+                        "newString": null,
+                        "replaceAll": null,
+                        "occurrence": null,
+                        "startLine": null,
+                        "endLine": null,
+                        "content": null,
+                    },
+                    { "oldString": "before", "newString": "after" },
+                ],
+            }),
+            project,
+        )
+        .expect("real edit must survive an all-null sentinel");
+        assert_eq!(
+            mixed.args["edits"],
+            serde_json::json!([{ "match": "before", "replacement": "after" }]),
+        );
+
+        let malformed = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{ "oldString": null, "newString": "replacement" }],
+            }),
+            project,
+        )
+        .expect_err("null oldString with real replacement must remain invalid");
+        assert!(malformed.message.contains("requires string 'oldString'"));
+
+        // Top-level nulls are absent mode sentinels, but null content in an
+        // otherwise selected symbol mode still fails the required-content check.
+        let top_level_base = serde_json::json!({
+            "path": "src/example.ts",
+            "edits": [{ "oldString": "before", "newString": "after" }],
+        });
+        for field in [
+            "appendContent",
+            "symbol",
+            "content",
+            "oldString",
+            "newString",
+            "replaceAll",
+            "occurrence",
+        ] {
+            let mut arguments = top_level_base.clone();
+            arguments
+                .as_object_mut()
+                .expect("edit arguments object")
+                .insert(field.to_string(), Value::Null);
+            subc_translate_owned("edit", arguments, project)
+                .unwrap_or_else(|error| panic!("top-level null {field}: {}", error.message));
+        }
+        let null_edits = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "appendContent": "append",
+                "edits": null,
+            }),
+            project,
+        )
+        .expect("top-level null edits must be absent");
+        assert_eq!(null_edits.command, "edit_match");
+
+        let symbol_error = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "symbol": "greetUser",
+                "content": null,
+            }),
+            project,
+        )
+        .expect_err("null symbol content must fail the required-content check");
+        assert_eq!(
+            symbol_error.message,
+            "edit: symbol mode requires both 'symbol' and 'content' string properties"
+        );
+
+        let occurrence_zero = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{ "oldString": "before", "occurrence": 0 }],
+            }),
+            project,
+        )
+        .expect_err("occurrence zero must not be treated as a null sentinel");
+        assert!(occurrence_zero.message.contains("occurrence"));
     }
 
     #[test]

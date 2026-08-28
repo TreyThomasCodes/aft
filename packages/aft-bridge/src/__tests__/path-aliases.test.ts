@@ -137,6 +137,27 @@ describe("edit boundary preparation", () => {
       expected: { path: "src/example.ts", appendContent: "append" },
     },
     {
+      label: "find and replace ignores null range sentinels",
+      input: {
+        filePath: "src/example.ts",
+        edits: [
+          {
+            oldString: "gamma line three",
+            newString: "GAMMA line three",
+            replaceAll: false,
+            occurrence: null,
+            startLine: null,
+            endLine: null,
+            content: null,
+          },
+        ],
+      },
+      expected: {
+        path: "src/example.ts",
+        edits: [{ oldString: "gamma line three", newString: "GAMMA line three" }],
+      },
+    },
+    {
       label: "symbol deletion keeps empty content",
       input: { filePath: "src/example.ts", symbol: "target", content: "" },
       expected: { path: "src/example.ts", symbol: "target", content: "" },
@@ -265,6 +286,115 @@ describe("edit boundary preparation", () => {
         }),
       ).toThrow("mixes find/replace and line-range fields");
     }
+  });
+
+  test("treats null optional fields as absent at both edit boundaries", () => {
+    const base = {
+      path: "src/example.ts",
+      edits: [{ oldString: "before", newString: "after" }],
+    };
+    for (const key of [
+      "appendContent",
+      "symbol",
+      "content",
+      "oldString",
+      "newString",
+      "replaceAll",
+      "occurrence",
+    ]) {
+      expect(prepareCanonicalEditArguments("edit", { ...base, [key]: null })).toEqual(base);
+    }
+    expect(
+      prepareCanonicalEditArguments("edit", {
+        path: "src/example.ts",
+        appendContent: "append",
+        edits: null,
+      }),
+    ).toEqual({ path: "src/example.ts", appendContent: "append" });
+
+    for (const key of [
+      "newString",
+      "replaceAll",
+      "occurrence",
+      "startLine",
+      "endLine",
+      "content",
+    ]) {
+      const input = {
+        path: "src/example.ts",
+        edits: [{ oldString: "before", newString: "after", [key]: null }],
+      };
+      const expectedItem =
+        key === "newString" ? { oldString: "before" } : { oldString: "before", newString: "after" };
+      expect(prepareCanonicalEditArguments("edit", input)).toEqual({
+        path: "src/example.ts",
+        edits: [expectedItem],
+      });
+    }
+  });
+
+  test("drops all-null edit items without hiding malformed non-null edits", () => {
+    const nullItem = {
+      oldString: null,
+      newString: null,
+      replaceAll: null,
+      occurrence: null,
+      startLine: null,
+      endLine: null,
+      content: null,
+    };
+    expect(() =>
+      prepareCanonicalEditArguments("edit", { path: "src/example.ts", edits: [nullItem] }),
+    ).toThrow("exactly one of");
+
+    expect(
+      prepareCanonicalEditArguments("edit", {
+        path: "src/example.ts",
+        edits: [nullItem, { oldString: "before", newString: "after" }],
+      }),
+    ).toEqual({
+      path: "src/example.ts",
+      edits: [{ oldString: "before", newString: "after" }],
+    });
+
+    expect(() =>
+      prepareCanonicalEditArguments("edit", {
+        path: "src/example.ts",
+        edits: [{ oldString: null, newString: "replacement" }],
+      }),
+    ).toThrow("requires string 'oldString'");
+  });
+
+  test("strips null find fields from a legitimate line-range delete", () => {
+    expect(
+      prepareCanonicalEditArguments("edit", {
+        path: "src/example.ts",
+        edits: [
+          {
+            startLine: 1,
+            endLine: 1,
+            content: "",
+            oldString: null,
+            newString: null,
+            replaceAll: null,
+            occurrence: null,
+          },
+        ],
+      }),
+    ).toEqual({
+      path: "src/example.ts",
+      edits: [{ startLine: 1, endLine: 1, content: "" }],
+    });
+  });
+
+  test("reports null symbol content as the missing required property", () => {
+    expect(() =>
+      prepareCanonicalEditArguments("edit", {
+        path: "src/example.ts",
+        symbol: "greetUser",
+        content: null,
+      }),
+    ).toThrow("symbol mode requires both 'symbol' and 'content' string properties");
   });
 
   test("applies mode conflict precedence before parsing stringified edits", () => {
