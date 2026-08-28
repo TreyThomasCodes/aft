@@ -262,7 +262,13 @@ The backup store treats its on-disk tree as authoritative across processes; dele
 
     // Pi-only fallback for older Pi versions that cannot report whether its
     // optional default PowerShell tool is enabled. OpenCode never registers it.
-    "powershell_tool": false
+    "powershell_tool": false,
+
+    // Whether a new user message detaches a blocking `wait: true` bash call to
+    // the background. Default true. Set false to keep the call blocking through
+    // steering messages; even then, a message containing `&detach` forces the
+    // detach (the token is stripped before the model sees the message).
+    "detach_on_user_message": true
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
