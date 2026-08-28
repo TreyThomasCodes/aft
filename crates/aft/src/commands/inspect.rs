@@ -1089,7 +1089,16 @@ fn finish_tier2_phases(
     match outcome {
         JobOutcome::Fresh { payload } => {
             if let Some(callgraph_phase) = callgraph_phase {
-                if payload.get("callgraph_available").and_then(Value::as_bool) == Some(true) {
+                if payload.get("callgraph_available").and_then(Value::as_bool) == Some(true)
+                    || payload
+                        .get("notes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|notes| {
+                            notes.iter().any(|note| {
+                                note.as_str() == Some("callgraph_path_identity_mismatch")
+                            })
+                        })
+                {
                     callgraph_phase.complete();
                 } else {
                     callgraph_phase.fail("dead_code aggregate has no ready callgraph snapshot");
@@ -1643,7 +1652,11 @@ fn render_symbol_category(
     if key == "dead_code"
         && section.get("callgraph_available").and_then(Value::as_bool) == Some(false)
     {
-        lines.push("Dead code analysis unavailable (no callgraph)".to_string());
+        let reason = section
+            .get("callgraph_unavailable_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("no callgraph");
+        lines.push(format!("Dead code analysis unavailable ({reason})"));
         return;
     }
     if let Some(status) = section.get("status").and_then(Value::as_str) {
@@ -2135,7 +2148,10 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         {
             // This is a terminal capability result, not a partial scan: dead-code
             // analysis cannot run without the callgraph, so it must not claim zero.
-            serde_json::json!({ "callgraph_available": false })
+            serde_json::json!({
+                "callgraph_available": false,
+                "reason": payload.get("callgraph_unavailable_reason"),
+            })
         }
         InspectCategory::DeadCode => serde_json::json!({
             "count": count_from_payload(Some(payload)),

@@ -17,9 +17,9 @@ use crate::inspect::scanners::DEFAULT_EXPORT_MARKER_KIND;
 use crate::symbols::SymbolKind;
 
 use super::{
-    database_ready, lang_from_label, projection_write_revision, CallGraphStoreError, Result,
-    BACKEND_TREESITTER, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, PROVENANCE_VALUE_REF,
-    TOP_LEVEL_SYMBOL,
+    database_ready, lang_from_label, path_identity_mismatch_reason, projection_write_revision,
+    CallGraphStoreError, Result, BACKEND_TREESITTER, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH,
+    PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
 };
 
 #[cfg(test)]
@@ -66,6 +66,9 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
         ));
     }
     let write_revision = projection_write_revision(&tx)?;
+    if let Some(reason) = path_identity_mismatch_reason(&tx)? {
+        return Err(CallGraphStoreError::Unavailable(reason));
+    }
 
     let project_root = project_root_from_backend_state(&tx)?;
     // Same predicate as InspectManager::callgraph_ready_for_snapshot: a store

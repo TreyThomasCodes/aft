@@ -538,7 +538,17 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
 }
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
-    json!({
+    callgraph_unavailable_aggregate_with_reason(scanned_files, None)
+}
+
+/// Report a terminal callgraph capability gap without inventing a dead-code
+/// count. Path-identity gaps include the raw path so an operator can correct a
+/// mount or alias mismatch instead of retrying the same unavailable store.
+pub(crate) fn callgraph_unavailable_aggregate_with_reason(
+    scanned_files: usize,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut aggregate = json!({
         "items": [],
         "by_language": {},
         "languages_skipped": [],
@@ -548,7 +558,12 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
         "callgraph_available": false,
         "scanned_files": scanned_files,
         "notes": ["callgraph_unavailable"],
-    })
+    });
+    if let Some(reason) = reason {
+        aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_path_identity_mismatch"]);
+        aggregate["callgraph_unavailable_reason"] = json!(reason);
+    }
+    aggregate
 }
 
 pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
