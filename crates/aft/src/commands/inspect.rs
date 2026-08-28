@@ -2016,26 +2016,29 @@ fn render_generated_duplicate_usage(
     }
 }
 
-fn render_duplicate_suppression(lines: &mut Vec<String>, section: &Value) {
+/// Suppression counts as a headline clause (e.g. " (238 suppressed by
+/// expected_mirrors, 8 by aft:expected-duplicate)"), so they read as summary
+/// stats instead of items inside the top-groups list.
+fn duplicate_suppression_clause(section: &Value) -> String {
     let mirror = section
         .get("mirror_suppressed_groups")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if mirror > 0 {
-        lines.push(format!(
-            "  {mirror} mirror {} suppressed by expected_mirrors",
-            plural_group(mirror)
-        ));
-    }
     let marker = section
         .get("marker_suppressed_groups")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let mut parts = Vec::new();
+    if mirror > 0 {
+        parts.push(format!("{mirror} suppressed by expected_mirrors"));
+    }
     if marker > 0 {
-        lines.push(format!(
-            "  {marker} marker {} suppressed by aft:expected-duplicate",
-            plural_group(marker)
-        ));
+        parts.push(format!("{marker} by aft:expected-duplicate"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
     }
 }
 
@@ -2843,17 +2846,13 @@ mod render_text_tests {
 
         assert!(
             text.contains(
-                "Duplicates: 42 duplicated lines (10.4% of 404 analyzed lines) across 3 files, 1 group (top by cost):"
+                "Duplicates: 42 duplicated lines (10.4% of 404 analyzed lines) across 3 files, 1 group (2 suppressed by expected_mirrors, 1 by aft:expected-duplicate) (top by cost):"
             ),
             "{text}"
         );
         assert!(
-            text.contains("2 mirror groups suppressed by expected_mirrors"),
-            "{text}"
-        );
-        assert!(
-            text.contains("1 marker group suppressed by aft:expected-duplicate"),
-            "{text}"
+            !text.contains("  2 mirror groups suppressed"),
+            "suppression stats must not render as list items: {text}"
         );
         assert!(
             text.contains("suggestion: consider extracting into a shared module"),
