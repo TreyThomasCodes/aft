@@ -352,8 +352,6 @@ describe("npmInvocation", () => {
             { SystemRoot: systemRoot },
             1_000,
           ),
-            25,
-          ),
         ).resolves.toBeUndefined();
       } finally {
         rmSync(systemRoot, { recursive: true, force: true });
