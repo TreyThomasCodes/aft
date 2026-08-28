@@ -1808,8 +1808,7 @@ fn validate_regular_handle(file: &File) -> io::Result<()> {
 
 /// Marker message for a validated-open that lost a race against an atomic
 /// replacement of the same artifact (see link-count semantics above).
-pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str =
-    "task artifact was concurrently replaced";
+pub(crate) const ARTIFACT_CONCURRENTLY_REPLACED: &str = "task artifact was concurrently replaced";
 
 #[cfg(unix)]
 pub fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
