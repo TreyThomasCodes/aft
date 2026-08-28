@@ -2473,10 +2473,9 @@ pub(crate) fn detached_command_for_plan(
         task_marker,
         Some((exit_fd, failure_fd)),
     )?;
-    use std::os::unix::process::CommandExt;
-
     let mut command = crate::effective_path::new_command(program);
-    command.args(args).process_group(0);
+    command.args(args);
+    crate::bash_background::process::start_new_session(&mut command);
     Ok((command, profile_handle))
 }
 
