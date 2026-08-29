@@ -3085,7 +3085,8 @@ fn schedule_artifact_loads(
         let symbol_storage = storage_dir.clone();
         let symbol_project_key = project_key.clone();
         let is_worktree_bridge_for_search = is_worktree_bridge;
-        let shared_artifacts_read_only_for_search = ctx.shared_artifacts_read_only();
+        let search_loads_shared_artifacts_read_only =
+            is_worktree_bridge_for_search || ctx.shared_artifacts_read_only();
         let session_id_for_bg = log_ctx::current_session();
         let search_cold_build_limiter = ctx.cold_build_limiter();
         let search_generation = configure_generation;
@@ -3117,7 +3118,10 @@ fn schedule_artifact_loads(
             }
             log_ctx::with_session(session_id_for_bg.clone(), || {
                 note_configure_artifact_load_attempt();
-                if shared_artifacts_read_only_for_search {
+                // Borrow-only opens are bounded disk reads, not cold builds. They
+                // must stay independent of the limiter that protects paths able
+                // to fall through to `rebuild_or_refresh_with_strategy` below.
+                if search_loads_shared_artifacts_read_only {
                     match crate::readonly_artifacts::open_search_index_read_only(
                         &root_for_search,
                         symbol_storage.as_deref(),
@@ -3187,6 +3191,9 @@ fn schedule_artifact_loads(
                 ) else {
                     return;
                 };
+                // Only writable roots reach this permit. Even a cache hit can
+                // discover stale inputs and rebuild, so the writable load stays
+                // cold-build limited before reading or refreshing the artifact.
                 let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
                     &search_cold_build_limiter,
                     "search index post-configure load",
@@ -3334,7 +3341,9 @@ fn schedule_artifact_loads(
         });
     }
 
-    if load_semantic && ctx.shared_artifacts_read_only() {
+    // The read-only semantic arm has the same bounded-open shape as search and
+    // likewise never enters the owner refresh/rebuild path below.
+    if load_semantic && (is_worktree_bridge || ctx.shared_artifacts_read_only()) {
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
@@ -4416,7 +4425,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
@@ -5294,6 +5303,20 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn persist_search_index_fixture(project_root: &Path, storage_dir: &Path) {
+        std::fs::write(
+            project_root.join("lib.rs"),
+            "pub fn limiter_fixture_marker() {}\n",
+        )
+        .expect("write search fixture");
+        let project_key = crate::search_index::artifact_cache_key(project_root);
+        let cache_dir =
+            crate::search_index::resolve_cache_dir_with_key(&project_key, Some(storage_dir));
+        let mut index = SearchIndex::build(project_root);
+        let git_head = crate::search_index::current_git_head(project_root);
+        assert!(index.write_to_disk(&cache_dir, git_head.as_deref()));
     }
 
     fn wait_for_search_index_ready(ctx: &AppContext, timeout: Duration) {
@@ -6833,6 +6856,96 @@ mod tests {
         );
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
+    }
+
+    #[test]
+    fn borrowed_search_load_bypasses_saturated_cold_build_limiter() {
+        let root = tempfile::tempdir().expect("create search root");
+        let storage = tempfile::tempdir().expect("create search storage");
+        persist_search_index_fixture(root.path(), storage.path());
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.search_index = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_role(true, None);
+        ctx.set_cache_writer_capabilities(false, true);
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let limiter = ctx.cold_build_limiter();
+        let _held_permits = (0..2)
+            .map(|permit_number| {
+                crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
+                    &limiter,
+                    &format!("hold borrowed-load control permit {permit_number}"),
+                    || true,
+                )
+                .expect("hold limiter permit")
+            })
+            .collect::<Vec<_>>();
+
+        let starts = super::schedule_artifact_loads(&ctx, true, false);
+        assert_eq!(starts.len(), 1);
+        assert!(super::start_artifact_loads(starts));
+        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|index| index.ready));
+    }
+
+    #[test]
+    fn owner_search_load_waits_for_cold_build_limiter_permit() {
+        let root = tempfile::tempdir().expect("create search root");
+        let storage = tempfile::tempdir().expect("create search storage");
+        persist_search_index_fixture(root.path(), storage.path());
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.search_index = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_role(false, None);
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let limiter = ctx.cold_build_limiter();
+        let mut held_permits = (0..2)
+            .map(|permit_number| {
+                crate::cold_build_limiter::acquire_blocking_while_with_test_limiter(
+                    &limiter,
+                    &format!("hold owner-load control permit {permit_number}"),
+                    || true,
+                )
+                .expect("hold limiter permit")
+            })
+            .collect::<Vec<_>>();
+
+        let starts = super::schedule_artifact_loads(&ctx, true, false);
+        assert_eq!(starts.len(), 1);
+        assert!(super::start_artifact_loads(starts));
+        std::thread::sleep(Duration::from_millis(150));
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "owner load must not read or publish while all permits are held"
+        );
+        assert!(
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "owner load should remain queued behind the limiter"
+        );
+
+        drop(held_permits.pop());
+        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
     }
 
     #[test]
