@@ -21,6 +21,11 @@ const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
 const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
+const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
+const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
+    subc_protocol::SUBC_MODULE_ID_ENV,
+    subc_protocol::SUBC_LAUNCH_NONCE_ENV,
+];
 
 /// The generated hook is POSIX `sh`, including on Git for Windows. It appends
 /// AFT's attribution before handing control to a repository hook with the same
@@ -156,6 +161,64 @@ pub fn scrub_inherited_process_markers() {
     }
 }
 
+/// True for environment variables reserved for subc's supervised-spawn
+/// identity. Tool children are not the module process and must never inherit
+/// present or future members of this credential family.
+pub(crate) fn is_subc_credential_env_key(key: &str) -> bool {
+    #[cfg(windows)]
+    {
+        key.as_bytes()
+            .get(..SUBC_CREDENTIAL_ENV_PREFIX.len())
+            .is_some_and(|prefix| {
+                prefix.eq_ignore_ascii_case(SUBC_CREDENTIAL_ENV_PREFIX.as_bytes())
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        key.starts_with(SUBC_CREDENTIAL_ENV_PREFIX)
+    }
+}
+
+/// Apply request overrides to a non-PTY child and remove subc credentials from
+/// both the inherited process environment and explicit command overrides.
+pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<String, String>) {
+    command.envs(environment);
+
+    let mut credential_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key))
+        .collect::<Vec<_>>();
+    credential_keys.extend(
+        command
+            .get_envs()
+            .map(|(key, _)| key.to_os_string())
+            .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key)),
+    );
+    for key in credential_keys {
+        command.env_remove(key);
+    }
+}
+
+/// Remove subc credentials from portable-pty's complete environment snapshot.
+/// CommandBuilder materializes the process environment when it is constructed,
+/// so filtering the builder covers Unix exec and Windows CreateProcess alike.
+pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
+    let mut credential_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key))
+        .collect::<Vec<_>>();
+    credential_keys.extend(
+        command
+            .iter_full_env_as_str()
+            .map(|(key, _)| OsString::from(key))
+            .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key)),
+    );
+    credential_keys.extend(SUBC_IDENTITY_ENV_KEYS.map(OsString::from));
+    for key in credential_keys {
+        command.env_remove(key);
+    }
+}
+
 /// Add governance to one child environment. This is the single seam used
 /// before foreground, background, sandboxed, and PTY launch planning.
 pub fn inject(
@@ -163,6 +226,11 @@ pub fn inject(
     storage_root: &Path,
     environment: &mut HashMap<String, String>,
 ) -> Result<(), String> {
+    // The module uses these launch-identity variables to authenticate its own
+    // daemon connection. Remove them only from the child snapshot so the module
+    // process retains the credentials it needs.
+    environment.retain(|key, _| !is_subc_credential_env_key(key));
+
     let gh_enabled = config.gh_shim.enabled;
     let co_author_enabled = config.git.co_author != "off";
 
@@ -594,6 +662,117 @@ mod tests {
         let mut after = before.clone();
         inject(&config, Path::new("/unused"), &mut after).unwrap();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn child_environment_strips_the_complete_subc_credential_family_before_config_gates() {
+        let mut config = Config::default();
+        config.gh_shim.enabled = false;
+        config.git = GitConfig::default();
+        let mut environment = HashMap::from([
+            ("SUBC_MODULE_ID".to_string(), "aft".to_string()),
+            ("SUBC_LAUNCH_NONCE".to_string(), "nonce".to_string()),
+            (
+                "SUBC_FUTURE_CREDENTIAL".to_string(),
+                "future-secret".to_string(),
+            ),
+            ("CUSTOM".to_string(), "kept".to_string()),
+        ]);
+
+        inject(&config, Path::new("/unused"), &mut environment).unwrap();
+
+        assert_eq!(environment.get("CUSTOM").map(String::as_str), Some("kept"));
+        assert!(
+            environment
+                .keys()
+                .all(|key| !is_subc_credential_env_key(key)),
+            "a subc supervised-spawn credential remained in the child snapshot"
+        );
+    }
+
+    #[test]
+    fn command_adapters_remove_explicit_subc_identity_material() {
+        let request_environment = HashMap::from([
+            ("SUBC_MODULE_ID".to_string(), "request-aft".to_string()),
+            ("CUSTOM".to_string(), "kept".to_string()),
+        ]);
+        let mut command = Command::new("unused-test-command");
+        command
+            .env("SUBC_LAUNCH_NONCE", "ambient-nonce")
+            .env("SUBC_FUTURE_CREDENTIAL", "future-secret");
+        apply_to_command(&mut command, &request_environment);
+        let configured = command
+            .get_envs()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            configured.get("CUSTOM").copied().flatten(),
+            Some(std::ffi::OsStr::new("kept"))
+        );
+        for key in [
+            "SUBC_MODULE_ID",
+            "SUBC_LAUNCH_NONCE",
+            "SUBC_FUTURE_CREDENTIAL",
+        ] {
+            assert_eq!(
+                configured.get(key).copied().flatten(),
+                None,
+                "std::process child retained {key}"
+            );
+        }
+
+        let mut pty_command = portable_pty::CommandBuilder::new("unused-test-command");
+        pty_command.env("SUBC_MODULE_ID", "aft");
+        pty_command.env("SUBC_LAUNCH_NONCE", "nonce");
+        pty_command.env("SUBC_FUTURE_CREDENTIAL", "future-secret");
+        pty_command.env("CUSTOM", "kept");
+        scrub_pty_command(&mut pty_command);
+        assert_eq!(
+            pty_command.get_env("CUSTOM"),
+            Some(std::ffi::OsStr::new("kept"))
+        );
+        for key in [
+            "SUBC_MODULE_ID",
+            "SUBC_LAUNCH_NONCE",
+            "SUBC_FUTURE_CREDENTIAL",
+        ] {
+            assert_eq!(pty_command.get_env(key), None, "PTY child retained {key}");
+        }
+    }
+
+    #[test]
+    fn agent_process_creation_sites_cannot_bypass_the_child_environment_funnel() {
+        let registry = include_str!("bash_background/registry.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let pty = include_str!("bash_background/pty_process.rs")
+            .split("// Every test in this module")
+            .next()
+            .unwrap();
+        let sandbox = include_str!("sandbox_spawn.rs");
+
+        let detached_spawns = registry.matches(".spawn()").count();
+        assert_eq!(detached_spawns, 2, "agent detached spawn inventory drifted");
+        assert_eq!(
+            registry
+                .matches("agent_child_env::apply_to_command")
+                .count(),
+            detached_spawns,
+            "every detached spawn must apply the scrubbed child environment"
+        );
+
+        let pty_spawns = pty.matches(".spawn_command(").count();
+        assert_eq!(pty_spawns, 1, "agent PTY spawn inventory drifted");
+        assert_eq!(
+            pty.matches("sandbox_spawn::pty_command_for_plan(").count(),
+            pty_spawns,
+            "every PTY spawn must use the scrubbed command factory"
+        );
+        assert!(
+            sandbox.contains("agent_child_env::scrub_pty_command(&mut command)"),
+            "the PTY command factory no longer scrubs child credentials"
+        );
     }
 
     #[cfg(unix)]

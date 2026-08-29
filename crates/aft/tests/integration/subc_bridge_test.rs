@@ -5571,6 +5571,13 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
 
     let mut module_inventory = Vec::new();
     let hello = read_raw_inventory_frame(&mut stream, "ModuleHello").await;
+    let hello_body: ModuleHelloBody =
+        serde_json::from_slice(&hello.body).expect("decode ModuleHello body");
+    assert_eq!(
+        hello_body.launch_nonce.as_deref(),
+        Some("test-launch-nonce"),
+        "the module must retain its own supervised-spawn nonce for its bind"
+    );
     let hello_corr = hello.header.corr;
     module_inventory.push(hello);
     send_frame(

@@ -5534,10 +5534,10 @@ fn spawn_detached_child(
         )?;
         child_command
             .current_dir(workdir)
-            .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        crate::agent_child_env::apply_to_command(&mut child_command, env);
         crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
         let child = child_command
             .spawn()
@@ -5604,10 +5604,10 @@ fn spawn_detached_child(
                 let mut cmd =
                     detached_shell_command_for(shell.clone(), command, &paths.exit, paths, flags)?;
                 cmd.current_dir(workdir)
-                    .envs(env)
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr));
+                crate::agent_child_env::apply_to_command(&mut cmd, env);
                 match cmd.spawn() {
                     Ok(child) => {
                         if idx > 0 {

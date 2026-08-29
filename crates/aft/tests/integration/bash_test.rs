@@ -165,6 +165,88 @@ eval "$2"
 
 #[cfg(unix)]
 #[test]
+fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("storage");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&storage).unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("SUBC_MODULE_ID", std::ffi::OsStr::new("aft")),
+        (
+            "SUBC_LAUNCH_NONCE",
+            std::ffi::OsStr::new("synthetic-module-launch-nonce"),
+        ),
+        (
+            "SUBC_FUTURE_CREDENTIAL",
+            std::ffi::OsStr::new("synthetic-future-secret"),
+        ),
+    ]);
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "configure-subc-child-scrub",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "storage_dir": storage,
+            "config": user_config(serde_json::json!({
+                "bash": { "background": true },
+                "sandbox": { "enabled": false }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    for (id, background, pty) in [
+        ("subc-scrub-foreground", false, false),
+        ("subc-scrub-background", true, false),
+        ("subc-scrub-pty", true, true),
+    ] {
+        let leaked_environment = project.join(format!("{id}.env"));
+        let command = format!(
+            "/usr/bin/env | /usr/bin/grep '^SUBC_' > {}",
+            shell_quote_path(&leaked_environment)
+        );
+        let response = aft.send(
+            &serde_json::json!({
+                "id": id,
+                "method": "bash",
+                "params": {
+                    "command": command,
+                    "background": background,
+                    "pty": pty,
+                    "compressed": false,
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{id} spawn failed: {response:?}");
+        let terminal = wait_for_terminal_status(&mut aft, response["task_id"].as_str().unwrap());
+        assert_eq!(
+            terminal["status"], "failed",
+            "{id} found subc credentials instead of grep's no-match result: {terminal:?}"
+        );
+        assert_eq!(
+            terminal["exit_code"], 1,
+            "{id} did not produce grep's no-match exit: {terminal:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&leaked_environment).unwrap(),
+            "",
+            "{id} exposed the module's supervised-spawn credential"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
 fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");

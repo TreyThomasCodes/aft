@@ -312,6 +312,15 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
         ("DYLD_INSERT_LIBRARIES", OsStr::new(dyld_hook)),
         ("BASH_ENV", OsStr::new("/untrusted/bash-env")),
         ("AWS_SECRET_ACCESS_KEY", OsStr::new("ambient-cloud-secret")),
+        ("SUBC_MODULE_ID", OsStr::new("aft")),
+        (
+            "SUBC_LAUNCH_NONCE",
+            OsStr::new("synthetic-module-launch-nonce"),
+        ),
+        (
+            "SUBC_FUTURE_CREDENTIAL",
+            OsStr::new("synthetic-future-secret"),
+        ),
     ];
     let mut aft = AftProcess::spawn_with_env(&ambient);
     let configured = configure_native(&mut aft, &project, &storage, true);
@@ -319,7 +328,12 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
         configured["success"], true,
         "configure failed: {configured:?}"
     );
-    let request_env = json!({ "AFT_REQUEST_ENV_TEST": "request-value" });
+    let request_env = json!({
+        "AFT_REQUEST_ENV_TEST": "request-value",
+        "SUBC_MODULE_ID": "request-smuggled-module",
+        "SUBC_LAUNCH_NONCE": "request-smuggled-nonce",
+        "SUBC_REQUEST_CREDENTIAL": "request-smuggled-future-secret"
+    });
 
     let sandboxed = foreground_with_env(
         &mut aft,
@@ -337,6 +351,10 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
         "DYLD_INSERT_LIBRARIES",
         "BASH_ENV",
         "AWS_SECRET_ACCESS_KEY",
+        "SUBC_MODULE_ID",
+        "SUBC_LAUNCH_NONCE",
+        "SUBC_FUTURE_CREDENTIAL",
+        "SUBC_REQUEST_CREDENTIAL",
     ] {
         assert!(
             !sandboxed_output
@@ -368,11 +386,11 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
             "method": "bash",
             "session_id": "native-sandbox-session",
             "params": {
-                "command": "/usr/bin/env | /usr/bin/grep -E '^(HOME|TERM|AFT_REQUEST_ENV_TEST|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|AWS_SECRET_ACCESS_KEY)='",
+                "command": "/usr/bin/env | /usr/bin/grep -E '^(HOME|TERM|AFT_REQUEST_ENV_TEST|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|AWS_SECRET_ACCESS_KEY|SUBC_[^=]*)='",
                 "pty": true,
                 "permissions_requested": true,
                 "compressed": false,
-                "env": { "AFT_REQUEST_ENV_TEST": "request-value" },
+                "env": request_env.clone(),
             },
         })
         .to_string(),
@@ -389,6 +407,10 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
         "DYLD_INSERT_LIBRARIES",
         "BASH_ENV",
         "AWS_SECRET_ACCESS_KEY",
+        "SUBC_MODULE_ID",
+        "SUBC_LAUNCH_NONCE",
+        "SUBC_FUTURE_CREDENTIAL",
+        "SUBC_REQUEST_CREDENTIAL",
     ] {
         assert!(
             !pty_output
@@ -421,6 +443,12 @@ fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
         "unsandboxed env: {unsandboxed:?}"
     );
     let unsandboxed_output = unsandboxed["output"].as_str().unwrap_or_default();
+    assert!(
+        unsandboxed_output
+            .lines()
+            .all(|line| !line.starts_with("SUBC_")),
+        "sandbox-disabled child exposed module or request subc credentials: {unsandboxed_output}"
+    );
     for expected in [
         format!("LD_PRELOAD={loader_hook}"),
         "BASH_ENV=/untrusted/bash-env".to_string(),
