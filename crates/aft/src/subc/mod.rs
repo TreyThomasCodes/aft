@@ -162,6 +162,72 @@ use self::manifest::{
 };
 pub use self::wire::SubcError;
 
+/// Lifecycle milestones emitted only by the dedicated subc integration-test runner.
+///
+/// Production entry points never install a probe, so these notifications cannot
+/// affect routing or delivery behavior.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubcLifecycleEvent {
+    RouteDetached {
+        route_channel: u16,
+        route_epoch: u32,
+        session_id: String,
+    },
+    ReliableCompletionRetained {
+        task_id: String,
+        session_id: String,
+    },
+    ReliableCompletionReplayed {
+        route_channel: u16,
+        route_epoch: u32,
+        task_id: String,
+        session_id: String,
+    },
+}
+
+/// Test-only observer for the detach/rebind lifecycle.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SubcTestLifecycleProbe {
+    events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>,
+}
+
+impl SubcTestLifecycleProbe {
+    #[doc(hidden)]
+    pub fn new(events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>) -> Self {
+        Self { events_tx }
+    }
+
+    fn route_detached(&self, route: RouteChannel, session_id: &str) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::RouteDetached {
+            route_channel: route.channel,
+            route_epoch: route.epoch,
+            session_id: session_id.to_string(),
+        });
+    }
+
+    fn reliable_completion_retained(&self, task_id: &str, session_id: &str) {
+        let _ = self
+            .events_tx
+            .send(SubcLifecycleEvent::ReliableCompletionRetained {
+                task_id: task_id.to_string(),
+                session_id: session_id.to_string(),
+            });
+    }
+
+    fn reliable_completion_replayed(&self, route: RouteChannel, task_id: &str, session_id: &str) {
+        let _ = self
+            .events_tx
+            .send(SubcLifecycleEvent::ReliableCompletionReplayed {
+                route_channel: route.channel,
+                route_epoch: route.epoch,
+                task_id: task_id.to_string(),
+                session_id: session_id.to_string(),
+            });
+    }
+}
+
 /// Test-only view of the fail-closed tool-call gate: would `name` be admitted
 /// on a bound route (as an agent tool or native plumbing)? Used by the
 /// plugin-send drift guard in `subc_plumbing_drift_test.rs`.
@@ -2040,6 +2106,7 @@ async fn teardown_installed_route(
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     shutdown: &Arc<Notify>,
     tool_response_body_limit: usize,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     remove_installed_route(installed_route_epochs, channel);
     let bg_end_cause = match cancellation_reason {
@@ -2123,7 +2190,13 @@ async fn teardown_installed_route(
             }
         }
     }
+    // This test-only delay lets the lifecycle probe verify that a queued rebind
+    // cannot run before the route is removed and a completion is recorded for replay.
+    delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        if let Some(probe) = lifecycle_probe {
+            probe.route_detached(channel, &identity.session);
+        }
         let session_still_routed = routes
             .values()
             .any(|route| route.root == identity.root && route.session == identity.session);
@@ -2180,6 +2253,19 @@ async fn teardown_installed_route(
         log::debug!("subc attach: unbound route {} torn down", channel.channel);
     }
     Ok(())
+}
+
+async fn delay_route_detach_for_test(lifecycle_probe: Option<&SubcTestLifecycleProbe>) {
+    if lifecycle_probe.is_none() {
+        return;
+    }
+    let Some(delay) = std::env::var("AFT_TEST_SUBC_ROUTE_DETACH_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
 fn remember_session_identity(
@@ -2255,6 +2341,7 @@ pub fn run_subc_mode(
         user_config_path,
         false,
         MAX_FRAME_BODY_LEN as usize,
+        None,
     )
 }
 
@@ -2266,6 +2353,7 @@ fn run_subc_mode_inner(
     user_config_path: Option<PathBuf>,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2292,6 +2380,7 @@ fn run_subc_mode_inner(
             user_config_path,
             allow_native_passthrough,
             tool_response_body_limit,
+            lifecycle_probe,
         )
         .await
     });
@@ -2337,6 +2426,29 @@ pub fn run_subc_mode_for_test(
         user_config_path,
         true,
         MAX_FRAME_BODY_LEN as usize,
+        None,
+    )
+}
+
+/// Test-only entry that observes detach/rebind lifecycle milestones.
+#[doc(hidden)]
+pub fn run_subc_mode_for_test_with_lifecycle_probe(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    lifecycle_probe: SubcTestLifecycleProbe,
+) -> Result<(), SubcError> {
+    run_subc_mode_inner(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        true,
+        MAX_FRAME_BODY_LEN as usize,
+        Some(lifecycle_probe),
     )
 }
 
@@ -2360,6 +2472,7 @@ pub fn run_subc_mode_for_test_with_response_body_limit(
         user_config_path,
         true,
         tool_response_body_limit,
+        None,
     )
 }
 
@@ -2583,6 +2696,7 @@ async fn process_route_bind_completion(
     standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
     handle_route_bind_completion(
@@ -2599,6 +2713,7 @@ async fn process_route_bind_completion(
         standing_actor,
         shutdown,
         metrics,
+        lifecycle_probe,
     )
     .await
 }
@@ -2618,6 +2733,7 @@ async fn drain_pending_route_bind_completions(
     standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<usize, SubcError> {
     let mut drained = 0;
     while let Ok(completion) = control_completion_rx.try_recv() {
@@ -2635,6 +2751,7 @@ async fn drain_pending_route_bind_completions(
             standing_actor,
             shutdown,
             metrics,
+            lifecycle_probe,
         )
         .await?;
         drained += 1;
@@ -2655,6 +2772,7 @@ async fn run_module_loop<R, W>(
     user_config_path: Option<PathBuf>,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2833,6 +2951,7 @@ where
             &standing_actor,
             &shutdown,
             &dispatch_path_metrics,
+            lifecycle_probe.as_ref(),
         )
         .await
         {
@@ -2903,6 +3022,7 @@ where
                 &mut bg_wake_epoch,
                 &mut reliable_rx,
                 None,
+                lifecycle_probe.as_ref(),
             );
             if deferred {
                 tokio::task::yield_now().await;
@@ -2940,6 +3060,7 @@ where
                     &standing_actor,
                     &shutdown,
                     &dispatch_path_metrics,
+                    lifecycle_probe.as_ref(),
                 )
                 .await
                 {
@@ -3025,6 +3146,7 @@ where
                             &mut push_buffer,
                             &shutdown,
                             tool_response_body_limit,
+                            lifecycle_probe.as_ref(),
                         )
                         .await
                         {
@@ -3074,6 +3196,7 @@ where
                             &shutdown,
                             &control_completion_tx,
                             &dispatch_path_metrics,
+                            lifecycle_probe.as_ref(),
                             &health_rollup_cache,
                             &push_senders,
                             dispatch,
@@ -3200,6 +3323,7 @@ where
                     &mut bg_wake_epoch,
                     &mut reliable_rx,
                     Some((root_id, frame)),
+                    lifecycle_probe.as_ref(),
                 );
                 if deferred {
                     tokio::task::yield_now().await;
@@ -3223,6 +3347,7 @@ where
                     &mut bg_wake_epoch,
                     &mut reliable_rx,
                     None,
+                    lifecycle_probe.as_ref(),
                 );
                 if deferred {
                     tokio::task::yield_now().await;
@@ -3774,6 +3899,7 @@ async fn handle_route_bind_completion(
     standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     let route_id = completion.route;
     let Some(pending) = pending_binds.remove(&route_id) else {
@@ -3944,6 +4070,7 @@ async fn handle_route_bind_completion(
         push_buffer,
         &replay_key,
         bind_trust,
+        lifecycle_probe,
     );
     if replayed > 0 {
         log::debug!(
@@ -4050,6 +4177,7 @@ async fn handle_control_request(
     shutdown: &Arc<Notify>,
     control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
     health_rollup_cache: &HealthRollupCache,
     push_senders: &PushSenders,
     dispatch: DispatchFn,
@@ -4128,6 +4256,7 @@ async fn handle_control_request(
                     push_buffer,
                     shutdown,
                     tool_response_body_limit,
+                    lifecycle_probe,
                 )
                 .await?;
                 bind_root_id = Some(replacement_root);
@@ -8483,6 +8612,7 @@ mod tests {
             &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
+            None,
         )
         .await
         .unwrap();

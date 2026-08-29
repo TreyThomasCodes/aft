@@ -20,8 +20,9 @@ use aft::protocol::{
     Response, StatusChangedFrame,
 };
 use aft::subc::{
-    run_subc_mode, run_subc_mode_for_test, run_subc_mode_for_test_with_response_body_limit,
-    SubcError,
+    run_subc_mode, run_subc_mode_for_test, run_subc_mode_for_test_with_lifecycle_probe,
+    run_subc_mode_for_test_with_response_body_limit, SubcError, SubcLifecycleEvent,
+    SubcTestLifecycleProbe,
 };
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 use subc_transport::{authenticate_server, read_frame as read_subc_frame, write_frame};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
@@ -55,6 +57,7 @@ pub(super) struct FakeDaemonInput {
     pub(super) state: Arc<BridgeState>,
     pub(super) executor: Arc<Executor>,
     pub(super) user_config_path: std::path::PathBuf,
+    pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
 }
 
 struct InitialAttachInput {
@@ -75,6 +78,7 @@ pub(super) struct FakeDaemonSession {
     pub(super) callgraph_file: std::path::PathBuf,
     pub(super) state: Arc<BridgeState>,
     pub(super) executor: Arc<Executor>,
+    pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
 }
 
 #[derive(Default)]
@@ -1364,6 +1368,7 @@ fn run_subc_bridge_test_with_response_body_limit<F, Fut, A>(
         Some(response_body_limit),
         bridge_dispatch,
         bridge_executor_config(),
+        false,
     );
 }
 
@@ -1397,6 +1402,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         None,
         bridge_dispatch,
         bridge_executor_config(),
+        false,
     );
 }
 
@@ -1434,6 +1440,7 @@ fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
         None,
         dispatch,
         bridge_executor_config(),
+        false,
     );
 }
 
@@ -1458,6 +1465,32 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
         None,
         dispatch,
         bridge_executor_config(),
+        false,
+    );
+}
+
+pub(super) fn run_subc_bridge_test_with_dispatch_and_lifecycle_probe<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        None,
+        dispatch,
+        bridge_executor_config(),
+        true,
     );
 }
 
@@ -1483,6 +1516,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
         None,
         dispatch,
         executor_config,
+        false,
     );
 }
 
@@ -1497,6 +1531,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     response_body_limit: Option<usize>,
     dispatch: aft::subc::DispatchFn,
     executor_config: ExecutorConfig,
+    with_lifecycle_probe: bool,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1526,6 +1561,18 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let executor = Arc::new(Executor::with_config(executor_config));
     let executor_for_daemon = Arc::clone(&executor);
     let executor_for_check = Arc::clone(&executor);
+    let (lifecycle_probe, lifecycle_events): (
+        Option<SubcTestLifecycleProbe>,
+        Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
+    ) = if with_lifecycle_probe {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        (
+            Some(SubcTestLifecycleProbe::new(events_tx)),
+            Some(events_rx),
+        )
+    } else {
+        (None, None)
+    };
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
@@ -1580,6 +1627,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     state: daemon_state,
                     executor: executor_for_daemon,
                     user_config_path: user_config_path_for_daemon,
+                    lifecycle_events,
                 }),
             )
             .await
@@ -1600,7 +1648,18 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
             response_body_limit,
         )
     } else if allow_native_passthrough {
-        run_subc_mode_for_test(&conn_path, ctx, executor, dispatch, Some(user_config_path))
+        if let Some(lifecycle_probe) = lifecycle_probe {
+            run_subc_mode_for_test_with_lifecycle_probe(
+                &conn_path,
+                ctx,
+                executor,
+                dispatch,
+                Some(user_config_path),
+                lifecycle_probe,
+            )
+        } else {
+            run_subc_mode_for_test(&conn_path, ctx, executor, dispatch, Some(user_config_path))
+        }
     } else {
         run_subc_mode(&conn_path, ctx, executor, dispatch, Some(user_config_path))
     };
@@ -2998,6 +3057,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
         state,
         executor,
         user_config_path: _,
+        lifecycle_events,
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     authenticate_server(
@@ -3046,6 +3106,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
             callgraph_file,
             state,
             executor,
+            lifecycle_events,
         },
         hello_body,
     )

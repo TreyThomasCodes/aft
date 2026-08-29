@@ -544,6 +544,7 @@ pub(super) fn replay_buffered_push_frames(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: &ReplayKey,
     trust: BindTrust,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
     let mut sent = 0;
     let remove_empty;
@@ -558,7 +559,16 @@ pub(super) fn replay_buffered_push_frames(
                 continue;
             }
             match try_send_push_frame(writer_tx, metrics, channel, &frame) {
-                PushSendOutcome::Sent => sent += 1,
+                PushSendOutcome::Sent => {
+                    sent += 1;
+                    if let (Some(probe), Some(task_id), Some(session_id)) = (
+                        lifecycle_probe,
+                        completed_task_id(&frame),
+                        frame_session(&frame),
+                    ) {
+                        probe.reliable_completion_replayed(channel, task_id, session_id);
+                    }
+                }
                 PushSendOutcome::Backpressure => {
                     queue.push_front(frame);
                     break;
@@ -674,6 +684,7 @@ fn buffer_detached_reliable_push_frame(
     session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     root: &ProjectRootId,
     frame: &PushFrame,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
     let Some(session) = frame_session(frame) else {
         log::warn!(
@@ -688,6 +699,9 @@ fn buffer_detached_reliable_push_frame(
             return;
         }
         buffer_push_frame(push_buffer, key, frame.clone());
+        if let (Some(probe), Some(task_id)) = (lifecycle_probe, completed_task_id(frame)) {
+            probe.reliable_completion_retained(task_id, session);
+        }
     } else {
         log::warn!(
             "subc attach: dropping reliable Push for root {} session {} because no retained harness identity is known",
@@ -750,11 +764,18 @@ fn fan_out_reliable_push_frame(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     root: &ProjectRootId,
     frame: &PushFrame,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> FanOutResult {
     let matching_channels = matching_route_channels(routes, root_channels, root, frame);
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
-        buffer_detached_reliable_push_frame(push_buffer, session_identity, root, frame);
+        buffer_detached_reliable_push_frame(
+            push_buffer,
+            session_identity,
+            root,
+            frame,
+            lifecycle_probe,
+        );
         return FanOutResult::default();
     }
 
@@ -809,6 +830,7 @@ fn process_reliable_push_frame(
     completed_tasks: &mut CompletedTaskIds,
     root: ProjectRootId,
     frame: PushFrame,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Option<(ProjectRootId, String)> {
     let completed_bg_session = completed_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
@@ -824,6 +846,7 @@ fn process_reliable_push_frame(
         push_buffer,
         &root,
         &frame,
+        lifecycle_probe,
     );
     completed_bg_session
 }
@@ -868,6 +891,7 @@ fn process_reliable_push_and_arm_bg_wake(
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     root: ProjectRootId,
     frame: PushFrame,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
     if let Some((root, session)) = process_reliable_push_frame(
         writer_tx,
@@ -880,6 +904,7 @@ fn process_reliable_push_and_arm_bg_wake(
         completed_tasks,
         root,
         frame,
+        lifecycle_probe,
     ) {
         arm_completed_bg_wake(
             metrics,
@@ -907,6 +932,7 @@ pub(super) fn drain_reliable_push_turn(
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
     first: Option<PushEnvelope>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> (usize, bool) {
     let mut processed = 0;
 
@@ -925,6 +951,7 @@ pub(super) fn drain_reliable_push_turn(
             bg_wake_epoch,
             root,
             frame,
+            lifecycle_probe,
         );
         processed += 1;
     }
@@ -947,6 +974,7 @@ pub(super) fn drain_reliable_push_turn(
             bg_wake_epoch,
             root,
             frame,
+            lifecycle_probe,
         );
         processed += 1;
     }
@@ -1131,6 +1159,7 @@ mod tests {
             &mut bg_wake_epoch,
             &mut reliable_rx,
             Some(first),
+            None,
         );
 
         assert_eq!(processed, RELIABLE_PUSH_DRAIN_BUDGET);
@@ -1169,6 +1198,7 @@ mod tests {
             &mut bg_wake_epoch,
             &mut reliable_rx,
             Some(next_first),
+            None,
         );
         let mut deferred = Vec::new();
         while let Ok(frame) = writer_rx.try_recv() {
@@ -1243,6 +1273,7 @@ mod tests {
             &mut push_buffer,
             &root,
             &completion_frame_with_session("session-only", "session-1"),
+            None,
         );
         assert_eq!(
             session_result,
@@ -1348,6 +1379,7 @@ mod tests {
             &mut push_buffer,
             &key,
             BindTrust::FirstParty,
+            None,
         );
 
         assert_eq!(replayed, 2);
@@ -1382,6 +1414,7 @@ mod tests {
             &mut push_buffer,
             &key,
             BindTrust::Untrusted,
+            None,
         );
 
         assert_eq!(replayed, 0);
@@ -1702,6 +1735,7 @@ mod tests {
             &mut push_buffer,
             &root,
             &completion_frame("retry-task"),
+            None,
         );
 
         assert_eq!(
@@ -1768,6 +1802,7 @@ mod tests {
             &mut push_buffer,
             &root,
             &first,
+            None,
         );
         let queued = writer_rx.try_recv().expect("free writer capacity");
         assert_eq!(queued.header.ty, FrameType::Ping);
@@ -1782,6 +1817,7 @@ mod tests {
             &mut push_buffer,
             &root,
             &second,
+            None,
         );
         assert!(
             writer_rx.try_recv().is_err(),
@@ -1845,7 +1881,8 @@ mod tests {
                 route_key(4, 1),
                 &mut push_buffer,
                 &key,
-                BindTrust::FirstParty
+                BindTrust::FirstParty,
+                None
             ),
             1
         );
@@ -1868,7 +1905,8 @@ mod tests {
                 route_key(4, 1),
                 &mut push_buffer,
                 &key,
-                BindTrust::FirstParty
+                BindTrust::FirstParty,
+                None
             ),
             2
         );
@@ -1938,7 +1976,8 @@ mod tests {
                 route_key(4, 1),
                 &mut push_buffer,
                 &key,
-                BindTrust::FirstParty
+                BindTrust::FirstParty,
+                None
             ),
             0
         );

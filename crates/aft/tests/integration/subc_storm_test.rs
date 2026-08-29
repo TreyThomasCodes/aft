@@ -11,9 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aft::context::AppContext;
-use aft::executor::{ExecutorConfig, Lane};
+use aft::executor::{Executor, ExecutorConfig, Lane};
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{ProgressFrame, ProgressKind, PushFrame, RawRequest, Response};
+use aft::subc::SubcLifecycleEvent;
 use aft::watcher_filter::{
     run_watcher_thread, watcher_dispatch_channel, WatcherDispatchEvent, WatcherFilterConfig,
     WatcherThreadHandle,
@@ -1037,7 +1038,7 @@ fn subc_storm_slow_config_read_does_not_delay_bind_ack() {
 
 #[test]
 fn subc_storm_detach_rebind_replays_completion_and_preserves_bash_task() {
-    subc_bridge_test::run_subc_bridge_test_with_dispatch(
+    subc_bridge_test::run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
         "subc_storm_detach_rebind_replays_completion_and_preserves_bash_task",
         Duration::from_secs(45),
         drive_detach_rebind_daemon,
@@ -1739,20 +1740,31 @@ async fn drive_slow_config_read_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
+    // The lifecycle probe enables the route-detach delay only for this test
+    // scenario. It makes an eager rebind race ahead of recording a completion
+    // for replay, so the awaited events verify ordering without transport timing.
+    let _detach_delay = EnvGuard::set("AFT_TEST_SUBC_ROUTE_DETACH_DELAY_MS", "200");
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let root = session.root1.clone();
     let state = Arc::clone(&session.state);
+    let executor = Arc::clone(&session.executor);
+    let mut lifecycle_events = session
+        .lifecycle_events
+        .expect("detach/rebind lifecycle probe installed");
     let (tx, mut rx) = start_io(session.stream);
-    let (_dirs, roots) = create_storm_roots(1);
     let mut corr = 3_000_u64;
+    const SESSION: &str = "restart-session";
+    const RELIABLE_TASK: &str = "restart-reliable-completion";
+
     send_bind(
         &tx,
         1,
         corr,
-        &roots[0],
-        "restart-session",
+        &root,
+        SESSION,
         storm_project_config(false, false, false, 0),
     );
-    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    expect_ack_or_watchdog(&mut rx, corr).await;
 
     corr += 1;
     send_tool(
@@ -1762,78 +1774,61 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
         "bash",
         json!({ "command": "sleep 1; printf storm-task-done", "background": true, "timeout": 10_000 }),
     );
-    let launch = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    let launch = expect_tool_response_or_watchdog(&mut rx, corr).await;
     let task_id = launch["task_id"].as_str().expect("task_id").to_string();
 
     corr += 1;
-    let reliable_task = "restart-reliable-completion";
     send_tool(
         &tx,
         1,
         corr,
         "subc_test_defer_bash_completed",
-        json!({ "task_id": reliable_task, "session_id": "restart-session" }),
+        json!({ "task_id": RELIABLE_TASK, "session_id": SESSION }),
     );
-    expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
+    expect_tool_response_or_watchdog(&mut rx, corr).await;
     send_route_goodbye(&tx, 1, corr + 10);
+    expect_lifecycle_event(
+        &mut lifecycle_events,
+        SubcLifecycleEvent::RouteDetached {
+            route_channel: 1,
+            route_epoch: 1,
+            session_id: SESSION.to_string(),
+        },
+    )
+    .await;
+
     state.release_deferred_pushes();
+    expect_lifecycle_event(
+        &mut lifecycle_events,
+        SubcLifecycleEvent::ReliableCompletionRetained {
+            task_id: RELIABLE_TASK.to_string(),
+            session_id: SESSION.to_string(),
+        },
+    )
+    .await;
+
     corr += 20;
     send_bind(
         &tx,
         2,
         corr,
-        &roots[0],
-        "restart-session",
+        &root,
+        SESSION,
         storm_project_config(false, false, false, 0),
     );
-    let deadline = Instant::now() + TOOL_BOUND;
-    let mut saw_ack = false;
-    let mut saw_replay = false;
-    while Instant::now() < deadline && !(saw_ack && saw_replay) {
-        let frame = read_frame_from_rx(&mut rx, TOOL_BOUND, "rebind replay").await;
-        if is_ack(&frame, corr) {
-            saw_ack = true;
-        } else if frame.header.ty == FrameType::Push
-            && push_task_id(&frame).as_deref() == Some(reliable_task)
-        {
-            saw_replay = true;
-        }
-    }
-    assert!(saw_ack, "rebind ack missing");
-    assert!(
-        saw_replay,
-        "reliable completion was not replayed after rebind"
-    );
+    expect_ack_or_watchdog(&mut rx, corr).await;
+    expect_lifecycle_event(
+        &mut lifecycle_events,
+        SubcLifecycleEvent::ReliableCompletionReplayed {
+            route_channel: 2,
+            route_epoch: 1,
+            task_id: RELIABLE_TASK.to_string(),
+            session_id: SESSION.to_string(),
+        },
+    )
+    .await;
 
-    corr += 1;
-    send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
-    let status = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
-    assert!(
-        status["status"].as_str().is_some(),
-        "detached background task status should be recoverable after rebind: {status:?}"
-    );
-    // Poll to terminal instead of a fixed post-sleep wait: a contended
-    // Windows CI runner can take several times the task's nominal 1s
-    // (detached wrapper spawn + scheduling), and fixed waits are the exact
-    // flake class the Windows integration rules ban.
-    let terminal_deadline = Instant::now() + Duration::from_secs(15);
-    let mut final_status = json!(null);
-    loop {
-        corr += 1;
-        send_tool(&tx, 2, corr, "bash_status", json!({ "task_id": task_id }));
-        final_status = expect_tool_response(&mut rx, corr, TOOL_BOUND).await;
-        if matches!(
-            final_status["status"].as_str(),
-            Some("completed") | Some("exited")
-        ) {
-            break;
-        }
-        assert!(
-            Instant::now() < terminal_deadline,
-            "detached background task should finish before the test leaves it behind: {final_status:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+    wait_for_registered_bash_task(&executor, &root, &task_id, SESSION).await;
     send_goodbye_and_wait(&tx).await;
 }
 
@@ -2854,6 +2849,90 @@ fn assert_bind_stats(latencies: &[Duration]) {
         max <= BIND_ACK_BOUND,
         "max bind latency {max:?} exceeded {BIND_ACK_BOUND:?}; p99={p99:?}"
     );
+}
+
+async fn expect_lifecycle_event(
+    events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
+    expected: SubcLifecycleEvent,
+) {
+    let actual = events
+        .recv()
+        .await
+        .expect("detach/rebind lifecycle probe closed");
+    assert_eq!(actual, expected, "unexpected detach/rebind lifecycle event");
+}
+
+async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
+    loop {
+        let frame = rx.recv().await.expect("EOF waiting for RouteBindAck");
+        if is_ack(&frame, corr) {
+            return;
+        }
+    }
+}
+
+async fn expect_tool_response_or_watchdog(
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    corr: u64,
+) -> Value {
+    loop {
+        let frame = rx.recv().await.expect("EOF waiting for tool response");
+        if frame.header.corr != corr {
+            continue;
+        }
+        if frame.header.ty == FrameType::Error {
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool error body");
+            panic!("tool corr {corr} returned error frame: {body:?}");
+        }
+        if frame.header.ty == FrameType::Response {
+            let body: Value = serde_json::from_slice(&frame.body).expect("tool body");
+            assert_ne!(
+                body.get("isError").and_then(Value::as_bool),
+                Some(true),
+                "tool failed: {body:?}"
+            );
+            return body.get("structuredContent").cloned().unwrap_or(body);
+        }
+    }
+}
+
+async fn wait_for_registered_bash_task(
+    executor: &Executor,
+    root: &Path,
+    task_id: &str,
+    session_id: &str,
+) {
+    let root_id = ProjectRootId::from_path(root).expect("bound restart root id");
+    loop {
+        let ctx = executor
+            .actor_context(&root_id)
+            .expect("rebound route retains its actor context");
+        let storage_dir = ctx.config().storage_dir.clone();
+        let snapshot = ctx
+            .bash_background()
+            .status(
+                task_id,
+                session_id,
+                Some(root),
+                storage_dir.as_deref(),
+                2_048,
+            )
+            .expect("background task remains registered after rebind");
+        if snapshot.info.status.is_terminal() {
+            assert_eq!(
+                snapshot.info.status,
+                aft::bash_background::BgTaskStatus::Completed,
+                "detached background task should complete successfully: {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.exit_code,
+                Some(0),
+                "detached background task should preserve its successful exit: {snapshot:?}"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn expect_ack_within(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64, bound: Duration) {
