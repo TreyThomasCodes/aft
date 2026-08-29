@@ -71,8 +71,8 @@
     },
     {
       "path": "crates/aft/src/commands/apply_patch.rs",
-      "location": "line 812, column 18",
-      "line": 812,
+      "location": "line 884, column 18",
+      "line": 884,
       "column": 18,
       "token": "filePath",
       "class": "rust-compatibility",
