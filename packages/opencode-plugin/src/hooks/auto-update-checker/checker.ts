@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getOpenCodeCacheRoot } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
@@ -197,7 +197,7 @@ export function getCachedVersion(spec?: string | null): string | null {
     getCurrentRuntimePackageJsonPath(),
     spec ? getSpecCachePackageJsonPath(spec) : null,
     getSpecCachePackageJsonPath(`${PACKAGE_NAME}@latest`),
-    join(homedir(), ".cache", "opencode", "node_modules", PACKAGE_NAME, "package.json"),
+    join(getOpenCodeCacheRoot(), "node_modules", PACKAGE_NAME, "package.json"),
   ].filter(isString);
 
   for (const packageJsonPath of candidates) {

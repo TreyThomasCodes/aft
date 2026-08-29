@@ -7,6 +7,8 @@ import {
   getAftCacheRoot,
   getAftLspBinariesDir,
   getAftLspPackagesDir,
+  getOpenCodeCacheRoot,
+  getOpenCodeConfigRoot,
 } from "../cache-paths.js";
 import { getCacheDir } from "../downloader.js";
 
@@ -19,6 +21,24 @@ function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
     if (descriptor) Object.defineProperty(process, "platform", descriptor);
   }
 }
+
+describe("shared OpenCode xdg paths", () => {
+  test("uses XDG roots on every platform and falls back to the home dot directories", () => {
+    const platforms: NodeJS.Platform[] = ["linux", "darwin", "win32"];
+    for (const platform of platforms) {
+      withPlatform(platform, () => {
+        const xdgEnv = {
+          XDG_CACHE_HOME: "/tmp/xdg-cache",
+          XDG_CONFIG_HOME: "/tmp/xdg-config",
+        };
+        expect(getOpenCodeCacheRoot(xdgEnv, "/tmp/home")).toBe("/tmp/xdg-cache/opencode");
+        expect(getOpenCodeConfigRoot(xdgEnv, "/tmp/home")).toBe("/tmp/xdg-config/opencode");
+        expect(getOpenCodeCacheRoot({}, "/tmp/home")).toBe("/tmp/home/.cache/opencode");
+        expect(getOpenCodeConfigRoot({}, "/tmp/home")).toBe("/tmp/home/.config/opencode");
+      });
+    }
+  });
+});
 
 describe("shared AFT cache paths", () => {
   test("uses one controlled root for the binary and both LSP subdirectories", () => {

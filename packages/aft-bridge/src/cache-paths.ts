@@ -10,8 +10,29 @@ interface CacheEnvironment {
   HOME?: string;
 }
 
+/** Environment values used by OpenCode's xdg-basedir path resolution. */
+export interface OpenCodePathEnvironment {
+  XDG_CACHE_HOME?: string;
+  XDG_CONFIG_HOME?: string;
+}
+
 function homeDir(env: CacheEnvironment): string {
   return (process.platform === "win32" ? env.USERPROFILE || env.HOME : env.HOME) || homedir();
+}
+
+/** Resolve OpenCode's cache root using xdg-basedir semantics on every OS. */
+export function getOpenCodeCacheRoot(
+  env: OpenCodePathEnvironment = process.env,
+  home = homedir(),
+): string {
+  return join(env.XDG_CACHE_HOME || join(home, ".cache"), "opencode");
+}
+
+export function getOpenCodeConfigRoot(
+  env: OpenCodePathEnvironment = process.env,
+  home = homedir(),
+): string {
+  return join(env.XDG_CONFIG_HOME || join(home, ".config"), "opencode");
 }
 
 /**
