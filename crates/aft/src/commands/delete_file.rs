@@ -124,36 +124,10 @@ fn delete_one_or_dir(
     recursive: bool,
     op_id: &str,
 ) -> Result<serde_json::Value, Response> {
-    let requested_path = Path::new(file);
-    if is_symlink(requested_path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to inspect '{}': {}", file, e),
-        )
-    })? {
-        return Err(Response::error(
-            &req.id,
-            "invalid_request",
-            format!(
-                "delete_file: refusing to delete symlink '{}'; symlink undo is not supported",
-                file
-            ),
-        ));
-    }
-
-    let path = match ctx.validate_path(&req.id, requested_path) {
+    let path = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return Err(resp),
     };
-
-    if !path.exists() {
-        return Err(Response::error(
-            &req.id,
-            "file_not_found",
-            format!("delete_file: file not found: {}", file),
-        ));
-    }
 
     if is_symlink(&path).map_err(|e| {
         Response::error(
@@ -169,6 +143,14 @@ fn delete_one_or_dir(
                 "delete_file: refusing to delete symlink '{}'; symlink undo is not supported",
                 file
             ),
+        ));
+    }
+
+    if !path.exists() {
+        return Err(Response::error(
+            &req.id,
+            "file_not_found",
+            format!("delete_file: file not found: {}", file),
         ));
     }
 

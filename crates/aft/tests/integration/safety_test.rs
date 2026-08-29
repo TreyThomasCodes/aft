@@ -739,6 +739,45 @@ fn symlink_file_delete_is_rejected_with_project_restriction() {
 
 #[cfg(unix)]
 #[test]
+fn relative_symlink_file_delete_is_rejected_with_project_restriction() {
+    let dir = temp_dir("delete_relative_symlink_restricted");
+    let target = dir.join("target.txt");
+    let symlink = dir.join("target-link.txt");
+
+    fs::write(&target, "target content").unwrap();
+    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_restricted(&mut aft, &dir, "cfg-delete-relative-symlink");
+
+    let delete = serde_json::json!({
+        "id": "delete-relative-symlink-restricted",
+        "command": "delete_file",
+        "file": "target-link.txt",
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
+    assert_eq!(resp["code"], "invalid_request");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("refusing to delete symlink"),
+        "message should explain symlink rejection: {resp:?}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&symlink).is_ok(),
+        "symlink should remain intact"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
 fn symlink_to_outside_file_blocks_recursive_delete() {
     let dir = temp_dir("delete_recursive_blocks_file_symlink");
     let target_dir = temp_dir("delete_recursive_blocks_file_symlink_target");
