@@ -8,6 +8,17 @@ type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activ
 
 export const BASH_WAIT_DETACH_MAGIC_KEYWORD = "&detach";
 const EMPTY_DETACH_MESSAGE = "(requested background detach)";
+const STANDALONE_DETACH_KEYWORD_SOURCE = `(^|[^\\p{L}\\p{N}_])${BASH_WAIT_DETACH_MAGIC_KEYWORD}(?![\\p{L}\\p{N}_])`;
+const STANDALONE_DETACH_KEYWORD_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "u");
+const STANDALONE_DETACH_KEYWORDS_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "gu");
+
+function containsStandaloneDetachKeyword(messageText: string): boolean {
+  return STANDALONE_DETACH_KEYWORD_PATTERN.test(messageText);
+}
+
+function stripStandaloneDetachKeywords(messageText: string): string {
+  return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");
+}
 
 type UserTextPart = { type?: unknown; text?: unknown; synthetic?: unknown; ignored?: unknown };
 
@@ -38,10 +49,10 @@ export function extractUserMessageText(output: unknown): string {
 export function stripUserMessageDetachKeyword(output: unknown): string {
   const parts = userTextParts(output);
   const original = parts.map((part) => part.text).join("\n");
-  if (!original.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)) return original;
+  if (!containsStandaloneDetachKeyword(original)) return original;
 
   const stripped = parts
-    .map((part) => part.text.replaceAll(BASH_WAIT_DETACH_MAGIC_KEYWORD, ""))
+    .map((part) => stripStandaloneDetachKeywords(part.text))
     .map((text) => text.replace(/[ \t]{2,}/g, " "));
   if (stripped.join("\n").trim() === "") {
     if (parts[0]) parts[0].text = EMPTY_DETACH_MESSAGE;
@@ -61,8 +72,7 @@ export function stripUserMessageDetachKeyword(output: unknown): string {
  */
 export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText: string): boolean {
   return (
-    resolveBashConfig(config).detach_on_user_message ||
-    messageText.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)
+    resolveBashConfig(config).detach_on_user_message || containsStandaloneDetachKeyword(messageText)
   );
 }
 

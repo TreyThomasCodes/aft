@@ -256,6 +256,41 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
 }
 
 #[test]
+fn inspect_engine_blocking_deadline_outlives_soft_deadline_for_cold_scan() {
+    let (_temp_dir, root, _file) = fixture_project();
+    let inspect_dir = root.join(".aft-cache").join("inspect");
+    let worker_count = Arc::new(AtomicUsize::new(0));
+    let manager = InspectManager::with_worker(
+        test_worker(Arc::clone(&worker_count), Duration::from_millis(100), 11),
+        Duration::from_millis(1),
+    );
+    let snapshot = snapshot(&root, &inspect_dir);
+    let scope = JobScope::for_project(root.clone());
+
+    let soft_outcome =
+        manager.submit_category(snapshot.clone(), InspectCategory::Metrics, scope.clone());
+    assert!(matches!(
+        soft_outcome,
+        JobOutcome::Pending { in_flight: true }
+    ));
+
+    let blocking_outcome = manager.submit_category_until(
+        snapshot,
+        InspectCategory::Metrics,
+        scope,
+        Instant::now() + Duration::from_secs(10),
+    );
+
+    assert!(matches!(blocking_outcome, JobOutcome::Fresh { .. }));
+    assert_eq!(blocking_outcome.payload().unwrap()["count"], 11);
+    assert_eq!(
+        worker_count.load(Ordering::SeqCst),
+        1,
+        "the blocking waiter must attach to the cold scan that exceeded the soft deadline"
+    );
+}
+
+#[test]
 fn inspect_engine_roots_share_bounded_named_thread_pool() {
     let (_first_temp, first_root, _first_file) = fixture_project();
     let (_second_temp, second_root, _second_file) = fixture_project();

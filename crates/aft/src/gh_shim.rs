@@ -44,7 +44,13 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
-const V10_ADMIN_TUPLES: &[&str] = &["workflow run"];
+// These v10 tuples are explicitly reviewed for the operator-only bypass and
+// still require a matching signed manifest declaration. A rerun is
+// administration rather than governed bot speech: it has no public attribution
+// surface, while granting speech Apps actions:write would widen the compromise
+// surface. `run cancel` remains deliberately absent because it is destructive
+// and rarely needed, so the operator bypass cannot enable it by accident.
+const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
 // The v10 manifest version is the first version whose code-side allowlist
 // permits these native comment mutations. The allowlist covers only the exact
 // flag variants below and does not broaden raw API writes.
@@ -1235,7 +1241,13 @@ enum TupleDecl {
         platform: Vec<String>,
         #[serde(default)]
         api_match: Option<String>,
-        #[serde(default)]
+        // Signed manifests key this prose as `reasoning` (v10 rows). Without the
+        // alias the parse silently DROPPED all signed justification text - the
+        // signature verifies the raw bytes first, then serde discarded the
+        // unknown field, so every cache-derived view showed rationale: null
+        // while the signed artifact carried the prose (found by CKCRED's
+        // structural diff during the v11 ceremony).
+        #[serde(default, alias = "reasoning")]
         rationale: Option<String>,
     },
 }
@@ -3747,6 +3759,70 @@ mod tests {
     }
 
     #[test]
+    fn v10_run_rerun_is_flag_tolerant_and_run_cancel_stays_out_of_bypass_set() {
+        let mut manifest = v10_fixture_manifest();
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v10 admin tier");
+        for tuple in ["run rerun", "run cancel"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
+        manifest.validate().expect("valid v10 admin extensions");
+
+        for args in [
+            vec![
+                OsString::from("run"),
+                OsString::from("rerun"),
+                OsString::from("123"),
+                OsString::from("--failed"),
+            ],
+            vec![
+                OsString::from("run"),
+                OsString::from("rerun"),
+                OsString::from("123"),
+                OsString::from("--job"),
+                OsString::from("17"),
+            ],
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { tuple } if tuple == "run rerun"
+            ));
+        }
+        assert!(is_reviewed_admin_tuple(10, "run rerun"));
+        assert!(!is_reviewed_admin_tuple(9, "run rerun"));
+        let mut v9_manifest = manifest.clone();
+        v9_manifest.manifest_version = 9;
+        let v9_rerun = [
+            OsString::from("run"),
+            OsString::from("rerun"),
+            OsString::from("123"),
+            OsString::from("--failed"),
+        ];
+        assert!(matches!(
+            classify(&v9_rerun, &v9_manifest, "macos"),
+            Classification::Unclassified
+        ));
+
+        let run_cancel = [
+            OsString::from("run"),
+            OsString::from("cancel"),
+            OsString::from("123"),
+        ];
+        assert!(!is_reviewed_admin_tuple(10, "run cancel"));
+        assert!(matches!(
+            classify(&run_cancel, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
     fn v10_edit_last_comment_variants_are_exactly_governed_and_author_scoped() {
         let manifest = v10_fixture_manifest();
         manifest.validate().expect("valid v10 manifest");
@@ -3963,6 +4039,49 @@ mod tests {
                 "holder refusal code must pass through without remapping"
             );
         }
+    }
+
+    /// Signed v10 manifests key in-row prose as `reasoning`. This test pins the
+    /// exact signed row shape through parse AND a full parse->serialize->parse
+    /// round trip, so a field rename can never again silently drop signed
+    /// justification text. Mutation control: removing the `reasoning` alias on
+    /// `TupleDecl::Details::rationale` must turn this test red by name.
+    #[test]
+    fn signed_v10_reasoning_prose_survives_parse_and_cache_round_trip() {
+        // Byte shape lifted from the signed v10 artifact (admin tier row).
+        let signed_row = r#"{
+            "tuple": "workflow run",
+            "platform": ["macos", "linux"],
+            "reasoning": "Administration: dispatching a workflow runs code but carries no public attribution surface; operator identity under explicit bypass."
+        }"#;
+        let parsed: TupleDecl = serde_json::from_str(signed_row).expect("signed row parses");
+        let TupleDecl::Details { rationale, .. } = &parsed else {
+            panic!("signed row must parse as a detailed declaration");
+        };
+        let prose = rationale
+            .as_deref()
+            .expect("signed `reasoning` prose must survive the parse, not default to None");
+        assert!(
+            prose.starts_with("Administration:"),
+            "prose intact: {prose}"
+        );
+
+        // The cache view is a re-serialization of the parsed struct; the prose
+        // must survive that full round trip too (this is the view that showed
+        // rationale: null for every signed row before the alias existed).
+        let cache_bytes = serde_json::to_string(&parsed).expect("cache serialization");
+        let reparsed: TupleDecl = serde_json::from_str(&cache_bytes).expect("cache view reparses");
+        let TupleDecl::Details {
+            rationale: cached, ..
+        } = &reparsed
+        else {
+            panic!("cache view must stay a detailed declaration");
+        };
+        assert_eq!(
+            cached.as_deref(),
+            Some(prose),
+            "prose must survive the parse->serialize->parse cache round trip verbatim"
+        );
     }
 
     #[test]

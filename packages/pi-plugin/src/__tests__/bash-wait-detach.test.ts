@@ -29,4 +29,28 @@ describe("bash wait detach helper (Pi)", () => {
       "before middle after",
     );
   });
+
+  test("recognizes standalone tokens at message boundaries", () => {
+    const config = { bash: { detach_on_user_message: false } };
+
+    expect(shouldDetachBashWaitOnUserMessage(config, "&detach, continue")).toBe(true);
+    expect(shouldDetachBashWaitOnUserMessage(config, "continue &detach")).toBe(true);
+    expect(stripUserMessageDetachKeyword("&detach, continue")).toBe(", continue");
+    expect(stripUserMessageDetachKeyword("continue &detach")).toBe("continue ");
+  });
+
+  test("does not detach or strip when the keyword is part of an identifier", () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const messages = [
+      "Please document &detachment behavior",
+      "keep before&detach unchanged",
+      "keep &detach_mode unchanged",
+      "keep &detaché unchanged",
+    ];
+
+    for (const message of messages) {
+      expect(shouldDetachBashWaitOnUserMessage(config, message)).toBe(false);
+      expect(stripUserMessageDetachKeyword(message)).toBe(message);
+    }
+  });
 });

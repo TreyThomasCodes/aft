@@ -686,12 +686,43 @@ impl InspectManager {
         self.submit_category_with_callgraph(snapshot, category, caller_scope, None)
     }
 
+    /// Wait for a category until the caller's absolute deadline instead of the
+    /// manager's short soft deadline. Blocking inspect uses this path because a
+    /// cold scan can sit behind parse-heavy Tier-2 work in the shared pool.
+    #[doc(hidden)]
+    pub fn submit_category_until(
+        &self,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+        deadline: Instant,
+    ) -> JobOutcome {
+        self.submit_category_with_callgraph_until(snapshot, category, caller_scope, None, deadline)
+    }
+
     pub fn submit_category_with_callgraph(
         &self,
         snapshot: InspectSnapshot,
         category: InspectCategory,
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
+    ) -> JobOutcome {
+        self.submit_category_with_callgraph_until(
+            snapshot,
+            category,
+            caller_scope,
+            callgraph_snapshot,
+            Instant::now() + self.soft_deadline,
+        )
+    }
+
+    fn submit_category_with_callgraph_until(
+        &self,
+        snapshot: InspectSnapshot,
+        category: InspectCategory,
+        caller_scope: JobScope,
+        callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
+        deadline: Instant,
     ) -> JobOutcome {
         if !category.is_active() {
             return JobOutcome::Failed {
@@ -720,7 +751,9 @@ impl InspectManager {
             waiter_tx,
             callgraph_snapshot,
         ) {
-            Ok(()) => self.wait_for_outcome(key, caller_scope, cache, waiter_rx, wait_snapshot),
+            Ok(()) => {
+                self.wait_for_outcome(key, caller_scope, cache, waiter_rx, wait_snapshot, deadline)
+            }
             Err(message) => JobOutcome::Failed { message },
         }
     }
@@ -2376,8 +2409,9 @@ impl InspectManager {
         cache: Arc<InspectCache>,
         waiter_rx: Receiver<JobOutcome>,
         snapshot: InspectSnapshot,
+        deadline: Instant,
     ) -> JobOutcome {
-        let timeout = after(self.soft_deadline);
+        let timeout = after(deadline.saturating_duration_since(Instant::now()));
         let result_rx = self.result_rx.clone();
         loop {
             select! {

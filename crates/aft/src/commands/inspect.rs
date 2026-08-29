@@ -295,6 +295,8 @@ fn handle_inspect_payload(
     }
 
     let manager = ctx.inspect_manager();
+    let blocking_tier1_deadline =
+        phase_log.map(|_| Instant::now() + diagnostics_phase_timeout(snapshot.config.as_ref()));
     let mut tier2_receivers = BTreeMap::new();
     for category in InspectCategory::active()
         .iter()
@@ -385,6 +387,8 @@ fn handle_inspect_payload(
                 // stat-verification path proves that artifact is still current.
                 manager.tier2_read_cached_readonly(snapshot.clone(), *category, scope.clone())
             }
+        } else if let Some(deadline) = blocking_tier1_deadline {
+            manager.submit_category_until(snapshot.clone(), *category, scope.clone(), deadline)
         } else {
             manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };

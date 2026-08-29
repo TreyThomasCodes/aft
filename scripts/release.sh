@@ -218,13 +218,19 @@ cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fm
 # dead tag and a full re-cut. The v0.49.0 release burned eight tag attempts on
 # exactly this class before the checks moved here.
 #
-# Only run when the gate script for the current release line exists: the gates
-# are version-scoped artifacts (release-gate-vNNN.mjs), so a later release line
-# without one skips this block instead of failing.
+# Prefer a gate dedicated to the current release line. The v0.49 gate is also
+# the shared surface-generation gate for later 0.x releases, matching the
+# release workflow's publish-time verification, so use it when no newer gate
+# script exists instead of silently skipping the preflight.
 release_line="$(printf '%s' "$VERSION" | cut -d. -f1,2)"
 line_slug="v${release_line//./}"
 gate_script="scripts/release-gate-${line_slug}.mjs"
 audit_script="scripts/audit-${line_slug}-agent-surface.ts"
+if [[ ! -f "$gate_script" && -f "scripts/release-gate-v049.mjs" ]]; then
+  line_slug="v049"
+  gate_script="scripts/release-gate-v049.mjs"
+  audit_script="scripts/audit-v049-agent-surface.ts"
+fi
 if [[ -f "$gate_script" ]]; then
   echo "  agent surface audit..."
   bun "$audit_script" >/dev/null 2>&1 || {
@@ -257,9 +263,19 @@ if [[ -f "$gate_script" ]]; then
       echo "  ↳ run: node $gate_script --stage --evidence-output $evidence_file"
       exit 1
     }
-    if ! git diff --quiet -- "$evidence_file"; then
+    evidence_source_commit="$(node -e '
+      const fs = require("node:fs");
+      const evidence = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(evidence.source_commit ?? "");
+    ' "$evidence_file")"
+    if [[ -z "$evidence_source_commit" ]]; then
+      echo "Error: activation evidence has no source commit"
+      exit 1
+    fi
+    echo "    ✓ evidence source commit: $evidence_source_commit"
+    if [[ -n "$(git status --porcelain -- "$evidence_file")" ]]; then
       git add "$evidence_file"
-      git commit -q -m "docs: restage ${line_slug} activation evidence for v${VERSION}"
+      git commit -q -m "Restage activation evidence for v${VERSION}"
       echo "  ↳ evidence was stale; restaged and committed"
     fi
     node "$gate_script" --candidate --evidence "$evidence_file" >/dev/null 2>&1 || {
