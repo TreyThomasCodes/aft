@@ -742,11 +742,17 @@ mod tests {
 
     #[test]
     fn agent_process_creation_sites_cannot_bypass_the_child_environment_funnel() {
-        let registry = include_str!("bash_background/registry.rs")
+        // Normalize line endings first: Windows checkouts materialize these
+        // sources with CRLF, and a split marker containing a bare \n would
+        // silently never match there - leaving the test half in the counted
+        // text and failing the inventory with test-code spawn sites.
+        let registry_source = include_str!("bash_background/registry.rs").replace("\r\n", "\n");
+        let registry = registry_source
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        let pty = include_str!("bash_background/pty_process.rs")
+        let pty_source = include_str!("bash_background/pty_process.rs").replace("\r\n", "\n");
+        let pty = pty_source
             .split("// Every test in this module")
             .next()
             .unwrap();
