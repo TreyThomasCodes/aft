@@ -2297,6 +2297,7 @@ struct DiskProjectIndex<'a> {
     caller_file: &'a str,
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
+    module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
 }
 
 impl DiskProjectIndex<'_> {
@@ -2440,8 +2441,12 @@ impl DiskProjectIndex<'_> {
 
     fn disk_module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
         let caller_dir = self.project_root.join(caller_file).parent()?.to_path_buf();
-        let candidate = callgraph::resolve_module_path(&caller_dir, module_path)?;
-        let rel_path = relative_path(self.project_root, &canonicalize_path(&candidate));
+        let candidate = callgraph::resolve_module_path_with_memo(
+            &caller_dir,
+            module_path,
+            self.module_resolution_memo,
+        )?;
+        let rel_path = relative_path(self.project_root, &candidate);
         self.contains_file(&rel_path).then_some(rel_path)
     }
 }
@@ -3447,6 +3452,39 @@ impl CallGraphStore {
         chunk_size: usize,
         corpus_fingerprint: &str,
     ) -> Result<ColdBuildStats> {
+        let module_resolution_memo = callgraph::ModuleResolutionMemo::default();
+        self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+            chunk_size,
+            corpus_fingerprint,
+            COLD_BUILD_RESOLVE_WINDOW,
+            &module_resolution_memo,
+        )
+    }
+
+    #[cfg(test)]
+    fn cold_build_chunked_with_resolution_memo_for_test(
+        &self,
+        files: &[PathBuf],
+        chunk_size: usize,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+    ) -> Result<ColdBuildStats> {
+        let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
+        self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+            chunk_size,
+            &corpus_fingerprint,
+            resolve_window.max(1),
+            module_resolution_memo,
+        )
+    }
+
+    fn cold_build_chunked_from_staged_inventory_with_resolution_memo(
+        &self,
+        chunk_size: usize,
+        corpus_fingerprint: &str,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+    ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
@@ -3566,7 +3604,7 @@ impl CallGraphStore {
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
         let mut resolve_cursor = staged_u64(&conn, STAGED_RESOLVE_CURSOR)?;
         loop {
-            let staged = load_staged_ref_window(&conn, resolve_cursor, COLD_BUILD_RESOLVE_WINDOW)?;
+            let staged = load_staged_ref_window(&conn, resolve_cursor, resolve_window)?;
             let Some(last_rowid) = staged.last().map(|entry| entry.rowid) else {
                 break;
             };
@@ -3595,6 +3633,7 @@ impl CallGraphStore {
                             caller_file: &caller_file,
                             caller_data: &caller_extract.data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
+                            module_resolution_memo,
                         };
                         for staged_ref in &staged[offset..end] {
                             let resolved = resolve_ref(staged_ref.raw.clone(), &index)?;
@@ -15035,6 +15074,179 @@ export function leaf() {}
         );
     }
 
+    #[test]
+    fn cold_build_resolution_memo_bounds_filesystem_probes_and_preserves_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let files = write_ts_resolution_memo_fixture(&project_root, 8, 8, 4);
+        let resolve_window = 19;
+
+        callgraph::clear_workspace_package_cache();
+        let uncached_memo = callgraph::ModuleResolutionMemo::new_for_test(false, true);
+        let uncached = CallGraphStore::open(
+            dir.path().join("store-uncached"),
+            project_root.to_path_buf(),
+        )
+        .expect("open uncached store");
+        let uncached_stats = uncached
+            .cold_build_chunked_with_resolution_memo_for_test(
+                &files,
+                7,
+                resolve_window,
+                &uncached_memo,
+            )
+            .expect("uncached comparison build");
+        assert!(
+            uncached_stats.refs > resolve_window * 2,
+            "fixture must cross several staged reference windows"
+        );
+
+        callgraph::clear_workspace_package_cache();
+        let cached_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let cached =
+            CallGraphStore::open(dir.path().join("store-cached"), project_root.to_path_buf())
+                .expect("open cached store");
+        let cached_stats = cached
+            .cold_build_chunked_with_resolution_memo_for_test(
+                &files,
+                7,
+                resolve_window,
+                &cached_memo,
+            )
+            .expect("cached build");
+
+        assert_cold_build_stats_match_except_elapsed(&uncached_stats, &cached_stats);
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+            "type_ref_names",
+            "meta",
+            "staging_file_inventory",
+            "staging_ref_context",
+        ] {
+            assert_eq!(
+                graph_table_rows(&uncached, table),
+                graph_table_rows(&cached, table),
+                "memoized and uncached cold builds must produce identical {table} rows"
+            );
+        }
+        assert_eq!(
+            graph_table_rows_without(&uncached, "files", &["indexed_at"]),
+            graph_table_rows_without(&cached, "files", &["indexed_at"]),
+            "files rows must match apart from indexed_at"
+        );
+        assert_eq!(
+            graph_table_rows_without(&uncached, "backend_file_state", &["updated_at"]),
+            graph_table_rows_without(&cached, "backend_file_state", &["updated_at"]),
+            "backend rows must match apart from updated_at"
+        );
+
+        let cached_module_computations = cached_memo.module_computations_for_test();
+        assert!(
+            !cached_module_computations.is_empty(),
+            "fixture must exercise module resolution"
+        );
+        assert!(
+            cached_module_computations.values().all(|count| *count == 1),
+            "each importing-directory/specifier pair must reach the filesystem once"
+        );
+        let uncached_module_computations = uncached_memo.module_computations_for_test();
+        assert!(
+            uncached_module_computations
+                .values()
+                .copied()
+                .max()
+                .unwrap_or_default()
+                > 16,
+            "mutation control: disabling the memo must recompute a hot module target"
+        );
+
+        let cached_package_probes = cached_memo
+            .json_probes_for_test()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(
+            !cached_package_probes.is_empty(),
+            "fixture must exercise package.json lookup"
+        );
+        assert!(
+            cached_package_probes.values().all(|count| *count == 1),
+            "every package.json path must be probed at most once per cold build"
+        );
+        let uncached_package_probes = uncached_memo
+            .json_probes_for_test()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            })
+            .collect::<HashMap<_, _>>();
+        let cached_probe_total: usize = cached_package_probes.values().sum();
+        let uncached_probe_total: usize = uncached_package_probes.values().sum();
+        assert!(
+            uncached_probe_total > cached_probe_total * 20,
+            "mutation control: disabled memo should repeat the package ladder ({uncached_probe_total} vs {cached_probe_total})"
+        );
+    }
+
+    // Benchmark the cold resolver with and without memoization. The generated
+    // workspace has hundreds of TypeScript files below a deep package-manifest
+    // ladder and enough imported calls for filesystem resolution to dominate
+    // the uncached run.
+    #[test]
+    #[ignore]
+    fn bench_cold_build_resolution_memo() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create benchmark root");
+        let project_root = fs::canonicalize(project_root).expect("canonical benchmark root");
+        let files = write_ts_resolution_memo_fixture(&project_root, 24, 12, 20);
+        assert!(
+            files.len() > 250,
+            "benchmark fixture must contain hundreds of files"
+        );
+
+        for enabled in [false, true] {
+            callgraph::clear_workspace_package_cache();
+            let memo = callgraph::ModuleResolutionMemo::new_for_test(enabled, false);
+            let store = CallGraphStore::open(
+                dir.path().join(if enabled {
+                    "store-cached"
+                } else {
+                    "store-uncached"
+                }),
+                project_root.to_path_buf(),
+            )
+            .expect("open benchmark store");
+            let cpu_started = process_cpu_time();
+            let wall_started = Instant::now();
+            let stats = store
+                .cold_build_chunked_with_resolution_memo_for_test(&files, 32, 257, &memo)
+                .expect("benchmark cold build");
+            let wall_ms = wall_started.elapsed().as_millis();
+            let cpu_ms = process_cpu_time()
+                .checked_sub(cpu_started)
+                .unwrap_or_default()
+                .as_millis();
+            println!(
+                "BENCH_COLD_BUILD_RESOLUTION_MEMO memo={} files={} refs={} edges={} wall_ms={} cpu_ms={}",
+                if enabled { "on" } else { "off" },
+                stats.files,
+                stats.refs,
+                stats.edges,
+                wall_ms,
+                cpu_ms
+            );
+        }
+    }
+
     // Perf A/B bench (not a gate): measures cold_build wall time at a given
     // chunk size against a real repo. Driven by env so the same binary can A/B
     // chunk=0 vs chunk=N in clean isolation. Reusable for the deferred DB-spill
@@ -15344,6 +15556,84 @@ export function leaf() {}
             target_symbol: Some("helper".to_string()),
             dependencies,
         }
+    }
+
+    fn write_ts_resolution_memo_fixture(
+        project_root: &Path,
+        package_count: usize,
+        files_per_package: usize,
+        calls_per_file: usize,
+    ) -> Vec<PathBuf> {
+        fs::create_dir_all(project_root).expect("create memo fixture root");
+        fs::write(
+            project_root.join("package.json"),
+            r#"{"name":"fixture-root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .expect("write workspace package manifest");
+        fs::write(
+            project_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{}}}"#,
+        )
+        .expect("write fixture tsconfig");
+
+        let shared_root = project_root.join("packages/shared");
+        let shared_source = shared_root.join("src/index.ts");
+        fs::create_dir_all(shared_source.parent().expect("shared source parent"))
+            .expect("create shared package");
+        fs::write(
+            shared_root.join("package.json"),
+            r#"{"name":"@fixture/shared","exports":{".":{"source":"./src/index.ts"}}}"#,
+        )
+        .expect("write shared package manifest");
+        fs::write(
+            &shared_source,
+            "export function shared(value: number) { return value + 1; }\n",
+        )
+        .expect("write shared source");
+        let mut files = vec![shared_source];
+
+        for package in 0..package_count {
+            let package_root = project_root.join(format!("packages/app-{package:02}"));
+            fs::create_dir_all(&package_root).expect("create app package");
+            fs::write(
+                package_root.join("package.json"),
+                format!(r#"{{"name":"@fixture/app-{package:02}"}}"#),
+            )
+            .expect("write app package manifest");
+            let source_dir = package_root.join("src/features/deep/nested/leaf");
+            fs::create_dir_all(&source_dir).expect("create deep app source dir");
+
+            for file in 0..files_per_package {
+                let source_path = source_dir.join(format!("caller_{file:03}.ts"));
+                let mut source = "import { shared } from \"@fixture/shared\";\n".to_string();
+                for call in 0..calls_per_file {
+                    source.push_str(&format!(
+                        "export function caller_{package}_{file}_{call}() {{ return shared({call}); }}\n"
+                    ));
+                }
+                fs::write(&source_path, source).expect("write app source");
+                files.push(source_path);
+            }
+        }
+
+        files
+    }
+
+    #[cfg(unix)]
+    fn process_cpu_time() -> Duration {
+        let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        let result =
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, value.as_mut_ptr()) };
+        if result != 0 {
+            return Duration::ZERO;
+        }
+        let value = unsafe { value.assume_init() };
+        Duration::new(value.tv_sec.max(0) as u64, value.tv_nsec.max(0) as u32)
+    }
+
+    #[cfg(not(unix))]
+    fn process_cpu_time() -> Duration {
+        Duration::ZERO
     }
 
     fn write_chunked_equivalence_fixture(project_root: &Path) {
