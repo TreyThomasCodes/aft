@@ -279,10 +279,11 @@ fn parse_symbols(
     let source = std::str::from_utf8(source).ok()?;
     let tree = parse_source_with_cached_parser(path, source, lang).ok()?;
     let symbols = extract_symbols_from_tree(source, &tree, lang).ok()?;
+    let line_starts = line_start_offsets(source);
 
     let mut parsed = BTreeMap::new();
     for symbol in symbols {
-        let (identity, parsed_symbol) = parsed_symbol(source, symbol);
+        let (identity, parsed_symbol) = parsed_symbol(source, &line_starts, symbol);
         // Extractors already deduplicate outline entries. Keeping the first value makes
         // an unexpected duplicate deterministic without inventing a new display key.
         parsed.entry(identity).or_insert(parsed_symbol);
@@ -290,7 +291,11 @@ fn parse_symbols(
     Some(parsed)
 }
 
-fn parsed_symbol(source: &str, symbol: Symbol) -> (SymbolIdentity, ParsedSymbol) {
+fn parsed_symbol(
+    source: &str,
+    line_starts: &[usize],
+    symbol: Symbol,
+) -> (SymbolIdentity, ParsedSymbol) {
     let outline_entry = symbol_to_entry(&symbol);
     let container_path = symbol.scope_chain.join(".");
     let identity = SymbolIdentity {
@@ -304,25 +309,45 @@ fn parsed_symbol(source: &str, symbol: Symbol) -> (SymbolIdentity, ParsedSymbol)
         signature_line: outline_entry.signature,
         container_path,
     };
-    let body = source_bytes_for_symbol(source, &symbol);
+    let body = source_bytes_for_symbol(source, line_starts, &symbol);
     (identity, ParsedSymbol { entry, body })
 }
 
-fn source_bytes_for_symbol(source: &str, symbol: &Symbol) -> Option<Vec<u8>> {
-    let start = byte_offset_at(source, symbol.range.start_line, symbol.range.start_col)?;
-    let end = byte_offset_at(source, symbol.range.end_line, symbol.range.end_col)?;
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    offsets.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    offsets
+}
+
+fn source_bytes_for_symbol(
+    source: &str,
+    line_starts: &[usize],
+    symbol: &Symbol,
+) -> Option<Vec<u8>> {
+    let start = byte_offset_at(
+        source,
+        line_starts,
+        symbol.range.start_line,
+        symbol.range.start_col,
+    )?;
+    let end = byte_offset_at(
+        source,
+        line_starts,
+        symbol.range.end_line,
+        symbol.range.end_col,
+    )?;
     (start <= end).then(|| source.as_bytes()[start..end].to_vec())
 }
 
-fn byte_offset_at(source: &str, line: u32, column: u32) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut line_start = 0;
-    for _ in 0..line {
-        let newline = bytes[line_start..].iter().position(|byte| *byte == b'\n')?;
-        line_start = line_start.checked_add(newline + 1)?;
-    }
+fn byte_offset_at(source: &str, line_starts: &[usize], line: u32, column: u32) -> Option<usize> {
+    let line_start = *line_starts.get(line as usize)?;
     let offset = line_start.checked_add(column as usize)?;
-    (offset <= bytes.len()).then_some(offset)
+    (offset <= source.len()).then_some(offset)
 }
 
 fn symbol_changed(old: &ParsedSymbol, new: &ParsedSymbol) -> bool {
@@ -574,6 +599,26 @@ export function added(): number { return 3; }
     }
 
     #[test]
+    fn indexed_byte_offsets_match_the_scanning_contract() {
+        let sources = ["", "a", "a\n", "alpha\nbeta", "α\nβ\r\nlast"];
+        let columns = [0, 1, 2, 3, 8, 32];
+
+        for source in sources {
+            let line_starts = line_start_offsets(source);
+            let last_line = source.bytes().filter(|byte| *byte == b'\n').count() as u32;
+            for line in 0..=last_line + 2 {
+                for column in columns {
+                    assert_eq!(
+                        byte_offset_at(source, &line_starts, line, column),
+                        scanning_byte_offset_at(source, line, column),
+                        "source={source:?}, line={line}, column={column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn json_returns_an_honest_line_count_only_fallback() {
         let diff = symbol_diff_file(
             LangId::Json,
@@ -662,6 +707,17 @@ export function added(): number { return 3; }
 
     fn entry_names(entries: &[SymbolDiffEntry]) -> Vec<&str> {
         entries.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    fn scanning_byte_offset_at(source: &str, line: u32, column: u32) -> Option<usize> {
+        let bytes = source.as_bytes();
+        let mut line_start = 0;
+        for _ in 0..line {
+            let newline = bytes[line_start..].iter().position(|byte| *byte == b'\n')?;
+            line_start = line_start.checked_add(newline + 1)?;
+        }
+        let offset = line_start.checked_add(column as usize)?;
+        (offset <= bytes.len()).then_some(offset)
     }
 
     fn committed_range(
