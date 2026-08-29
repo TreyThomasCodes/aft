@@ -24,7 +24,7 @@
 //!
 //! Bad filters are skipped with a warning, never panic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -453,6 +453,13 @@ fn apply_filter_to_text(
     output: &str,
     exit_code: Option<i32>,
 ) -> CompressionResult {
+    if filter.shortcircuit_when.is_none()
+        && filter.class_cap.is_none()
+        && filter.max_lines != usize::MAX
+    {
+        return apply_plain_cap_streaming(filter, output);
+    }
+
     // Phase 1: line strip
     let original_line_count = output.lines().count();
     let kept: Vec<&str> = output
@@ -497,7 +504,68 @@ fn apply_filter_to_text(
     )
 }
 
+/// Apply a finite plain cap without materializing lines that the cap will discard.
+fn apply_plain_cap_streaming(filter: &TomlFilter, output: &str) -> CompressionResult {
+    let max_lines = filter.max_lines;
+    let head_count = match filter.keep {
+        KeepMode::Head => max_lines,
+        KeepMode::Tail => 0,
+        KeepMode::Middle => max_lines / 2,
+    };
+    let tail_count = match filter.keep {
+        KeepMode::Head => 0,
+        KeepMode::Tail => max_lines,
+        KeepMode::Middle => max_lines - head_count,
+    };
+    let mut head = Vec::new();
+    let mut tail = VecDeque::new();
+    let mut kept_line_count = 0usize;
+    let mut strip_removed_lines = false;
+
+    for line in output.lines() {
+        if filter.strip.iter().any(|pattern| pattern.is_match(line)) {
+            strip_removed_lines = true;
+            continue;
+        }
+
+        kept_line_count += 1;
+        if head.len() < head_count {
+            head.push(line);
+            continue;
+        }
+        if tail_count == 0 {
+            continue;
+        }
+        if tail.len() == tail_count {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+
+    head.extend(tail);
+    let selected: Vec<String> = head
+        .into_iter()
+        .map(|line| truncate_line(line, filter.line_max))
+        .collect();
+    let text = selected.join("\n");
+
+    if kept_line_count <= max_lines {
+        return CompressionResult::new(text);
+    }
+    if max_lines == 0 {
+        return CompressionResult::with_inner_drop(String::new(), false);
+    }
+    if matches!(filter.keep, KeepMode::Tail) && !strip_removed_lines {
+        return CompressionResult::with_prefix_drop(
+            text,
+            kept_line_count.saturating_sub(max_lines) + 1,
+        );
+    }
+    CompressionResult::with_inner_drop(text, false)
+}
+
 fn truncate_line(line: &str, line_max: usize) -> String {
+    record_truncate_line_call();
     if line.chars().count() <= line_max {
         return line.to_string();
     }
@@ -513,6 +581,29 @@ fn truncate_line(line: &str, line_max: usize) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRUNCATE_LINE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_truncate_line_call() {
+    TRUNCATE_LINE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_truncate_line_call() {}
+
+#[cfg(test)]
+fn reset_truncate_line_calls() {
+    TRUNCATE_LINE_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn truncate_line_calls() -> usize {
+    TRUNCATE_LINE_CALLS.with(std::cell::Cell::get)
 }
 
 fn cap_class_lines(lines: &[String], class_cap: &TomlClassCap) -> CompressionResult {
@@ -641,6 +732,25 @@ mod tests {
 
     fn parse(content: &str) -> TomlFilter {
         parse_filter("test", content, FilterSource::Builtin).expect("parse")
+    }
+
+    fn materialized_plain_cap_reference(filter: &TomlFilter, output: &str) -> CompressionResult {
+        let original_line_count = output.lines().count();
+        let kept: Vec<&str> = output
+            .lines()
+            .filter(|line| !filter.strip.iter().any(|pattern| pattern.is_match(line)))
+            .collect();
+        let strip_removed_lines = kept.len() < original_line_count;
+        let truncated: Vec<String> = kept
+            .iter()
+            .map(|line| truncate_line(line, filter.line_max))
+            .collect();
+        cap_lines(
+            &truncated,
+            filter.max_lines,
+            filter.keep,
+            strip_removed_lines,
+        )
     }
 
     #[test]
@@ -922,6 +1032,62 @@ keep = "head"
         assert!(!out.text.contains("warning 3"));
         assert_eq!(out.dropped_by_class.get(&DropClass::Warning), Some(&1));
         assert!(out.text.lines().count() > 1, "plain [cap] must not stack");
+    }
+
+    #[test]
+    fn streaming_plain_caps_match_materialized_reference() {
+        let input = "keep first\ndrop chatter\nkeep a very long line\nkeep middle\n\
+                     drop more chatter\nkeep penultimate\nkeep last\n";
+        for keep in ["head", "tail", "middle"] {
+            for max_lines in 0..=6 {
+                let filter = parse(&format!(
+                    r#"
+[filter]
+matches = ["x"]
+
+[strip]
+patterns = ["^drop"]
+
+[truncate]
+line_max = 10
+
+[cap]
+max_lines = {max_lines}
+keep = "{keep}"
+"#
+                ));
+
+                assert_eq!(
+                    apply_filter_to_text(&filter, input, None),
+                    materialized_plain_cap_reference(&filter, input),
+                    "keep={keep}, max_lines={max_lines}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finite_plain_cap_only_truncates_retained_lines() {
+        let filter = parse(
+            r#"
+[filter]
+matches = ["x"]
+
+[cap]
+max_lines = 3
+keep = "tail"
+"#,
+        );
+        let input = (0..100)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        reset_truncate_line_calls();
+
+        let output = apply_filter(&filter, &input);
+
+        assert_eq!(output.text, "line 97\nline 98\nline 99");
+        assert_eq!(truncate_line_calls(), 3);
     }
 
     #[test]
