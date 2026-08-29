@@ -4116,6 +4116,24 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true);
+}
+
+/// Sort paths emitted by one filesystem walk without resolving every path again.
+///
+/// Walk entries already share one resolved root and do not traverse symlinks, so
+/// lexical normalization produces the same display tie-break key. Calling
+/// `canonicalize` for every match only repeats filesystem lookups the walk just
+/// performed.
+pub(crate) fn sort_walked_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false);
+}
+
+fn sort_paths_by_mtime_desc_with_key_normalization(
+    paths: &mut [PathBuf],
+    stable_root: &Path,
+    canonicalize_paths: bool,
+) {
     use std::collections::HashMap;
     let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
@@ -4130,7 +4148,11 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path
             } else {
                 stable_root.join(path)
             };
-            let comparison_path = crate::inspect::job::canonicalize_normalized(&resolved);
+            let comparison_path = if canonicalize_paths {
+                crate::inspect::job::canonicalize_normalized(&resolved)
+            } else {
+                crate::inspect::job::normalize_path(&resolved)
+            };
             normalized_display_sort_key(Some(&stable_root), &comparison_path)
         });
     }
@@ -7792,6 +7814,69 @@ mod tests {
             .map(|name| dir.path().join(name))
             .to_vec();
         assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn walked_path_sort_matches_canonical_sort_for_regular_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut paths = Vec::new();
+        for index in (0..40).rev() {
+            let path = dir.path().join(format!("module-{index:02}.ts"));
+            fs::write(&path, format!("export const value = {index};\n")).expect("write fixture");
+            let mtime = filetime::FileTime::from_unix_time(1_700_000_000 + i64::from(index % 4), 0);
+            filetime::set_file_mtime(&path, mtime).expect("pin fixture mtime");
+            paths.push(path);
+        }
+
+        let mut canonicalized = paths.clone();
+        sort_paths_by_mtime_desc(&mut canonicalized, dir.path());
+        sort_walked_paths_by_mtime_desc(&mut paths, dir.path());
+
+        assert_eq!(paths, canonicalized);
+    }
+
+    /// Manual release-mode probe for the sort paid by one fallback glob walk.
+    #[test]
+    #[ignore = "manual release-mode fallback glob sort performance probe"]
+    fn walked_path_sort_perf_probe() {
+        const DIRECTORIES: usize = 100;
+        const FILES_PER_DIRECTORY: usize = 100;
+        const SAMPLES: usize = 9;
+        const ITERATIONS: usize = 3;
+
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let tied_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        let mut paths = Vec::with_capacity(DIRECTORIES * FILES_PER_DIRECTORY);
+        for directory in 0..DIRECTORIES {
+            let path = temp.path().join(format!("package-{directory:03}/src"));
+            fs::create_dir_all(&path).expect("create package directory");
+            for file in 0..FILES_PER_DIRECTORY {
+                let file_path = path.join(format!("module-{file:03}.ts"));
+                fs::write(&file_path, b"export const value = 1;\n").expect("write fixture");
+                filetime::set_file_mtime(&file_path, tied_mtime).expect("pin fixture mtime");
+                paths.push(file_path);
+            }
+        }
+
+        let mut micros_per_operation = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let mut sample = paths.clone();
+                sort_walked_paths_by_mtime_desc(&mut sample, temp.path());
+                std::hint::black_box(sample);
+            }
+            micros_per_operation.push(started.elapsed().as_micros() / ITERATIONS as u128);
+        }
+        micros_per_operation.sort_unstable();
+        let median = micros_per_operation[SAMPLES / 2];
+
+        eprintln!(
+            "fallback glob sort: files={} samples={SAMPLES} iterations={ITERATIONS}",
+            paths.len()
+        );
+        eprintln!("microseconds per glob operation: {micros_per_operation:?}");
+        eprintln!("median: {median}us per glob operation");
     }
 
     #[cfg(windows)]

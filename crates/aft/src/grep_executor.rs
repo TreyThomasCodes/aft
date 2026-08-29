@@ -16,7 +16,7 @@ use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
     build_path_filters, decompose_grep_pattern, has_any_project_file_from, read_searchable_text,
-    resolve_search_scope, sort_grep_matches_by_mtime_desc, sort_paths_by_mtime_desc,
+    resolve_search_scope, sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc,
     try_read_with_budget, GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult,
     IndexStatus, PathFilters, RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
@@ -623,7 +623,7 @@ fn bounded_fallback_walk_files_with_limits(
         }
     }
 
-    sort_paths_by_mtime_desc(&mut files, filter_root);
+    sort_walked_paths_by_mtime_desc(&mut files, filter_root);
     FallbackWalkOutcome {
         files,
         walk_truncated,
