@@ -334,19 +334,17 @@ fn is_null_or_empty_string(value: Option<&Value>) -> bool {
     }
 }
 
-/// An edits item is a serialization sentinel when the host emitted every
-/// optional field with a type-default value and put the real payload in a
-/// sibling field. Such an item carries no real edit intent and must not claim
-/// the `edits` mode.
+/// An edits item is a serialization sentinel when every payload field carries
+/// its type-default value and the real payload lives in a sibling field. Such
+/// an item carries no real edit intent and must not claim the `edits` mode.
 ///
 /// A pure line-range item ({startLine,endLine,content}) is never a sentinel,
 /// even when `content` is "", because deleting lines is real edit intent. A
 /// null `oldString` with a non-null range boundary is treated the same way. A
-/// real replacement has a non-empty `oldString`, so it is
-/// never a sentinel. `{oldString:"", newString:"non-empty"}` is deliberately
-/// NOT a sentinel: it is kept so the batch parser reports its specific
-/// empty-match error instead of us silently discarding a broken but
-/// intentional edit.
+/// real replacement has a non-empty `oldString`, so it is never a sentinel.
+/// `{oldString:"", newString:"non-empty"}` is deliberately NOT a sentinel:
+/// it is kept so the batch parser reports its specific empty-match error
+/// instead of silently discarding a broken but intentional edit.
 fn is_edit_sentinel_item(item: &Value) -> bool {
     let Some(obj) = item.as_object() else {
         return false;
@@ -366,13 +364,28 @@ fn is_edit_sentinel_item(item: &Value) -> bool {
     {
         return false;
     }
-    // `newString` must be empty, null, or absent.
-    let new_string_empty = is_null_or_empty_string(obj.get("newString"));
-    if !new_string_empty {
-        return false;
+    // Every other payload field must also carry its omitted-value sentinel.
+    // Meaningful occurrence or replaceAll values must reach item-family
+    // validation instead of being silently discarded.
+    is_null_or_empty_string(obj.get("newString"))
+        && is_null_or_empty_string(obj.get("content"))
+        && matches!(
+            obj.get("replaceAll"),
+            None | Some(Value::Null) | Some(Value::Bool(false))
+        )
+        && is_default_occurrence(obj.get("occurrence"))
+}
+
+fn has_meaningful_find_payload(item: &Map<String, Value>) -> bool {
+    is_non_empty_string(item.get("oldString"))
+}
+
+fn is_default_occurrence(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::Number(value)) => value.as_u64() == Some(1),
+        _ => false,
     }
-    // `content` must be empty, null, or absent.
-    is_null_or_empty_string(obj.get("content"))
 }
 
 /// Filter serialization-sentinel items out of the `edits` array (or its
@@ -456,13 +469,14 @@ fn parse_edit_array(value: Option<Value>) -> Result<Vec<Value>, TranslateError> 
     Ok(items)
 }
 
-/// Strip default values from an edit item before selecting its family.
+/// Normalize default fields before selecting an edit family.
 ///
-/// Some hosts serialize all optional fields. Null values are absent fields, and
-/// the default find/replace values cannot affect a line-range edit. Non-default
-/// values remain to surface a mixed-mode request instead of being discarded.
-fn strip_line_range_sentinels(item: &mut Map<String, Value>) {
-    let has_range = ["startLine", "endLine", "content"]
+/// A family whose payload is only omitted-value sentinels yields to the family
+/// with meaningful payload. This preserves intentional line-range deletes
+/// while allowing hosts that serialize unused fields to submit find/replace
+/// requests without a false mixed-mode error.
+fn normalize_edit_item_sentinels(item: &mut Map<String, Value>) {
+    let had_range_fields = ["startLine", "endLine", "content"]
         .iter()
         .any(|key| item.contains_key(*key));
 
@@ -482,10 +496,35 @@ fn strip_line_range_sentinels(item: &mut Map<String, Value>) {
         }
     }
 
-    if !has_range {
+    let content_is_empty =
+        matches!(item.get("content"), Some(Value::String(value)) if value.is_empty());
+    if has_meaningful_find_payload(item) && (!item.contains_key("content") || content_is_empty) {
+        // A meaningful match wins over blank or absent line-range payload. The
+        // boundaries are serializer defaults too when no range content exists.
+        for key in ["startLine", "endLine", "content"] {
+            item.remove(key);
+        }
+        // Hosts commonly emit false and 1 alongside an omitted range. They
+        // have no effect on a find/replace edit, so keep the established
+        // canonical form while preserving meaningful find options.
+        if had_range_fields {
+            if matches!(item.get("replaceAll"), Some(Value::Bool(false))) {
+                item.remove("replaceAll");
+            }
+            if is_default_occurrence(item.get("occurrence")) && item.contains_key("occurrence") {
+                item.remove("occurrence");
+            }
+        }
         return;
     }
 
+    if !is_non_empty_string(item.get("content")) {
+        return;
+    }
+
+    // A meaningful range replacement wins over default find/replace fields.
+    // Non-default find fields remain so the mixed-mode validator can reject
+    // genuinely ambiguous requests.
     if matches!(item.get("oldString"), Some(Value::String(value)) if value.is_empty()) {
         item.remove("oldString");
     }
@@ -495,7 +534,7 @@ fn strip_line_range_sentinels(item: &mut Map<String, Value>) {
     if matches!(item.get("replaceAll"), Some(Value::Bool(false))) {
         item.remove("replaceAll");
     }
-    if item.get("occurrence").and_then(Value::as_u64) == Some(1) {
+    if is_default_occurrence(item.get("occurrence")) && item.contains_key("occurrence") {
         item.remove("occurrence");
     }
 }
@@ -509,7 +548,7 @@ fn normalize_edit_item(value: Value, index: usize) -> Result<Map<String, Value>,
 
     normalize_item_alias(&mut item, "oldString", "oldText");
     normalize_item_alias(&mut item, "newString", "newText");
-    strip_line_range_sentinels(&mut item);
+    normalize_edit_item_sentinels(&mut item);
 
     let has_find = ["oldString", "newString", "replaceAll", "occurrence"]
         .iter()
@@ -2835,8 +2874,82 @@ mod tests {
     }
 
     #[test]
-    fn edit_normalization_strips_line_range_sentinels_without_hiding_meaningful_fields() {
+    fn meaningful_find_payload_predicate_rejects_empty_match_mutation_control() {
+        let meaningful = serde_json::json!({ "oldString": "before" });
+        let empty = serde_json::json!({ "oldString": "" });
+        let absent = serde_json::json!({});
+
+        assert!(has_meaningful_find_payload(
+            meaningful.as_object().expect("meaningful item object")
+        ));
+        assert!(!has_meaningful_find_payload(
+            empty.as_object().expect("empty item object")
+        ));
+        assert!(!has_meaningful_find_payload(
+            absent.as_object().expect("absent item object")
+        ));
+    }
+
+    #[test]
+    fn edit_normalization_applies_symmetric_item_sentinel_precedence() {
         let project = Path::new("/project");
+
+        // A meaningful match wins when range fields are blank serializer
+        // defaults, including all three range-shaped fields.
+        for item in [
+            serde_json::json!({
+                "oldString": "before", "newString": "after",
+                "startLine": 1, "endLine": 1, "content": "",
+            }),
+            serde_json::json!({
+                "oldString": "before", "newString": "after",
+                "startLine": 1, "endLine": 1,
+            }),
+        ] {
+            let translated = subc_translate_owned(
+                "edit",
+                serde_json::json!({ "path": "src/example.ts", "edits": [item] }),
+                project,
+            )
+            .expect("empty or absent range payload must yield to find/replace");
+            assert_eq!(
+                translated.args["edits"],
+                serde_json::json!([{ "match": "before", "replacement": "after" }]),
+            );
+        }
+
+        // A range delete with no find/replace fields is real intent, not a
+        // serializer sentinel.
+        let line_delete = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{ "startLine": 1, "endLine": 1, "content": "" }],
+            }),
+            project,
+        )
+        .expect("bare line-range delete must remain a range edit");
+        assert_eq!(
+            line_delete.args["edits"],
+            serde_json::json!([{ "line_start": 1, "line_end": 1, "content": "" }]),
+        );
+
+        // An all-default object carries no edit payload, so it is removed
+        // before validation and leaves no selected edit mode.
+        let all_sentinels = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/example.ts",
+                "edits": [{
+                    "oldString": "", "newString": "", "replaceAll": false,
+                    "occurrence": 1, "startLine": 1, "endLine": 1, "content": "",
+                }],
+            }),
+            project,
+        )
+        .expect_err("all-default item must be dropped");
+        assert!(all_sentinels.message.contains("exactly one of"));
+
         let issue_payload = serde_json::json!({
             "path": "src/example.ts",
             "edits": [{

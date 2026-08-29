@@ -272,6 +272,81 @@ describe("edit boundary preparation", () => {
     });
   }
 
+  test("applies symmetric edit-item sentinel precedence", () => {
+    const cases: Array<{
+      label: string;
+      item: Record<string, unknown>;
+      expected?: Record<string, unknown>;
+      error?: string;
+    }> = [
+      {
+        label: "find/replace wins over empty range defaults",
+        item: { oldString: "before", newString: "after", startLine: 1, endLine: 1, content: "" },
+        expected: { oldString: "before", newString: "after" },
+      },
+      {
+        label: "find/replace strips bare range boundaries",
+        item: { oldString: "before", newString: "after", startLine: 1, endLine: 1 },
+        expected: { oldString: "before", newString: "after" },
+      },
+      {
+        label: "range replacement wins over empty find defaults",
+        item: {
+          startLine: 1,
+          endLine: 1,
+          content: "after",
+          oldString: "",
+          newString: "",
+          replaceAll: false,
+          occurrence: 1,
+        },
+        expected: { startLine: 1, endLine: 1, content: "after" },
+      },
+      {
+        label: "bare range deletion remains a range edit",
+        item: { startLine: 1, endLine: 1, content: "" },
+        expected: { startLine: 1, endLine: 1, content: "" },
+      },
+      {
+        label: "both meaningful payloads remain rejected",
+        item: {
+          oldString: "before",
+          newString: "after",
+          startLine: 1,
+          endLine: 1,
+          content: "after",
+        },
+        error: "mixes find/replace and line-range fields",
+      },
+      {
+        label: "all default payloads are dropped",
+        item: {
+          oldString: "",
+          newString: "",
+          replaceAll: false,
+          occurrence: 1,
+          startLine: 1,
+          endLine: 1,
+          content: "",
+        },
+        error: "exactly one of",
+      },
+    ];
+
+    for (const { label, item, expected, error } of cases) {
+      const input = { path: "src/example.ts", edits: [item] };
+      if (error) {
+        expect(() => prepareCanonicalEditArguments("edit", input)).toThrow(error);
+      } else {
+        if (!expected) throw new Error(`${label}: expected normalized item is required`);
+        expect(prepareCanonicalEditArguments("edit", input)).toEqual({
+          path: "src/example.ts",
+          edits: [expected],
+        });
+      }
+    }
+  });
+
   test("retains meaningful fields alongside line-range edits as mixed-mode errors", () => {
     const lineRange = { content: "replacement", startLine: 14, endLine: 14 };
     for (const findFields of [

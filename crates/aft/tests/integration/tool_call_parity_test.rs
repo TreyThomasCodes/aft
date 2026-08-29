@@ -619,6 +619,43 @@ fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
 }
 
 #[test]
+fn edit_tool_call_applies_find_replace_with_empty_line_range_sentinels() {
+    let project = tempfile::tempdir().expect("tool_call find/replace sentinel temp project");
+    let target = project.path().join("src/example.ts");
+    fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
+    fs::write(&target, "const value = before;\n").expect("write edit fixture");
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, project.path(), "cfg-edit-find-range-sentinels");
+    let response = send_json(
+        &mut aft,
+        json!({
+            "id": "tool-call-edit-find-range-sentinels",
+            "command": "tool_call",
+            "session_id": SESSION_ID,
+            "name": "edit",
+            "arguments": {
+                "filePath": "src/example.ts",
+                "edits": [{
+                    "oldString": "before",
+                    "newString": "after",
+                    "startLine": 1,
+                    "endLine": 1,
+                    "content": "",
+                }],
+            },
+        }),
+    );
+
+    assert_eq!(response["success"], true, "edit failed: {response:#}");
+    assert_eq!(
+        fs::read_to_string(target).expect("read edited fixture"),
+        "const value = after;\n"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
     let project = tempfile::tempdir().expect("tool_call line-range sentinel temp project");
     let target = project.path().join("src/example.ts");

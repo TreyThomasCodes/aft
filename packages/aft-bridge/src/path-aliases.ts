@@ -437,18 +437,17 @@ const OMIT_OPTIONAL_FIELDS_STEERING =
   "Omit unused optional fields entirely; do not send empty strings or empty arrays for them.";
 
 /**
- * An edits item is a serialization sentinel when the host emitted every
- * optional field with a type-default value and put the real payload in a
- * sibling field. Such an item carries no real edit intent and must not claim
- * the `edits` mode.
+ * An edits item is a serialization sentinel when every payload field carries
+ * its type-default value and the real payload lives in a sibling field. Such
+ * an item carries no real edit intent and must not claim the `edits` mode.
  *
  * A pure line-range item ({startLine,endLine,content}) is never a sentinel,
  * even when `content` is "", because deleting lines is real edit intent. A
  * null `oldString` with a non-null range boundary is treated the same way. A
  * real replacement has a non-empty `oldString`, so it is never a sentinel.
- * `{oldString:"", newString:"non-empty"}` is deliberately NOT a
- * sentinel: it is kept so the batch parser reports its specific empty-match
- * error instead of silently discarding a broken but intentional edit.
+ * `{oldString:"", newString:"non-empty"}` is deliberately NOT a sentinel:
+ * it is kept so the batch parser reports its specific empty-match error
+ * instead of silently discarding a broken but intentional edit.
  */
 function isEditSentinelItem(item: unknown): boolean {
   if (!item || typeof item !== "object" || Array.isArray(item)) return false;
@@ -463,9 +462,23 @@ function isEditSentinelItem(item: unknown): boolean {
   ) {
     return false;
   }
-  const newStringEmpty = !hasOwn(record, "newString") || isNullOrEmptyString(record.newString);
-  if (!newStringEmpty) return false;
-  return !hasOwn(record, "content") || isNullOrEmptyString(record.content);
+  // Every other payload field must also carry its omitted-value sentinel.
+  // Meaningful occurrence or replaceAll values must reach item-family
+  // validation instead of being silently discarded.
+  return (
+    (!hasOwn(record, "newString") || isNullOrEmptyString(record.newString)) &&
+    (!hasOwn(record, "content") || isNullOrEmptyString(record.content)) &&
+    (!hasOwn(record, "replaceAll") || record.replaceAll === null || record.replaceAll === false) &&
+    isDefaultOccurrence(record.occurrence)
+  );
+}
+
+function hasMeaningfulFindPayload(item: Record<string, unknown>): boolean {
+  return isNonEmptyString(item.oldString);
+}
+
+function isDefaultOccurrence(value: unknown): boolean {
+  return value === undefined || value === null || value === 1;
 }
 
 /**
@@ -528,14 +541,15 @@ function parseEditArray(value: unknown): unknown[] {
 }
 
 /**
- * Strip default values from an edit item before selecting its family.
+ * Normalize default fields before selecting an edit family.
  *
- * Some hosts serialize all optional fields. Null values are absent fields, and
- * the default find/replace values cannot affect a line-range edit. Non-default
- * values remain to surface a mixed-mode request instead of being discarded.
+ * A family whose payload is only omitted-value sentinels yields to the family
+ * with meaningful payload. This preserves intentional line-range deletes
+ * while allowing hosts that serialize unused fields to submit find/replace
+ * requests without a false mixed-mode error.
  */
-function stripLineRangeSentinels(item: Record<string, unknown>): void {
-  const hasRangeField = ["startLine", "endLine", "content"].some((key) => hasOwn(item, key));
+function normalizeEditItemSentinels(item: Record<string, unknown>): void {
+  const hadRangeFields = ["startLine", "endLine", "content"].some((key) => hasOwn(item, key));
 
   // Null is how some hosts serialize an omitted optional property. Remove it
   // before counting either edit family so it cannot create a false conflict.
@@ -551,12 +565,31 @@ function stripLineRangeSentinels(item: Record<string, unknown>): void {
     if (item[key] === null) delete item[key];
   }
 
-  if (!hasRangeField) return;
+  const contentIsEmpty = item.content === "";
+  if (hasMeaningfulFindPayload(item) && (!hasOwn(item, "content") || contentIsEmpty)) {
+    // A meaningful match wins over blank or absent line-range payload. The
+    // boundaries are serializer defaults too when no range content exists.
+    for (const key of ["startLine", "endLine", "content"]) delete item[key];
+    // Hosts commonly emit false and 1 alongside an omitted range. They have
+    // no effect on a find/replace edit, so keep the established canonical form
+    // while preserving meaningful find options.
+    if (hadRangeFields) {
+      if (item.replaceAll === false) delete item.replaceAll;
+      if (hasOwn(item, "occurrence") && isDefaultOccurrence(item.occurrence))
+        delete item.occurrence;
+    }
+    return;
+  }
 
+  if (!isNonEmptyString(item.content)) return;
+
+  // A meaningful range replacement wins over default find/replace fields.
+  // Non-default find fields remain so the mixed-mode validator can reject
+  // genuinely ambiguous requests.
   if (item.oldString === "") delete item.oldString;
   if (item.newString === "") delete item.newString;
   if (item.replaceAll === false) delete item.replaceAll;
-  if (item.occurrence === 1) delete item.occurrence;
+  if (hasOwn(item, "occurrence") && isDefaultOccurrence(item.occurrence)) delete item.occurrence;
 }
 
 function normalizeEditItem(value: unknown, index: number): Record<string, unknown> {
@@ -568,7 +601,7 @@ function normalizeEditItem(value: unknown, index: number): Record<string, unknow
   const item = copyOwnProperties(source);
   normalizeItemAlias(item, "oldString", "oldText");
   normalizeItemAlias(item, "newString", "newText");
-  stripLineRangeSentinels(item);
+  normalizeEditItemSentinels(item);
 
   const hasFindField = ["oldString", "newString", "replaceAll", "occurrence"].some((key) =>
     hasOwn(item, key),

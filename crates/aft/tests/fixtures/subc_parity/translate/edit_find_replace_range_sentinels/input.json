@@ -1,0 +1,16 @@
+{
+  "agent_args": {
+    "edits": [
+      {
+        "content": "",
+        "endLine": 1,
+        "newString": "after",
+        "oldString": "before",
+        "startLine": 1
+      }
+    ],
+    "filePath": "src/main.ts"
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "edit"
+}
