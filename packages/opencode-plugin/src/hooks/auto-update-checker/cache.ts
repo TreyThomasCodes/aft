@@ -7,7 +7,7 @@ import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
 import { getCurrentRuntimePackageJsonPath } from "./checker.js";
-import { CACHE_DIR, PACKAGE_NAME } from "./constants.js";
+import { cacheDir, PACKAGE_NAME } from "./constants.js";
 import { PackageJsonSchema } from "./types.js";
 
 /**
@@ -179,9 +179,10 @@ export function resolveInstallContext(
     return null;
   }
 
-  const legacyPackageJsonPath = join(dirname(CACHE_DIR), "package.json");
+  const cacheRoot = dirname(cacheDir());
+  const legacyPackageJsonPath = join(cacheRoot, "package.json");
   if (existsSync(legacyPackageJsonPath)) {
-    return { installDir: dirname(CACHE_DIR), packageJsonPath: legacyPackageJsonPath };
+    return { installDir: cacheRoot, packageJsonPath: legacyPackageJsonPath };
   }
 
   return null;
