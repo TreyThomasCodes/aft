@@ -76,6 +76,10 @@ fn write_amplification_baseline_enabled() -> bool {
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
 static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
     OnceLock::new();
@@ -595,6 +599,12 @@ thread_local! {
     #[cfg(test)]
     static COLD_BUILD_BEFORE_PUBLISH_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildBeforePublishObserver>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_SLICE_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildSliceObserver>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildExtractObserver>>> =
+        const { std::cell::RefCell::new(None) };
     static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
     static MIGRATION_FAIL_AFTER_TEMP_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -633,6 +643,38 @@ fn notify_cold_build_before_publish_observer() {
 #[cfg(not(test))]
 fn notify_cold_build_before_publish_observer() {}
 
+#[cfg(test)]
+fn set_cold_build_slice_observer(observer: Option<Arc<ColdBuildSliceObserver>>) {
+    COLD_BUILD_SLICE_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_slice_observer(stage: &'static str, completed: usize, total: usize) {
+    let observer = COLD_BUILD_SLICE_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(stage, completed, total);
+    }
+}
+
+#[cfg(not(test))]
+fn notify_cold_build_slice_observer(_stage: &'static str, _completed: usize, _total: usize) {}
+
+#[cfg(test)]
+fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
+    COLD_BUILD_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_extract_observer(paths: &[PathBuf]) {
+    let observer = COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(paths);
+    }
+}
+
+#[cfg(not(test))]
+fn notify_cold_build_extract_observer(_paths: &[PathBuf]) {}
+
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
     MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow_mut() = bytes);
@@ -668,6 +710,21 @@ pub(crate) fn with_publish_epoch<R>(
     let previous = PUBLISH_ADMISSION.with(|slot| slot.replace(Some((epoch, expected))));
     let _guard = PublishAdmissionGuard { previous };
     run()
+}
+
+fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
+    notify_cold_build_slice_observer(stage, completed, total);
+    let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
+    if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
+        return Ok(());
+    }
+    crate::slog_info!(
+        "callgraph cold build superseded, stopping after {}/{} ({})",
+        completed,
+        total,
+        stage
+    );
+    Err(CallGraphStoreError::Superseded)
 }
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
@@ -3045,7 +3102,9 @@ impl CallGraphStore {
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
             }
+            ensure_cold_build_current("inventory", 0, 1)?;
             let corpus_fingerprint = temp_store.stage_cold_build_file_inventory(files)?;
+            ensure_cold_build_current("inventory", 1, 1)?;
             let stats = temp_store
                 .cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)?;
             let _ = temp_store.checkpoint_wal_truncate();
@@ -3081,9 +3140,9 @@ impl CallGraphStore {
             }
             Ok(())
         });
-        if matches!(publication, Err(CallGraphStoreError::Superseded)) {
-            remove_sqlite_file_set(&temp_path);
-        }
+        // A superseded generation remains a valid resumable staging artifact.
+        // Its successor compares the durable corpus fingerprint before either
+        // adopting this work or resetting it for a changed corpus.
         publication?;
         // Pointer publication is the only automatic breaker reset. The staging
         // batches above never reset history because a process can die after them.
@@ -3491,11 +3550,24 @@ impl CallGraphStore {
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
+        ensure_cold_build_current("staging-admission", 0, 1)?;
         let mut phase = staged_build_phase(&conn)?;
         let staged_fingerprint = staged_string(&conn, STAGED_CORPUS_FINGERPRINT)?;
-        if phase.as_deref().is_none_or(|phase| phase == "ready")
-            || staged_fingerprint.as_deref() != Some(corpus_fingerprint)
-        {
+        let fingerprint_matches = staged_fingerprint.as_deref() == Some(corpus_fingerprint);
+        if phase.as_deref() == Some("ready") && fingerprint_matches {
+            ensure_cold_build_current("completed-staging", 1, 1)?;
+            crate::slog_info!(
+                "callgraph cold-build decision: reason=matching completed staging; action=publish"
+            );
+            conn.execute("DELETE FROM staging_file_inventory", [])?;
+            return cold_build_stats_from_connection(&conn, started);
+        }
+        if phase.is_none() || !fingerprint_matches {
+            if staged_fingerprint.is_some() && !fingerprint_matches {
+                crate::slog_info!(
+                    "callgraph cold-build decision: reason=fingerprint mismatch; action=restart staging"
+                );
+            }
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
@@ -3519,6 +3591,10 @@ impl CallGraphStore {
         if phase.as_deref() == Some("extracting") {
             prune_staged_files_not_in_inventory(&mut conn)?;
 
+            let total_files =
+                query_count(&conn, "SELECT COUNT(*) FROM staging_file_inventory")? as usize;
+            let mut completed_files = 0usize;
+            ensure_cold_build_current("extraction", completed_files, total_files)?;
             let mut after_path = String::new();
             loop {
                 let Some(batch) = load_staged_file_batch(
@@ -3532,17 +3608,21 @@ impl CallGraphStore {
                     break;
                 };
                 after_path = batch.last_path;
+                let batch_files = batch.paths.len();
 
-                let mut needs_extract = Vec::with_capacity(batch.paths.len());
+                let mut needs_extract = Vec::with_capacity(batch_files);
                 for path in batch.paths {
                     if !staged_content_matches(&conn, &self.project_root, &path)? {
                         needs_extract.push(path);
                     }
                 }
                 if needs_extract.is_empty() {
+                    completed_files = completed_files.saturating_add(batch_files);
+                    ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
 
+                notify_cold_build_extract_observer(&needs_extract);
                 let build = build_extracts_parallel(&self.project_root, &needs_extract);
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
@@ -3576,14 +3656,18 @@ impl CallGraphStore {
                 tx.commit()?;
                 note_cold_build_commit_barrier("extraction_batch_committed");
                 self.record_commit(total_changes_before, &conn);
+                completed_files = completed_files.saturating_add(batch_files);
+                ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
 
+            ensure_cold_build_current("extraction", completed_files, total_files)?;
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             set_staged_build_phase(&tx, "indexing")?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
             phase = Some("indexing".to_string());
+            ensure_cold_build_current("extraction", total_files, total_files)?;
         }
 
         // Secondary indexes are intentionally created only after every extract is
@@ -3591,6 +3675,7 @@ impl CallGraphStore {
         // corpus-wide symbol/export table.
         note_cold_build_phase("symbol_export_index");
         if phase.as_deref() == Some("indexing") {
+            ensure_cold_build_current("symbol-export-index", 0, 1)?;
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
@@ -3598,10 +3683,15 @@ impl CallGraphStore {
             set_staged_build_phase(&tx, "resolving")?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
+            ensure_cold_build_current("symbol-export-index", 1, 1)?;
         }
 
         note_cold_build_phase("resolution");
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        let total_refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
+        let mut resolved_refs =
+            query_count(&conn, "SELECT COUNT(*) FROM refs WHERE status <> 'staged'")? as usize;
+        ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         let mut resolve_cursor = staged_u64(&conn, STAGED_RESOLVE_CURSOR)?;
         loop {
             let staged = load_staged_ref_window(&conn, resolve_cursor, resolve_window)?;
@@ -3652,8 +3742,11 @@ impl CallGraphStore {
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
             resolve_cursor = last_rowid;
+            resolved_refs = resolved_refs.saturating_add(staged.len()).min(total_refs);
+            ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         }
 
+        ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         note_cold_build_phase("publication");
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
@@ -3668,29 +3761,7 @@ impl CallGraphStore {
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
 
-        let files = query_count(&conn, "SELECT COUNT(*) FROM files")? as usize;
-        let nodes = query_count(&conn, "SELECT COUNT(*) FROM nodes")? as usize;
-        let refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
-        let edges = query_count(&conn, "SELECT COUNT(*) FROM edges")? as usize;
-        let failed_files = staged_failed_files(&conn)?;
-        let elapsed_ms = started.elapsed().as_millis();
-        crate::slog_info!(
-            "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
-            files,
-            nodes,
-            refs,
-            edges,
-            staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
-            elapsed_ms
-        );
-        Ok(ColdBuildStats {
-            files,
-            nodes,
-            refs,
-            edges,
-            failed_files,
-            elapsed_ms,
-        })
+        cold_build_stats_from_connection(&conn, started)
     }
 
     pub fn refresh_files(&self, changed_files: &[PathBuf]) -> Result<IncrementalStats> {
@@ -7299,6 +7370,32 @@ fn query_count(conn: &Connection, query: &str) -> Result<u64> {
         .map_err(Into::into)
 }
 
+fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Result<ColdBuildStats> {
+    let files = query_count(conn, "SELECT COUNT(*) FROM files")? as usize;
+    let nodes = query_count(conn, "SELECT COUNT(*) FROM nodes")? as usize;
+    let refs = query_count(conn, "SELECT COUNT(*) FROM refs")? as usize;
+    let edges = query_count(conn, "SELECT COUNT(*) FROM edges")? as usize;
+    let failed_files = staged_failed_files(conn)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    crate::slog_info!(
+        "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
+        files,
+        nodes,
+        refs,
+        edges,
+        staged_u64(conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
+        elapsed_ms
+    );
+    Ok(ColdBuildStats {
+        files,
+        nodes,
+        refs,
+        edges,
+        failed_files,
+        elapsed_ms,
+    })
+}
+
 fn staged_failed_files(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "SELECT DISTINCT file_path FROM backend_file_state WHERE status = 'stale' ORDER BY file_path",
@@ -7496,7 +7593,7 @@ fn log_root_repair_rebuild(repair: &OpenRootRepair) {
     } = repair
     {
         crate::slog_info!(
-            "callgraph store root mismatch from {} to {} requires cold rebuild: {}",
+            "callgraph cold-build decision: reason=re-rooting refused; from={}; to={}; detail={}",
             previous_roots.join(", "),
             current_root,
             reason
@@ -10242,6 +10339,12 @@ fn insert_method_dispatch_edges_chunked(
     project_root: &Path,
     chunk_size: usize,
 ) -> Result<usize> {
+    let total_files = query_count(
+        tx,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT caller_file FROM refs)",
+    )? as usize;
+    let mut completed_files = 0usize;
+    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     let mut inserted = 0usize;
     let mut after_file = String::new();
     loop {
@@ -10264,7 +10367,12 @@ fn insert_method_dispatch_edges_chunked(
         };
         inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?;
         after_file = last_file;
+        completed_files = completed_files
+            .saturating_add(caller_files.len())
+            .min(total_files);
+        ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     }
+    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     Ok(inserted)
 }
 
@@ -14928,6 +15036,227 @@ export function leaf() {}
             .nodes_matching("old_generation_marker")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn publish_fence_supersession_keeps_completed_staging_for_zero_work_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn completed_marker() {}\n").unwrap();
+        let files = vec![source];
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let epoch_for_observer = epoch.clone();
+        set_cold_build_before_publish_observer(Some(Arc::new(move || {
+            epoch_for_observer.next();
+        })));
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_before_publish_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let staging = callgraph_dir
+            .path()
+            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staged = Connection::open(&staging).unwrap();
+        assert_eq!(
+            staged_build_phase(&staged).unwrap().as_deref(),
+            Some("ready")
+        );
+        drop(staged);
+
+        let extracted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer.fetch_add(paths.len(), AtomicOrdering::SeqCst);
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch, successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("completed same-corpus staging publishes without rebuilding");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            extracted.load(AtomicOrdering::SeqCst),
+            0,
+            "completed staging must not repeat extraction"
+        );
+        drop(store);
+    }
+
+    #[test]
+    fn superseded_slice_preserves_staging_and_same_corpus_successor_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let files = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|name| {
+                let path = root.path().join(name);
+                std::fs::write(&path, format!("pub fn {}() {{}}\n", name.replace('.', "_")))
+                    .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let superseded = Arc::new(AtomicBool::new(false));
+        let epoch_for_observer = epoch.clone();
+        let superseded_for_observer = Arc::clone(&superseded);
+        set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
+            if stage == "extraction"
+                && completed == 1
+                && !superseded_for_observer.swap(true, AtomicOrdering::SeqCst)
+            {
+                epoch_for_observer.next();
+            }
+        })));
+
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_slice_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+        assert!(superseded.load(AtomicOrdering::SeqCst));
+
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let staging = callgraph_dir
+            .path()
+            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        assert!(staging.exists(), "supersession must retain durable staging");
+        let staged = Connection::open(&staging).unwrap();
+        assert_eq!(
+            staged_build_phase(&staged).unwrap().as_deref(),
+            Some("extracting")
+        );
+        assert_eq!(
+            query_count(&staged, "SELECT COUNT(*) FROM files").unwrap(),
+            1
+        );
+        drop(staged);
+
+        let extracted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer
+                .lock()
+                .unwrap()
+                .extend(paths.iter().filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }));
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch.clone(), successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("same-corpus successor resumes and publishes");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 3);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec!["b.rs".to_string(), "c.rs".to_string()],
+            "the successor must not repeat the committed first slice"
+        );
+        drop(store);
+        assert!(
+            !staging.exists(),
+            "published staging moves to its generation"
+        );
+    }
+
+    #[test]
+    fn changed_corpus_restarts_instead_of_adopting_staged_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let first = root.path().join("a.rs");
+        let second = root.path().join("b.rs");
+        std::fs::write(&first, "pub fn a() {}\n").unwrap();
+        std::fs::write(&second, "pub fn b() {}\n").unwrap();
+        let mut files = vec![first.clone(), second.clone()];
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let advanced = Arc::new(AtomicBool::new(false));
+        let epoch_for_observer = epoch.clone();
+        let advanced_for_observer = Arc::clone(&advanced);
+        set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
+            if stage == "extraction"
+                && completed == 1
+                && !advanced_for_observer.swap(true, AtomicOrdering::SeqCst)
+            {
+                epoch_for_observer.next();
+            }
+        })));
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_slice_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+
+        std::fs::write(&first, "pub fn a_changed() { b(); }\n").unwrap();
+        let third = root.path().join("c.rs");
+        std::fs::write(&third, "pub fn c() {}\n").unwrap();
+        files.push(third);
+        let extracted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer
+                .lock()
+                .unwrap()
+                .extend(paths.iter().filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }));
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch, successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("changed-corpus successor restarts and publishes");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 3);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()],
+            "fingerprint mismatch must invalidate every old extraction slice"
+        );
+        drop(store);
     }
 
     #[test]

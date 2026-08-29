@@ -2718,7 +2718,8 @@ pub(crate) fn configure_search_order_context_for_test(
         reset_filter_registry: false,
         clear_failed_spawns: false,
         warm_callgraph_store: false,
-        supersede_artifact_persistence: false,
+        supersede_search_artifact_persistence: false,
+        supersede_callgraph_artifact_persistence: false,
         supersede_semantic_artifact_persistence: false,
         artifact_load_starts: Vec::new(),
     })

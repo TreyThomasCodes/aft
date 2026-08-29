@@ -1772,6 +1772,26 @@ fn configure_warm_key(
     )
 }
 
+fn configure_callgraph_build_key(
+    canonical_root: &Path,
+    config: &Config,
+    home_match: bool,
+    is_worktree_bridge: bool,
+    shared_artifacts_read_only: bool,
+    workspace_manifests: Option<&str>,
+) -> String {
+    format!(
+        "root={:?};storage={:?};home={};worktree={};readonly={};enabled={};manifests={}",
+        canonical_root,
+        config.storage_dir,
+        home_match,
+        is_worktree_bridge,
+        shared_artifacts_read_only,
+        config.callgraph_store,
+        workspace_manifests.unwrap_or_default(),
+    )
+}
+
 /// Cooperative cancellation checkpoint for foreground configure phases.
 ///
 /// A cancelled RouteBind (route Goodbye or bind-deadline expiry) signals the
@@ -2224,7 +2244,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 reset_filter_registry: false,
                 clear_failed_spawns: false,
                 warm_callgraph_store: false,
-                supersede_artifact_persistence: false,
+                supersede_search_artifact_persistence: false,
+                supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
                 artifact_load_starts: Vec::new(),
             });
@@ -2473,6 +2494,16 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         workspace_manifests.as_deref(),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
+    let callgraph_build_key = configure_callgraph_build_key(
+        &canonical_cache_root,
+        &next_config,
+        home_match,
+        is_worktree_bridge,
+        ctx.shared_artifacts_read_only(),
+        workspace_manifests.as_deref(),
+    );
+    let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
+    let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_build_inputs_changed = project_root_changed
         || previous_config.semantic_search != next_config.semantic_search
@@ -2541,7 +2572,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 configure_generation
             );
         }
-        if ctx.callgraph_store_rx().lock().is_some() {
+        if callgraph_build_in_progress {
             slog_info!(
                 "callgraph store warm build adopted by equivalent reconfigure (generation {})",
                 configure_generation
@@ -2553,9 +2584,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             semantic_search,
         ));
     } else {
-        // A semantic worker whose corpus inputs are unchanged keeps its receiver
-        // and build epoch. Other artifact lanes are replaced normally, while a
-        // semantic input change invalidates the old worker before its next batch.
+        // Semantic and callgraph workers keep their receiver and dedicated
+        // build epoch when that lane's inputs are unchanged. Changed lane inputs
+        // invalidate the old worker at its next bounded batch or slice.
         if search_build_in_progress {
             slog_warn!(
                 "search index build cancelled (superseded by generation {})",
@@ -2575,11 +2606,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
-        if ctx.callgraph_store_rx().lock().is_some() {
-            slog_warn!(
-                "callgraph store warm build cancelled (superseded by generation {})",
-                configure_generation
-            );
+        if callgraph_build_in_progress {
+            if equivalent_callgraph_build {
+                slog_info!(
+                    "callgraph store warm build adopted by matching root and corpus configuration (generation {})",
+                    configure_generation
+                );
+            } else {
+                slog_warn!(
+                    "callgraph store warm build cancelled (callgraph inputs changed at generation {})",
+                    configure_generation
+                );
+            }
         }
 
         *ctx.search_index()
@@ -2599,12 +2637,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.retire_semantic_index_rx();
             ctx.set_semantic_build_progress(None);
         }
-        *ctx.callgraph_store()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        ctx.retire_callgraph_store_rx();
-        if previous_project_root.as_ref() == Some(&root_path) {
-            ctx.mark_callgraph_store_force_rebuild();
+        if equivalent_callgraph_build {
+            if callgraph_build_in_progress {
+                let adopted = ctx.adopt_callgraph_store_rx_generation(configure_generation);
+                debug_assert!(
+                    adopted,
+                    "callgraph build receiver disappeared before adoption"
+                );
+            }
+        } else {
+            *ctx.callgraph_store()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            ctx.retire_callgraph_store_rx();
+            if previous_project_root.as_ref() == Some(&root_path) {
+                ctx.mark_callgraph_store_force_rebuild();
+            }
         }
         if !semantic_build_adopted {
             *ctx.semantic_index_status()
@@ -2613,7 +2661,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
         }
-        ctx.clear_pending_index_updates();
+        if equivalent_callgraph_build {
+            ctx.clear_pending_index_updates_preserving_callgraph();
+        } else {
+            ctx.clear_pending_index_updates();
+        }
 
         artifact_load_starts.extend(schedule_missing_artifact_loads(
             ctx,
@@ -2648,8 +2700,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         sync_bash_compress_flag,
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
-        warm_callgraph_store: next_config.callgraph_store && !home_match && !equivalent_warm_config,
-        supersede_artifact_persistence: !equivalent_warm_config,
+        warm_callgraph_store: next_config.callgraph_store
+            && !home_match
+            && !equivalent_warm_config
+            && (!equivalent_callgraph_build || !callgraph_build_in_progress),
+        supersede_search_artifact_persistence: !equivalent_warm_config,
+        supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
         supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
         artifact_load_starts,
     });
@@ -4117,11 +4173,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
         // final-route teardown either precedes all starts or follows all starts.
         if ctx
             .run_if_subc_bound_generation(job.generation, || {
-                if job.supersede_artifact_persistence {
+                if job.supersede_search_artifact_persistence {
                     ctx.next_search_persist_epoch();
                     if job.supersede_semantic_artifact_persistence {
                         ctx.next_semantic_persist_epoch();
                     }
+                }
+                if job.supersede_callgraph_artifact_persistence {
                     ctx.next_callgraph_persist_epoch();
                 }
                 for start in &job.artifact_load_starts {
@@ -7513,6 +7571,89 @@ mod tests {
             ctx.callgraph_persist_epoch_flag().current() > old_persist_epoch,
             "receiver retirement must also invalidate stale disk publication"
         );
+    }
+
+    #[test]
+    fn matching_callgraph_rebinds_adopt_epoch_across_generation_churn() {
+        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn stable_epoch_marker() {}\n").unwrap();
+        let ctx = test_context();
+        let request = |max_file_size| {
+            configure_request_with_params(json!({
+                "project_root": root.path(),
+                "harness": "opencode",
+                "storage_dir": storage.path(),
+                "search_index_max_file_size": max_file_size,
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": true
+                }))]
+            }))
+        };
+        assert!(handle_configure_for_test(&request(1_000), &ctx).success);
+
+        let initial_generation = ctx.configure_generation();
+        let (_worker_tx, worker_rx) = crossbeam_channel::unbounded();
+        ctx.note_callgraph_store_rx_generation(initial_generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(worker_rx);
+        let publication_epoch = ctx.next_callgraph_persist_epoch();
+        let publication_flag = ctx.callgraph_persist_epoch_flag();
+        let callgraph_dir = ctx.callgraph_store_dir();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let build_source = root_path.join("lib.rs");
+        let release_build = Arc::new(Barrier::new(2));
+        let release_worker = Arc::clone(&release_build);
+        let build_flag = publication_flag.clone();
+        let build = std::thread::spawn(move || {
+            release_worker.wait();
+            crate::callgraph_store::with_publish_epoch(build_flag, publication_epoch, || {
+                crate::callgraph_store::CallGraphStore::cold_build_with_lease_chunked(
+                    callgraph_dir,
+                    root_path,
+                    &[build_source],
+                    1,
+                )
+            })
+        });
+
+        let mut previous_generation = initial_generation;
+        for max_file_size in [2_000, 3_000, 4_000] {
+            assert!(handle_configure_for_test(&request(max_file_size), &ctx).success);
+            super::drain_deferred_configure_maintenance(&ctx);
+            assert!(ctx.configure_generation() > previous_generation);
+            previous_generation = ctx.configure_generation();
+            assert_eq!(
+                ctx.callgraph_store_rx_generation(),
+                previous_generation,
+                "the live build receiver must follow each matching callgraph rebind"
+            );
+            assert_eq!(
+                publication_flag.current(),
+                publication_epoch,
+                "unrelated configuration churn must not supersede callgraph publication"
+            );
+        }
+
+        release_build.wait();
+        let (store, stats) = build
+            .join()
+            .unwrap()
+            .expect("the adopted build publishes under its original epoch");
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            store.nodes_matching("stable_epoch_marker").unwrap().len(),
+            1
+        );
+        drop(store);
     }
 
     #[test]
