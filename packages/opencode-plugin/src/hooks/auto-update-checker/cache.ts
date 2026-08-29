@@ -2,7 +2,12 @@ import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import {
+  npmInvocation,
+  npmSpawnEnv,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
@@ -36,6 +41,7 @@ interface AutoUpdateSnapshot {
 }
 
 const pendingSnapshots = new Map<string, AutoUpdateSnapshot>();
+const quarantinedInstallDirs = new Set<string>();
 
 function createAutoUpdateSnapshot(
   installDir: string,
@@ -154,6 +160,13 @@ function ensureDependencyVersion(
   }
 }
 
+function restorePendingSnapshot(installDir: string): void {
+  const snapshot = pendingSnapshots.get(installDir);
+  if (!snapshot) return;
+  pendingSnapshots.delete(installDir);
+  restoreAutoUpdateSnapshot(snapshot);
+}
+
 function removeInstalledPackage(installDir: string, packageName: string): boolean {
   const packageDir = join(installDir, "node_modules", packageName);
   if (!existsSync(packageDir)) return false;
@@ -197,6 +210,18 @@ export function preparePackageUpdate(
     const installContext = resolveInstallContext(runtimePackageJsonPath);
     if (!installContext) {
       warn("[auto-update-checker] No install context found for auto-update");
+      return null;
+    }
+
+    if (quarantinedInstallDirs.has(installContext.installDir)) {
+      const recoverySnapshot = pendingSnapshots.get(installContext.installDir);
+      const recoveryDetail = recoverySnapshot
+        ? ` Recovery snapshot: ${recoverySnapshot.tempDir}`
+        : "";
+      warn(
+        `[auto-update-checker] Auto-update blocked after unconfirmed npm termination; ` +
+          `restart OpenCode to retry.${recoveryDetail}`,
+      );
       return null;
     }
 
@@ -254,26 +279,34 @@ export async function runNpmInstallSafe(
   let stderrTail = "";
 
   try {
-    if (options.signal?.aborted) return { ok: false, reason: "aborted" };
+    if (options.signal?.aborted) {
+      restorePendingSnapshot(installDir);
+      return { ok: false, reason: "aborted" };
+    }
     // Resolve npm beyond PATH: GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT
     // and the update silently never installs. resolveNpm() also yields the bin
     // dir so npm's `#!/usr/bin/env node` shebang can find its sibling node.
     const npm = resolveNpm();
     if (!npm) {
+      restorePendingSnapshot(installDir);
       const reason = "npm not found on PATH or in known version-manager locations";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason };
     }
-    const proc = spawn(
-      npm.command,
-      ["install", "--no-audit", "--no-fund", "--no-progress", "--ignore-scripts"],
-      {
-        cwd: installDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: npmSpawnEnv(npm),
-      },
-    );
+    const invocation = npmInvocation(npm, [
+      "install",
+      "--no-audit",
+      "--no-fund",
+      "--no-progress",
+      "--ignore-scripts",
+    ]);
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: installDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...npmSpawnEnv(npm), ...invocation.env },
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderrTail += chunk.toString("utf8");
       if (stderrTail.length > STDERR_TAIL_BYTES) {
@@ -284,14 +317,11 @@ export async function runNpmInstallSafe(
       // Drain stdout too; stderr carries the actionable failure detail.
     });
 
+    let terminationPromise: Promise<void> | null = null;
     const abortProcess = () => {
-      try {
-        proc.kill();
-      } catch {
-        // best-effort
-      }
+      terminationPromise ??= terminateNpmProcessTree(proc, invocation);
+      return terminationPromise;
     };
-    options.signal?.addEventListener("abort", abortProcess, { once: true });
 
     const exitPromise = new Promise<{ ok: boolean; reason?: string }>((resolveExit) => {
       proc.on("error", (err) => resolveExit({ ok: false, reason: `spawn error: ${String(err)}` }));
@@ -306,17 +336,36 @@ export async function runNpmInstallSafe(
     const timeoutPromise = new Promise<"timeout">((resolveTimeout) => {
       timeout = setTimeout(() => resolveTimeout("timeout"), options.timeoutMs ?? 60_000);
     });
-    const result = await Promise.race([exitPromise, timeoutPromise]);
-    options.signal?.removeEventListener("abort", abortProcess);
+    let resolveAbort!: (result: "abort") => void;
+    const abortPromise = new Promise<"abort">((resolve) => {
+      resolveAbort = resolve;
+    });
+    const onAbort = () => resolveAbort("abort");
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    // Close the registration race for signals aborted before the listener was attached.
+    if (options.signal?.aborted) onAbort();
 
-    if (result === "timeout" || options.signal?.aborted) {
-      abortProcess();
-      const snapshot = pendingSnapshots.get(installDir);
-      if (snapshot) {
-        pendingSnapshots.delete(installDir);
-        restoreAutoUpdateSnapshot(snapshot);
+    const result = await Promise.race([exitPromise, timeoutPromise, abortPromise]);
+    options.signal?.removeEventListener("abort", onAbort);
+
+    if (result === "timeout" || result === "abort") {
+      try {
+        await abortProcess();
+      } catch (error) {
+        // Fail closed: restoring while an unobserved npm descendant may still
+        // write would turn a timeout into cache corruption. Keep the staged
+        // snapshot and report the unknown outcome for manual recovery/restart.
+        quarantinedInstallDirs.add(installDir);
+        const recoverySnapshot = pendingSnapshots.get(installDir);
+        const recoveryDetail = recoverySnapshot
+          ? `; auto-update quarantined for this session; recovery snapshot: ${recoverySnapshot.tempDir}`
+          : "; auto-update quarantined for this session";
+        const reason = `termination outcome unknown: ${String(error)}${recoveryDetail}`;
+        warnNpmInstallFailure(reason, stderrTail);
+        return { ok: false, reason, stderrTail: stderrTail || undefined };
       }
-      const reason = options.signal?.aborted ? "aborted" : "timeout";
+      restorePendingSnapshot(installDir);
+      const reason = result === "abort" ? "aborted" : "timeout";
       warnNpmInstallFailure(reason, stderrTail);
       return { ok: false, reason, stderrTail: stderrTail || undefined };
     }
@@ -332,11 +381,7 @@ export async function runNpmInstallSafe(
     }
     return { ...result, stderrTail: stderrTail || undefined };
   } catch (err) {
-    const snapshot = pendingSnapshots.get(installDir);
-    if (snapshot) {
-      pendingSnapshots.delete(installDir);
-      restoreAutoUpdateSnapshot(snapshot);
-    }
+    restorePendingSnapshot(installDir);
     const reason = `exception: ${String(err)}`;
     warnNpmInstallFailure(reason, stderrTail);
     return { ok: false, reason, stderrTail: stderrTail || undefined };

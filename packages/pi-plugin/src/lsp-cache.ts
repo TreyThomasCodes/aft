@@ -15,6 +15,7 @@
  * for any future packages with unusual characters.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   mkdirSync,
@@ -146,6 +147,11 @@ function lockPath(npmPackage: string): string {
 
 const STALE_LOCK_MS = 30 * 60 * 1000;
 
+export interface InstallLockLease {
+  retain(): void;
+  release(): void;
+}
+
 /**
  * Acquire an install lock for `lockKey` using an atomic `O_EXCL` open.
  *
@@ -157,33 +163,53 @@ const STALE_LOCK_MS = 30 * 60 * 1000;
  * Stale-lock recovery: if the lock file exists, we read it. If the recorded
  * PID is no longer alive OR the file is older than `STALE_LOCK_MS`, we claim
  * the lock by atomically replacing it (unlink + create with `wx`). If that
- * race fails (someone else just claimed it), we return false honestly.
+ * race fails (someone else just claimed it), we return null honestly.
  *
- * The lock file content is `<pid>\n<iso-timestamp>\n` so other processes
- * can detect dead owners.
+ * The lock file content is `<pid>\n<iso-timestamp>\n<acquisition-token>\n` so
+ * other processes can detect dead owners while releases remain generation-safe.
  */
-export function acquireInstallLock(lockKey: string): boolean {
+export function acquireInstallLock(lockKey: string): InstallLockLease | null {
   mkdirSync(lspPackageDir(lockKey), { recursive: true });
   const lock = lockPath(lockKey);
-  const tryClaim = (): boolean => {
+  const token = randomUUID();
+  const tryClaim = (): InstallLockLease | null => {
     try {
       // Atomic exclusive create. If the file exists, throws EEXIST.
       const fd = openSync(lock, "wx");
       try {
-        writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
+        writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n${token}\n`);
       } finally {
         closeSync(fd);
       }
-      return true;
+      let retained = false;
+      let released = false;
+      return {
+        retain() {
+          retained = true;
+        },
+        release() {
+          if (released) return;
+          released = true;
+          if (retained) {
+            warn(
+              `[lsp] retaining install lock for ${lockKey} after unconfirmed npm termination; ` +
+                `cross-process retries remain blocked until stale-lock recovery`,
+            );
+            return;
+          }
+          releaseInstallLock(lockKey, token);
+        },
+      };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") return false;
+      if (code === "EEXIST") return null;
       warn(`[lsp] unexpected error acquiring install lock for ${lockKey}: ${err}`);
-      return false;
+      return null;
     }
   };
 
-  if (tryClaim()) return true;
+  const claimed = tryClaim();
+  if (claimed) return claimed;
 
   // Failed — inspect the existing lock to decide whether to steal it.
   let owningPid: number | null = null;
@@ -213,7 +239,7 @@ export function acquireInstallLock(lockKey: string): boolean {
   const skipLiveness = process.platform === "win32";
   const ownerAlive = !skipLiveness && owningPid !== null && isProcessAlive(owningPid);
   if (skipLiveness ? ageWithinFresh : ownerAlive && ageWithinFresh) {
-    return false;
+    return null;
   }
 
   // Steal: log why, then atomically replace. unlink+wx avoids a brief window
@@ -246,18 +272,20 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-export function releaseInstallLock(lockKey: string): void {
+function releaseInstallLock(lockKey: string, acquisitionToken: string): void {
   const lock = lockPath(lockKey);
-  // TOCTOU defense — only unlink if we still own the lock.
+  // TOCTOU defense — only unlink if this acquisition token still owns the lock.
   // The previous `existsSync && unlinkSync` would delete another process's
   // lock if A's lock had been reclaimed by B due to STALE_LOCK_MS.
   try {
     let owningPid: number | null = null;
+    let owningToken = "";
     try {
       const raw = readFileSync(lock, "utf8");
-      const firstLine = raw.split(/\r?\n/, 1)[0]?.trim() ?? "";
-      const parsed = Number.parseInt(firstLine, 10);
+      const lines = raw.split(/\r?\n/);
+      const parsed = Number.parseInt(lines[0]?.trim() ?? "", 10);
       if (Number.isFinite(parsed) && parsed > 0) owningPid = parsed;
+      owningToken = lines[2]?.trim() ?? "";
     } catch (readErr) {
       const code = (readErr as NodeJS.ErrnoException).code;
       if (code === "ENOENT") return;
@@ -265,10 +293,8 @@ export function releaseInstallLock(lockKey: string): void {
       return;
     }
 
-    if (owningPid !== process.pid) {
-      log(
-        `[lsp] not releasing install lock for ${lockKey}: owned by pid ${owningPid ?? "unknown"} (we are ${process.pid})`,
-      );
+    if (owningPid !== process.pid || owningToken !== acquisitionToken) {
+      log(`[lsp] not releasing install lock for ${lockKey}: acquisition ownership changed`);
       return;
     }
 
@@ -294,13 +320,14 @@ export function releaseInstallLock(lockKey: string): void {
  */
 export async function withInstallLock<T>(
   lockKey: string,
-  task: () => Promise<T>,
+  task: (lease: InstallLockLease) => Promise<T>,
 ): Promise<T | null> {
-  if (!acquireInstallLock(lockKey)) return null;
+  const lease = acquireInstallLock(lockKey);
+  if (!lease) return null;
   try {
-    return await task();
+    return await task(lease);
   } finally {
-    releaseInstallLock(lockKey);
+    lease.release();
   }
 }
 

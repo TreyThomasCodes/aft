@@ -15,18 +15,30 @@
  * its bin directory; `npmSpawnEnv()` prepends that directory to PATH for the
  * spawn so npm can find its own node.
  */
-import { execFileSync } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 export interface ResolvedNpm {
-  /** Absolute path to the npm executable (or a bare name if only PATH-resolved). */
+  /** Absolute path to npm (or a bare name). Pass it through `npmInvocation()`. */
   command: string;
   /** Directory containing npm, prepended to PATH at spawn time so npm's
    * `#!/usr/bin/env node` shebang can find its sibling node. Null when the
    * command was found via the OS PATH resolver and no augmentation is needed. */
   binDir: string | null;
+}
+
+/** Executable and arguments suitable for Node's child-process APIs. */
+export interface NpmInvocation {
+  command: string;
+  args: string[];
+  /** Environment additions required by the invocation. */
+  env?: Readonly<Record<string, string>>;
+  /** Required when passing a fully quoted command line to cmd.exe. */
+  windowsVerbatimArguments?: boolean;
+  /** True when cmd.exe is wrapping an npm.cmd/npm.bat script. */
+  windowsCmdShim?: boolean;
 }
 
 interface ResolveNpmDeps {
@@ -185,6 +197,236 @@ export function resolveNpm(deps: ResolveNpmDeps = defaultDeps()): ResolvedNpm | 
   return null;
 }
 
+function quoteCmdArgument(value: string): string {
+  // cmd.exe expands percent variables even inside quotes, while quotes and line
+  // breaks can terminate the argument and append another command. npm's current
+  // callers use fixed flags and validated package specs, so reject these unsafe
+  // forms rather than silently introducing shell parsing.
+  if (/[\0\r\n"%]/.test(value)) {
+    throw new Error(
+      `npm argument cannot be represented safely for cmd.exe: ${JSON.stringify(value)}`,
+    );
+  }
+  return `"${value}"`;
+}
+
+/**
+ * Build a cross-platform child-process invocation for a resolved npm command.
+ *
+ * Windows `.cmd`/`.bat` shims are scripts, not native executables, and direct
+ * `spawn()`/`execFileSync()` calls fail with EINVAL. Route only those shims
+ * through cmd.exe; native executables and Unix npm scripts remain direct.
+ */
+export function npmInvocation(
+  resolved: ResolvedNpm,
+  npmArgs: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): NpmInvocation {
+  if (platform !== "win32" || !/\.(?:cmd|bat)$/i.test(resolved.command)) {
+    return { command: resolved.command, args: [...npmArgs] };
+  }
+
+  if (/[\0\r\n"]/.test(resolved.command)) {
+    throw new Error(
+      `npm command cannot be represented safely for cmd.exe: ${JSON.stringify(resolved.command)}`,
+    );
+  }
+
+  // Keep the path out of cmd.exe's command text. In particular, cmd expands
+  // `%NAME%` even inside quotes; expansion is single-pass, so a literal `%` in
+  // the environment value remains literal after `%AFT_NPM_COMMAND%` expands.
+  const commandEnvName = "AFT_NPM_COMMAND";
+  const quotedArgs = npmArgs.map(quoteCmdArgument);
+  const commandLine = `""%${commandEnvName}%"${quotedArgs.length > 0 ? ` ${quotedArgs.join(" ")}` : ""}"`;
+  return {
+    command: env.ComSpec ?? env.COMSPEC ?? "cmd.exe",
+    args: ["/d", "/s", "/v:off", "/c", commandLine],
+    env: { [commandEnvName]: resolved.command },
+    windowsVerbatimArguments: true,
+    windowsCmdShim: true,
+  };
+}
+
+/**
+ * Terminate an npm child safely. Windows cmd shims create a cmd.exe -> node.exe
+ * tree, so killing only the immediate child can leave npm writing in the
+ * background after a rollback or install-lock release. Resolves after the
+ * immediate child exits, or once Windows tree termination is confirmed at the
+ * grace deadline. Direct children escalate to SIGKILL after a grace period.
+ * Windows tree-kill failures reject as unknown outcomes instead of falling back
+ * to killing cmd.exe alone.
+ */
+export class NpmTerminationUnknownError extends Error {
+  readonly code = "npm_termination_unknown";
+
+  constructor(detail: string) {
+    super(`npm process-tree termination could not be confirmed: ${detail}`);
+    this.name = "NpmTerminationUnknownError";
+  }
+}
+
+function terminateDirectNpmChild(child: ChildProcess, gracePeriodMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let forceTimer: ReturnType<typeof setTimeout> | null = null;
+    let confirmationTimer: ReturnType<typeof setTimeout> | null = null;
+    let signalFailure: string | null = null;
+    const cleanup = () => {
+      if (forceTimer) clearTimeout(forceTimer);
+      if (confirmationTimer) clearTimeout(confirmationTimer);
+      child.removeListener("exit", finish);
+      child.removeListener("error", onChildError);
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const fail = () => {
+      if (settled) return;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        finish();
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(
+        new NpmTerminationUnknownError(
+          signalFailure ?? `direct npm child did not exit after SIGKILL within ${gracePeriodMs}ms`,
+        ),
+      );
+    };
+    const onChildError = (error: Error) => {
+      signalFailure = `direct npm child error during termination: ${String(error)}`;
+    };
+    const signal = (value?: NodeJS.Signals) => {
+      try {
+        if (!child.kill(value)) {
+          signalFailure = `direct npm child rejected ${value ?? "SIGTERM"}`;
+        }
+      } catch (error) {
+        signalFailure = `direct npm child ${value ?? "SIGTERM"} failed: ${String(error)}`;
+      }
+    };
+
+    child.once("exit", finish);
+    child.on("error", onChildError);
+    forceTimer = setTimeout(() => {
+      signal("SIGKILL");
+      confirmationTimer = setTimeout(fail, gracePeriodMs);
+    }, gracePeriodMs);
+    signal();
+    if (child.exitCode !== null || child.signalCode !== null) finish();
+  });
+}
+
+export function terminateNpmProcessTree(
+  child: ChildProcess,
+  invocation: NpmInvocation,
+  env: NodeJS.ProcessEnv = process.env,
+  gracePeriodMs = 5_000,
+): Promise<void> {
+  if (!invocation.windowsCmdShim) return terminateDirectNpmChild(child, gracePeriodMs);
+  const exitedSuccessfully = () => child.exitCode === 0 && child.signalCode === null;
+  // A shim that completed successfully before cancellation won the race: cmd.exe
+  // waited for npm.cmd, which waited for node, so there is no live tree to kill.
+  // Do not generalize this to nonzero or signal exits; those remain unknown.
+  if (exitedSuccessfully()) return Promise.resolve();
+  if (child.pid === undefined) {
+    return Promise.reject(new NpmTerminationUnknownError("cmd.exe child has no process ID"));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let childExited = child.exitCode !== null || child.signalCode !== null;
+    let treeKillConfirmed = false;
+    let treeKillFailure: string | null = null;
+    let killer: ChildProcess | null = null;
+    const timeout = setTimeout(() => {
+      try {
+        killer?.kill();
+      } catch {
+        // The taskkill process may already have exited.
+      }
+      if (treeKillConfirmed || exitedSuccessfully()) {
+        settled = true;
+        cleanup();
+        resolve();
+        return;
+      }
+      fail(treeKillFailure ?? `taskkill.exe did not finish within ${gracePeriodMs}ms`);
+    }, gracePeriodMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.removeListener("exit", onChildExit);
+    };
+    const succeedIfConfirmed = () => {
+      if (settled || !childExited || !treeKillConfirmed) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const fail = (detail: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new NpmTerminationUnknownError(detail));
+    };
+    function onChildExit() {
+      childExited = true;
+      if (treeKillFailure !== null) {
+        if (exitedSuccessfully()) {
+          settled = true;
+          cleanup();
+          resolve();
+        } else {
+          fail(treeKillFailure);
+        }
+        return;
+      }
+      succeedIfConfirmed();
+    }
+    const recordTreeKillFailure = (detail: string) => {
+      if (settled) return;
+      if (exitedSuccessfully()) {
+        settled = true;
+        cleanup();
+        resolve();
+        return;
+      }
+      treeKillFailure = detail;
+      if (childExited) fail(detail);
+    };
+
+    child.once("exit", onChildExit);
+    const systemRoot = env.SystemRoot ?? env.SYSTEMROOT;
+    const taskkill = systemRoot ? join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
+    try {
+      killer = spawn(taskkill, ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.once("error", (error) =>
+        recordTreeKillFailure(`taskkill.exe failed to start: ${String(error)}`),
+      );
+      killer.once("exit", (code) => {
+        if (code !== 0) {
+          recordTreeKillFailure(`taskkill.exe exited with code ${code ?? "unknown"}`);
+          return;
+        }
+        treeKillConfirmed = true;
+        succeedIfConfirmed();
+      });
+    } catch (error) {
+      recordTreeKillFailure(`taskkill.exe failed to start: ${String(error)}`);
+    }
+  });
+}
+
 /**
  * Build a spawn env that makes a resolved npm runnable: prepend its bin dir to
  * PATH so npm's `#!/usr/bin/env node` shebang finds its sibling node, even when
@@ -211,14 +453,17 @@ export function isNpmAvailable(deps: ResolveNpmDeps = defaultDeps()): boolean {
 /** Test seam: verify a resolved npm actually executes (used by diagnostics). */
 export function probeNpmVersion(resolved: ResolvedNpm): string | null {
   try {
-    const out = execFileSync(resolved.command, ["--version"], {
-      env: npmSpawnEnv(resolved),
+    const invocation = npmInvocation(resolved, ["--version"]);
+    const result = spawnSync(invocation.command, invocation.args, {
+      env: { ...npmSpawnEnv(resolved), ...invocation.env },
       encoding: "utf-8",
       timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
-    const v = out.trim();
-    return /^\d+\.\d+\.\d+/.test(v) ? v : null;
+    if (result.error || result.status !== 0) return null;
+    const version = result.stdout.trim();
+    return /^\d+\.\d+\.\d+/.test(version) ? version : null;
   } catch {
     return null;
   }

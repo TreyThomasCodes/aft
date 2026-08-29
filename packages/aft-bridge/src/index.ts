@@ -130,12 +130,15 @@ export {
   resolveLegacyStorageRoot,
 } from "./migration.js";
 // --- npm resolution (PATH-stripped GUI launch fallback) ---
-export type { ResolvedNpm } from "./npm-resolver.js";
+export type { NpmInvocation, ResolvedNpm } from "./npm-resolver.js";
 export {
   isNpmAvailable,
+  NpmTerminationUnknownError,
+  npmInvocation,
   npmSpawnEnv,
   probeNpmVersion,
   resolveNpm,
+  terminateNpmProcessTree,
 } from "./npm-resolver.js";
 // --- ONNX runtime ---
 export {

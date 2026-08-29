@@ -95,6 +95,7 @@ fn interleaving_worker(
     large_started: Arc<AtomicBool>,
     large_finished: Arc<AtomicBool>,
     small_finished: Arc<AtomicBool>,
+    small_interleaved: Arc<AtomicBool>,
 ) -> InspectWorker {
     Arc::new(move |job| {
         let started = Instant::now();
@@ -104,6 +105,7 @@ fn interleaving_worker(
             thread::sleep(Duration::from_millis(800));
             large_finished.store(true, Ordering::SeqCst);
         } else {
+            small_interleaved.store(!large_finished.load(Ordering::SeqCst), Ordering::SeqCst);
             thread::sleep(Duration::from_millis(25));
             small_finished.store(true, Ordering::SeqCst);
         }
@@ -359,11 +361,13 @@ fn inspect_engine_small_root_interleaves_with_large_scan() {
     let large_started = Arc::new(AtomicBool::new(false));
     let large_finished = Arc::new(AtomicBool::new(false));
     let small_finished = Arc::new(AtomicBool::new(false));
+    let small_interleaved = Arc::new(AtomicBool::new(false));
     let worker = interleaving_worker(
         large_root.clone(),
         Arc::clone(&large_started),
         Arc::clone(&large_finished),
         Arc::clone(&small_finished),
+        Arc::clone(&small_interleaved),
     );
     let large_manager = Arc::new(InspectManager::with_worker(
         Arc::clone(&worker),
@@ -388,19 +392,14 @@ fn inspect_engine_small_root_interleaves_with_large_scan() {
 
     let small_snapshot = snapshot(&small_root, &small_root.join(".aft-cache/inspect"));
     let small_scope = JobScope::for_project(small_root.clone());
-    let small_manager_for_thread = Arc::clone(&small_manager);
-    let small = thread::spawn(move || {
-        small_manager_for_thread.submit_category(
-            small_snapshot,
-            InspectCategory::Todos,
-            small_scope,
-        )
-    });
+    // Submit the small scan from this test thread. Spawning another OS thread
+    // here lets a heavily loaded runner delay submission until after the fixed
+    // large-scan sleep, producing a false serialization failure.
+    let small_result =
+        small_manager.submit_category(small_snapshot, InspectCategory::Todos, small_scope);
     let small_completed_before_timeout =
         wait_for_flag(small_finished.as_ref(), Duration::from_secs(5));
-    let large_finished_when_small_completed = large_finished.load(Ordering::SeqCst);
     let large_result = large.join().expect("large scan");
-    let small_result = small.join().expect("small scan");
 
     assert!(
         small_completed_before_timeout,
@@ -408,8 +407,8 @@ fn inspect_engine_small_root_interleaves_with_large_scan() {
     );
     if pool_size > 1 {
         assert!(
-            !large_finished_when_small_completed,
-            "small root waited for the large scan to finish (pool_size={pool_size})"
+            small_interleaved.load(Ordering::SeqCst),
+            "small root did not start while the large scan was running (pool_size={pool_size})"
         );
     }
     assert!(matches!(large_result, JobOutcome::Fresh { .. }));

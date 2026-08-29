@@ -1,8 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { npmSpawnEnv, resolveNpm } from "../npm-resolver.js";
+import {
+  NpmTerminationUnknownError,
+  npmInvocation,
+  npmSpawnEnv,
+  probeNpmVersion,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "../npm-resolver.js";
 
 /**
  * The resolver is dependency-injected (platform/env/home/execPath) so we can
@@ -127,6 +136,366 @@ describe("resolveNpm", () => {
     });
     expect(result).toBeNull();
   });
+});
+
+describe("npmInvocation", () => {
+  it("leaves Unix npm invocations direct", () => {
+    expect(
+      npmInvocation({ command: "/usr/bin/npm", binDir: "/usr/bin" }, ["install", "pkg"], "linux"),
+    ).toEqual({
+      command: "/usr/bin/npm",
+      args: ["install", "pkg"],
+    });
+  });
+
+  it("leaves native Windows executables direct", () => {
+    expect(
+      npmInvocation({ command: "C:\\tools\\npm.exe", binDir: "C:\\tools" }, ["--version"], "win32"),
+    ).toEqual({
+      command: "C:\\tools\\npm.exe",
+      args: ["--version"],
+    });
+  });
+
+  it("routes Windows cmd shims through ComSpec with a quoted command line", () => {
+    const invocation = npmInvocation(
+      {
+        command: "C:\\Program Files\\nodejs\\npm.cmd",
+        binDir: "C:\\Program Files\\nodejs",
+      },
+      ["install", "@scope/pkg@1.2.3", "argument with spaces"],
+      "win32",
+      { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    );
+
+    expect(invocation).toEqual({
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: [
+        "/d",
+        "/s",
+        "/v:off",
+        "/c",
+        '""%AFT_NPM_COMMAND%" "install" "@scope/pkg@1.2.3" "argument with spaces""',
+      ],
+      env: { AFT_NPM_COMMAND: "C:\\Program Files\\nodejs\\npm.cmd" },
+      windowsVerbatimArguments: true,
+      windowsCmdShim: true,
+    });
+  });
+
+  it("rejects cmd arguments that would be expanded or terminate the command", () => {
+    expect(() =>
+      npmInvocation({ command: "C:\\nodejs\\npm.cmd", binDir: "C:\\nodejs" }, ["%PATH%"], "win32"),
+    ).toThrow("cannot be represented safely");
+  });
+
+  it("waits for a direct child to report its actual exit", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return true;
+        },
+      },
+    });
+
+    let settled = false;
+    const termination = terminateNpmProcessTree(
+      child,
+      { command: "/usr/bin/npm", args: ["install"] },
+      process.env,
+      1_000,
+    ).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(signals).toEqual([undefined]);
+    expect(settled).toBe(false);
+    exitCode = 0;
+    child.emit("exit", 0, null);
+    await termination;
+    expect(settled).toBe(true);
+  });
+
+  it("force-kills a direct child after the termination grace period", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          if (signal === "SIGKILL") {
+            exitCode = 1;
+            child.emit("exit", null, "SIGKILL");
+          }
+          return true;
+        },
+      },
+    });
+
+    await terminateNpmProcessTree(
+      child,
+      { command: "/usr/bin/npm", args: ["install"] },
+      process.env,
+      10,
+    );
+    expect(signals).toEqual([undefined, "SIGKILL"]);
+  });
+
+  it("fails closed when a direct child never reports exit after SIGKILL", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: null },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return false;
+        },
+      },
+    });
+
+    await expect(
+      terminateNpmProcessTree(
+        child,
+        { command: "/usr/bin/npm", args: ["install"] },
+        process.env,
+        10,
+      ),
+    ).rejects.toBeInstanceOf(NpmTerminationUnknownError);
+    expect(signals).toEqual([undefined, "SIGKILL"]);
+  });
+
+  it("does not invoke taskkill for an already-successful cmd shim", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: 0 },
+      signalCode: { value: null },
+    });
+
+    await expect(
+      terminateNpmProcessTree(
+        child,
+        { command: "cmd.exe", args: [], windowsCmdShim: true },
+        { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+        10,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accepts a successful cmd exit racing taskkill startup failure", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    let exitCode: number | null = null;
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { get: () => exitCode },
+      signalCode: { value: null },
+    });
+
+    const termination = terminateNpmProcessTree(
+      child,
+      { command: "cmd.exe", args: [], windowsCmdShim: true },
+      { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+      100,
+    );
+    exitCode = 0;
+    child.emit("exit", 0, null);
+
+    await expect(termination).resolves.toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "accepts a successful cmd exit while taskkill remains pending past grace",
+    async () => {
+      const systemRoot = mkdtempSync(join(tmpdir(), "aft-hanging-taskkill-"));
+      try {
+        const system32 = join(systemRoot, "System32");
+        const taskkill = join(system32, "taskkill.exe");
+        mkdirSync(system32, { recursive: true });
+        writeFileSync(taskkill, "#!/bin/sh\nexec sleep 10\n");
+        chmodSync(taskkill, 0o755);
+
+        const child = new EventEmitter() as ChildProcess;
+        let exitCode: number | null = null;
+        Object.defineProperties(child, {
+          pid: { value: 123 },
+          exitCode: { get: () => exitCode },
+          signalCode: { value: null },
+        });
+
+        const termination = terminateNpmProcessTree(
+          child,
+          { command: "cmd.exe", args: [], windowsCmdShim: true },
+          { SystemRoot: systemRoot },
+          25,
+        );
+        exitCode = 0;
+        child.emit("exit", 0, null);
+
+        await expect(termination).resolves.toBeUndefined();
+      } finally {
+        rmSync(systemRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "accepts confirmed taskkill when the child exit event lags past grace",
+    async () => {
+      const systemRoot = mkdtempSync(join(tmpdir(), "aft-successful-taskkill-"));
+      try {
+        const system32 = join(systemRoot, "System32");
+        const taskkill = join(system32, "taskkill.exe");
+        mkdirSync(system32, { recursive: true });
+        writeFileSync(taskkill, "#!/bin/sh\nexit 0\n");
+        chmodSync(taskkill, 0o755);
+
+        const child = new EventEmitter() as ChildProcess;
+        Object.defineProperties(child, {
+          pid: { value: 123 },
+          exitCode: { value: null },
+          signalCode: { value: null },
+        });
+
+        await expect(
+          terminateNpmProcessTree(
+            child,
+            { command: "cmd.exe", args: [], windowsCmdShim: true },
+            { SystemRoot: systemRoot },
+            1_000,
+          ),
+        ).resolves.toBeUndefined();
+      } finally {
+        rmSync(systemRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("fails closed when taskkill cannot start", async () => {
+    const child = new EventEmitter() as ChildProcess;
+    const signals: Array<NodeJS.Signals | undefined> = [];
+    Object.defineProperties(child, {
+      pid: { value: 123 },
+      exitCode: { value: null },
+      signalCode: { value: null },
+      kill: {
+        value: (signal?: NodeJS.Signals) => {
+          signals.push(signal);
+          return true;
+        },
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await terminateNpmProcessTree(
+        child,
+        { command: "cmd.exe", args: [], windowsCmdShim: true },
+        { SystemRoot: join(tmpdir(), "aft-missing-system-root") },
+        10,
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(NpmTerminationUnknownError);
+    expect((caught as NpmTerminationUnknownError).code).toBe("npm_termination_unknown");
+    expect(signals).toEqual([]);
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "executes a cmd shim whose absolute path contains spaces",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "npm invocation "));
+      try {
+        const shim = join(root, "npm.cmd");
+        writeFileSync(shim, "@echo off\r\necho [%~1] [%~2]\r\n");
+        const invocation = npmInvocation({ command: shim, binDir: root }, ["hello world", "plain"]);
+        const result = spawnSync(invocation.command, invocation.args, {
+          encoding: "utf8",
+          env: { ...process.env, ...invocation.env },
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(0);
+        expect(result.stdout.trim()).toBe("[hello world] [plain]");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "probes npm.cmd from a path containing a literal percent",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "npm %TEMP% probe "));
+      try {
+        const shim = join(root, "npm.cmd");
+        writeFileSync(shim, "@echo off\r\necho 9.8.7\r\n");
+        expect(probeNpmVersion({ command: shim, binDir: root })).toBe("9.8.7");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "terminates the node descendant of a cmd shim",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "npm tree kill "));
+      try {
+        const shim = join(root, "npm.cmd");
+        const started = join(root, "npm-descendant-started");
+        const sentinel = join(root, "npm-still-running");
+        writeFileSync(
+          shim,
+          "@echo off\r\n\"%AFT_TEST_NODE%\" -e \"require('fs').writeFileSync(process.argv[1], 'started'); setTimeout(function(){require('fs').writeFileSync(process.argv[2], 'leaked')}, 1000)\" \"%~1\" \"%~2\"\r\n",
+        );
+        const invocation = npmInvocation({ command: shim, binDir: root }, [started, sentinel]);
+        const child = spawn(invocation.command, invocation.args, {
+          env: {
+            ...process.env,
+            PATH: "",
+            AFT_TEST_NODE: process.execPath,
+            ...invocation.env,
+          },
+          stdio: "ignore",
+          windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        });
+        let terminated = false;
+        try {
+          const startDeadline = Date.now() + 3_000;
+          while (!existsSync(started) && Date.now() < startDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          expect(existsSync(started)).toBe(true);
+          await terminateNpmProcessTree(child, invocation);
+          terminated = true;
+          await new Promise((resolve) => setTimeout(resolve, 1_100));
+          expect(existsSync(sentinel)).toBe(false);
+        } finally {
+          if (!terminated) await terminateNpmProcessTree(child, invocation);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("npmSpawnEnv", () => {

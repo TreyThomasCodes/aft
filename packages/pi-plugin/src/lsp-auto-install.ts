@@ -40,9 +40,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { type AftTransportPool, npmSpawnEnv, resolveNpm } from "@cortexkit/aft-bridge";
+import {
+  type AftTransportPool,
+  npmInvocation,
+  npmSpawnEnv,
+  resolveNpm,
+  terminateNpmProcessTree,
+} from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
+  type InstallLockLease,
   isInstalled,
   lspBinaryPath,
   lspBinDir,
@@ -153,6 +160,9 @@ interface InFlightAutoInstall {
 }
 
 const inFlightAutoInstalls = new Set<InFlightAutoInstall>();
+// A taskkill failure leaves descendant liveness unknowable. Block retries for
+// this host session without creating a permanent cross-process tombstone.
+const quarantinedNpmInstalls = new Set<string>();
 
 function trackInFlightAutoInstall(
   controller: AbortController,
@@ -266,6 +276,7 @@ function runInstall(
   spec: NpmServerSpec,
   version: string,
   cwd: string,
+  installLock: InstallLockLease,
   signal?: AbortSignal,
 ): Promise<boolean> {
   return new Promise((resolve) => {
@@ -281,9 +292,9 @@ function runInstall(
     // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
     // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
     // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
-    // resolveNpm() handles both, and npmSpawnEnv() makes npm's node sibling
-    // reachable. shell:true is avoided so a user-supplied `target` semver is
-    // never shell-parsed.
+    // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
+    // reachable, and npmInvocation() safely routes Windows shims through cmd.exe
+    // without enabling shell parsing on other platforms.
     const npm = resolveNpm();
     if (!npm) {
       warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
@@ -293,24 +304,27 @@ function runInstall(
 
     ensureInstallAnchor(cwd);
 
-    const child = spawn(
-      npm.command,
-      ["install", "--no-save", "--ignore-scripts", "--silent", target],
-      {
-        stdio: ["ignore", "pipe", "pipe"],
-        cwd,
-        env: npmSpawnEnv(npm),
-      },
-    );
+    const invocation = npmInvocation(npm, [
+      "install",
+      "--no-save",
+      "--ignore-scripts",
+      "--silent",
+      target,
+    ]);
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      cwd,
+      env: { ...npmSpawnEnv(npm), ...invocation.env },
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
     child.unref();
 
     let stderrBuf = "";
     let settled = false;
-    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let terminationPromise: Promise<void> | null = null;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
-      if (killTimer) clearTimeout(killTimer);
     };
     const finish = (ok: boolean) => {
       if (settled) return;
@@ -318,13 +332,34 @@ function runInstall(
       cleanup();
       resolve(ok);
     };
+    const childCompletedSuccessfully = () => child.exitCode === 0 && child.signalCode === null;
+    const finishAfterConfirmedTermination = () => {
+      const completedSuccessfully = childCompletedSuccessfully();
+      if (completedSuccessfully) log(`[lsp] installed ${target}`);
+      finish(completedSuccessfully);
+    };
     const onAbort = () => {
+      if (childCompletedSuccessfully()) {
+        finishAfterConfirmedTermination();
+        return;
+      }
       warn(`[lsp] install ${target} aborted during shutdown`);
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => {
-        if (!settled) child.kill("SIGKILL");
-      }, 5_000);
-      killTimer.unref?.();
+      terminationPromise ??= terminateNpmProcessTree(child, invocation);
+      void terminationPromise.then(finishAfterConfirmedTermination, (terminationError) => {
+        // A child with no PID never spawned, so it cannot still be mutating the
+        // cache and does not need cross-process quarantine.
+        if (child.pid === undefined) {
+          error(`[lsp] install ${target} failed to spawn during shutdown: ${terminationError}`);
+          finish(false);
+          return;
+        }
+        quarantinedNpmInstalls.add(spec.npm);
+        installLock.retain();
+        error(
+          `[lsp] install ${target} termination outcome unknown; quarantining retries for this session: ${String(terminationError)}`,
+        );
+        finish(false);
+      });
     };
 
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -340,10 +375,17 @@ function runInstall(
       }
     });
     child.on("error", (err) => {
-      error(`[lsp] install ${target} failed to spawn: ${err}`);
+      if (settled) return;
+      error(`[lsp] install ${target} child-process error: ${err}`);
+      // Once abort termination owns settlement, a post-spawn error must not
+      // release the install lock before the terminator confirms process exit.
+      if (terminationPromise && child.pid !== undefined) return;
       finish(false);
     });
     child.on("exit", (code) => {
+      // Abort settlement is owned by the awaited terminator on every platform;
+      // do not report a raced wrapper exit independently.
+      if (settled || terminationPromise) return;
       if (code === 0) {
         log(`[lsp] installed ${target}`);
         finish(true);
@@ -363,6 +405,13 @@ async function ensureServerInstalled(
   fetchImpl: typeof fetch,
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
+  if (quarantinedNpmInstalls.has(spec.npm)) {
+    return {
+      started: false,
+      reason: "install blocked after unconfirmed npm termination; restart the host to retry",
+    };
+  }
+
   // The lock MUST be held through install completion, not just through the
   // start decision. Two parallel sessions would otherwise both pass the
   // "is install needed" check and run `bun add` into the same cache dir
@@ -374,7 +423,7 @@ async function ensureServerInstalled(
   // which awaits the install — but the OUTER call site in index.ts uses
   // .catch on the whole runAutoInstall promise, so the plugin doesn't block
   // on it. The lock is still released when each install actually finishes.
-  const outcome = await withInstallLock(spec.npm, async () => {
+  const outcome = await withInstallLock(spec.npm, async (installLock) => {
     const { version, probe } = await resolveTargetVersion(spec, config, fetchImpl);
 
     // Grace blocked + nothing installed = skip with warning.
@@ -430,12 +479,16 @@ async function ensureServerInstalled(
     // Run the install AND wait for completion before releasing the lock.
     // Errors are logged but we still return { started: true } so the caller
     // counts the attempt. The next session will retry if installation failed.
-    const ok = await runInstall(spec, version, cachedPackageDir(spec.npm), signal).catch(
-      (err: unknown) => {
-        error(`[lsp] background install ${spec.npm} crashed: ${err}`);
-        return false;
-      },
-    );
+    const ok = await runInstall(
+      spec,
+      version,
+      cachedPackageDir(spec.npm),
+      installLock,
+      signal,
+    ).catch((err: unknown) => {
+      error(`[lsp] background install ${spec.npm} crashed: ${err}`);
+      return false;
+    });
     if (!ok) {
       return { started: true, reason: "install failed (see plugin log)" };
     }

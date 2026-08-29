@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import {
   buildDoctorFixPlan,
@@ -20,6 +21,12 @@ import {
   type HarnessDiagnostic,
   renderDiagnosticsMarkdown,
 } from "../lib/diagnostics.js";
+
+test("doctor npm timeout waits for termination even if the child emits an error", () => {
+  const source = readFileSync(new URL("../commands/doctor.ts", import.meta.url), "utf8");
+  expect(source).toMatch(/child\.once\("error", \(error\) => \{\s*if \(terminating\) return;/);
+  expect(source).toContain("terminateNpmProcessTree(child, invocation).then(");
+});
 
 function makeAdapter(overrides: Partial<HarnessAdapter> = {}): HarnessAdapter {
   const configPaths: HarnessConfigPaths = {

@@ -293,12 +293,24 @@ describe("runAutoInstall", () => {
   // silently reintroduce a bun dependency.
   test("runInstall spawns npm (resolved), not bun (GitHub #46)", () => {
     const source = readFileSync(new URL("../lsp-auto-install.ts", import.meta.url), "utf8");
-    // npm must be resolved via the shared resolver (which handles npm.cmd on
-    // win32 AND finds npm beyond a GUI-stripped PATH), then spawned by its
-    // resolved command with the spawn-env that makes its node sibling reachable.
+    // npm must be resolved beyond a GUI-stripped PATH, then converted to a
+    // platform-safe invocation (npm.cmd requires cmd.exe on Windows).
     expect(source).toMatch(/resolveNpm\(\)/);
-    expect(source).toMatch(/spawn\(\s*npm\.command\s*,/);
-    expect(source).toMatch(/env:\s*npmSpawnEnv\(npm\)/);
+    expect(source).toMatch(/npmInvocation\(npm,/);
+    expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
+    expect(source).toContain("npmSpawnEnv(npm)");
+    expect(source).toContain("terminateNpmProcessTree(child, invocation)");
+    expect(source).toMatch(/terminationPromise\.then\(\s*finishAfterConfirmedTermination,/);
+    expect(source).toContain("const completedSuccessfully = childCompletedSuccessfully()");
+    expect(source).toContain("finish(completedSuccessfully)");
+    expect(source).toContain("if (settled || terminationPromise) return;");
+    expect(source).toContain("quarantining retries for this session");
+    expect(source).toContain("quarantinedNpmInstalls.has(spec.npm)");
+    expect(source).toContain("installLock.retain()");
+    expect(source).toContain("if (child.pid === undefined)");
+    expect(source).toContain("if (terminationPromise && child.pid !== undefined) return;");
+    expect(source).not.toContain('child.kill("SIGTERM")');
+    expect(source).toContain("finish(false)");
     expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
     // There must be no live `spawn("bun", ...)` call. Comments referencing
     // the old behavior are fine (they explain the historical bug); only a
