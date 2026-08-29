@@ -9,21 +9,29 @@ type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot">;
 
 export const BASH_WAIT_DETACH_MAGIC_KEYWORD = "&detach";
 const EMPTY_DETACH_MESSAGE = "(requested background detach)";
+const STANDALONE_DETACH_KEYWORD_SOURCE = `(^|[^\\p{L}\\p{N}_])${BASH_WAIT_DETACH_MAGIC_KEYWORD}(?![\\p{L}\\p{N}_])`;
+const STANDALONE_DETACH_KEYWORD_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "u");
+const STANDALONE_DETACH_KEYWORDS_PATTERN = new RegExp(STANDALONE_DETACH_KEYWORD_SOURCE, "gu");
+
+function containsStandaloneDetachKeyword(messageText: string): boolean {
+  return STANDALONE_DETACH_KEYWORD_PATTERN.test(messageText);
+}
+
+function stripStandaloneDetachKeywords(messageText: string): string {
+  return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");
+}
 
 /** Strip the `&detach` control token before Pi's input transform delivers the user message to the model. */
 export function stripUserMessageDetachKeyword(messageText: string): string {
-  if (!messageText.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)) return messageText;
-  const stripped = messageText
-    .replaceAll(BASH_WAIT_DETACH_MAGIC_KEYWORD, "")
-    .replace(/[ \t]{2,}/g, " ");
+  if (!containsStandaloneDetachKeyword(messageText)) return messageText;
+  const stripped = stripStandaloneDetachKeywords(messageText).replace(/[ \t]{2,}/g, " ");
   return stripped.trim() === "" ? EMPTY_DETACH_MESSAGE : stripped;
 }
 
 /** Decide whether a user message should signal an active wait:true bash call. */
 export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText: string): boolean {
   return (
-    resolveBashConfig(config).detach_on_user_message ||
-    messageText.includes(BASH_WAIT_DETACH_MAGIC_KEYWORD)
+    resolveBashConfig(config).detach_on_user_message || containsStandaloneDetachKeyword(messageText)
   );
 }
 

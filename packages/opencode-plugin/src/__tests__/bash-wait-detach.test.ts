@@ -46,6 +46,34 @@ describe("bash wait detach helper", () => {
     expect(output.parts[0].text).toBe("before middle after");
   });
 
+  test("recognizes standalone tokens at message boundaries", () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const first = { parts: [{ type: "text", text: "&detach, continue" }] };
+    const last = { parts: [{ type: "text", text: "continue &detach" }] };
+
+    expect(shouldDetachBashWaitOnUserMessage(config, first.parts[0].text)).toBe(true);
+    expect(shouldDetachBashWaitOnUserMessage(config, last.parts[0].text)).toBe(true);
+    expect(stripUserMessageDetachKeyword(first)).toBe(", continue");
+    expect(stripUserMessageDetachKeyword(last)).toBe("continue ");
+  });
+
+  test("does not detach or strip when the keyword is part of an identifier", () => {
+    const config = { bash: { detach_on_user_message: false } };
+    const messages = [
+      "Please document &detachment behavior",
+      "keep before&detach unchanged",
+      "keep &detach_mode unchanged",
+      "keep &detaché unchanged",
+    ];
+
+    for (const message of messages) {
+      const output = { parts: [{ type: "text", text: message }] };
+      expect(shouldDetachBashWaitOnUserMessage(config, message)).toBe(false);
+      expect(stripUserMessageDetachKeyword(output)).toBe(message);
+      expect(output.parts[0].text).toBe(message);
+    }
+  });
+
   test("substitutes an honest message when the token is the only user text", () => {
     const output = { parts: [{ type: "text", text: "  &detach  " }] };
 
