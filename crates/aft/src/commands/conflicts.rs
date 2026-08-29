@@ -21,11 +21,16 @@ struct ConflictRegion {
     end_line: usize,
 }
 
-/// Resolve the git toplevel for `base_dir`.
-fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
+/// Resolve the git toplevel containing `base_path`, which may be a file or directory.
+fn git_toplevel(base_path: &Path) -> Result<PathBuf, String> {
+    let working_dir = if base_path.is_file() {
+        base_path.parent().unwrap_or(base_path)
+    } else {
+        base_path
+    };
     let output = crate::effective_path::new_command("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(base_dir)
+        .current_dir(working_dir)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
 
@@ -385,6 +390,11 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    use crate::config::Config;
+    use crate::context::default_language_provider_factory;
+    use crate::protocol::RawRequest;
 
     #[test]
     fn test_find_conflict_regions_basic() {
@@ -493,6 +503,56 @@ line 6"#;
 
         assert!(output.contains("   1: <<<<<<< HEAD"));
         assert!(output.contains("   6: line 6"));
+    }
+
+    #[test]
+    fn conflicts_path_accepts_file_inside_repo() {
+        let temp = tempfile::tempdir().expect("create temp repo");
+        let repo = std::fs::canonicalize(temp.path()).expect("canonicalize temp repo");
+        let file = repo.join("conflicted.txt");
+        std::fs::write(
+            &file,
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n",
+        )
+        .expect("write conflicted file");
+
+        let init = crate::effective_path::new_command("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("run git init");
+        assert!(init.success(), "git init failed: {init}");
+        let add = crate::effective_path::new_command("git")
+            .args(["add", "conflicted.txt"])
+            .current_dir(&repo)
+            .status()
+            .expect("run git add");
+        assert!(add.success(), "git add failed: {add}");
+
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(repo),
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "conflicts-file-path".to_string(),
+            command: "git_conflicts".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "path": file }),
+        };
+
+        let response = handle_git_conflicts(&ctx, &req);
+
+        assert!(
+            response.success,
+            "a file path inside the repo should select that repo: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["file_count"], 1);
+        assert_eq!(response.data["conflict_count"], 1);
     }
 
     #[test]
