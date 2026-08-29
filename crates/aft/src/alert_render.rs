@@ -393,7 +393,11 @@ pub fn is_excluded_finalization_command(command: &str) -> bool {
 pub fn normalize_alert_message(message: &str) -> String {
     let first_line = message.lines().next().unwrap_or_default().trim();
     let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
-    compose_common_nfc(&collapsed)
+    if collapsed.is_ascii() {
+        collapsed
+    } else {
+        compose_common_nfc(&collapsed)
+    }
 }
 
 fn canonical_dispatch_root(root: &Path) -> PathBuf {
@@ -503,7 +507,7 @@ fn compose_pair(base: char, mark: char) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_alert_message, AlertDiagnostic, AlertEngine, AlertSeverity,
+        compose_common_nfc, normalize_alert_message, AlertDiagnostic, AlertEngine, AlertSeverity,
         EXCLUDED_FINALIZATION_COMMANDS, MAX_ALERT_LINE_CHARS,
     };
     use std::path::Path;
@@ -522,6 +526,36 @@ mod tests {
             normalize_alert_message("src/a.rs:42 \"quoted\""),
             "src/a.rs:42 \"quoted\""
         );
+    }
+
+    fn normalize_alert_message_reference(message: &str) -> String {
+        let first_line = message.lines().next().unwrap_or_default().trim();
+        let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        compose_common_nfc(&collapsed)
+    }
+
+    #[test]
+    fn ascii_fast_path_preserves_normalized_bytes() {
+        let mut messages = vec![
+            String::new(),
+            "  mismatched   types\tnear `request`  \nignored".to_string(),
+            "Cafe\u{301}   failed".to_string(),
+            "déjà vu".to_string(),
+            "a\u{0327}\u{0301} unfamiliar decomposition".to_string(),
+        ];
+        for character in '\0'..='\u{7f}' {
+            messages.push(format!(
+                "  prefix{character}{character}suffix\t detail  \nignored"
+            ));
+        }
+
+        for message in messages {
+            assert_eq!(
+                normalize_alert_message(&message).as_bytes(),
+                normalize_alert_message_reference(&message).as_bytes(),
+                "normalization changed for {message:?}",
+            );
+        }
     }
 
     #[test]
@@ -667,5 +701,54 @@ mod tests {
         let line = alert.text.lines().nth(1).expect("alert line");
         assert!(line.chars().count() <= MAX_ALERT_LINE_CHARS);
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    #[ignore = "manual performance probe"]
+    fn ascii_alert_normalization_perf_probe() {
+        const PASSES: usize = 100_000;
+        const SAMPLE_COUNT: usize = 11;
+        const MESSAGES: [&str; 8] = [
+            "error[E0308]:   mismatched types in crates/aft/src/commands/inspect.rs: expected `Result`, found `Option`",
+            "Cannot find name 'resolvedProjectRoot'.   Did you mean 'resolveProjectRoot'?",
+            "borrow of moved value: `request`   value borrowed here after move",
+            "the trait bound `PathBuf: Copy` is not satisfied   required by this call",
+            "Module not found: Can't resolve   '../../transport/runtime' in '/workspace/src'",
+            "Property 'agent_visible_response_ordinal' does not exist on type 'AlertState'",
+            "unused import: `std::collections::HashMap`   `#[warn(unused_imports)]` on by default",
+            "lifetime may not live long enough   returning this value requires that `'1` must outlive `'static'",
+        ];
+
+        for message in MESSAGES {
+            std::hint::black_box(normalize_alert_message(message));
+        }
+
+        let mut samples_ms = Vec::with_capacity(SAMPLE_COUNT);
+        let mut checksum = 0usize;
+        for _ in 0..SAMPLE_COUNT {
+            let started = std::time::Instant::now();
+            let mut sample_checksum = 0usize;
+            for _ in 0..PASSES {
+                for message in MESSAGES {
+                    sample_checksum = sample_checksum.wrapping_add(
+                        std::hint::black_box(normalize_alert_message(std::hint::black_box(
+                            message,
+                        )))
+                        .len(),
+                    );
+                }
+            }
+            samples_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+            checksum = checksum.wrapping_add(std::hint::black_box(sample_checksum));
+        }
+        samples_ms.sort_by(f64::total_cmp);
+
+        println!(
+            "ascii-alert-normalization: calls_per_sample={} samples_ms={samples_ms:?} min_ms={:.3} median_ms={:.3} max_ms={:.3} checksum={checksum}",
+            PASSES * MESSAGES.len(),
+            samples_ms[0],
+            samples_ms[SAMPLE_COUNT / 2],
+            samples_ms[SAMPLE_COUNT - 1],
+        );
     }
 }

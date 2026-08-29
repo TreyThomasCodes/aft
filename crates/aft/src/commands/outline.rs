@@ -877,11 +877,18 @@ fn collect_outline_files_with_device_lookup<F>(
             *collection_truncated = true;
             return;
         }
-        let path = entry.path();
-        if is_symlink(&path) {
+        // Query the directory entry once. Calling Path::is_dir, Path::is_file,
+        // and symlink_metadata separately issues up to three metadata lookups per
+        // file, which dominates `files: true` outlines on large repositories.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
             continue;
         }
-        if path.is_dir() {
+
+        let path = entry.path();
+        if file_type.is_dir() {
             if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
                 continue;
             }
@@ -908,19 +915,13 @@ fn collect_outline_files_with_device_lookup<F>(
             if *collection_truncated {
                 return;
             }
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if is_ignored_outline_path(&path, false, options) {
                 continue;
             }
             files.push(path.to_string_lossy().to_string());
         }
     }
-}
-
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 fn is_ignored_outline_path(
@@ -1935,5 +1936,52 @@ mod tests {
         ));
         assert!(!signature_has_visibility("def compute(value):"));
         assert!(!signature_has_visibility("func Parse(input string)"));
+    }
+
+    /// Manual release-mode probe for the directory walk paid by one outline
+    /// `files: true` request on a realistic 10k-file monorepo.
+    #[test]
+    #[ignore = "manual release-mode outline files performance probe"]
+    fn outline_files_walk_perf_probe() {
+        const DIRECTORIES: usize = 100;
+        const FILES_PER_DIRECTORY: usize = 100;
+        const SAMPLES: usize = 9;
+        const ITERATIONS: usize = 3;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        for directory in 0..DIRECTORIES {
+            let path = temp.path().join(format!("package-{directory:03}/src"));
+            std::fs::create_dir_all(&path).expect("create package directory");
+            for file in 0..FILES_PER_DIRECTORY {
+                std::fs::write(
+                    path.join(format!("module-{file:03}.ts")),
+                    b"export const value = 1;\n",
+                )
+                .expect("write source fixture");
+            }
+        }
+
+        let discovery = discover_outline_files(temp.path());
+        assert_eq!(discovery.files.len(), OUTLINE_FILE_WALK_CAP);
+        assert!(discovery.walk_truncated);
+
+        let mut micros_per_operation = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                let discovery = discover_outline_files(std::hint::black_box(temp.path()));
+                std::hint::black_box(discovery);
+            }
+            micros_per_operation.push(started.elapsed().as_micros() / ITERATIONS as u128);
+        }
+        micros_per_operation.sort_unstable();
+        let median = micros_per_operation[SAMPLES / 2];
+
+        eprintln!(
+            "outline files walk: files={} samples={SAMPLES} iterations={ITERATIONS}",
+            DIRECTORIES * FILES_PER_DIRECTORY
+        );
+        eprintln!("microseconds per outline operation: {micros_per_operation:?}");
+        eprintln!("median: {median}us per outline operation");
     }
 }

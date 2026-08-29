@@ -769,9 +769,13 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) reset_filter_registry: bool,
     pub(crate) clear_failed_spawns: bool,
     pub(crate) warm_callgraph_store: bool,
-    /// Advance disk-publication epochs in the post-ack configure tail. This can
-    /// wait for an already-committing writer, so it must never run on bind.
-    pub(crate) supersede_artifact_persistence: bool,
+    /// Advance search disk-publication epochs only after the configure
+    /// acknowledgement is sent. Updating an epoch may wait for a writer already
+    /// committing, so the initial route bind must not perform this work.
+    pub(crate) supersede_search_artifact_persistence: bool,
+    /// Advance the callgraph publication epoch only when its root/corpus inputs
+    /// changed. Unrelated reconfiguration adopts the live callgraph worker.
+    pub(crate) supersede_callgraph_artifact_persistence: bool,
     /// Keep the adopted semantic worker's artifact-publication epoch valid so it
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
@@ -1745,6 +1749,10 @@ pub struct AppContext {
     /// Deferred maintenance uses the same gate for the state check and admission.
     subc_lifecycle: SubcLifecycleAdmission,
     configure_warm_state: parking_lot::Mutex<ConfigureWarmState>,
+    /// Identity of the inputs that govern callgraph disk publication. It is
+    /// narrower than the all-artifact warm key so unrelated lanes can rebind
+    /// without superseding a valid callgraph build.
+    callgraph_build_key: parking_lot::Mutex<Option<String>>,
     configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
@@ -2166,6 +2174,7 @@ impl AppContext {
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle: SubcLifecycleAdmission::default(),
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
+            callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
@@ -2988,6 +2997,15 @@ impl AppContext {
             .key
             .as_deref()
             .is_some_and(|current| current == key)
+    }
+
+    /// Record the callgraph-specific corpus/publication identity and report
+    /// whether an existing worker remains valid under the new configure.
+    pub(crate) fn note_callgraph_build_key(&self, key: String) -> bool {
+        let mut current = self.callgraph_build_key.lock();
+        let equivalent = current.as_deref() == Some(key.as_str());
+        *current = Some(key);
+        equivalent
     }
 
     pub(crate) fn invalidate_configure_warm_state(&self) {
@@ -4244,8 +4262,14 @@ impl AppContext {
             // default 0). Transport-loop warmers pass zero so stdin EOF stays
             // observable while the cold build runs in the background.
             let work = if let Some(force_token) = force_token {
+                crate::slog_info!(
+                    "callgraph cold-build decision: reason=corpus drift; action=force rebuild"
+                );
                 CallgraphBackgroundWork::ForceRebuild(force_token)
             } else {
+                crate::slog_info!(
+                    "callgraph cold-build decision: reason=no current generation; action=ensure build"
+                );
                 CallgraphBackgroundWork::Ensure
             };
             // A concurrent caller may have installed a receiver after the
@@ -4464,7 +4488,6 @@ impl AppContext {
         let session_id = crate::log_ctx::current_session();
         let chunk_size = self.config().callgraph_chunk_size;
         let build_generation = self.configure_generation();
-        let generation_flag = self.configure_generation_flag();
         let configured_keys = self.configured_callgraph_keys(&project_root);
         let summary_logged = Arc::clone(&self.callgraph_legacy_migration_summary_logged);
 
@@ -4514,7 +4537,7 @@ impl AppContext {
                     return;
                 }
                 let built = crate::callgraph_store::with_publish_epoch(
-                    persist_epoch_flag,
+                    persist_epoch_flag.clone(),
                     persist_epoch,
                     || match work {
                         CallgraphBackgroundWork::LegacyMigration => {
@@ -4575,12 +4598,12 @@ impl AppContext {
                                 ),
                             }
                         }
-                        if generation_flag.load(Ordering::SeqCst) == build_generation {
+                        if persist_epoch_flag.is_current(persist_epoch) {
                             settlement.ready(store);
                         } else {
                             crate::slog_info!(
-                                "callgraph store warm build result discarded for stale generation {}",
-                                build_generation
+                                "callgraph store warm build result discarded for superseded publication epoch {}",
+                                persist_epoch
                             );
                         }
                     }
@@ -4651,6 +4674,17 @@ impl AppContext {
         let mut receiver = self.callgraph_store_rx.lock();
         *receiver = None;
         self.next_callgraph_store_rx_epoch();
+    }
+
+    /// Rebind a live callgraph build receiver while its dedicated publication
+    /// epoch remains valid for the same root and corpus inputs.
+    pub(crate) fn adopt_callgraph_store_rx_generation(&self, generation: u64) -> bool {
+        let receiver = self.callgraph_store_rx.lock();
+        if receiver.is_none() {
+            return false;
+        }
+        self.note_callgraph_store_rx_generation(generation);
+        true
     }
 
     pub(crate) fn note_callgraph_store_rx_generation(&self, generation: u64) {
@@ -4941,8 +4975,18 @@ impl AppContext {
     }
 
     pub fn clear_pending_index_updates(&self) {
+        self.clear_pending_index_updates_with_callgraph(true);
+    }
+
+    pub(crate) fn clear_pending_index_updates_preserving_callgraph(&self) {
+        self.clear_pending_index_updates_with_callgraph(false);
+    }
+
+    fn clear_pending_index_updates_with_callgraph(&self, clear_callgraph: bool) {
         self.pending_search_index_paths.lock().clear();
-        self.pending_callgraph_store_paths.lock().clear();
+        if clear_callgraph {
+            self.pending_callgraph_store_paths.lock().clear();
+        }
         self.pending_tier2_paths.lock().clear();
         self.pending_semantic_index_paths.lock().clear();
         *self.pending_semantic_corpus_refresh.lock() = false;

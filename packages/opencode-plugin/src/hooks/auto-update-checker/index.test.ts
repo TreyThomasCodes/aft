@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+
+import { OpenCodeAdapter } from "../../../../aft-cli/src/adapters/opencode.js";
+import { cacheDir, getOpenCodeCacheRoot } from "./constants.js";
 
 const logMock = mock(() => {});
 const warnMock = mock(() => {});
@@ -60,6 +63,12 @@ async function waitForCalls(fn: { mock: { calls: unknown[] } }, minCalls = 1): P
 let testStorageDir: string;
 
 describe("auto-update-checker/index", () => {
+  test("CLI and auto-update cache roots stay aligned", () => {
+    // All three resolve at call time under the same environment, so this holds
+    // regardless of what XDG_* mutations other test files performed earlier.
+    expect(dirname(cacheDir())).toBe(getOpenCodeCacheRoot());
+    expect(new OpenCodeAdapter().getOpenCodeCacheDir()).toBe(dirname(cacheDir()));
+  });
   beforeEach(() => {
     testStorageDir = mkdtempSync(join(tmpdir(), "aft-update-test-"));
     logMock.mockClear();

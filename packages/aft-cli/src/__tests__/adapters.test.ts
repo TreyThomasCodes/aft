@@ -1,13 +1,23 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getAdapter, getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { PiAdapter } from "../adapters/pi.js";
+
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
 
 describe("registry", () => {
   test("getAllAdapters returns known adapters", () => {
@@ -39,12 +49,49 @@ describe("OpenCodeAdapter configuration", () => {
     tmpHome = mkdtempSync(join(tmpdir(), "aft-cli-test-"));
     configDir = join(tmpHome, ".config", "opencode");
     mkdirSync(configDir, { recursive: true });
-    releaseEnv = await acquireEnv({ OPENCODE_CONFIG_DIR: configDir });
+    releaseEnv = await acquireEnv({
+      OPENCODE_CONFIG_DIR: configDir,
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+      LOCALAPPDATA: process.env.LOCALAPPDATA,
+    });
   });
 
   afterEach(() => {
     releaseEnv?.();
     releaseEnv = undefined;
+  });
+
+  test("getPluginCacheInfo uses XDG cache on simulated Windows", () => {
+    const xdgCache = join(tmpHome, "xdg-cache");
+    process.env.XDG_CACHE_HOME = xdgCache;
+
+    withPlatform("win32", () => {
+      expect(new OpenCodeAdapter().getPluginCacheInfo().path).toBe(
+        join(xdgCache, "opencode", "packages", "@cortexkit", "aft-opencode@latest"),
+      );
+    });
+  });
+
+  test("clearPluginCache removes the previously reported LOCALAPPDATA path as legacy", async () => {
+    const legacyRoot = join(tmpHome, "legacy-local-app-data");
+    const legacyPath = join(
+      legacyRoot,
+      "opencode",
+      "packages",
+      "@cortexkit",
+      "aft-opencode@latest",
+    );
+    mkdirSync(legacyPath, { recursive: true });
+    process.env.XDG_CACHE_HOME = join(tmpHome, "xdg-cache");
+    process.env.LOCALAPPDATA = legacyRoot;
+
+    const result = withPlatform("win32", () => new OpenCodeAdapter().clearPluginCache(true));
+    const resolved = await result;
+
+    expect(resolved.action).toBe("legacy_path_cleared");
+    expect(resolved.legacy_path_cleared).toBe(legacyPath);
+    expect(resolved.path).toBe(legacyPath);
+    expect(() => rmSync(legacyRoot, { recursive: true, force: true })).not.toThrow();
   });
 
   test("isInstalled returns true when the OpenCode config dir exists (Desktop, no CLI on PATH)", () => {

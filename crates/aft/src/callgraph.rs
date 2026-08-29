@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
@@ -38,6 +38,238 @@ static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+// Cold builds retain one resolver memo across every staged reference window. The
+// entry and retained-weight ceilings keep that speedup inside the bounded-build
+// working-set contract: at most 9 MiB of estimated keys/values are retained.
+const MODULE_RESOLUTION_MEMO_MAX_ENTRIES: usize = 32_768;
+const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const JSON_VALUE_MEMO_MAX_ENTRIES: usize = 8_192;
+const JSON_VALUE_MEMO_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES: usize = 2_048;
+const WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES: usize = 1024 * 1024;
+const MEMO_ENTRY_OVERHEAD_BYTES: usize = 128;
+
+type ModuleResolutionKey = (PathBuf, String);
+type WorkspacePackageKey = (PathBuf, String);
+
+struct BoundedMemo<K, V> {
+    entries: HashMap<K, V>,
+    retained_weight: usize,
+    max_entries: usize,
+    max_retained_weight: usize,
+}
+
+impl<K: Eq + std::hash::Hash, V> BoundedMemo<K, V> {
+    fn new(max_entries: usize, max_retained_weight: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            retained_weight: 0,
+            max_entries,
+            max_retained_weight,
+        }
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: K, value: V, retained_weight: usize) {
+        if self.entries.contains_key(&key)
+            || self.entries.len() >= self.max_entries
+            || self.retained_weight.saturating_add(retained_weight) > self.max_retained_weight
+        {
+            return;
+        }
+        self.retained_weight += retained_weight;
+        self.entries.insert(key, value);
+    }
+}
+
+/// Snapshot-scoped filesystem memo used by the staged cold-build resolver.
+///
+/// The cold build reads one fixed corpus, so no watcher invalidation is needed:
+/// the memo is dropped when publication completes or the build aborts.
+pub(crate) struct ModuleResolutionMemo {
+    enabled: bool,
+    module_paths: RefCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
+    json_values: RefCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
+    workspace_packages: RefCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
+    #[cfg(test)]
+    collect_metrics: bool,
+    #[cfg(test)]
+    module_computations: RefCell<HashMap<ModuleResolutionKey, usize>>,
+    #[cfg(test)]
+    json_probes: RefCell<HashMap<PathBuf, usize>>,
+}
+
+impl Default for ModuleResolutionMemo {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            module_paths: RefCell::new(BoundedMemo::new(
+                MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
+                MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
+            )),
+            json_values: RefCell::new(BoundedMemo::new(
+                JSON_VALUE_MEMO_MAX_ENTRIES,
+                JSON_VALUE_MEMO_MAX_RETAINED_BYTES,
+            )),
+            workspace_packages: RefCell::new(BoundedMemo::new(
+                WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES,
+                WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES,
+            )),
+            #[cfg(test)]
+            collect_metrics: false,
+            #[cfg(test)]
+            module_computations: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            json_probes: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl ModuleResolutionMemo {
+    fn resolve_module_path(&self, from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+        let key = (from_dir.to_path_buf(), module_path.to_string());
+        if self.enabled {
+            if let Some(cached) = self.module_paths.borrow().get(&key) {
+                return cached.clone();
+            }
+        }
+
+        self.note_module_computation(&key);
+        let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self));
+        if self.enabled {
+            let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
+            self.module_paths
+                .borrow_mut()
+                .insert(key, resolved.clone(), retained_weight);
+        }
+        resolved
+    }
+
+    fn json_value(&self, path: &Path) -> Option<Arc<Value>> {
+        if self.enabled {
+            if let Some(cached) = self.json_values.borrow().get(path) {
+                return cached.clone();
+            }
+        }
+
+        self.note_json_probe(path);
+        let parsed = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|source| serde_json::from_str(&source).ok())
+            .map(Arc::new);
+        if self.enabled {
+            let retained_weight = MEMO_ENTRY_OVERHEAD_BYTES
+                + path_retained_weight(path)
+                + parsed
+                    .as_deref()
+                    .map(json_retained_weight)
+                    .unwrap_or_default();
+            self.json_values.borrow_mut().insert(
+                path.to_path_buf(),
+                parsed.clone(),
+                retained_weight,
+            );
+        }
+        parsed
+    }
+
+    fn workspace_package(&self, key: &WorkspacePackageKey) -> Option<Option<PathBuf>> {
+        self.enabled
+            .then(|| self.workspace_packages.borrow().get(key).cloned())
+            .flatten()
+    }
+
+    fn remember_workspace_package(&self, key: WorkspacePackageKey, resolved: Option<PathBuf>) {
+        if !self.enabled {
+            return;
+        }
+        let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
+        self.workspace_packages
+            .borrow_mut()
+            .insert(key, resolved, retained_weight);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(enabled: bool, collect_metrics: bool) -> Self {
+        Self {
+            enabled,
+            collect_metrics,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn module_computations_for_test(&self) -> HashMap<ModuleResolutionKey, usize> {
+        self.module_computations.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn json_probes_for_test(&self) -> HashMap<PathBuf, usize> {
+        self.json_probes.borrow().clone()
+    }
+
+    #[cfg(test)]
+    fn note_module_computation(&self, key: &ModuleResolutionKey) {
+        if self.collect_metrics {
+            *self
+                .module_computations
+                .borrow_mut()
+                .entry(key.clone())
+                .or_default() += 1;
+        }
+    }
+
+    #[cfg(not(test))]
+    fn note_module_computation(&self, _key: &ModuleResolutionKey) {}
+
+    #[cfg(test)]
+    fn note_json_probe(&self, path: &Path) {
+        if self.collect_metrics {
+            *self
+                .json_probes
+                .borrow_mut()
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+        }
+    }
+
+    #[cfg(not(test))]
+    fn note_json_probe(&self, _path: &Path) {}
+}
+
+fn module_resolution_entry_weight(key: &(PathBuf, String), resolved: Option<&Path>) -> usize {
+    MEMO_ENTRY_OVERHEAD_BYTES
+        + path_retained_weight(&key.0)
+        + key.1.len()
+        + resolved.map(path_retained_weight).unwrap_or_default()
+}
+
+fn path_retained_weight(path: &Path) -> usize {
+    path.to_string_lossy().len()
+}
+
+fn json_retained_weight(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(value) => value.len(),
+            Value::Array(values) => values.iter().map(json_retained_weight).sum(),
+            Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| {
+                    key.len() + MEMO_ENTRY_OVERHEAD_BYTES + json_retained_weight(value)
+                })
+                .sum(),
+        }
+}
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -1412,6 +1644,22 @@ fn collect_calls_full_with_ranges_inner(
 ///
 /// Tries common file extensions for TypeScript/JavaScript projects.
 pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    resolve_module_path_uncached(from_dir, module_path, None)
+}
+
+pub(crate) fn resolve_module_path_with_memo(
+    from_dir: &Path,
+    module_path: &str,
+    memo: &ModuleResolutionMemo,
+) -> Option<PathBuf> {
+    memo.resolve_module_path(from_dir, module_path)
+}
+
+fn resolve_module_path_uncached(
+    from_dir: &Path,
+    module_path: &str,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
     if module_path.starts_with('.') {
         return resolve_relative_module_path(from_dir, module_path);
     }
@@ -1420,11 +1668,11 @@ pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<
         return None;
     }
 
-    if let Some(path) = resolve_tsconfig_path(from_dir, module_path) {
+    if let Some(path) = resolve_tsconfig_path(from_dir, module_path, memo) {
         return Some(path);
     }
 
-    resolve_workspace_module_path(from_dir, module_path)
+    resolve_workspace_module_path(from_dir, module_path, memo)
 }
 
 fn resolve_relative_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
@@ -1458,10 +1706,14 @@ fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_workspace_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+fn resolve_workspace_module_path(
+    from_dir: &Path,
+    module_path: &str,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
     let (package_name, subpath) = split_package_import(module_path)?;
-    let package_root = find_package_root_for_import(from_dir, &package_name)?;
-    resolve_package_entry(&package_root, &subpath)
+    let package_root = find_package_root_for_import(from_dir, &package_name, memo)?;
+    resolve_package_entry(&package_root, &subpath, memo)
 }
 
 fn is_rust_source_file(path: &Path) -> bool {
@@ -2033,9 +2285,13 @@ fn canonicalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn resolve_tsconfig_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+fn resolve_tsconfig_path(
+    from_dir: &Path,
+    module_path: &str,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
     let tsconfig_dir = find_tsconfig_dir(from_dir)?;
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"))?;
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), memo)?;
     let compiler_options = tsconfig.get("compilerOptions")?;
     let paths = compiler_options.get("paths")?.as_object()?;
     let base_url = compiler_options
@@ -2114,23 +2370,27 @@ fn split_package_import(module_path: &str) -> Option<(String, Option<String>)> {
     }
 }
 
-fn find_package_root_for_import(from_dir: &Path, package_name: &str) -> Option<PathBuf> {
+fn find_package_root_for_import(
+    from_dir: &Path,
+    package_name: &str,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
     let mut current = Some(from_dir);
     while let Some(dir) = current {
-        if package_json_name(dir).as_deref() == Some(package_name) {
+        if package_json_name(dir, memo).as_deref() == Some(package_name) {
             return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
         }
         current = dir.parent();
     }
 
-    find_workspace_root(from_dir)
-        .and_then(|workspace_root| resolve_workspace_package(&workspace_root, package_name))
+    find_workspace_root(from_dir, memo)
+        .and_then(|workspace_root| resolve_workspace_package(&workspace_root, package_name, memo))
 }
 
-fn find_workspace_root(from_dir: &Path) -> Option<PathBuf> {
+fn find_workspace_root(from_dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<PathBuf> {
     let mut current = Some(from_dir);
     while let Some(dir) = current {
-        if is_workspace_root(dir) {
+        if is_workspace_root(dir, memo) {
             return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
         }
         current = dir.parent();
@@ -2138,8 +2398,8 @@ fn find_workspace_root(from_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn is_workspace_root(dir: &Path) -> bool {
-    package_json_value(dir)
+fn is_workspace_root(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> bool {
+    package_json_value(dir, memo)
         .map(|value| !workspace_patterns(&value).is_empty())
         .unwrap_or(false)
         || !pnpm_workspace_patterns(dir).is_empty()
@@ -2157,31 +2417,44 @@ pub(crate) fn clear_workspace_package_cache() {
     }
 }
 
-fn resolve_workspace_package(workspace_root: &Path, package_name: &str) -> Option<PathBuf> {
+fn resolve_workspace_package(
+    workspace_root: &Path,
+    package_name: &str,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
     let workspace_root =
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
-    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+    if let Some(memo) = memo {
+        if let Some(cached) = memo.workspace_package(&cache_key) {
+            return cached;
+        }
+    } else if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
         if let Some(cached) = cache.get(&cache_key) {
             return cached.clone();
         }
     }
 
-    let resolved = workspace_member_dirs(&workspace_root)
+    let resolved = workspace_member_dirs(&workspace_root, memo)
         .into_iter()
-        .find(|dir| package_json_name(dir).as_deref() == Some(package_name))
+        .find(|dir| package_json_name(dir, memo).as_deref() == Some(package_name))
         .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
 
-    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+    if let Some(memo) = memo {
+        memo.remember_workspace_package(cache_key, resolved.clone());
+    } else if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.insert(cache_key, resolved.clone());
     }
 
     resolved
 }
 
-fn workspace_member_dirs(workspace_root: &Path) -> Vec<PathBuf> {
-    let mut patterns = package_json_value(workspace_root)
+fn workspace_member_dirs(
+    workspace_root: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Vec<PathBuf> {
+    let mut patterns = package_json_value(workspace_root, memo)
         .map(|package_json| workspace_patterns(&package_json))
         .unwrap_or_default();
     patterns.extend(pnpm_workspace_patterns(workspace_root));
@@ -2351,24 +2624,32 @@ fn collect_workspace_member_dirs(
     }
 }
 
-fn package_json_value(dir: &Path) -> Option<Value> {
-    package_json_like_value(&dir.join("package.json"))
+fn package_json_value(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<Arc<Value>> {
+    package_json_like_value(&dir.join("package.json"), memo)
 }
 
-fn package_json_like_value(path: &Path) -> Option<Value> {
+fn package_json_like_value(path: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<Arc<Value>> {
+    if let Some(memo) = memo {
+        return memo.json_value(path);
+    }
     let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&json).ok()
+    serde_json::from_str(&json).ok().map(Arc::new)
 }
 
-fn package_json_name(dir: &Path) -> Option<String> {
-    package_json_value(dir)?
+fn package_json_name(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<String> {
+    package_json_value(dir, memo)?
         .get("name")?
         .as_str()
         .map(ToOwned::to_owned)
 }
 
-fn resolve_package_entry(package_root: &Path, subpath: &Option<String>) -> Option<PathBuf> {
-    let package_json = package_json_value(package_root).unwrap_or(Value::Null);
+fn resolve_package_entry(
+    package_root: &Path,
+    subpath: &Option<String>,
+    memo: Option<&ModuleResolutionMemo>,
+) -> Option<PathBuf> {
+    let package_json =
+        package_json_value(package_root, memo).unwrap_or_else(|| Arc::new(Value::Null));
 
     if let Some(exports) = package_json.get("exports") {
         if let Some(target) = export_target_for_subpath(exports, subpath.as_deref()) {

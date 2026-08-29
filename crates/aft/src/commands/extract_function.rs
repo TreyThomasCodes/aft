@@ -60,12 +60,12 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let start_line_1based = match req.params.get("start_line").and_then(|v| v.as_u64()) {
-        Some(l) if l >= 1 => l as u32,
+        Some(l) if (1..=u64::from(u32::MAX)).contains(&l) => l as u32,
         Some(_) => {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "extract_function: 'start_line' must be >= 1 (1-based)",
+                "extract_function: 'start_line' must fit a positive 32-bit line number",
             );
         }
         None => {
@@ -79,12 +79,12 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     let start_line = start_line_1based - 1;
 
     let end_line_1based = match req.params.get("end_line").and_then(|v| v.as_u64()) {
-        Some(l) if l >= 1 => l as u32,
+        Some(l) if (1..=u64::from(u32::MAX)).contains(&l) => l as u32,
         Some(_) => {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "extract_function: 'end_line' must be >= 1 (1-based)",
+                "extract_function: 'end_line' must fit a positive 32-bit line number",
             );
         }
         None => {
@@ -629,6 +629,37 @@ mod tests {
         assert_eq!(json["code"], "invalid_request");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_function_rejects_line_numbers_that_do_not_fit_internal_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.ts");
+        let original = "function total() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n";
+        std::fs::write(&file, original).unwrap();
+
+        // These values used to wrap to lines 2-3 when narrowed to u32, causing
+        // a valid extraction at a completely different range than requested.
+        let req = make_request(
+            "6",
+            "extract_function",
+            serde_json::json!({
+                "file": file.display().to_string(),
+                "name": "extracted",
+                "start_line": u64::from(u32::MAX) + 3,
+                "end_line": u64::from(u32::MAX) + 5,
+            }),
+        );
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+
+        let resp = handle_extract_function(&req, &ctx);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], false);
+        assert_eq!(json["code"], "invalid_request");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), original);
     }
 
     #[test]

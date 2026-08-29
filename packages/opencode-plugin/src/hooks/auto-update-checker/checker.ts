@@ -1,17 +1,17 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getOpenCodeCacheRoot } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 import { log, warn } from "../../logger.js";
 import {
-  CACHE_DIR,
+  cacheDir,
   NPM_FETCH_TIMEOUT,
   NPM_REGISTRY_URL,
   PACKAGE_NAME,
-  USER_OPENCODE_CONFIG,
-  USER_OPENCODE_CONFIG_JSONC,
+  userOpenCodeConfig,
+  userOpenCodeConfigJsonc,
 } from "./constants.js";
 import {
   NpmPackageEnvelopeSchema,
@@ -69,8 +69,8 @@ function getConfigPaths(directory: string): string[] {
   return [
     join(directory, ".opencode", "opencode.json"),
     join(directory, ".opencode", "opencode.jsonc"),
-    USER_OPENCODE_CONFIG,
-    USER_OPENCODE_CONFIG_JSONC,
+    userOpenCodeConfig(),
+    userOpenCodeConfigJsonc(),
   ];
 }
 
@@ -187,7 +187,7 @@ export function findPluginEntry(directory: string): PluginEntryInfo | null {
 let cachedPackageVersion: string | null = null;
 
 function getSpecCachePackageJsonPath(spec: string): string {
-  return join(CACHE_DIR, spec, "node_modules", PACKAGE_NAME, "package.json");
+  return join(cacheDir(), spec, "node_modules", PACKAGE_NAME, "package.json");
 }
 
 export function getCachedVersion(spec?: string | null): string | null {
@@ -197,7 +197,7 @@ export function getCachedVersion(spec?: string | null): string | null {
     getCurrentRuntimePackageJsonPath(),
     spec ? getSpecCachePackageJsonPath(spec) : null,
     getSpecCachePackageJsonPath(`${PACKAGE_NAME}@latest`),
-    join(homedir(), ".cache", "opencode", "node_modules", PACKAGE_NAME, "package.json"),
+    join(getOpenCodeCacheRoot(), "node_modules", PACKAGE_NAME, "package.json"),
   ].filter(isString);
 
   for (const packageJsonPath of candidates) {

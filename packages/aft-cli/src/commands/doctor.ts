@@ -1128,7 +1128,11 @@ async function clearPluginCache(
   const bytes = info.exists ? dirSize(info.path) : 0;
   const result = await adapter.clearPluginCache(true);
 
-  if (result.action === "cleared") {
+  if (result.legacy_path_cleared) {
+    log.success(`${adapter.displayName}: legacy_path_cleared at ${result.legacy_path_cleared}`);
+  }
+
+  if (result.action === "cleared" || result.action === "legacy_path_cleared") {
     const suffix = includeBytes ? `, reclaimed ${formatBytes(bytes)}` : "";
     log.success(`${adapter.displayName}: cleared plugin cache at ${result.path}${suffix}`);
     return { action: "cleared", bytes };

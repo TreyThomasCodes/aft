@@ -2520,7 +2520,9 @@ fn sandboxed_child_environment(
         // dynamic-loader or shell/interpreter startup hook here would execute
         // code OUTSIDE confinement, so those keys are dropped even though they
         // arrived through the (otherwise honored) request environment.
-        if is_preexec_hijack_env_key(key.as_str()) {
+        if is_preexec_hijack_env_key(key.as_str())
+            || crate::agent_child_env::is_subc_credential_env_key(key)
+        {
             continue;
         }
         environment.insert(OsString::from(key), OsString::from(value));
@@ -2631,6 +2633,7 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
     }
+    crate::agent_child_env::scrub_pty_command(&mut command);
     Ok((command, profile_handle))
 }
 
@@ -2898,6 +2901,31 @@ mod tests {
         // A benign request var still flows through, proving we filtered rather
         // than dropped the whole request environment.
         assert!(output.contains("REQUEST_SENTINEL=kept\n"), "{output}");
+    }
+
+    #[test]
+    fn request_environment_cannot_smuggle_subc_credentials_into_sandbox_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let request_environment = HashMap::from([
+            ("SUBC_MODULE_ID".to_string(), "aft".to_string()),
+            ("SUBC_LAUNCH_NONCE".to_string(), "nonce".to_string()),
+            (
+                "SUBC_FUTURE_CREDENTIAL".to_string(),
+                "future-secret".to_string(),
+            ),
+            ("REQUEST_SENTINEL".to_string(), "kept".to_string()),
+        ]);
+
+        let environment = sandboxed_child_environment(&request_environment, temp.path());
+
+        assert!(environment
+            .keys()
+            .filter_map(|key| key.to_str())
+            .all(|key| !crate::agent_child_env::is_subc_credential_env_key(key)));
+        assert_eq!(
+            environment.get(OsStr::new("REQUEST_SENTINEL")),
+            Some(&OsString::from("kept"))
+        );
     }
 
     #[test]

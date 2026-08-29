@@ -45,7 +45,44 @@ const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
+/// Fresh borrowed trigram bases were measured ready 1.1–2.5 seconds after root
+/// bind. Waiting through that observed window prevents a healthy first search
+/// from returning an empty loading response while keeping a stuck load bounded.
+const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
+const SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
+
+#[cfg(test)]
+thread_local! {
+    static FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn first_search_index_load_wait_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
+        return budget;
+    }
+    FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET
+}
+
+#[cfg(test)]
+fn with_first_search_index_load_wait_budget_for_test<T>(
+    budget: Duration,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<Duration>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let previous =
+        FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET_OVERRIDE.with(|slot| slot.replace(Some(budget)));
+    let _reset = Reset(previous);
+    action()
+}
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
 const STALE_CLI_SNAPSHOT_WARNING: &str = "Serving the last usable standing-root CLI snapshot after its freshness could not be verified; rerun `npx @cortexkit/aft index` to refresh it.";
@@ -100,6 +137,12 @@ enum SearchMode {
     Literal,
     Semantic,
     Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIndexWaitError {
+    Cancelled,
+    Contended,
 }
 
 #[derive(Debug, Clone)]
@@ -300,9 +343,16 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = match search_index_ready_with_budget(ctx) {
+    let search_index_wait_budget = match &semantic_status_snapshot {
+        SemanticIndexStatus::Building { stage, .. } if stage == "loading_artifacts" => {
+            first_search_index_load_wait_budget()
+        }
+        _ => INTERACTIVE_ARTIFACT_READ_BUDGET,
+    };
+    let lexical_ready = match search_index_ready_with_budget(ctx, search_index_wait_budget) {
         Ok(ready) => ready,
-        Err(()) => {
+        Err(SearchIndexWaitError::Cancelled) => return cancelled_search_response(req),
+        Err(SearchIndexWaitError::Contended) => {
             return artifact_contention_fallback_response(
                 req,
                 ctx,
@@ -336,6 +386,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             top_k,
             shape,
             mode,
+            lexical_ready,
             semantic_status_snapshot,
             semantic_status,
             warnings,
@@ -1497,6 +1548,7 @@ fn handle_semantic_or_hybrid_search(
     top_k: usize,
     shape: QueryShape,
     mode: SearchMode,
+    lexical_ready: bool,
     status: SemanticIndexStatus,
     semantic_status: &'static str,
     mut warnings: Vec<String>,
@@ -1511,19 +1563,11 @@ fn handle_semantic_or_hybrid_search(
             project_root,
         )
     } else {
-        match search_index_ready_with_budget(ctx) {
-            Ok(ready) => LexicalCollection {
-                files: Vec::new(),
-                ready,
-                engine_capped: false,
-                artifact_lock_timed_out: false,
-            },
-            Err(()) => LexicalCollection {
-                files: Vec::new(),
-                ready: false,
-                engine_capped: false,
-                artifact_lock_timed_out: true,
-            },
+        LexicalCollection {
+            files: Vec::new(),
+            ready: lexical_ready,
+            engine_capped: false,
+            artifact_lock_timed_out: false,
         }
     };
 
@@ -2745,35 +2789,57 @@ fn collect_lexical_files_from_snapshot(
     }
 }
 
-fn search_index_ready_with_budget(ctx: &AppContext) -> Result<bool, ()> {
-    let deadline = Instant::now() + INTERACTIVE_ARTIFACT_READ_BUDGET;
+fn search_index_ready_with_budget(
+    ctx: &AppContext,
+    wait_budget: Duration,
+) -> Result<bool, SearchIndexWaitError> {
+    let deadline = Instant::now() + wait_budget;
     loop {
-        let search_index = try_read_with_budget(
-            ctx.search_index(),
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(INTERACTIVE_ARTIFACT_READ_BUDGET),
-        )
-        .ok_or(())?;
+        if search_cancellation_requested() {
+            return Err(SearchIndexWaitError::Cancelled);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let read_budget = remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
+        let Some(search_index) = try_read_with_budget(ctx.search_index(), read_budget) else {
+            if Instant::now() >= deadline {
+                return Err(SearchIndexWaitError::Contended);
+            }
+            continue;
+        };
         if search_index.as_ref().is_some_and(|index| index.ready) {
             return Ok(true);
         }
         drop(search_index);
 
-        // A read-only root publishes its borrowed artifact on the completion
-        // receiver. Drain it here so a search that races the load can use the
-        // artifact within the existing interactive budget instead of reporting
-        // an empty fallback before publication.
-        crate::runtime_drain::drain_search_index_events(ctx);
-        if Instant::now() >= deadline {
+        // The loader publishes through a channel; the query holds neither the
+        // index nor receiver lock while draining, so it cannot block publication.
+        let Some(search_receiver) = try_read_with_budget(ctx.search_index_rx(), read_budget) else {
+            if Instant::now() >= deadline {
+                return Err(SearchIndexWaitError::Contended);
+            }
+            continue;
+        };
+        let load_in_progress = search_receiver.is_some();
+        drop(search_receiver);
+        if !load_in_progress {
             return Ok(false);
         }
-        std::thread::sleep(Duration::from_millis(1));
+
+        crate::runtime_drain::drain_search_index_events(ctx);
+        if search_cancellation_requested() {
+            return Err(SearchIndexWaitError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL));
     }
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx).unwrap_or(false)
+    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET).unwrap_or(false)
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
@@ -4429,7 +4495,11 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_load_window_waits_for_published_search_index() {
+    fn first_search_waits_for_slow_borrowed_base_and_returns_results() {
+        assert_eq!(
+            FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET,
+            Duration::from_millis(2_500)
+        );
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/lib.rs");
         std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -4450,7 +4520,7 @@ mod tests {
         ctx.install_search_index_rx(rx, ctx.configure_generation());
         let publish_file = source_file.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(60));
             let mut index = SearchIndex::new();
             index.index_file(&publish_file, source.as_bytes());
             index.ready = true;
@@ -4458,21 +4528,28 @@ mod tests {
         });
 
         let started = Instant::now();
-        let response = response_value(handle_semantic_search(
-            &semantic_request("waited_for_borrowed_artifact", 5),
-            &ctx,
-        ));
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_millis(200), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("waited_for_borrowed_artifact", 5),
+                    &ctx,
+                ))
+            });
 
-        assert!(started.elapsed() >= Duration::from_millis(10));
-        assert!(started.elapsed() < INTERACTIVE_ARTIFACT_READ_BUDGET);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(response["interpreted_as"], "lexical");
         assert!(response["results"]
             .as_array()
             .is_some_and(|results| !results.is_empty()));
+        assert!(!response["text"]
+            .as_str()
+            .expect("response text")
+            .contains("nothing was searched yet"));
     }
 
     #[test]
-    fn borrowed_load_window_stops_at_interactive_budget_with_actionable_status() {
+    fn first_search_wait_budget_expires_with_honest_loading_reply() {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
         *ctx.semantic_index_status()
@@ -4486,18 +4563,122 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
 
+        let wait_budget = Duration::from_millis(40);
         let started = Instant::now();
-        let response = response_value(handle_semantic_search(
-            &semantic_request("still_loading", 5),
-            &ctx,
-        ));
+        let response = with_first_search_index_load_wait_budget_for_test(wait_budget, || {
+            response_value(handle_semantic_search(
+                &semantic_request("still_loading", 5),
+                &ctx,
+            ))
+        });
 
-        assert!(started.elapsed() >= INTERACTIVE_ARTIFACT_READ_BUDGET);
+        assert!(started.elapsed() >= wait_budget);
         assert!(started.elapsed() < Duration::from_secs(1));
         let text = response["text"].as_str().expect("response text");
         assert!(text.contains("nothing was searched yet"));
         assert!(text.contains("Retry in a few seconds"));
         assert!(!text.contains("Found 0"));
+    }
+
+    #[test]
+    fn first_search_and_in_progress_load_complete_without_deadlock() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        let source = "pub fn no_deadlock_borrowed_artifact() {}\n";
+        std::fs::write(&source_file, source).expect("write source file");
+        let ctx = Arc::new(test_context(project.path()));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        let publish_file = source_file.clone();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let mut index = SearchIndex::new();
+            index.index_file(&publish_file, source.as_bytes());
+            index.ready = true;
+            tx.send(index).expect("publish search index");
+        });
+        let search_ctx = Arc::clone(&ctx);
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        let search = std::thread::spawn(move || {
+            let response = with_first_search_index_load_wait_budget_for_test(
+                Duration::from_millis(200),
+                || {
+                    response_value(handle_semantic_search(
+                        &semantic_request("no_deadlock_borrowed_artifact", 5),
+                        &search_ctx,
+                    ))
+                },
+            );
+            completed_tx
+                .send(response)
+                .expect("publish search response");
+        });
+
+        let response = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("search and artifact publication must not deadlock");
+        assert!(response["results"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty()));
+        publisher.join().expect("publisher joins");
+        search.join().expect("search joins");
+    }
+
+    #[test]
+    fn first_search_wait_observes_executor_cancellation() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = Arc::new(test_context(project.path()));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let cancellation = crate::executor::JobCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_ctx = Arc::clone(&ctx);
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let _installed = crate::executor::install_job_cancellation(worker_cancellation);
+            started_tx.send(()).expect("signal wait start");
+            let response =
+                with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
+                    response_value(handle_semantic_search(
+                        &semantic_request("cancelled_wait", 5),
+                        &worker_ctx,
+                    ))
+                });
+            completed_tx
+                .send(response)
+                .expect("publish cancelled response");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("search wait starts");
+        std::thread::sleep(Duration::from_millis(20));
+        cancellation.request_cancel();
+        let response = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled wait completes promptly");
+        assert_eq!(response["code"], "request_cancelled");
+        worker.join().expect("cancelled search joins");
     }
 
     #[test]

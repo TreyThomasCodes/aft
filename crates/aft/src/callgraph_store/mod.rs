@@ -76,6 +76,10 @@ fn write_amplification_baseline_enabled() -> bool {
 
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
 static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
     OnceLock::new();
@@ -595,6 +599,12 @@ thread_local! {
     #[cfg(test)]
     static COLD_BUILD_BEFORE_PUBLISH_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildBeforePublishObserver>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_SLICE_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildSliceObserver>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildExtractObserver>>> =
+        const { std::cell::RefCell::new(None) };
     static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
     static MIGRATION_FAIL_AFTER_TEMP_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -633,6 +643,38 @@ fn notify_cold_build_before_publish_observer() {
 #[cfg(not(test))]
 fn notify_cold_build_before_publish_observer() {}
 
+#[cfg(test)]
+fn set_cold_build_slice_observer(observer: Option<Arc<ColdBuildSliceObserver>>) {
+    COLD_BUILD_SLICE_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_slice_observer(stage: &'static str, completed: usize, total: usize) {
+    let observer = COLD_BUILD_SLICE_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(stage, completed, total);
+    }
+}
+
+#[cfg(not(test))]
+fn notify_cold_build_slice_observer(_stage: &'static str, _completed: usize, _total: usize) {}
+
+#[cfg(test)]
+fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
+    COLD_BUILD_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_extract_observer(paths: &[PathBuf]) {
+    let observer = COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(paths);
+    }
+}
+
+#[cfg(not(test))]
+fn notify_cold_build_extract_observer(_paths: &[PathBuf]) {}
+
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
     MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow_mut() = bytes);
@@ -668,6 +710,21 @@ pub(crate) fn with_publish_epoch<R>(
     let previous = PUBLISH_ADMISSION.with(|slot| slot.replace(Some((epoch, expected))));
     let _guard = PublishAdmissionGuard { previous };
     run()
+}
+
+fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
+    notify_cold_build_slice_observer(stage, completed, total);
+    let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
+    if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
+        return Ok(());
+    }
+    crate::slog_info!(
+        "callgraph cold build superseded, stopping after {}/{} ({})",
+        completed,
+        total,
+        stage
+    );
+    Err(CallGraphStoreError::Superseded)
 }
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
@@ -2297,6 +2354,7 @@ struct DiskProjectIndex<'a> {
     caller_file: &'a str,
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
+    module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
 }
 
 impl DiskProjectIndex<'_> {
@@ -2440,8 +2498,12 @@ impl DiskProjectIndex<'_> {
 
     fn disk_module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
         let caller_dir = self.project_root.join(caller_file).parent()?.to_path_buf();
-        let candidate = callgraph::resolve_module_path(&caller_dir, module_path)?;
-        let rel_path = relative_path(self.project_root, &canonicalize_path(&candidate));
+        let candidate = callgraph::resolve_module_path_with_memo(
+            &caller_dir,
+            module_path,
+            self.module_resolution_memo,
+        )?;
+        let rel_path = relative_path(self.project_root, &candidate);
         self.contains_file(&rel_path).then_some(rel_path)
     }
 }
@@ -3040,7 +3102,9 @@ impl CallGraphStore {
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
             }
+            ensure_cold_build_current("inventory", 0, 1)?;
             let corpus_fingerprint = temp_store.stage_cold_build_file_inventory(files)?;
+            ensure_cold_build_current("inventory", 1, 1)?;
             let stats = temp_store
                 .cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)?;
             let _ = temp_store.checkpoint_wal_truncate();
@@ -3076,9 +3140,9 @@ impl CallGraphStore {
             }
             Ok(())
         });
-        if matches!(publication, Err(CallGraphStoreError::Superseded)) {
-            remove_sqlite_file_set(&temp_path);
-        }
+        // A superseded generation remains a valid resumable staging artifact.
+        // Its successor compares the durable corpus fingerprint before either
+        // adopting this work or resetting it for a changed corpus.
         publication?;
         // Pointer publication is the only automatic breaker reset. The staging
         // batches above never reset history because a process can die after them.
@@ -3447,17 +3511,63 @@ impl CallGraphStore {
         chunk_size: usize,
         corpus_fingerprint: &str,
     ) -> Result<ColdBuildStats> {
+        let module_resolution_memo = callgraph::ModuleResolutionMemo::default();
+        self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+            chunk_size,
+            corpus_fingerprint,
+            COLD_BUILD_RESOLVE_WINDOW,
+            &module_resolution_memo,
+        )
+    }
+
+    #[cfg(test)]
+    fn cold_build_chunked_with_resolution_memo_for_test(
+        &self,
+        files: &[PathBuf],
+        chunk_size: usize,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+    ) -> Result<ColdBuildStats> {
+        let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
+        self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+            chunk_size,
+            &corpus_fingerprint,
+            resolve_window.max(1),
+            module_resolution_memo,
+        )
+    }
+
+    fn cold_build_chunked_from_staged_inventory_with_resolution_memo(
+        &self,
+        chunk_size: usize,
+        corpus_fingerprint: &str,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+    ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
+        ensure_cold_build_current("staging-admission", 0, 1)?;
         let mut phase = staged_build_phase(&conn)?;
         let staged_fingerprint = staged_string(&conn, STAGED_CORPUS_FINGERPRINT)?;
-        if phase.as_deref().is_none_or(|phase| phase == "ready")
-            || staged_fingerprint.as_deref() != Some(corpus_fingerprint)
-        {
+        let fingerprint_matches = staged_fingerprint.as_deref() == Some(corpus_fingerprint);
+        if phase.as_deref() == Some("ready") && fingerprint_matches {
+            ensure_cold_build_current("completed-staging", 1, 1)?;
+            crate::slog_info!(
+                "callgraph cold-build decision: reason=matching completed staging; action=publish"
+            );
+            conn.execute("DELETE FROM staging_file_inventory", [])?;
+            return cold_build_stats_from_connection(&conn, started);
+        }
+        if phase.is_none() || !fingerprint_matches {
+            if staged_fingerprint.is_some() && !fingerprint_matches {
+                crate::slog_info!(
+                    "callgraph cold-build decision: reason=fingerprint mismatch; action=restart staging"
+                );
+            }
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             clear_tables(&tx)?;
@@ -3481,6 +3591,10 @@ impl CallGraphStore {
         if phase.as_deref() == Some("extracting") {
             prune_staged_files_not_in_inventory(&mut conn)?;
 
+            let total_files =
+                query_count(&conn, "SELECT COUNT(*) FROM staging_file_inventory")? as usize;
+            let mut completed_files = 0usize;
+            ensure_cold_build_current("extraction", completed_files, total_files)?;
             let mut after_path = String::new();
             loop {
                 let Some(batch) = load_staged_file_batch(
@@ -3494,17 +3608,21 @@ impl CallGraphStore {
                     break;
                 };
                 after_path = batch.last_path;
+                let batch_files = batch.paths.len();
 
-                let mut needs_extract = Vec::with_capacity(batch.paths.len());
+                let mut needs_extract = Vec::with_capacity(batch_files);
                 for path in batch.paths {
                     if !staged_content_matches(&conn, &self.project_root, &path)? {
                         needs_extract.push(path);
                     }
                 }
                 if needs_extract.is_empty() {
+                    completed_files = completed_files.saturating_add(batch_files);
+                    ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
 
+                notify_cold_build_extract_observer(&needs_extract);
                 let build = build_extracts_parallel(&self.project_root, &needs_extract);
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
@@ -3538,14 +3656,18 @@ impl CallGraphStore {
                 tx.commit()?;
                 note_cold_build_commit_barrier("extraction_batch_committed");
                 self.record_commit(total_changes_before, &conn);
+                completed_files = completed_files.saturating_add(batch_files);
+                ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
 
+            ensure_cold_build_current("extraction", completed_files, total_files)?;
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
             set_staged_build_phase(&tx, "indexing")?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
             phase = Some("indexing".to_string());
+            ensure_cold_build_current("extraction", total_files, total_files)?;
         }
 
         // Secondary indexes are intentionally created only after every extract is
@@ -3553,6 +3675,7 @@ impl CallGraphStore {
         // corpus-wide symbol/export table.
         note_cold_build_phase("symbol_export_index");
         if phase.as_deref() == Some("indexing") {
+            ensure_cold_build_current("symbol-export-index", 0, 1)?;
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
             let tx = conn.transaction()?;
@@ -3560,13 +3683,18 @@ impl CallGraphStore {
             set_staged_build_phase(&tx, "resolving")?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
+            ensure_cold_build_current("symbol-export-index", 1, 1)?;
         }
 
         note_cold_build_phase("resolution");
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        let total_refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
+        let mut resolved_refs =
+            query_count(&conn, "SELECT COUNT(*) FROM refs WHERE status <> 'staged'")? as usize;
+        ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         let mut resolve_cursor = staged_u64(&conn, STAGED_RESOLVE_CURSOR)?;
         loop {
-            let staged = load_staged_ref_window(&conn, resolve_cursor, COLD_BUILD_RESOLVE_WINDOW)?;
+            let staged = load_staged_ref_window(&conn, resolve_cursor, resolve_window)?;
             let Some(last_rowid) = staged.last().map(|entry| entry.rowid) else {
                 break;
             };
@@ -3595,6 +3723,7 @@ impl CallGraphStore {
                             caller_file: &caller_file,
                             caller_data: &caller_extract.data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
+                            module_resolution_memo,
                         };
                         for staged_ref in &staged[offset..end] {
                             let resolved = resolve_ref(staged_ref.raw.clone(), &index)?;
@@ -3613,8 +3742,11 @@ impl CallGraphStore {
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
             resolve_cursor = last_rowid;
+            resolved_refs = resolved_refs.saturating_add(staged.len()).min(total_refs);
+            ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         }
 
+        ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         note_cold_build_phase("publication");
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
@@ -3629,29 +3761,7 @@ impl CallGraphStore {
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
 
-        let files = query_count(&conn, "SELECT COUNT(*) FROM files")? as usize;
-        let nodes = query_count(&conn, "SELECT COUNT(*) FROM nodes")? as usize;
-        let refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
-        let edges = query_count(&conn, "SELECT COUNT(*) FROM edges")? as usize;
-        let failed_files = staged_failed_files(&conn)?;
-        let elapsed_ms = started.elapsed().as_millis();
-        crate::slog_info!(
-            "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
-            files,
-            nodes,
-            refs,
-            edges,
-            staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
-            elapsed_ms
-        );
-        Ok(ColdBuildStats {
-            files,
-            nodes,
-            refs,
-            edges,
-            failed_files,
-            elapsed_ms,
-        })
+        cold_build_stats_from_connection(&conn, started)
     }
 
     pub fn refresh_files(&self, changed_files: &[PathBuf]) -> Result<IncrementalStats> {
@@ -7260,6 +7370,32 @@ fn query_count(conn: &Connection, query: &str) -> Result<u64> {
         .map_err(Into::into)
 }
 
+fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Result<ColdBuildStats> {
+    let files = query_count(conn, "SELECT COUNT(*) FROM files")? as usize;
+    let nodes = query_count(conn, "SELECT COUNT(*) FROM nodes")? as usize;
+    let refs = query_count(conn, "SELECT COUNT(*) FROM refs")? as usize;
+    let edges = query_count(conn, "SELECT COUNT(*) FROM edges")? as usize;
+    let failed_files = staged_failed_files(conn)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    crate::slog_info!(
+        "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
+        files,
+        nodes,
+        refs,
+        edges,
+        staged_u64(conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
+        elapsed_ms
+    );
+    Ok(ColdBuildStats {
+        files,
+        nodes,
+        refs,
+        edges,
+        failed_files,
+        elapsed_ms,
+    })
+}
+
 fn staged_failed_files(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "SELECT DISTINCT file_path FROM backend_file_state WHERE status = 'stale' ORDER BY file_path",
@@ -7457,7 +7593,7 @@ fn log_root_repair_rebuild(repair: &OpenRootRepair) {
     } = repair
     {
         crate::slog_info!(
-            "callgraph store root mismatch from {} to {} requires cold rebuild: {}",
+            "callgraph cold-build decision: reason=re-rooting refused; from={}; to={}; detail={}",
             previous_roots.join(", "),
             current_root,
             reason
@@ -10203,6 +10339,12 @@ fn insert_method_dispatch_edges_chunked(
     project_root: &Path,
     chunk_size: usize,
 ) -> Result<usize> {
+    let total_files = query_count(
+        tx,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT caller_file FROM refs)",
+    )? as usize;
+    let mut completed_files = 0usize;
+    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     let mut inserted = 0usize;
     let mut after_file = String::new();
     loop {
@@ -10225,7 +10367,12 @@ fn insert_method_dispatch_edges_chunked(
         };
         inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?;
         after_file = last_file;
+        completed_files = completed_files
+            .saturating_add(caller_files.len())
+            .min(total_files);
+        ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     }
+    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     Ok(inserted)
 }
 
@@ -14892,6 +15039,227 @@ export function leaf() {}
     }
 
     #[test]
+    fn publish_fence_supersession_keeps_completed_staging_for_zero_work_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn completed_marker() {}\n").unwrap();
+        let files = vec![source];
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let epoch_for_observer = epoch.clone();
+        set_cold_build_before_publish_observer(Some(Arc::new(move || {
+            epoch_for_observer.next();
+        })));
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_before_publish_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let staging = callgraph_dir
+            .path()
+            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staged = Connection::open(&staging).unwrap();
+        assert_eq!(
+            staged_build_phase(&staged).unwrap().as_deref(),
+            Some("ready")
+        );
+        drop(staged);
+
+        let extracted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer.fetch_add(paths.len(), AtomicOrdering::SeqCst);
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch, successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("completed same-corpus staging publishes without rebuilding");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            extracted.load(AtomicOrdering::SeqCst),
+            0,
+            "completed staging must not repeat extraction"
+        );
+        drop(store);
+    }
+
+    #[test]
+    fn superseded_slice_preserves_staging_and_same_corpus_successor_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let files = ["a.rs", "b.rs", "c.rs"]
+            .into_iter()
+            .map(|name| {
+                let path = root.path().join(name);
+                std::fs::write(&path, format!("pub fn {}() {{}}\n", name.replace('.', "_")))
+                    .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let superseded = Arc::new(AtomicBool::new(false));
+        let epoch_for_observer = epoch.clone();
+        let superseded_for_observer = Arc::clone(&superseded);
+        set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
+            if stage == "extraction"
+                && completed == 1
+                && !superseded_for_observer.swap(true, AtomicOrdering::SeqCst)
+            {
+                epoch_for_observer.next();
+            }
+        })));
+
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_slice_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+        assert!(superseded.load(AtomicOrdering::SeqCst));
+
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let staging = callgraph_dir
+            .path()
+            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        assert!(staging.exists(), "supersession must retain durable staging");
+        let staged = Connection::open(&staging).unwrap();
+        assert_eq!(
+            staged_build_phase(&staged).unwrap().as_deref(),
+            Some("extracting")
+        );
+        assert_eq!(
+            query_count(&staged, "SELECT COUNT(*) FROM files").unwrap(),
+            1
+        );
+        drop(staged);
+
+        let extracted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer
+                .lock()
+                .unwrap()
+                .extend(paths.iter().filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }));
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch.clone(), successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("same-corpus successor resumes and publishes");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 3);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec!["b.rs".to_string(), "c.rs".to_string()],
+            "the successor must not repeat the committed first slice"
+        );
+        drop(store);
+        assert!(
+            !staging.exists(),
+            "published staging moves to its generation"
+        );
+    }
+
+    #[test]
+    fn changed_corpus_restarts_instead_of_adopting_staged_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let first = root.path().join("a.rs");
+        let second = root.path().join("b.rs");
+        std::fs::write(&first, "pub fn a() {}\n").unwrap();
+        std::fs::write(&second, "pub fn b() {}\n").unwrap();
+        let mut files = vec![first.clone(), second.clone()];
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let old_epoch = epoch.next();
+        let advanced = Arc::new(AtomicBool::new(false));
+        let epoch_for_observer = epoch.clone();
+        let advanced_for_observer = Arc::clone(&advanced);
+        set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, _total| {
+            if stage == "extraction"
+                && completed == 1
+                && !advanced_for_observer.swap(true, AtomicOrdering::SeqCst)
+            {
+                epoch_for_observer.next();
+            }
+        })));
+        let result = with_publish_epoch(epoch.clone(), old_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        });
+        set_cold_build_slice_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::Superseded)));
+
+        std::fs::write(&first, "pub fn a_changed() { b(); }\n").unwrap();
+        let third = root.path().join("c.rs");
+        std::fs::write(&third, "pub fn c() {}\n").unwrap();
+        files.push(third);
+        let extracted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let extracted_for_observer = Arc::clone(&extracted);
+        set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            extracted_for_observer
+                .lock()
+                .unwrap()
+                .extend(paths.iter().filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }));
+        })));
+        let successor_epoch = epoch.next();
+        let (store, stats) = with_publish_epoch(epoch, successor_epoch, || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                callgraph_dir.path().to_path_buf(),
+                root.path().to_path_buf(),
+                &files,
+                1,
+            )
+        })
+        .expect("changed-corpus successor restarts and publishes");
+        set_cold_build_extract_observer(None);
+
+        assert_eq!(stats.files, 3);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()],
+            "fingerprint mismatch must invalidate every old extraction slice"
+        );
+        drop(store);
+    }
+
+    #[test]
     fn cold_build_prepared_bulk_insert_matches_reference_rows() {
         let dir = tempdir().expect("temp dir");
         let project_root = dir.path();
@@ -15033,6 +15401,179 @@ export function leaf() {}
             rebuild_stats.is_none(),
             "changing callgraph_chunk_size must not affect store identity or force a rebuild"
         );
+    }
+
+    #[test]
+    fn cold_build_resolution_memo_bounds_filesystem_probes_and_preserves_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let files = write_ts_resolution_memo_fixture(&project_root, 8, 8, 4);
+        let resolve_window = 19;
+
+        callgraph::clear_workspace_package_cache();
+        let uncached_memo = callgraph::ModuleResolutionMemo::new_for_test(false, true);
+        let uncached = CallGraphStore::open(
+            dir.path().join("store-uncached"),
+            project_root.to_path_buf(),
+        )
+        .expect("open uncached store");
+        let uncached_stats = uncached
+            .cold_build_chunked_with_resolution_memo_for_test(
+                &files,
+                7,
+                resolve_window,
+                &uncached_memo,
+            )
+            .expect("uncached comparison build");
+        assert!(
+            uncached_stats.refs > resolve_window * 2,
+            "fixture must cross several staged reference windows"
+        );
+
+        callgraph::clear_workspace_package_cache();
+        let cached_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let cached =
+            CallGraphStore::open(dir.path().join("store-cached"), project_root.to_path_buf())
+                .expect("open cached store");
+        let cached_stats = cached
+            .cold_build_chunked_with_resolution_memo_for_test(
+                &files,
+                7,
+                resolve_window,
+                &cached_memo,
+            )
+            .expect("cached build");
+
+        assert_cold_build_stats_match_except_elapsed(&uncached_stats, &cached_stats);
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+            "type_ref_names",
+            "meta",
+            "staging_file_inventory",
+            "staging_ref_context",
+        ] {
+            assert_eq!(
+                graph_table_rows(&uncached, table),
+                graph_table_rows(&cached, table),
+                "memoized and uncached cold builds must produce identical {table} rows"
+            );
+        }
+        assert_eq!(
+            graph_table_rows_without(&uncached, "files", &["indexed_at"]),
+            graph_table_rows_without(&cached, "files", &["indexed_at"]),
+            "files rows must match apart from indexed_at"
+        );
+        assert_eq!(
+            graph_table_rows_without(&uncached, "backend_file_state", &["updated_at"]),
+            graph_table_rows_without(&cached, "backend_file_state", &["updated_at"]),
+            "backend rows must match apart from updated_at"
+        );
+
+        let cached_module_computations = cached_memo.module_computations_for_test();
+        assert!(
+            !cached_module_computations.is_empty(),
+            "fixture must exercise module resolution"
+        );
+        assert!(
+            cached_module_computations.values().all(|count| *count == 1),
+            "each importing-directory/specifier pair must reach the filesystem once"
+        );
+        let uncached_module_computations = uncached_memo.module_computations_for_test();
+        assert!(
+            uncached_module_computations
+                .values()
+                .copied()
+                .max()
+                .unwrap_or_default()
+                > 16,
+            "mutation control: disabling the memo must recompute a hot module target"
+        );
+
+        let cached_package_probes = cached_memo
+            .json_probes_for_test()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(
+            !cached_package_probes.is_empty(),
+            "fixture must exercise package.json lookup"
+        );
+        assert!(
+            cached_package_probes.values().all(|count| *count == 1),
+            "every package.json path must be probed at most once per cold build"
+        );
+        let uncached_package_probes = uncached_memo
+            .json_probes_for_test()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.file_name().and_then(|name| name.to_str()) == Some("package.json")
+            })
+            .collect::<HashMap<_, _>>();
+        let cached_probe_total: usize = cached_package_probes.values().sum();
+        let uncached_probe_total: usize = uncached_package_probes.values().sum();
+        assert!(
+            uncached_probe_total > cached_probe_total * 20,
+            "mutation control: disabled memo should repeat the package ladder ({uncached_probe_total} vs {cached_probe_total})"
+        );
+    }
+
+    // Benchmark the cold resolver with and without memoization. The generated
+    // workspace has hundreds of TypeScript files below a deep package-manifest
+    // ladder and enough imported calls for filesystem resolution to dominate
+    // the uncached run.
+    #[test]
+    #[ignore]
+    fn bench_cold_build_resolution_memo() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create benchmark root");
+        let project_root = fs::canonicalize(project_root).expect("canonical benchmark root");
+        let files = write_ts_resolution_memo_fixture(&project_root, 24, 12, 20);
+        assert!(
+            files.len() > 250,
+            "benchmark fixture must contain hundreds of files"
+        );
+
+        for enabled in [false, true] {
+            callgraph::clear_workspace_package_cache();
+            let memo = callgraph::ModuleResolutionMemo::new_for_test(enabled, false);
+            let store = CallGraphStore::open(
+                dir.path().join(if enabled {
+                    "store-cached"
+                } else {
+                    "store-uncached"
+                }),
+                project_root.to_path_buf(),
+            )
+            .expect("open benchmark store");
+            let cpu_started = process_cpu_time();
+            let wall_started = Instant::now();
+            let stats = store
+                .cold_build_chunked_with_resolution_memo_for_test(&files, 32, 257, &memo)
+                .expect("benchmark cold build");
+            let wall_ms = wall_started.elapsed().as_millis();
+            let cpu_ms = process_cpu_time()
+                .checked_sub(cpu_started)
+                .unwrap_or_default()
+                .as_millis();
+            println!(
+                "BENCH_COLD_BUILD_RESOLUTION_MEMO memo={} files={} refs={} edges={} wall_ms={} cpu_ms={}",
+                if enabled { "on" } else { "off" },
+                stats.files,
+                stats.refs,
+                stats.edges,
+                wall_ms,
+                cpu_ms
+            );
+        }
     }
 
     // Perf A/B bench (not a gate): measures cold_build wall time at a given
@@ -15344,6 +15885,84 @@ export function leaf() {}
             target_symbol: Some("helper".to_string()),
             dependencies,
         }
+    }
+
+    fn write_ts_resolution_memo_fixture(
+        project_root: &Path,
+        package_count: usize,
+        files_per_package: usize,
+        calls_per_file: usize,
+    ) -> Vec<PathBuf> {
+        fs::create_dir_all(project_root).expect("create memo fixture root");
+        fs::write(
+            project_root.join("package.json"),
+            r#"{"name":"fixture-root","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .expect("write workspace package manifest");
+        fs::write(
+            project_root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{}}}"#,
+        )
+        .expect("write fixture tsconfig");
+
+        let shared_root = project_root.join("packages/shared");
+        let shared_source = shared_root.join("src/index.ts");
+        fs::create_dir_all(shared_source.parent().expect("shared source parent"))
+            .expect("create shared package");
+        fs::write(
+            shared_root.join("package.json"),
+            r#"{"name":"@fixture/shared","exports":{".":{"source":"./src/index.ts"}}}"#,
+        )
+        .expect("write shared package manifest");
+        fs::write(
+            &shared_source,
+            "export function shared(value: number) { return value + 1; }\n",
+        )
+        .expect("write shared source");
+        let mut files = vec![shared_source];
+
+        for package in 0..package_count {
+            let package_root = project_root.join(format!("packages/app-{package:02}"));
+            fs::create_dir_all(&package_root).expect("create app package");
+            fs::write(
+                package_root.join("package.json"),
+                format!(r#"{{"name":"@fixture/app-{package:02}"}}"#),
+            )
+            .expect("write app package manifest");
+            let source_dir = package_root.join("src/features/deep/nested/leaf");
+            fs::create_dir_all(&source_dir).expect("create deep app source dir");
+
+            for file in 0..files_per_package {
+                let source_path = source_dir.join(format!("caller_{file:03}.ts"));
+                let mut source = "import { shared } from \"@fixture/shared\";\n".to_string();
+                for call in 0..calls_per_file {
+                    source.push_str(&format!(
+                        "export function caller_{package}_{file}_{call}() {{ return shared({call}); }}\n"
+                    ));
+                }
+                fs::write(&source_path, source).expect("write app source");
+                files.push(source_path);
+            }
+        }
+
+        files
+    }
+
+    #[cfg(unix)]
+    fn process_cpu_time() -> Duration {
+        let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        let result =
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, value.as_mut_ptr()) };
+        if result != 0 {
+            return Duration::ZERO;
+        }
+        let value = unsafe { value.assume_init() };
+        Duration::new(value.tv_sec.max(0) as u64, value.tv_nsec.max(0) as u32)
+    }
+
+    #[cfg(not(unix))]
+    fn process_cpu_time() -> Duration {
+        Duration::ZERO
     }
 
     fn write_chunked_equivalence_fixture(project_root: &Path) {

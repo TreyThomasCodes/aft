@@ -22,7 +22,7 @@ import {
   getLatestVersion,
   getLocalDevVersion,
 } from "./checker.js";
-import { CACHE_DIR, NPM_FETCH_TIMEOUT, NPM_REGISTRY_URL, PACKAGE_NAME } from "./constants.js";
+import { cacheDir, NPM_FETCH_TIMEOUT, NPM_REGISTRY_URL, PACKAGE_NAME } from "./constants.js";
 import type { AutoUpdateCheckerOptions } from "./types.js";
 
 type OpenCodeEvent = {
@@ -472,7 +472,7 @@ async function runBackgroundUpdateCheck(
 }
 
 export function getAutoUpdateInstallDir(): string {
-  return resolveInstallContext()?.installDir ?? CACHE_DIR;
+  return resolveInstallContext()?.installDir ?? cacheDir();
 }
 
 function showToast(

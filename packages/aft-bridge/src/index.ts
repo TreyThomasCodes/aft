@@ -58,6 +58,9 @@ export {
   getAftCacheRoot,
   getAftLspBinariesDir,
   getAftLspPackagesDir,
+  getOpenCodeCacheRoot,
+  getOpenCodeConfigRoot,
+  type OpenCodePathEnvironment,
 } from "./cache-paths.js";
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
 export type { CallgraphFormatOptions, CallgraphTheme } from "./callgraph-format.js";

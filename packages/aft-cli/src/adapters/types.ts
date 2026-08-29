@@ -95,10 +95,18 @@ export interface HarnessAdapter {
    * no-op because Pi caches are managed by `pi install` itself.
    */
   clearPluginCache(force: boolean): Promise<{
-    action: "cleared" | "up_to_date" | "not_found" | "not_applicable" | "error";
+    action:
+      | "cleared"
+      | "legacy_path_cleared"
+      | "up_to_date"
+      | "not_found"
+      | "not_applicable"
+      | "error";
     path: string;
     cached?: string;
     latest?: string;
     error?: string;
+    /** Reports whether the cache location previously used on Windows (`LOCALAPPDATA`) was removed while clearing the current cache. */
+    legacy_path_cleared?: string;
   }>;
 }

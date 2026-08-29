@@ -83,6 +83,10 @@ impl ArtifactPublishEpoch {
         *self.current.lock()
     }
 
+    pub fn is_current(&self, expected: u64) -> bool {
+        *self.current.lock() == expected
+    }
+
     pub fn run_if_current<R>(&self, expected: u64, publish: impl FnOnce() -> R) -> Option<R> {
         let current = self.current.lock();
         if *current != expected {

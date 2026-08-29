@@ -3,7 +3,12 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveAftLogPath, resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import {
+  getOpenCodeCacheRoot,
+  getOpenCodeConfigRoot,
+  resolveAftLogPath,
+  resolveCortexKitUserConfigPath,
+} from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
@@ -22,18 +27,32 @@ const PLUGIN_ENTRY = `${PLUGIN_NAME}@latest`;
 function getOpenCodeConfigDir(): string {
   const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
   if (envDir) return resolve(envDir);
-  const xdg = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(xdg, "opencode");
+  return getOpenCodeConfigRoot();
+}
+
+function getLegacyOpenCodePluginCachePath(primaryPath: string): string | null {
+  if (process.platform !== "win32") return null;
+  const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
+  const legacyPath = join(localAppData, "opencode", "packages", PLUGIN_ENTRY);
+  return resolve(legacyPath) === resolve(primaryPath) ? null : legacyPath;
+}
+
+function clearLegacyOpenCodePluginCache(primaryPath: string): {
+  clearedPath: string | null;
+  error?: string;
+} {
+  const legacyPath = getLegacyOpenCodePluginCachePath(primaryPath);
+  if (!legacyPath || !existsSync(legacyPath)) return { clearedPath: null };
+  try {
+    rmSync(legacyPath, { recursive: true, force: true });
+    return { clearedPath: legacyPath };
+  } catch (error) {
+    return { clearedPath: null, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function getOpenCodeCacheDir(): string {
-  const xdg = process.env.XDG_CACHE_HOME;
-  if (xdg) return join(xdg, "opencode");
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-    return join(localAppData, "opencode");
-  }
-  return join(homedir(), ".cache", "opencode");
+  return getOpenCodeCacheRoot();
 }
 
 /** True when the `opencode` CLI is runnable on PATH. */
@@ -369,15 +388,37 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   async clearPluginCache(force: boolean): Promise<{
-    action: "cleared" | "up_to_date" | "not_found" | "not_applicable" | "error";
+    action:
+      | "cleared"
+      | "legacy_path_cleared"
+      | "up_to_date"
+      | "not_found"
+      | "not_applicable"
+      | "error";
     path: string;
     cached?: string;
     latest?: string;
     error?: string;
+    legacy_path_cleared?: string;
   }> {
     const info = this.getPluginCacheInfo();
+    const clearLegacy = force ? clearLegacyOpenCodePluginCache(info.path) : { clearedPath: null };
+    if (clearLegacy.error) {
+      return {
+        action: "error",
+        path: info.path,
+        error: `Could not clear legacy OpenCode cache: ${clearLegacy.error}`,
+        ...(clearLegacy.clearedPath ? { legacy_path_cleared: clearLegacy.clearedPath } : {}),
+      };
+    }
     if (!info.exists) {
-      return { action: "not_found", path: info.path };
+      return clearLegacy.clearedPath
+        ? {
+            action: "legacy_path_cleared",
+            path: clearLegacy.clearedPath,
+            legacy_path_cleared: clearLegacy.clearedPath,
+          }
+        : { action: "not_found", path: info.path };
     }
     if (!force && info.cached && info.cached === info.latest) {
       return {
@@ -394,6 +435,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
         path: info.path,
         cached: info.cached,
         latest: info.latest,
+        ...(clearLegacy.clearedPath ? { legacy_path_cleared: clearLegacy.clearedPath } : {}),
       };
     } catch (error) {
       return {

@@ -1,0 +1,15 @@
+{
+  "args": {
+    "diagnostics": false,
+    "edits": [
+      {
+        "match": "before",
+        "replacement": "after"
+      }
+    ],
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "include_diff_content": true,
+    "preview": false
+  },
+  "command": "batch"
+}

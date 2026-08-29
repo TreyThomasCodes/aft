@@ -2312,6 +2312,36 @@ fn main() {}
 }
 
 #[test]
+fn organize_imports_rs_refuses_to_detach_outer_attribute() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("organize_rs_attribute.rs");
+    let original = "\
+#[cfg(unix)]
+use platform::unix::Thing;
+use alpha::Common;
+
+fn main() {}
+";
+    fs::write(&file, original).unwrap();
+
+    let response = send_organize_imports(&mut aft, "org-rs-attribute", &file.display().to_string());
+
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        original,
+        "organize must not move #[cfg] onto another import; response: {response:?}"
+    );
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(
+        response["code"], "unsupported_import_attributes",
+        "response: {response:?}"
+    );
+
+    aft.shutdown();
+}
+
+#[test]
 fn organize_imports_rs_preserves_pub_use_and_private_use_pair() {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
