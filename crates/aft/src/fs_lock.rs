@@ -831,6 +831,45 @@ fn reclaim_token_path(lock_path: &Path) -> PathBuf {
     lock_path.with_file_name(format!(".{file_name}.reclaim"))
 }
 
+#[cfg(test)]
+thread_local! {
+    // The observer is thread-local so concurrent lock tests cannot record one
+    // another's retry decisions.
+    static RETRY_SLEEP_OBSERVER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct RetrySleepObserverGuard {
+    previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(test)]
+impl Drop for RetrySleepObserverGuard {
+    fn drop(&mut self) {
+        RETRY_SLEEP_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn observe_retry_sleeps_for_test(
+    observer: Arc<std::sync::atomic::AtomicUsize>,
+) -> RetrySleepObserverGuard {
+    let previous = RETRY_SLEEP_OBSERVER.with(|slot| slot.replace(Some(observer)));
+    RetrySleepObserverGuard { previous }
+}
+
+#[cfg(test)]
+fn note_retry_sleep_for_test() {
+    RETRY_SLEEP_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow().as_ref() {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
 fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result<(), AcquireError> {
     let poll = Duration::from_millis(poll_interval_ms);
     let sleep_for = match deadline {
@@ -843,6 +882,8 @@ fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result
         }
         None => poll,
     };
+    #[cfg(test)]
+    note_retry_sleep_for_test();
     thread::sleep(sleep_for);
     Ok(())
 }
@@ -1245,39 +1286,49 @@ mod tests {
 
     #[test]
     fn try_acquire_once_never_waits_behind_live_owner() {
+        const OUTER_THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
         let (_dir, path) = test_lock_path();
         let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
         let contender_path = path.clone();
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let sleeper_entries = Arc::new(AtomicUsize::new(0));
+        let contender_sleeper_entries = Arc::clone(&sleeper_entries);
+        let (announced_tx, announced_rx) = mpsc::sync_channel(1);
+        let (enter_tx, enter_rx) = mpsc::sync_channel::<()>(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let contender = std::thread::spawn(move || {
-            let _ = started_tx.send(());
+            let _ = announced_tx.send(());
+            let _ = enter_rx.recv();
+            let _observer = observe_retry_sleeps_for_test(contender_sleeper_entries);
             let _ = result_tx.send(try_acquire_once(&contender_path));
         });
 
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("contender should start");
-        let result = match result_rx.recv_timeout(Duration::from_secs(2)) {
+        announced_rx
+            .recv_timeout(OUTER_THREAD_JOIN_TIMEOUT)
+            .expect("contender should announce before the controlled enter gate");
+        // Keep the announce-to-enter gap under channel control rather than
+        // charging an arbitrary scheduler pause to the acquisition decision.
+        enter_tx
+            .send(())
+            .expect("contender should wait at the controlled enter gate");
+
+        let result = match result_rx.recv_timeout(OUTER_THREAD_JOIN_TIMEOUT) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                contender.join().expect("contender should not panic");
-                panic!("contender exited without reporting a result");
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(error) => {
                 drop(guard);
-                match result_rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        let _ = contender.join();
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                panic!("try-acquire blocked behind the live owner");
+                let _ = result_rx.recv_timeout(OUTER_THREAD_JOIN_TIMEOUT);
+                let _ = contender.join();
+                panic!("contender did not finish before the outer join bound: {error}");
             }
         };
 
         contender.join().expect("contender should exit");
         assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(
+            sleeper_entries.load(Ordering::SeqCst),
+            0,
+            "zero-timeout acquisition must return Timeout without sleeping"
+        );
     }
 
     #[test]
