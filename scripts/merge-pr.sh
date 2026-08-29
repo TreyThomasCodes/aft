@@ -62,7 +62,18 @@ NEWER=$(
     gh api "repos/$OWNER_REPO/pulls/$PR/reviews" --paginate --jq '.[] | select(.state != "APPROVED" and .state != "PENDING") | .submitted_at'
   } | awk -v head="$HEAD_TS" '$0 > head' | wc -l | tr -d ' '
 )
-[ "$NEWER" -eq 0 ] || refuse "$NEWER review comment(s)/review(s) are newer than the head commit - the author has not pushed over the latest finding"
+if [ "$NEWER" -ne 0 ]; then
+  # The check exists to stop merging while an author is still addressing
+  # findings. When the maintainer resolved the outstanding threads with a
+  # recorded rationale (so newer comments are the resolution itself, not
+  # unaddressed findings), the maintainer can acknowledge them explicitly.
+  # The reason is printed so the merge log carries the judgment.
+  if [ -n "${AFT_MERGE_PR_ACK_FINDINGS:-}" ]; then
+    echo "merge-pr: ACK - $NEWER post-head comment(s) acknowledged by maintainer: ${AFT_MERGE_PR_ACK_FINDINGS}"
+  else
+    refuse "$NEWER review comment(s)/review(s) are newer than the head commit - the author has not pushed over the latest finding (set AFT_MERGE_PR_ACK_FINDINGS=\"reason\" to acknowledge deliberately)"
+  fi
+fi
 
 # --- 3. Author mid-iteration (head pushed too recently) --------------------
 NOW_EPOCH=$(date -u +%s)
