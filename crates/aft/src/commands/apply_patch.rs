@@ -94,6 +94,16 @@ fn normalize_resolved_path(path: PathBuf) -> PathBuf {
     crate::inspect::job::canonicalize_normalized(&path)
 }
 
+fn normalize_write_location(path: PathBuf) -> PathBuf {
+    let normalized = crate::inspect::job::normalize_path(&path);
+    let Some(file_name) = normalized.file_name() else {
+        return normalize_resolved_path(normalized);
+    };
+    let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+    let parent = normalize_resolved_path(parent.to_path_buf());
+    crate::inspect::job::normalize_path(&parent.join(file_name))
+}
+
 fn relative_path(abs: &Path, root: Option<&Path>) -> String {
     let abs = crate::inspect::job::canonicalize_normalized(abs);
     if let Some(root) = root {
@@ -108,12 +118,70 @@ fn relative_path(abs: &Path, root: Option<&Path>) -> String {
     display_slash(&abs)
 }
 
-fn resolve_path(req: &RawRequest, ctx: &AppContext, path: &str) -> Result<ResolvedPath, Response> {
+fn resolve_path(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &str,
+    preserve_final_component: bool,
+) -> Result<ResolvedPath, Response> {
     let input = resolve_patch_input(ctx, path);
-    let abs = normalize_resolved_path(ctx.validate_path(&req.id, &input)?);
+    let validated = if preserve_final_component {
+        ctx.validate_write_location(&req.id, &input)?
+    } else {
+        ctx.validate_path(&req.id, &input)?
+    };
+    let abs = if preserve_final_component {
+        normalize_write_location(validated)
+    } else {
+        normalize_resolved_path(validated)
+    };
     let root = project_root_for_relative_paths(ctx);
-    let rel = relative_path(&abs, root.as_deref());
+    let rel = if preserve_final_component {
+        relative_path_without_final_resolution(&abs, root.as_deref())
+    } else {
+        relative_path(&abs, root.as_deref())
+    };
     Ok(ResolvedPath { abs, rel })
+}
+
+fn relative_path_without_final_resolution(abs: &Path, root: Option<&Path>) -> String {
+    if let Some(root) = root {
+        let root = crate::inspect::job::canonicalize_normalized(root);
+        if let Ok(rel) = abs.strip_prefix(root) {
+            return display_slash(rel);
+        }
+    }
+    display_slash(abs)
+}
+
+fn reject_symlink_delete(
+    req: &RawRequest,
+    path: &str,
+    resolved: &ResolvedPath,
+) -> Result<(), Response> {
+    let metadata = match fs::symlink_metadata(&resolved.abs) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Response::error(
+                &req.id,
+                "io_error",
+                format!("apply_patch: failed to inspect '{path}': {error}"),
+            ));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "apply_patch: refusing to delete symlink '{path}'; symlink undo is not supported"
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn remember_path(
@@ -141,13 +209,17 @@ fn resolve_hunks(
     let mut affected_rel = Vec::new();
 
     for hunk in hunks {
-        let (source_path, move_path) = match &hunk {
-            Hunk::Add { path, .. } | Hunk::Delete { path } => (path.as_str(), None),
+        let (source_path, move_path, preserve_source_entry) = match &hunk {
+            Hunk::Add { path, .. } => (path.as_str(), None, false),
+            Hunk::Delete { path } => (path.as_str(), None, true),
             Hunk::Update {
                 path, move_path, ..
-            } => (path.as_str(), move_path.as_deref()),
+            } => (path.as_str(), move_path.as_deref(), move_path.is_some()),
         };
-        let source = resolve_path(req, ctx, source_path)?;
+        let source = resolve_path(req, ctx, source_path, preserve_source_entry)?;
+        if matches!(&hunk, Hunk::Delete { .. }) {
+            reject_symlink_delete(req, source_path, &source)?;
+        }
         remember_path(
             &source.abs,
             &source.rel,
@@ -155,7 +227,7 @@ fn resolve_hunks(
             &mut affected_rel,
         );
         let move_dest = if let Some(move_path) = move_path {
-            let dest = resolve_path(req, ctx, move_path)?;
+            let dest = resolve_path(req, ctx, move_path, true)?;
             if dest.abs == source.abs {
                 // Models can spell an in-place edit as a move back to the same file.
                 // Drop the move so apply and preview both use the normal update path.

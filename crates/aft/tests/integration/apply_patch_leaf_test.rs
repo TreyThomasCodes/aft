@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+#[cfg(unix)]
+use super::helpers::user_config;
 use super::helpers::AftProcess;
 
 fn configured_aft(project: &Path) -> AftProcess {
@@ -13,6 +15,26 @@ fn configured_aft(project: &Path) -> AftProcess {
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    aft
+}
+
+#[cfg(unix)]
+fn configured_restricted_aft(project: &Path) -> AftProcess {
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-apply-patch-restricted",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "config": user_config(json!({ "restrict_to_project_root": true })),
         })
         .to_string(),
     );
@@ -328,6 +350,110 @@ fn apply_patch_move_happy_path_and_undo_restores_source() {
         "before\nkeep\n"
     );
     assert!(!root.join("nested/dest.txt").exists());
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_rejects_symlink_delete_without_touching_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let target = write_file(root, "target.txt", "target contents\n");
+    let link = root.join("target-link.txt");
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Delete File: target-link.txt
+*** End Patch"#;
+    let response = apply(&mut aft, "apply-delete-symlink", patch);
+
+    assert_eq!(
+        response["success"], false,
+        "delete should fail: {response:?}"
+    );
+    assert_eq!(response["code"], "invalid_request");
+    assert!(response["message"]
+        .as_str()
+        .unwrap()
+        .contains("refusing to delete symlink"));
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "symlink should remain intact"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target contents\n");
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_move_removes_symlink_entry_without_touching_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let target = write_file(root, "target.txt", "target contents\n");
+    let source = root.join("before-link.txt");
+    let destination = root.join("after.txt");
+    std::os::unix::fs::symlink("target.txt", &source).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: before-link.txt
+*** Move to: after.txt
+@@
+-target contents
++updated contents
+*** End Patch"#;
+    let response = apply(&mut aft, "apply-move-symlink", patch);
+
+    assert_eq!(
+        response["success"], true,
+        "move should succeed: {response:?}"
+    );
+    assert!(
+        fs::symlink_metadata(&source).is_err(),
+        "the source symlink entry should be removed"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target contents\n");
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "updated contents\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn restricted_apply_patch_symlink_delete_rejection_rolls_back_prior_hunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let good = write_file(root, "good.txt", "before\n");
+    let target = write_file(root, "target.txt", "target contents\n");
+    let link = root.join("target-link.txt");
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    let mut aft = configured_restricted_aft(root);
+
+    let patch = r#"*** Begin Patch
+*** Update File: good.txt
+@@
+-before
++after
+*** Delete File: target-link.txt
+*** End Patch"#;
+    let response = apply(&mut aft, "apply-delete-symlink-rollback", patch);
+
+    assert_eq!(
+        response["success"], false,
+        "patch should fail: {response:?}"
+    );
+    assert_eq!(fs::read_to_string(&good).unwrap(), "before\n");
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "symlink should remain intact"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target contents\n");
 
     assert!(aft.shutdown().success());
 }
