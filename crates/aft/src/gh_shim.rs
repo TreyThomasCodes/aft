@@ -1241,7 +1241,13 @@ enum TupleDecl {
         platform: Vec<String>,
         #[serde(default)]
         api_match: Option<String>,
-        #[serde(default)]
+        // Signed manifests key this prose as `reasoning` (v10 rows). Without the
+        // alias the parse silently DROPPED all signed justification text - the
+        // signature verifies the raw bytes first, then serde discarded the
+        // unknown field, so every cache-derived view showed rationale: null
+        // while the signed artifact carried the prose (found by CKCRED's
+        // structural diff during the v11 ceremony).
+        #[serde(default, alias = "reasoning")]
         rationale: Option<String>,
     },
 }
@@ -4033,6 +4039,49 @@ mod tests {
                 "holder refusal code must pass through without remapping"
             );
         }
+    }
+
+    /// Signed v10 manifests key in-row prose as `reasoning`. This test pins the
+    /// exact signed row shape through parse AND a full parse->serialize->parse
+    /// round trip, so a field rename can never again silently drop signed
+    /// justification text. Mutation control: removing the `reasoning` alias on
+    /// `TupleDecl::Details::rationale` must turn this test red by name.
+    #[test]
+    fn signed_v10_reasoning_prose_survives_parse_and_cache_round_trip() {
+        // Byte shape lifted from the signed v10 artifact (admin tier row).
+        let signed_row = r#"{
+            "tuple": "workflow run",
+            "platform": ["macos", "linux"],
+            "reasoning": "Administration: dispatching a workflow runs code but carries no public attribution surface; operator identity under explicit bypass."
+        }"#;
+        let parsed: TupleDecl = serde_json::from_str(signed_row).expect("signed row parses");
+        let TupleDecl::Details { rationale, .. } = &parsed else {
+            panic!("signed row must parse as a detailed declaration");
+        };
+        let prose = rationale
+            .as_deref()
+            .expect("signed `reasoning` prose must survive the parse, not default to None");
+        assert!(
+            prose.starts_with("Administration:"),
+            "prose intact: {prose}"
+        );
+
+        // The cache view is a re-serialization of the parsed struct; the prose
+        // must survive that full round trip too (this is the view that showed
+        // rationale: null for every signed row before the alias existed).
+        let cache_bytes = serde_json::to_string(&parsed).expect("cache serialization");
+        let reparsed: TupleDecl = serde_json::from_str(&cache_bytes).expect("cache view reparses");
+        let TupleDecl::Details {
+            rationale: cached, ..
+        } = &reparsed
+        else {
+            panic!("cache view must stay a detailed declaration");
+        };
+        assert_eq!(
+            cached.as_deref(),
+            Some(prose),
+            "prose must survive the parse->serialize->parse cache round trip verbatim"
+        );
     }
 
     #[test]
