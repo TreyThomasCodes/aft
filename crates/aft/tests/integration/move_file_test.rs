@@ -184,6 +184,58 @@ fn undo_after_move_file_restores_source_and_removes_destination() {
 
 #[cfg(unix)]
 #[test]
+fn restricted_move_file_moves_symlink_instead_of_its_target() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let root = tmp.path();
+    let target = root.join("target.txt");
+    let source = root.join("before-link.txt");
+    let destination = root.join("after-link.txt");
+    std::fs::write(&target, "target contents\n").expect("write target");
+    std::os::unix::fs::symlink("target.txt", &source).expect("create source symlink");
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.to_path_buf()),
+            restrict_to_project_root: true,
+            ..Config::default()
+        },
+    );
+    let req: RawRequest = serde_json::from_value(json!({
+        "id": "move-restricted-symlink",
+        "command": "move_file",
+        "file": source.display().to_string(),
+        "destination": destination.display().to_string(),
+    }))
+    .expect("request parses");
+
+    let response = handle_move_file(&req, &ctx);
+    let resp = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
+    assert!(
+        std::fs::symlink_metadata(&source).is_err(),
+        "source symlink should be moved away"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "target contents\n",
+        "moving the link must not move its target"
+    );
+    assert!(
+        std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "destination should be the moved symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(&destination).unwrap(),
+        std::path::PathBuf::from("target.txt")
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn undo_after_move_file_restores_symlink_source_and_removes_destination() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let root = tmp.path();

@@ -40,11 +40,11 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let src_path = match ctx.validate_path(&req.id, Path::new(file)) {
+    let src_path = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
-    let dst_path = match ctx.validate_path(&req.id, Path::new(destination)) {
+    let dst_path = match ctx.validate_write_location(&req.id, Path::new(destination)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
