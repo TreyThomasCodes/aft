@@ -12,7 +12,7 @@ use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
     FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
-    InspectSnapshot, JobKey, JobOutcome,
+    InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
 use aft::lsp::registry::ServerKind;
@@ -331,23 +331,62 @@ fn tier2_run(ctx: &AppContext, categories: &[&str]) {
     if categories.contains(&"dead_code") {
         ensure_callgraph_store_ready(ctx);
     }
-    enqueue_tier2_run(ctx, categories);
+    let submission = enqueue_tier2_run(ctx, categories);
+    let in_flight = submission["in_flight_categories"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Tier-2 submission has no in-flight list: {submission:#}"));
+    for category in categories {
+        assert!(
+            in_flight.iter().any(|queued| queued == category),
+            "Tier-2 submission did not queue {category}: {submission:#}"
+        );
+    }
+    assert!(
+        submission["errors"].as_array().is_some_and(Vec::is_empty),
+        "Tier-2 submission failed: {submission:#}"
+    );
     wait_for_tier2(ctx, categories);
 }
 
 fn wait_for_tier2(ctx: &AppContext, categories: &[&str]) {
-    ctx.inspect_manager().drain_completions();
-    let response = inspect(
-        ctx,
-        json!({
-            "id": "inspect-tier2-wait",
-            "command": "inspect",
-        }),
+    let manager = ctx.inspect_manager();
+    // The in-flight registry is installed before the worker starts and removed
+    // only after its terminal outcome is published. Wait on that lifecycle
+    // event instead of using an unrelated inspect request's one-second Tier-1
+    // soft deadline as a proxy for Tier-2 completion.
+    let hang_deadline = Instant::now() + Duration::from_secs(90);
+    while manager.tier2_any_in_flight() {
+        assert!(
+            Instant::now() < hang_deadline,
+            "timed out waiting for Tier-2 completion event for {categories:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let config = ctx.config();
+    let root = config
+        .project_root
+        .clone()
+        .expect("configured project root");
+    let snapshot = InspectSnapshot::new_with_capabilities(
+        root.clone(),
+        ctx.inspect_dir(),
+        config,
+        ctx.symbol_cache(),
+        ctx.inspect_writer(),
+        ctx.callgraph_writer(),
     );
-    assert_eq!(
-        response["success"], true,
-        "inspect should wait for fresh Tier-2 categories {categories:?}: {response:#}"
-    );
+    let scope = JobScope::for_project(root);
+    for category in categories {
+        let category = category
+            .parse::<InspectCategory>()
+            .unwrap_or_else(|error| panic!("invalid Tier-2 category {category}: {error}"));
+        let outcome = manager.tier2_read_cached(snapshot.clone(), category, scope.clone());
+        assert!(
+            matches!(outcome, JobOutcome::Fresh { .. }),
+            "completed Tier-2 category {category} must be fresh: {outcome:?}"
+        );
+    }
 }
 
 fn assert_summary_count(response: &Value, category: &str, count: u64) {
