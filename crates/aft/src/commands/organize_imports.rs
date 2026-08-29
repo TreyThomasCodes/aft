@@ -134,6 +134,17 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if lang == LangId::Rust && rust_use_declarations_have_outer_attributes(&_tree) {
+        return Response::error_with_data(
+            &req.id,
+            "unsupported_import_attributes",
+            format!(
+                "organize_imports: Rust use declaration in {file} has an outer attribute; refusing to organize because sorting or merging could attach the attribute to a different import"
+            ),
+            serde_json::json!({ "file": file }),
+        );
+    }
+
     // --- Auto-backup ---
     let backup_id = match edit::auto_backup(
         ctx,
@@ -346,6 +357,53 @@ fn node_contains_comment(node: tree_sitter::Node<'_>) -> bool {
     if cursor.goto_first_child() {
         loop {
             if node_contains_comment(cursor.node()) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    false
+}
+
+fn rust_use_declarations_have_outer_attributes(tree: &tree_sitter::Tree) -> bool {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+
+    let mut pending_attribute = false;
+    loop {
+        let node = cursor.node();
+        match node.kind() {
+            "attribute_item" => pending_attribute = true,
+            "use_declaration" => {
+                if pending_attribute || node_contains_kind(node, "attribute_item") {
+                    return true;
+                }
+                pending_attribute = false;
+            }
+            _ if node.is_extra() => {}
+            _ => pending_attribute = false,
+        }
+
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    false
+}
+
+fn node_contains_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.kind() == kind || node_contains_kind(child, kind) {
                 return true;
             }
             if !cursor.goto_next_sibling() {
