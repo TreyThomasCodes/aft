@@ -2000,15 +2000,44 @@ fn wait_on_callgraph_build_start_gate(root: &Path) {
 fn wait_on_callgraph_build_start_gate(_root: &Path) {}
 
 #[cfg(test)]
-static REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN: AtomicBool = AtomicBool::new(false);
+static CALLGRAPH_POINTER_REMOVAL_ARMS: std::sync::OnceLock<parking_lot::Mutex<BTreeSet<PathBuf>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
-struct RemoveCallgraphPointerBeforeInlineReopenGuard;
+struct RemoveCallgraphPointerBeforeInlineReopenGuard {
+    pointer: PathBuf,
+}
 
 #[cfg(test)]
 impl Drop for RemoveCallgraphPointerBeforeInlineReopenGuard {
     fn drop(&mut self) {
-        REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.store(false, Ordering::SeqCst);
+        CALLGRAPH_POINTER_REMOVAL_ARMS
+            .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
+            .lock()
+            .remove(&self.pointer);
+    }
+}
+
+#[cfg(test)]
+fn install_callgraph_pointer_removal_arm(
+    pointer: PathBuf,
+) -> RemoveCallgraphPointerBeforeInlineReopenGuard {
+    let inserted = CALLGRAPH_POINTER_REMOVAL_ARMS
+        .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
+        .lock()
+        .insert(pointer.clone());
+    assert!(inserted, "callgraph pointer removal arm already installed");
+    RemoveCallgraphPointerBeforeInlineReopenGuard { pointer }
+}
+
+#[cfg(test)]
+fn remove_armed_callgraph_pointer_for_test(pointer: &Path) {
+    let armed = CALLGRAPH_POINTER_REMOVAL_ARMS
+        .get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))
+        .lock()
+        .remove(pointer);
+    if armed {
+        std::fs::remove_file(pointer).expect("remove callgraph pointer before inline reopen");
     }
 }
 
@@ -2017,10 +2046,8 @@ fn remove_callgraph_pointer_before_inline_reopen_for_test(
     callgraph_dir: &Path,
     store: &CallGraphStore,
 ) {
-    if REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.swap(false, Ordering::SeqCst) {
-        let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
-        std::fs::remove_file(pointer).expect("remove callgraph pointer before inline reopen");
-    }
+    let pointer = callgraph_dir.join(format!("{}.current", store.project_key()));
+    remove_armed_callgraph_pointer_for_test(&pointer);
 }
 
 #[cfg(not(test))]
@@ -8228,6 +8255,32 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
+    fn pointer_removal_arm_is_scoped_to_its_callgraph_pointer() {
+        let temp = TempDir::new().expect("pointer tempdir");
+        let target = temp.path().join("target.current");
+        let unrelated = temp.path().join("unrelated.current");
+        std::fs::write(&target, "target-generation\n").expect("target pointer");
+        std::fs::write(&unrelated, "unrelated-generation\n").expect("unrelated pointer");
+        let _arm = install_callgraph_pointer_removal_arm(target.clone());
+
+        // The test hook must remove only its target pointer. Completing another
+        // callgraph build must leave that pointer and the target hook intact.
+        remove_armed_callgraph_pointer_for_test(&unrelated);
+        assert!(
+            unrelated.exists(),
+            "unrelated pointer must remain published"
+        );
+        assert!(target.exists(), "target arm must remain pending");
+
+        remove_armed_callgraph_pointer_for_test(&target);
+        assert!(!target.exists(), "target pointer should consume its arm");
+        assert!(
+            unrelated.exists(),
+            "unrelated pointer must remain published"
+        );
+    }
+
+    #[test]
     fn inline_ready_without_published_pointer_settles_and_preserves_pending_paths() {
         let _env_guard = callgraph_build_wait_ms(2_000);
         let project = TempDir::new().expect("project tempdir");
@@ -8246,8 +8299,10 @@ mod callgraph_store_for_ops_tests {
         crate::root_cache::configure_artifact_access(project.path(), &project_key, false);
         let pending = project.path().join("pending.rs");
         ctx.add_pending_callgraph_store_paths([pending.clone()]);
-        REMOVE_CALLGRAPH_POINTER_BEFORE_INLINE_REOPEN.store(true, Ordering::SeqCst);
-        let _remove_pointer_guard = RemoveCallgraphPointerBeforeInlineReopenGuard;
+        let pointer = ctx
+            .callgraph_store_dir()
+            .join(format!("{project_key}.current"));
+        let _remove_pointer_guard = install_callgraph_pointer_removal_arm(pointer);
 
         assert!(matches!(
             ctx.callgraph_store_for_ops(),

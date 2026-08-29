@@ -297,6 +297,24 @@ fn handle_inspect_payload(
     let manager = ctx.inspect_manager();
     let blocking_tier1_deadline =
         phase_log.map(|_| Instant::now() + diagnostics_phase_timeout(snapshot.config.as_ref()));
+    let mut outcomes = BTreeMap::new();
+    if blocking_tier1_deadline.is_none() {
+        // The nonblocking path gives each Tier-1 scan a short soft deadline. Join
+        // those completion events before queuing parse-heavy Tier-2 work so the
+        // request cannot consume its own budget waiting behind work it enqueued.
+        for category in [InspectCategory::Metrics, InspectCategory::Todos] {
+            if inspect_cancellation_requested() {
+                return inspect_interrupted_response(&req.id);
+            }
+            let outcome = manager.submit_category_with_callgraph(
+                snapshot.clone(),
+                category,
+                scope.clone(),
+                None,
+            );
+            outcomes.insert(category, outcome);
+        }
+    }
     let mut tier2_receivers = BTreeMap::new();
     for category in InspectCategory::active()
         .iter()
@@ -353,8 +371,10 @@ fn handle_inspect_payload(
         );
     }
 
-    let mut outcomes = BTreeMap::new();
     for category in InspectCategory::active() {
+        if outcomes.contains_key(category) {
+            continue;
+        }
         if inspect_cancellation_requested() {
             return inspect_interrupted_response(&req.id);
         }
