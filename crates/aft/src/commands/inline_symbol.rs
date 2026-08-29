@@ -62,12 +62,12 @@ pub fn handle_inline_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let call_site_line = match req.params.get("call_site_line").and_then(|v| v.as_u64()) {
-        Some(l) if l >= 1 => (l - 1) as u32,
+        Some(l) if (1..=u64::from(u32::MAX)).contains(&l) => l as u32 - 1,
         Some(_) => {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "inline_symbol: 'call_site_line' must be >= 1 (1-based)",
+                "inline_symbol: 'call_site_line' must fit a positive 32-bit line number",
             );
         }
         None => {

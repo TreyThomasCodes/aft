@@ -121,6 +121,30 @@ fn inline_symbol_basic_ts() {
     aft.shutdown();
 }
 
+#[test]
+fn inline_symbol_rejects_call_site_line_above_u32_range() {
+    let (_tmp, root) = setup_inline_fixture();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let file = format!("{root}/sample.ts");
+    let original = std::fs::read_to_string(&file).expect("read fixture");
+    let resp = aft.send(&format!(
+        r#"{{"id":"line-overflow","command":"inline_symbol","file":{},"symbol":"add","call_site_line":4294967307}}"#,
+        crate::helpers::json_string(&file)
+    ));
+
+    assert_eq!(resp["success"], false, "oversized line must fail: {resp:?}");
+    assert_eq!(resp["code"], "invalid_request");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read fixture after request"),
+        original,
+        "an oversized line must not wrap to line 11 and edit the file"
+    );
+
+    aft.shutdown();
+}
+
 /// Expression-body arrow function: implicit return inlined correctly.
 #[test]
 fn inline_symbol_expression_body() {
