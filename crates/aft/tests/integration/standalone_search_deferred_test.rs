@@ -106,6 +106,27 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
         "configure failed: {configure:?}"
     );
 
+    // Wait for the semantic index to reach Ready before issuing the search.
+    // A search sent while the index is still building takes the building-reply
+    // arm and never starts a query embedding, so the query_started signal this
+    // test blocks on would time out - exactly what happened on loaded CI
+    // shards where the tiny fixture index was not yet built.
+    let ready_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = aft.send(
+            &serde_json::to_string(&json!({"id": "ready-poll", "command": "status"}))
+                .expect("serialize status request"),
+        );
+        if status["semantic_index"]["status"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "semantic index never became ready before the search: {status:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
     aft.send_silent(
         &serde_json::to_string(&json!({
             "id": "slow-search",
