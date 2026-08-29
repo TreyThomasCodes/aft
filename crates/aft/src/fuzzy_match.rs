@@ -300,10 +300,9 @@ fn find_reflow_matches(
         .len()
         .saturating_sub(REFLOW_NON_WS_TOLERANCE);
     let max_non_whitespace = needle_non_whitespace.len() + REFLOW_NON_WS_TOLERANCE;
-    let line_non_whitespace_lens: Vec<usize> = haystack_lines
-        .iter()
-        .map(|line| strip_reflow_whitespace(line).len())
-        .collect();
+    // The scan only needs byte lengths. Materializing a whitespace-stripped String
+    // for every source line made large generated-file misses allocate repeatedly.
+    let line_non_whitespace_lens = reflow_non_whitespace_lens(haystack_lines);
     let mut matches = Vec::new();
 
     for start in 0..haystack_lines.len() {
@@ -369,6 +368,18 @@ fn normalize_reflow_whitespace(s: &str) -> String {
     }
 
     normalized
+}
+
+fn reflow_non_whitespace_lens(lines: &[&str]) -> Vec<usize> {
+    lines
+        .iter()
+        .map(|line| {
+            line.chars()
+                .filter(|character| !character.is_whitespace())
+                .map(char::len_utf8)
+                .sum()
+        })
+        .collect()
 }
 
 fn strip_reflow_whitespace(s: &str) -> String {
@@ -527,6 +538,24 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pass, 1);
         assert_eq!(matches[0].byte_start, source.rfind("let total").unwrap());
+    }
+
+    #[test]
+    fn reflow_length_precomputation_allocates_only_the_result_vector() {
+        let line =
+            "export const generated = café\u{2003}+\t中 + padding_padding_padding_padding;\n";
+        let source = line.repeat(256);
+        let lines: Vec<&str> = source.lines().collect();
+        let expected: Vec<usize> = lines
+            .iter()
+            .map(|line| strip_reflow_whitespace(line).len())
+            .collect();
+
+        let (actual, allocations) =
+            crate::test_allocations::count(|| reflow_non_whitespace_lens(&lines));
+
+        assert_eq!(actual, expected);
+        assert_eq!(allocations, 1, "length precomputation allocated per line");
     }
 
     #[test]
