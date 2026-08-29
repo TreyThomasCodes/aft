@@ -32,6 +32,85 @@ function writeExecutable(name: string, source: string): string {
 }
 
 describe("BinaryBridge transport regressions", () => {
+  test("aborting a standalone request sends cancel_request for its wire id", async () => {
+    const requestsPath = join(workDir, "abort-requests.ndjson");
+    const script = writeExecutable(
+      "cancel-request.js",
+      `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    appendFileSync(${JSON.stringify(requestsPath)}, JSON.stringify(req) + "\\n");
+    if (req.command === "tool_call" && req.name === "search") {
+      process.stdout.write(JSON.stringify({
+        type: "progress",
+        request_id: req.id,
+        kind: "stdout",
+        chunk: "embedding-started",
+      }) + "\\n");
+      continue;
+    }
+    if (req.command === "cancel_request") {
+      const target = req.params && req.params.id;
+      process.stdout.write(JSON.stringify({
+        id: target,
+        success: false,
+        code: "request_cancelled",
+        message: "Search request cancelled because its route closed.",
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, cancelled: true }) + "\\n");
+      continue;
+    }
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const controller = new AbortController();
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+
+    try {
+      const search = bridge.toolCall(
+        "abort-session",
+        "search",
+        { query: "slow embedding" },
+        {
+          abortSignal: controller.signal,
+          onProgress: () => markStarted?.(),
+        },
+      );
+      await started;
+      controller.abort();
+      const response = await search;
+      expect(response).toMatchObject({ success: false, code: "request_cancelled" });
+
+      const requests = readFileSync(requestsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const searchRequest = requests.find(
+        (request) => request.command === "tool_call" && request.name === "search",
+      );
+      const cancelRequest = requests.find((request) => request.command === "cancel_request");
+      expect(cancelRequest).toMatchObject({
+        params: { id: searchRequest?.id },
+      });
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("hashline registration is immutable and session-scoped across concurrent calls", async () => {
     const requestsPath = join(workDir, "requests.ndjson");
     const script = writeExecutable(

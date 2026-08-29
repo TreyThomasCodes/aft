@@ -1779,6 +1779,9 @@ fn handle_semantic_or_hybrid_search(
     let query_vector = match embed_query(&params.query, ctx) {
         Ok(query_vector) => query_vector,
         Err(error) => {
+            if search_cancellation_requested() {
+                return cancelled_search_response(req);
+            }
             let lexical = if mode == SearchMode::Semantic {
                 collect_lexical_files(
                     ctx,
@@ -1810,6 +1813,9 @@ fn handle_semantic_or_hybrid_search(
             );
         }
     };
+    if search_cancellation_requested() {
+        return cancelled_search_response(req);
+    }
 
     let semantic_limit = if params.include_tests {
         semantic_candidate_limit(top_k)

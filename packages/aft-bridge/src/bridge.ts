@@ -162,6 +162,7 @@ interface PendingRequest {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
+  onSettled?: () => void;
   command: string;
 }
 
@@ -358,6 +359,11 @@ export interface StatusSnapshot {
 
 export interface BridgeRequestOptions {
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
+  /**
+   * Host cancellation for one standalone NDJSON request. Supervisor-backed subc
+   * routes ignore this because route closure already signals executor cancellation.
+   */
+  abortSignal?: AbortSignal;
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
   transportTimeoutMs?: number;
   /**
@@ -733,6 +739,23 @@ export class BinaryBridge implements AftProjectTransport {
    * status_bar/bg_completions and every other sidecar stay top-level so the
    * existing plugin ingest/capture path sees the same raw response shape.
    */
+  private listenForRequestAbort(requestId: string, signal: AbortSignal | undefined): () => void {
+    if (!signal) return () => {};
+    let fired = false;
+    const onAbort = () => {
+      if (fired) return;
+      fired = true;
+      void this.send("cancel_request", { id: requestId }, { keepBridgeOnTimeout: true }).catch(
+        () => {
+          // Transport teardown can win the race with best-effort cancellation.
+        },
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    return () => signal.removeEventListener("abort", onAbort);
+  }
+
   async toolCall(
     sessionId: string | undefined,
     name: string,
@@ -773,7 +796,7 @@ export class BinaryBridge implements AftProjectTransport {
         );
       }
 
-      if (Object.hasOwn(params, "id")) {
+      if (Object.hasOwn(params, "id") && command !== "cancel_request") {
         throw new Error("params cannot contain reserved key 'id'");
       }
 
@@ -892,7 +915,11 @@ export class BinaryBridge implements AftProjectTransport {
       // `bash` (whose params include `command: "<shell command>"`) silently
       // loses `session_id` because it stays nested inside `params`.
       let request: Record<string, unknown>;
-      if (Object.hasOwn(params, "command") || Object.hasOwn(params, "method")) {
+      if (
+        command === "cancel_request" ||
+        Object.hasOwn(params, "command") ||
+        Object.hasOwn(params, "method")
+      ) {
         const nested: Record<string, unknown> = { ...params };
         const reserved: Record<string, unknown> = {};
         for (const key of ["session_id", "lsp_hints"] as const) {
@@ -922,6 +949,7 @@ export class BinaryBridge implements AftProjectTransport {
           if (!entry) return;
           this.pending.delete(id);
           clearTimeout(entry.timer);
+          entry.onSettled?.();
 
           if (keepBridgeOnTimeout) {
             const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`;
@@ -969,7 +997,14 @@ export class BinaryBridge implements AftProjectTransport {
           this.handleTimeout(requestSessionId);
         }, effectiveTimeoutMs);
 
-        this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress, command });
+        const entry: PendingRequest = {
+          resolve,
+          reject,
+          timer,
+          onProgress: options?.onProgress,
+          command,
+        };
+        this.pending.set(id, entry);
 
         if (!child?.stdin?.writable) {
           this.pending.delete(id);
@@ -993,6 +1028,7 @@ export class BinaryBridge implements AftProjectTransport {
           if (entry) {
             this.pending.delete(id);
             clearTimeout(entry.timer);
+            entry.onSettled?.();
             entry.reject(error);
           }
           if (this.process === child) this.invalidateTransportProcess(error);
@@ -1003,6 +1039,9 @@ export class BinaryBridge implements AftProjectTransport {
           });
         } catch (err) {
           handleWriteFailure(err);
+        }
+        if (this.pending.has(id)) {
+          entry.onSettled = this.listenForRequestAbort(id, options?.abortSignal);
         }
       });
 
@@ -1513,6 +1552,7 @@ export class BinaryBridge implements AftProjectTransport {
         if (requestId && entry) {
           this.pending.delete(requestId);
           clearTimeout(entry.timer);
+          entry.onSettled?.();
           entry.resolve({
             success: false,
             code: "permission_required",
@@ -1554,6 +1594,7 @@ export class BinaryBridge implements AftProjectTransport {
         if (!entry) return;
         this.pending.delete(id);
         clearTimeout(entry.timer);
+        entry.onSettled?.();
         this.consecutiveRequestTimeouts = 0;
         this.scheduleRestartCountReset();
         this.accountForBashTaskResponse(entry.command, response);
@@ -1698,6 +1739,7 @@ export class BinaryBridge implements AftProjectTransport {
   private rejectAllPending(error: Error): void {
     for (const [_id, entry] of this.pending) {
       clearTimeout(entry.timer);
+      entry.onSettled?.();
       entry.reject(error);
     }
     this.pending.clear();

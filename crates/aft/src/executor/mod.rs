@@ -14,7 +14,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use tokio::sync::oneshot;
 
 use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
@@ -345,6 +345,8 @@ pub struct JobCancellation {
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
+    wait_lock: Mutex<()>,
+    wake: Condvar,
 }
 
 const JOB_CANCEL_STATE_PENDING: u8 = 0;
@@ -353,10 +355,12 @@ const JOB_CANCEL_STATE_COMMITTED: u8 = 2;
 const JOB_CANCEL_STATE_CANCELLED: u8 = 3;
 
 impl JobCancellation {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(JobCancellationInner {
                 state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
+                wait_lock: Mutex::new(()),
+                wake: Condvar::new(),
             }),
         }
     }
@@ -402,10 +406,10 @@ impl JobCancellation {
     /// Move to cancelled unless the job already sealed its commit. Returns the
     /// state the transition observed (`COMMITTED` when the seal won).
     fn signal_cancel(&self) -> u8 {
-        loop {
+        let observed = loop {
             let current = self.state();
             match current {
-                JOB_CANCEL_STATE_COMMITTED | JOB_CANCEL_STATE_CANCELLED => return current,
+                JOB_CANCEL_STATE_COMMITTED | JOB_CANCEL_STATE_CANCELLED => break current,
                 _ => {
                     if self
                         .inner
@@ -418,11 +422,16 @@ impl JobCancellation {
                         )
                         .is_ok()
                     {
-                        return current;
+                        break current;
                     }
                 }
             }
+        };
+        if observed != JOB_CANCEL_STATE_COMMITTED {
+            let _wait_guard = self.inner.wait_lock.lock();
+            self.inner.wake.notify_all();
         }
+        observed
     }
 
     fn state(&self) -> u8 {
@@ -439,6 +448,22 @@ impl JobCancellation {
     /// True when a cancel won the state race and the job must abort.
     pub fn cancel_requested_before_commit(&self) -> bool {
         self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
+    /// Sleep until cancellation is requested or the timeout expires.
+    ///
+    /// Cancellation takes the same lock before notifying, so a waiter cannot
+    /// miss a signal between its state check and the condition-variable wait.
+    pub fn wait_for_cancellation(&self, timeout: Duration) -> bool {
+        if self.cancel_requested_before_commit() {
+            return true;
+        }
+        let mut guard = self.inner.wait_lock.lock();
+        if self.cancel_requested_before_commit() {
+            return true;
+        }
+        self.inner.wake.wait_for(&mut guard, timeout);
+        self.cancel_requested_before_commit()
     }
 
     fn same_token(&self, other: &JobCancellation) -> bool {

@@ -60,6 +60,22 @@ describe("aft_search adapter", () => {
     expect(detailsResults[0].source).toBe("semantic");
   });
 
+  test("forwards the host abort signal to standalone search transport", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerSemanticTool(api, makePluginContext(bridge));
+    const controller = new AbortController();
+
+    await executeTool(
+      tools.get("aft_search")!,
+      { query: "slow embedding" },
+      undefined,
+      controller.signal,
+    );
+
+    expect(calls[0].options).toMatchObject({ abortSignal: controller.signal });
+  });
+
   test("throws bridge failure envelopes so Pi renders them through its error path", async () => {
     const { api, tools } = makeMockApi();
     const { bridge } = makeMockBridge(() => ({

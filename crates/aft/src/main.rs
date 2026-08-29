@@ -20,7 +20,7 @@ use aft::context::{App, AppContext, SemanticIndexStatus};
 use aft::log_ctx;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
-use aft::response_finalize::{DispatchOutcome, PendingResponses};
+use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -297,23 +297,22 @@ fn main() {
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
-                let attach_command = if req.command == "tool_call" {
-                    req.params
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("tool_call")
-                        .to_string()
-                } else {
-                    req.command.clone()
-                };
+                let attach_command = attach_command_for_request(&req);
                 let session_id_for_log = req.session_id.clone();
                 // P3-02/P3-03 seam: request-root identity is absent in
                 // standalone; the selected single runtime is the root today.
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
-                let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
-                    log_ctx::with_session(session_id_for_log, || dispatch_outcome(req, runtime))
-                }));
+                let dispatch_result = if req.command == "cancel_request" {
+                    Ok(DispatchOutcome::Immediate(handle_cancel_request(
+                        &req,
+                        &mut pending,
+                    )))
+                } else {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        log_ctx::with_session(session_id_for_log, || dispatch_outcome(req, runtime))
+                    }))
+                };
                 match dispatch_result {
                     Ok(DispatchOutcome::Immediate(mut response)) => {
                         aft::response_finalize::finalize_response(
@@ -876,8 +875,103 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn attach_command_for_request(req: &RawRequest) -> String {
+    if req.command == "tool_call" {
+        req.params
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool_call")
+            .to_string()
+    } else {
+        req.command.clone()
+    }
+}
+
+fn is_semantic_search_request(req: &RawRequest) -> bool {
+    req.command == "semantic_search"
+        || (req.command == "tool_call"
+            && req.params.get("name").and_then(|value| value.as_str()) == Some("search"))
+}
+
+fn cancelled_semantic_search_response(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "request_cancelled",
+        "Search request cancelled because its route closed.",
+    )
+}
+
+fn handle_semantic_search_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let request_id = req.id.clone();
+    let shutdown_request_id = request_id.clone();
+    let session_id = req.session().to_string();
+    let attach_command = attach_command_for_request(&req);
+    let cancellation = aft::executor::JobCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let worker_session_id = req.session_id.clone();
+    let disconnected_request_id = request_id.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
+        let response = log_ctx::with_session(worker_session_id, || dispatch(req, &ctx));
+        let _ = tx.send(response);
+    });
+
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id,
+        session_id,
+        attach_command,
+        poll: Box::new(move |_| match rx.try_recv() {
+            Ok(response) => Some(response),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
+                &disconnected_request_id,
+                "internal_error",
+                "semantic search worker disconnected before producing a response",
+            )),
+        }),
+        cancellation: Some(cancellation),
+        on_shutdown: Some(Box::new(move |_| {
+            cancelled_semantic_search_response(&shutdown_request_id)
+        })),
+    })
+}
+
+fn cancel_request_target(req: &RawRequest) -> Option<&str> {
+    req.params
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            req.params
+                .get("params")
+                .and_then(|params| params.get("id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+}
+
+fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Response {
+    let Some(request_id) = cancel_request_target(req) else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "cancel_request: missing required string param 'id'",
+        );
+    };
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "cancelled": pending.cancel_request(request_id),
+            "request_id": request_id,
+        }),
+    )
+}
+
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     aft::commands::tool_call::register_dispatch(dispatch);
+    if is_semantic_search_request(&req) {
+        return handle_semantic_search_deferred(req, Arc::clone(ctx));
+    }
     if req.command == "inspect" {
         return aft::commands::inspect::handle_inspect_deferred(&req, Arc::clone(ctx));
     }
@@ -924,6 +1018,9 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
+        if aft::executor::current_job_cancelled() {
+            return Some(cancelled_semantic_search_response(&req.id));
+        }
         aft::runtime_drain::drain_search_index_events(ctx);
         aft::runtime_drain::drain_semantic_index_events(ctx);
 
@@ -949,7 +1046,16 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
             }
         }
 
-        thread::sleep(Duration::from_millis(250));
+        let sleep_for = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if let Some(cancellation) = aft::executor::current_job_cancellation() {
+            if cancellation.wait_for_cancellation(sleep_for) {
+                return Some(cancelled_semantic_search_response(&req.id));
+            }
+        } else {
+            thread::sleep(sleep_for);
+        }
     }
 }
 
@@ -1582,6 +1688,345 @@ mod pending_response_tests {
         );
         assert!(writer.is_empty());
         assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_semantic_search_tests {
+    use super::{
+        attach_command_for_request, dispatch, dispatch_outcome, handle_cancel_request,
+        wait_for_semantic_index_before_search, write_ready_pending_to_writer,
+    };
+    use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
+    use aft::context::{AppContext, SemanticIndexStatus};
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use aft::response_finalize::{finalize_response, DispatchOutcome, PendingResponses};
+    use aft::semantic_index::SemanticIndex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct SemanticReadyWaitEnv;
+
+    impl Drop for SemanticReadyWaitEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("AFT_WAIT_FOR_SEMANTIC_READY");
+            std::env::remove_var("AFT_WAIT_FOR_SEMANTIC_READY_MS");
+        }
+    }
+
+    fn request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: id.to_string(),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: Some("standalone-search-test".to_string()),
+            params,
+        }
+    }
+
+    fn slow_search_request(id: &str) -> RawRequest {
+        request(
+            id,
+            "semantic_search",
+            serde_json::json!({
+                "query": "where does standalone search cancellation stop a remote request"
+            }),
+        )
+    }
+
+    fn semantic_context(root: &Path, base_url: String) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                semantic_search: true,
+                semantic: SemanticBackendConfig {
+                    backend: SemanticBackend::OpenAiCompatible,
+                    model: "test-embedding".to_string(),
+                    base_url: Some(base_url),
+                    api_key_env: None,
+                    query_timeout_ms: 3_000,
+                    ..SemanticBackendConfig::default()
+                },
+                ..Config::default()
+            },
+        ));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.to_path_buf(), 3));
+        ctx
+    }
+
+    fn start_slow_embedding_server(
+        response_delay: Duration,
+    ) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
+        let addr = listener
+            .local_addr()
+            .expect("slow embedding server address");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            started_tx.send(()).expect("signal embedding request start");
+            thread::sleep(response_delay);
+            let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), started_rx, handle)
+    }
+
+    fn register_deferred(outcome: DispatchOutcome) -> PendingResponses {
+        let mut pending = PendingResponses::default();
+        match outcome {
+            DispatchOutcome::Deferred(response) => pending.register(response),
+            DispatchOutcome::Immediate(response) => {
+                panic!("semantic search must be deferred, got {response:?}")
+            }
+        }
+        pending
+    }
+
+    fn wait_for_response(
+        ctx: &AppContext,
+        pending: &mut PendingResponses,
+    ) -> aft::protocol::Response {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(response) = pending.poll_ready(ctx).into_iter().next() {
+                return response.response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred search"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn deferred_search_keeps_sibling_status_latency_bounded() {
+        const EMBED_DELAY: Duration = Duration::from_millis(650);
+        let root = tempfile::tempdir().expect("create search project");
+
+        let (inline_url, _inline_started, inline_server) = start_slow_embedding_server(EMBED_DELAY);
+        let inline_ctx = semantic_context(root.path(), inline_url);
+        let inline_started_at = Instant::now();
+        let inline_response = dispatch(slow_search_request("inline-search"), &inline_ctx);
+        assert!(inline_response.success);
+        let inline_status = dispatch(
+            request("inline-status", "status", serde_json::json!({})),
+            &inline_ctx,
+        );
+        let inline_sibling_latency = inline_started_at.elapsed();
+        assert!(inline_status.success);
+        inline_server.join().expect("inline embedding server joins");
+
+        let (deferred_url, deferred_started, deferred_server) =
+            start_slow_embedding_server(EMBED_DELAY);
+        let deferred_ctx = semantic_context(root.path(), deferred_url);
+        let mut pending = register_deferred(dispatch_outcome(
+            slow_search_request("deferred-search"),
+            &deferred_ctx,
+        ));
+        deferred_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred query embedding starts");
+        let status_started_at = Instant::now();
+        let deferred_status = dispatch(
+            request("deferred-status", "status", serde_json::json!({})),
+            &deferred_ctx,
+        );
+        let deferred_sibling_latency = status_started_at.elapsed();
+        assert!(deferred_status.success);
+
+        eprintln!(
+            "standalone sibling status latency: inline={}ms deferred={}ms",
+            inline_sibling_latency.as_millis(),
+            deferred_sibling_latency.as_millis()
+        );
+        assert!(
+            inline_sibling_latency >= Duration::from_millis(500),
+            "inline control must include the slow query embedding"
+        );
+        assert!(
+            deferred_sibling_latency < Duration::from_millis(250),
+            "status must not wait behind the deferred query embedding"
+        );
+
+        let response = wait_for_response(&deferred_ctx, &mut pending);
+        assert!(response.success);
+        deferred_server
+            .join()
+            .expect("deferred embedding server joins");
+    }
+
+    #[test]
+    fn cancel_request_stops_deferred_query_embedding_and_resolves_cancelled() {
+        let root = tempfile::tempdir().expect("create search project");
+        let (base_url, started, server) = start_slow_embedding_server(Duration::from_millis(1_000));
+        let ctx = semantic_context(root.path(), base_url);
+        let mut pending = register_deferred(dispatch_outcome(
+            slow_search_request("cancelled-search"),
+            &ctx,
+        ));
+        started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("query embedding starts");
+
+        let cancel_started_at = Instant::now();
+        let cancel = handle_cancel_request(
+            &request(
+                "cancel-command",
+                "cancel_request",
+                serde_json::json!({"params": {"id": "cancelled-search"}}),
+            ),
+            &mut pending,
+        );
+        assert!(cancel.success);
+        assert_eq!(cancel.data["cancelled"], true);
+        let response = wait_for_response(&ctx, &mut pending);
+        let cancel_latency = cancel_started_at.elapsed();
+        assert_eq!(response.id, "cancelled-search");
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "request_cancelled");
+        assert!(
+            cancel_latency < Duration::from_millis(300),
+            "cancellation must wake the query-embedding wait, not wait for the remote response"
+        );
+        server.join().expect("cancel embedding server joins");
+    }
+
+    #[test]
+    fn semantic_ready_harness_wait_wakes_on_cancellation() {
+        let _env_guard = super::test_env::process_env_lock();
+        std::env::set_var("AFT_WAIT_FOR_SEMANTIC_READY", "1");
+        std::env::set_var("AFT_WAIT_FOR_SEMANTIC_READY_MS", "5000");
+        let _wait_env = SemanticReadyWaitEnv;
+        let root = tempfile::tempdir().expect("create search project");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                semantic_search: true,
+                ..Config::default()
+            },
+        ));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "test_wait".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let cancellation = aft::executor::JobCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_ctx = Arc::clone(&ctx);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _installed = aft::executor::install_job_cancellation(worker_cancellation);
+            started_tx.send(()).expect("signal semantic wait start");
+            let response = wait_for_semantic_index_before_search(
+                &slow_search_request("cancelled-ready-wait"),
+                &worker_ctx,
+            )
+            .expect("cancelled wait returns a response");
+            response_tx
+                .send(response)
+                .expect("send cancelled wait response");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("semantic-ready wait starts");
+        thread::sleep(Duration::from_millis(20));
+        cancellation.request_cancel();
+        let response = response_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("cancellation wakes semantic-ready wait");
+        assert_eq!(response.data["code"], "request_cancelled");
+        worker.join().expect("semantic-ready waiter joins");
+    }
+
+    #[test]
+    fn deferred_tool_call_search_preserves_inline_response_bytes() {
+        let root = tempfile::tempdir().expect("create search project");
+        std::fs::write(
+            root.path().join("fixture.rs"),
+            "fn parity_needle() -> usize { 4 }\n",
+        )
+        .expect("write parity fixture");
+        let make_ctx = || {
+            Arc::new(AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(root.path().to_path_buf()),
+                    ..Config::default()
+                },
+            ))
+        };
+        let make_request = || {
+            request(
+                "parity-search",
+                "tool_call",
+                serde_json::json!({
+                    "name": "search",
+                    "arguments": {"query": "parity_needle.*"}
+                }),
+            )
+        };
+
+        aft::commands::tool_call::register_dispatch(dispatch);
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-search-test",
+            &inline_attach,
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred parity response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(deferred_bytes, inline_bytes);
     }
 }
 

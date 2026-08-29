@@ -778,6 +778,60 @@ fn sleep_before_embedding_retry(attempt_index: usize) {
     }
 }
 
+const QUERY_EMBEDDING_CANCELLED_MARKER: &str = "__AFT_QUERY_EMBEDDING_CANCELLED__";
+const QUERY_EMBEDDING_CANCEL_POLL: Duration = Duration::from_millis(10);
+
+enum EmbeddingExchange {
+    SendFailed(reqwest::Error),
+    Response {
+        status: reqwest::StatusCode,
+        body: Result<String, reqwest::Error>,
+    },
+}
+
+fn execute_embedding_exchange(request: reqwest::blocking::RequestBuilder) -> EmbeddingExchange {
+    match request.send() {
+        Ok(response) => EmbeddingExchange::Response {
+            status: response.status(),
+            body: response.text(),
+        },
+        Err(error) => EmbeddingExchange::SendFailed(error),
+    }
+}
+
+fn execute_query_embedding_exchange(
+    request: reqwest::blocking::RequestBuilder,
+) -> Result<EmbeddingExchange, String> {
+    let Some(cancellation) = crate::executor::current_job_cancellation() else {
+        return Ok(execute_embedding_exchange(request));
+    };
+    if cancellation.cancel_requested_before_commit() {
+        return Err(QUERY_EMBEDDING_CANCELLED_MARKER.to_string());
+    }
+
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(execute_embedding_exchange(request));
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(exchange) => {
+                if cancellation.cancel_requested_before_commit() {
+                    return Err(QUERY_EMBEDDING_CANCELLED_MARKER.to_string());
+                }
+                return Ok(exchange);
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                return Err("embedding request worker disconnected".to_string());
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+        if cancellation.wait_for_cancellation(QUERY_EMBEDDING_CANCEL_POLL) {
+            return Err(QUERY_EMBEDDING_CANCELLED_MARKER.to_string());
+        }
+    }
+}
+
 fn send_embedding_request<F>(
     mut make_request: F,
     backend_label: &str,
@@ -794,9 +848,12 @@ where
             request = request.timeout(timeout);
         }
 
-        let response = match request.send() {
-            Ok(response) => response,
-            Err(error) => {
+        let exchange = match policy {
+            EmbeddingRequestPolicy::Build => execute_embedding_exchange(request),
+            EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
+        };
+        let (status, raw) = match exchange {
+            EmbeddingExchange::SendFailed(error) => {
                 if !last_attempt && is_retryable_embedding_error(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;
@@ -820,12 +877,14 @@ where
                     render_error_source_chain(&error)
                 ));
             }
-        };
-
-        let status = response.status();
-        let raw = match response.text() {
-            Ok(raw) => raw,
-            Err(error) => {
+            EmbeddingExchange::Response {
+                status,
+                body: Ok(raw),
+            } => (status, raw),
+            EmbeddingExchange::Response {
+                status: _,
+                body: Err(error),
+            } => {
                 if !last_attempt && embedding_response_read_error_is_transient(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;

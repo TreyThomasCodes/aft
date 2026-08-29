@@ -143,6 +143,23 @@ impl PendingResponses {
         self.entries.push(pending);
     }
 
+    /// Signal cooperative cancellation without removing the response slot.
+    /// The worker owns the terminal response and resolves it through `poll_ready`.
+    pub fn cancel_request(&mut self, request_id: &str) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.request_id == request_id)
+        else {
+            return false;
+        };
+        let Some(cancellation) = &entry.cancellation else {
+            return false;
+        };
+        cancellation.request_cancel();
+        true
+    }
+
     pub fn poll_ready(&mut self, ctx: &AppContext) -> Vec<ResolvedPending> {
         let mut ready = Vec::new();
         let mut waiting = Vec::with_capacity(self.entries.len());

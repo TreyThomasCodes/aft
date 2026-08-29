@@ -210,7 +210,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       async execute(
         _toolCallId: string,
         params: Static<typeof SearchParams>,
-        _signal,
+        signal,
         _onUpdate,
         extCtx,
       ) {
@@ -227,7 +227,13 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (params.topK !== undefined) req.topK = params.topK;
         if (params.includeTests !== undefined) req.includeTests = params.includeTests;
         if (params.path !== undefined) req.path = params.path;
-        const response = await callToolCall(bridge, "search", req, extCtx);
+        const response = await callToolCall(
+          bridge,
+          "search",
+          req,
+          extCtx,
+          signal ? { abortSignal: signal } : undefined,
+        );
         if (response.success === false) {
           throw new Error(response.text || response.message || "search failed");
         }

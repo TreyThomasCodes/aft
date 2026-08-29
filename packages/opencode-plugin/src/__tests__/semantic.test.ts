@@ -159,7 +159,10 @@ describe("semanticTools", () => {
           query: "authentication logic",
           topK: 5,
         },
-        options: expect.objectContaining({ timeoutMs: 60_000 }),
+        options: expect.objectContaining({
+          timeoutMs: 60_000,
+          abortSignal: sdkCtx.abort,
+        }),
       },
     ]);
     // The agent gets exactly Rust's clean text — no JSON dump, no leaked

@@ -122,6 +122,7 @@ export async function executeTool(
   tool: MockToolDef,
   params: Record<string, unknown>,
   extCtx: ExtensionContext = makeExtContext(),
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  return tool.execute("call-id", params, undefined, undefined, extCtx);
+  return tool.execute("call-id", params, signal, undefined, extCtx);
 }

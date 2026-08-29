@@ -79,7 +79,9 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       if (topK !== undefined) rawArgs.topK = topK;
       if (typeof args.includeTests === "boolean") rawArgs.includeTests = args.includeTests;
       if (pathArg) rawArgs.path = pathArg;
-      const response = await callToolCall(ctx, context, "search", rawArgs);
+      const response = await callToolCall(ctx, context, "search", rawArgs, {
+        abortSignal: context.abort,
+      });
 
       if (response.success === false) {
         const message =
