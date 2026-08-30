@@ -2156,56 +2156,6 @@ impl SemanticIndex {
         }
     }
 
-    pub(crate) fn adopt_frozen_base_for_root(
-        &mut self,
-        project_root: &Path,
-        config: &SemanticBackendConfig,
-    ) -> Option<Self> {
-        let expected = SemanticIndexFingerprint::for_config_dimension(config, self.dimension());
-        if !self
-            .fingerprint()
-            .is_some_and(|fingerprint| fingerprint.matches(&expected))
-        {
-            return None;
-        }
-
-        if let Some(base) = self.shared_base.as_ref() {
-            return Some(Self::from_shared_base(
-                project_root.to_path_buf(),
-                Arc::clone(base),
-            ));
-        }
-
-        let paths_are_shareable = self
-            .entries
-            .iter()
-            .all(|entry| cache_relative_path(&self.project_root, &entry.chunk.file).is_some())
-            && self
-                .file_mtimes
-                .keys()
-                .chain(self.file_sizes.keys())
-                .chain(self.file_hashes.keys())
-                .chain(self.deferred_files.iter())
-                .all(|path| cache_relative_path(&self.project_root, path).is_some());
-        if !paths_are_shareable {
-            return None;
-        }
-
-        // Move the resident vectors into one immutable relative-path base rather
-        // than cloning them. The owner and each matching worktree then retain
-        // only an Arc plus their own root for path projection.
-        let owner_root = self.project_root.clone();
-        let placeholder = Self::new(owner_root.clone(), self.dimension());
-        let private = std::mem::replace(self, placeholder);
-        let base = Arc::new(
-            private
-                .into_shared_base()
-                .expect("shareable semantic paths were validated before freezing"),
-        );
-        *self = Self::from_shared_base(owner_root, Arc::clone(&base));
-        Some(Self::from_shared_base(project_root.to_path_buf(), base))
-    }
-
     fn into_shared_base(mut self) -> Option<SharedSemanticBase> {
         for entry in &mut self.entries {
             entry.chunk.file = cache_relative_path(&self.project_root, &entry.chunk.file)?;
@@ -3571,11 +3521,6 @@ impl SemanticIndex {
     #[cfg(test)]
     pub(crate) fn removal_retain_passes_for_test(&self) -> usize {
         self.removal_retain_passes
-    }
-
-    #[cfg(test)]
-    pub(crate) fn uses_shared_base_for_test(&self) -> bool {
-        self.shared_base.is_some()
     }
 
     /// Get the embedding dimension

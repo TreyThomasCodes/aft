@@ -85,7 +85,6 @@ fn with_first_search_index_load_wait_budget_for_test<T>(
 }
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
-const BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS: &str = "Semantic lane is loading the shared index; lexical results below are complete for exact/identifier matches.";
 const STALE_CLI_SNAPSHOT_WARNING: &str = "Serving the last usable standing-root CLI snapshot after its freshness could not be verified; rerun `npx @cortexkit/aft index` to refresh it.";
 /// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
 /// virtually every real function/type so the agent doesn't re-read a file it
@@ -1645,7 +1644,6 @@ fn handle_semantic_or_hybrid_search(
             entries_done,
             entries_total,
         } => {
-            let borrowed_loading = stage == "loading_artifacts" && ctx.shared_artifacts_read_only();
             let mut detail = format!("Semantic index is still building (stage: {}).", stage);
             if let Some(files) = files {
                 detail.push_str(&format!(" files: {}", files));
@@ -1665,12 +1663,7 @@ fn handle_semantic_or_hybrid_search(
                     &shape,
                     "building",
                     detail,
-                    if borrowed_loading {
-                        "loading"
-                    } else {
-                        "building"
-                    },
-                    borrowed_loading,
+                    "building",
                     warnings,
                     project_root,
                     top_k,
@@ -1688,7 +1681,7 @@ fn handle_semantic_or_hybrid_search(
                 project_root,
             );
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
-            let note = building_lexical_note(borrowed_loading && !results.is_empty());
+            let note = building_lexical_note();
             let mut extras = serde_json::Map::new();
             extras.insert("stage".to_string(), serde_json::json!(stage));
             extras.insert("files".to_string(), serde_json::json!(files));
@@ -1698,16 +1691,7 @@ fn handle_semantic_or_hybrid_search(
                 serde_json::json!(entries_total),
             );
             extras.insert("note".to_string(), serde_json::json!(note));
-            extras.insert(
-                "semantic_rebuilding".to_string(),
-                serde_json::json!(!borrowed_loading),
-            );
-            if borrowed_loading {
-                extras.insert(
-                    "semantic_loading_shared".to_string(),
-                    serde_json::json!(true),
-                );
-            }
+            extras.insert("semantic_rebuilding".to_string(), serde_json::json!(true));
             extras.insert(
                 "lexical_only_fallback".to_string(),
                 serde_json::json!(lexical.ready),
@@ -1733,7 +1717,6 @@ fn handle_semantic_or_hybrid_search(
                         project_root,
                         lexical.ready,
                         stage == "loading_artifacts",
-                        borrowed_loading,
                     ),
                     results: result_values,
                     more_available: lexical_count > top_k || lexical_engine_capped,
@@ -2151,7 +2134,6 @@ fn artifact_contention_fallback_response(
             INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
         ),
         "artifact contention",
-        false,
         Vec::new(),
         project_root,
         top_k,
@@ -2238,7 +2220,6 @@ fn semantic_unavailable_or_fallback_response(
             semantic_status,
             detail,
             footer_reason,
-            false,
             warnings,
             project_root,
             top_k,
@@ -2306,7 +2287,6 @@ fn semantic_unavailable_grep_fallback_response(
     semantic_status: &'static str,
     detail: String,
     footer_reason: &str,
-    borrowed_loading: bool,
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
@@ -2322,11 +2302,6 @@ fn semantic_unavailable_grep_fallback_response(
         Err(response) => return response,
     };
     let result = &fallback.grep;
-    let detail = if borrowed_loading && !result.matches.is_empty() {
-        BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string()
-    } else {
-        detail
-    };
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
@@ -3333,12 +3308,8 @@ fn format_grep_lexical_unavailable_text(
     )
 }
 
-fn building_lexical_note(borrowed_loading_with_results: bool) -> &'static str {
-    if borrowed_loading_with_results {
-        BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
-    } else {
-        "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
-    }
+fn building_lexical_note() -> &'static str {
+    "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
 }
 
 fn format_building_lexical_text(
@@ -3347,7 +3318,6 @@ fn format_building_lexical_text(
     project_root: &Path,
     lexical_index_ready: bool,
     loading_artifacts: bool,
-    borrowed_loading: bool,
 ) -> String {
     if results.is_empty() && !lexical_index_ready {
         if loading_artifacts {
@@ -3360,18 +3330,10 @@ fn format_building_lexical_text(
         );
     }
 
-    let note = building_lexical_note(borrowed_loading && !results.is_empty());
+    let note = building_lexical_note();
     if results.is_empty() {
         return format!(
             "{detail}\n{note}\nFound 0 lexical fallback result(s). [semantic: rebuilding]"
-        );
-    }
-
-    if borrowed_loading {
-        return format!(
-            "{note}\n\n{}\n\nFound {} lexical fallback result(s). [semantic: loading]",
-            format_result_sections(results, project_root),
-            results.len()
         );
     }
 
@@ -4463,10 +4425,10 @@ mod tests {
             .as_str()
             .expect("note")
             .contains("lexical-only fallback"));
-        let text = response["text"].as_str().expect("text");
-        assert!(text.contains("lexical fallback"));
-        assert!(text.contains("Semantic index is rebuilding"));
-        assert!(!text.contains(BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS));
+        assert!(response["text"]
+            .as_str()
+            .expect("text")
+            .contains("lexical fallback"));
         let results = response["results"].as_array().expect("results array");
         assert!(
             results.iter().any(|result| {
@@ -4481,47 +4443,6 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_loading_with_lexical_results_describes_shared_lane_truthfully() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/lib.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        let source = "pub fn borrowed_loading_needle() {}\n";
-        std::fs::write(&source_file, source).expect("write source file");
-
-        let ctx = test_context(project.path());
-        ctx.set_cache_role(true, None);
-        let mut index = SearchIndex::new();
-        index.index_file(&source_file, source.as_bytes());
-        index.ready = true;
-        *ctx.search_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-
-        let response = response_value(handle_semantic_search(
-            &semantic_request("borrowed_loading_needle", 5),
-            &ctx,
-        ));
-        let text = response["text"].as_str().expect("response text");
-        assert!(text.contains(
-            "Semantic lane is loading the shared index; lexical results below are complete for exact/identifier matches."
-        ));
-        assert!(!text.contains("still building"));
-        assert!(!text.contains("rebuilding"));
-        assert!(response["results"]
-            .as_array()
-            .is_some_and(|results| !results.is_empty()));
-    }
-
-    #[test]
     fn loading_artifacts_without_lexical_index_reports_one_actionable_status() {
         let text = format_building_lexical_text(
             "Semantic index is still building (stage: loading_artifacts).",
@@ -4529,7 +4450,6 @@ mod tests {
             Path::new("/fixture"),
             false,
             true,
-            false,
         );
 
         assert!(text.contains("Index artifacts are loading for this root"));
@@ -4537,7 +4457,6 @@ mod tests {
         assert!(text.contains("Retry in a few seconds"));
         assert!(!text.contains("Found 0"));
         assert!(!text.contains("rebuilding"));
-        assert!(!text.contains(BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS));
     }
 
     #[test]

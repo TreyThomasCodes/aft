@@ -756,10 +756,6 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                             .collect::<Vec<_>>();
                         index.invalidate_files(&refresh_paths);
                         let corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
-                        if let Some(root) = ctx.canonical_cache_root_opt() {
-                            let semantic_config = ctx.config().semantic.clone();
-                            let _ = index.adopt_frozen_base_for_root(&root, &semantic_config);
-                        }
                         *ctx.semantic_index()
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);

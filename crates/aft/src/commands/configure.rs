@@ -49,64 +49,6 @@ static CONFIGURE_DEFERRED_DELAY_REACHED: AtomicUsize = AtomicUsize::new(0);
 static CONFIGURE_ARTIFACT_POST_GATE_REACHED: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static CONFIGURE_DEFERRED_MAINTENANCE_GATE: OnceLock<
-    Mutex<Option<ConfigureDeferredMaintenanceGate>>,
-> = OnceLock::new();
-
-#[cfg(test)]
-#[derive(Clone)]
-struct ConfigureDeferredMaintenanceGate {
-    root: PathBuf,
-    reached: crossbeam_channel::Sender<()>,
-    release: crossbeam_channel::Receiver<()>,
-}
-
-#[cfg(test)]
-pub(crate) struct ConfigureDeferredMaintenanceGateGuard {
-    root: PathBuf,
-}
-
-#[cfg(test)]
-impl Drop for ConfigureDeferredMaintenanceGateGuard {
-    fn drop(&mut self) {
-        let mut slot = CONFIGURE_DEFERRED_MAINTENANCE_GATE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.as_ref().is_some_and(|gate| gate.root == self.root) {
-            *slot = None;
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn gate_configure_deferred_maintenance_for_test(
-    root: PathBuf,
-) -> (
-    ConfigureDeferredMaintenanceGateGuard,
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let gate = ConfigureDeferredMaintenanceGate {
-        root: root.clone(),
-        reached: reached_tx,
-        release: release_rx,
-    };
-    let mut slot = CONFIGURE_DEFERRED_MAINTENANCE_GATE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(slot.is_none(), "configure gate already installed");
-    *slot = Some(gate);
-    (
-        ConfigureDeferredMaintenanceGateGuard { root },
-        reached_rx,
-        release_tx,
-    )
-}
 
 #[cfg(test)]
 thread_local! {
@@ -297,22 +239,9 @@ fn run_configure_deferred_walk_synchronously_for_test() -> bool {
     false
 }
 
-fn delay_configure_deferred_maintenance_for_test(_root: &Path) {
+fn delay_configure_deferred_maintenance_for_test() {
     #[cfg(test)]
-    {
-        CONFIGURE_DEFERRED_DELAY_REACHED.fetch_add(1, Ordering::SeqCst);
-        let gate = CONFIGURE_DEFERRED_MAINTENANCE_GATE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|gate| gate.root == _root)
-            .cloned();
-        if let Some(gate) = gate {
-            let _ = gate.reached.send(());
-            let _ = gate.release.recv();
-        }
-    }
+    CONFIGURE_DEFERRED_DELAY_REACHED.fetch_add(1, Ordering::SeqCst);
     sleep_from_env_ms("AFT_TEST_CONFIGURE_DEFERRED_MAINTENANCE_DELAY_MS");
 }
 
@@ -2649,12 +2578,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 configure_generation
             );
         }
-        let _ = adopt_resident_semantic_index_if_available(
-            ctx,
-            semantic_search,
-            &project_key,
-            &ctx.config().semantic,
-        );
         artifact_load_starts.extend(schedule_missing_artifact_loads(
             ctx,
             search_index,
@@ -2744,12 +2667,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.clear_pending_index_updates();
         }
 
-        let _ = adopt_resident_semantic_index_if_available(
-            ctx,
-            semantic_search,
-            &project_key,
-            &ctx.config().semantic,
-        );
         artifact_load_starts.extend(schedule_missing_artifact_loads(
             ctx,
             search_index,
@@ -2876,32 +2793,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 struct ArtifactLoadNeeds {
     search: bool,
     semantic: bool,
-}
-
-fn adopt_resident_semantic_index_if_available(
-    ctx: &AppContext,
-    semantic_search: bool,
-    project_key: &str,
-    semantic_config: &SemanticBackendConfig,
-) -> bool {
-    if !semantic_search || !ctx.shared_artifacts_read_only() {
-        return false;
-    }
-    let Some(index) = ctx.app().adopt_resident_semantic_index(
-        project_key,
-        &ctx.canonical_cache_root(),
-        semantic_config,
-    ) else {
-        return false;
-    };
-    *ctx.semantic_index()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-    slog_info!("semantic index adopted from matching resident artifact family");
-    true
 }
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
@@ -4284,7 +4175,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             continue;
         }
 
-        delay_configure_deferred_maintenance_for_test(&job.root_path);
+        delay_configure_deferred_maintenance_for_test();
         // Artifact workers are created in a blocked state during configure so
         // no deserialization can race ahead of the bind acknowledgement. The
         // lifecycle gate makes the bound check and gate release one admission:
@@ -4551,11 +4442,11 @@ mod tests {
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
-    use crate::context::{App, AppContext, SemanticRefreshEvent, SemanticRefreshRequest};
+    use crate::context::{AppContext, SemanticRefreshEvent, SemanticRefreshRequest};
     use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use crate::search_index::{CacheLock, SearchIndex};
-    use crate::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
+    use crate::semantic_index::SemanticIndex;
     use std::process::Command;
 
     struct TestContext {
@@ -6268,139 +6159,6 @@ mod tests {
         assert_eq!(
             manifest_after_worktree.checkout_path,
             main_manifest.checkout_path
-        );
-    }
-
-    #[test]
-    fn matching_worktree_adopts_resident_parent_semantic_base_without_disk_load() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let temp = tempfile::tempdir().unwrap();
-        let storage = temp.path().join("storage");
-        let main = temp.path().join("main");
-        init_git_fixture(&main);
-        let worktree = temp.path().join("worktree");
-        let mut worktree_command = Command::new("git");
-        assert!(
-            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
-                .args(["worktree", "add", "--detach", "--quiet"])
-                .arg(&worktree)
-                .arg("HEAD")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let canonical_main = std::fs::canonicalize(&main).unwrap();
-        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
-        let app = App::default_shared();
-        let executor = crate::executor::Executor::new();
-        let owner_ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            Config {
-                storage_dir: Some(storage.clone()),
-                ..Config::default()
-            },
-        ));
-        let owner_root = crate::path_identity::ProjectRootId::from_path(&canonical_main).unwrap();
-        assert!(executor.register_actor(owner_root, Arc::clone(&owner_ctx)));
-        let request = configure_semantic_with_options(
-            &canonical_main,
-            &storage,
-            "http://127.0.0.1:9/v1",
-            true,
-            64,
-            false,
-        );
-        assert!(handle_configure_for_test(&request, &owner_ctx).success);
-        owner_ctx.retire_semantic_index_rx();
-        let mut owner_index = SemanticIndex::new(canonical_main.clone(), 3);
-        owner_index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
-            &owner_ctx.config().semantic,
-            3,
-        ));
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
-        owner_ctx.install_semantic_index_rx(ready_rx, owner_ctx.configure_generation());
-        ready_tx
-            .send(crate::context::SemanticIndexEvent::Ready(owner_index))
-            .expect("queue resident semantic index");
-        crate::runtime_drain::drain_semantic_index_events(&owner_ctx);
-        assert!(
-            owner_ctx
-                .semantic_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(SemanticIndex::uses_shared_base_for_test),
-            "ready resident indexes should freeze before a worktree bind arrives"
-        );
-        let project_key = owner_ctx
-            .cached_artifact_cache_key(&canonical_main)
-            .expect("owner artifact key");
-        let semantic_artifact = storage
-            .join("semantic")
-            .join(&project_key)
-            .join("semantic.bin");
-        assert!(
-            !semantic_artifact.exists(),
-            "the control requires adoption to succeed without a disk snapshot"
-        );
-
-        let mut mismatched_config = owner_ctx.config().semantic.clone();
-        mismatched_config.model = "different-resident-model".to_string();
-        assert!(
-            app.adopt_resident_semantic_index(
-                &project_key,
-                &canonical_worktree,
-                &mismatched_config,
-            )
-            .is_none(),
-            "a mismatched semantic fingerprint must not adopt the resident base"
-        );
-
-        let borrower_ctx = Arc::new(AppContext::from_app(
-            Arc::clone(&app),
-            Config {
-                storage_dir: Some(storage.clone()),
-                ..Config::default()
-            },
-        ));
-        let borrower_root =
-            crate::path_identity::ProjectRootId::from_path(&canonical_worktree).unwrap();
-        assert!(executor.register_actor(borrower_root, Arc::clone(&borrower_ctx)));
-        let borrower_request = configure_semantic_with_options(
-            &canonical_worktree,
-            &storage,
-            "http://127.0.0.1:9/v1",
-            true,
-            64,
-            false,
-        );
-        let response = handle_configure_for_test(&borrower_request, &borrower_ctx);
-
-        assert!(response.success);
-        assert_eq!(borrower_ctx.cache_role(), "worktree");
-        assert!(
-            borrower_ctx.semantic_index_rx().lock().is_none(),
-            "resident adoption must not schedule a semantic disk loader"
-        );
-        let borrower_index = borrower_ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            borrower_index
-                .as_ref()
-                .is_some_and(SemanticIndex::uses_shared_base_for_test),
-            "the worktree should point at the resident frozen base"
-        );
-        assert!(
-            owner_ctx
-                .semantic_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .is_some_and(SemanticIndex::uses_shared_base_for_test),
-            "the parent should retain the same frozen base"
         );
     }
 

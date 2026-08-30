@@ -5408,10 +5408,16 @@ fn submit_maintenance_job(
         .map(|ctx| ctx.configure_generation())
         .unwrap_or(0);
     let (outcome_tx, outcome_rx) = oneshot::channel::<MaintenanceJobOutcome>();
-    // Deferred drains mutate subsystem state behind each subsystem's own lock.
-    // Keeping every drain on MaintenanceCommit lets interactive reads and lazy
-    // HeavyInit queries run while maintenance converges after the bind ack.
-    let lane = Lane::MaintenanceCommit;
+    // ConfigureTail runs deferred configure mutations and needs the actor
+    // epoch write gate. The other drain kinds only mutate subsystem state
+    // behind that subsystem's own lock, so they run on MaintenanceCommit and
+    // overlap interactive reads instead of excluding them.
+    let lane = match kind {
+        MaintenanceDrainKind::ConfigureTail => Lane::Mutating,
+        MaintenanceDrainKind::Watcher
+        | MaintenanceDrainKind::Lsp
+        | MaintenanceDrainKind::CompletionDrains => Lane::MaintenanceCommit,
+    };
     let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let outcome = match kind {
             MaintenanceDrainKind::Watcher => {
@@ -8070,111 +8076,6 @@ mod tests {
             vec![(root, MaintenanceDrainKind::CompletionDrains)]
         );
         assert!(!deferred);
-    }
-
-    #[tokio::test]
-    async fn slow_configure_tail_admits_first_search_but_not_mutating_work() {
-        let root_dir = tempfile::tempdir().unwrap();
-        let root_path = std::fs::canonicalize(root_dir.path()).unwrap();
-        let root = ProjectRootId::from_path(&root_path).unwrap();
-        let ctx = test_ctx();
-        ctx.mark_subc_bound();
-        let storage_root = ctx.storage_dir();
-        ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
-            generation: ctx.configure_generation(),
-            root_path: root_path.clone(),
-            canonical_cache_root: root_path.clone(),
-            harness: crate::harness::Harness::Opencode,
-            storage_root: storage_root.clone(),
-            harness_dir: storage_root.join("opencode"),
-            session_id: "first-search-admission".to_string(),
-            home_match: false,
-            format_tool_cache_clear_needed: false,
-            run_bash_replay: false,
-            refresh_project_runtime: false,
-            sync_bash_compress_flag: false,
-            reset_filter_registry: false,
-            clear_failed_spawns: false,
-            warm_callgraph_store: false,
-            supersede_search_artifact_persistence: false,
-            supersede_callgraph_artifact_persistence: false,
-            supersede_semantic_artifact_persistence: false,
-            artifact_load_starts: Vec::new(),
-        })
-        .expect("queue configure maintenance");
-        let (_gate, maintenance_reached, release_maintenance) =
-            crate::commands::configure::gate_configure_deferred_maintenance_for_test(
-                root_path.clone(),
-            );
-
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let (completion_tx, mut completion_rx) = mpsc::channel(2);
-        submit_maintenance_job(
-            &executor,
-            root.clone(),
-            MaintenanceDrainKind::ConfigureTail,
-            Vec::new(),
-            &completion_tx,
-            &metrics,
-        );
-        maintenance_reached
-            .recv_timeout(Duration::from_secs(2))
-            .expect("configure tail reached gate");
-
-        let admission_started = std::time::Instant::now();
-        let (search_admitted_tx, search_admitted_rx) = crossbeam_channel::bounded(1);
-        let search = executor.submit_async(
-            root.clone(),
-            Lane::HeavyInit,
-            "first-search".to_string(),
-            Box::new(move |_ctx| {
-                search_admitted_tx
-                    .send(())
-                    .expect("signal search admission");
-                Response::success("first-search", json!({}))
-            }),
-        );
-        let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded(1);
-        let mutation = executor.submit_async(
-            root,
-            Lane::Mutating,
-            "queued-mutation".to_string(),
-            Box::new(move |_ctx| {
-                mutation_started_tx.send(()).expect("signal mutation start");
-                Response::success("queued-mutation", json!({}))
-            }),
-        );
-
-        let search_admission = search_admitted_rx.recv_timeout(Duration::from_millis(100));
-        let admission_elapsed = admission_started.elapsed();
-        let mutation_waited = mutation_started_rx.try_recv().is_err();
-        release_maintenance
-            .send(())
-            .expect("release configure maintenance");
-        search_admission
-            .expect("first search must admit while configure maintenance remains gated");
-        eprintln!(
-            "first-search admission while configure maintenance is gated: {}ms",
-            admission_elapsed.as_millis()
-        );
-        assert!(
-            mutation_waited,
-            "mutating work must wait for configure maintenance to release its read epoch"
-        );
-        tokio::time::timeout(Duration::from_secs(5), search)
-            .await
-            .expect("first search completion timed out")
-            .expect("first search completion channel closed");
-        tokio::time::timeout(Duration::from_secs(5), mutation)
-            .await
-            .expect("mutation completion timed out")
-            .expect("mutation completion channel closed");
-        tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-            .await
-            .expect("configure-tail completion timed out")
-            .expect("configure-tail completion channel closed");
     }
 
     #[tokio::test]
