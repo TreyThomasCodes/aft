@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+  "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -227,7 +227,7 @@
         ],
         "tools": {
           "read": {
-            "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nGitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+            "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1061,7 +1061,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1091,7 +1091,7 @@
         ],
         "tools": {
           "read": {
-            "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nGitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+            "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -2090,7 +2090,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2281,7 +2281,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -2555,7 +2555,7 @@
           "read": {
             "name": "read",
             "label": "read",
-            "description": "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported. GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).",
+            "description": "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
             "promptSnippet": "Read file contents (supports offset/limit for large files)",
             "promptGuidelines": [
               "Use read to examine files instead of cat or sed."
@@ -3249,7 +3249,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
+      "source_commit": "ce02a58ad25ee6fd2db9070bd66ac6ae3bb22d1a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -3527,7 +3527,7 @@
           "read": {
             "name": "read",
             "label": "read",
-            "description": "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported. GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).",
+            "description": "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
             "promptSnippet": "Read file contents (supports offset/limit for large files)",
             "promptGuidelines": [
               "Use read to examine files instead of cat or sed."
