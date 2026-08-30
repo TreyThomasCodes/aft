@@ -508,9 +508,22 @@ fn outline_symbol_name(symbol: &Symbol, is_heading: bool) -> String {
 }
 
 fn format_outline_symbol(symbol: &Symbol) -> String {
+    format_outline_symbol_labeled(symbol, false)
+}
+
+/// Heading suggestions render the DE-LINKED label (`[Label](url)` -> `Label`):
+/// zoom accepts plain-text heading queries via normalization, so the URL adds
+/// tokens without adding addressability - the long-standing suggestion
+/// contract strips it.
+fn format_outline_symbol_labeled(symbol: &Symbol, is_heading: bool) -> String {
     let start = symbol.range.start_line.saturating_add(1);
     let end = symbol.range.end_line.saturating_add(1).max(start);
-    format!("`{}` (lines {start}-{end})", symbol.name)
+    let name = if is_heading {
+        normalize_heading_label(&symbol.name)
+    } else {
+        symbol.name.clone()
+    };
+    format!("`{name}` (lines {start}-{end})")
 }
 
 fn nearest_outline_symbols(
@@ -541,7 +554,7 @@ fn nearest_outline_symbols(
     for name in names {
         for (symbol, candidate_name) in &candidates {
             if candidate_name == &name {
-                let rendered = format_outline_symbol(symbol);
+                let rendered = format_outline_symbol_labeled(symbol, is_heading);
                 if !suggestions.contains(&rendered) {
                     suggestions.push(rendered);
                 }
@@ -624,7 +637,7 @@ fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_headin
             format!("{item_label} '{symbol_name}' not found"),
             &format!(
                 "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `file` or `symbol`.",
-                format_outline_symbol(closest)
+                format_outline_symbol_labeled(closest, is_heading)
             ),
         );
     }

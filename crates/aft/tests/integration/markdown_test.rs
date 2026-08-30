@@ -343,7 +343,16 @@ HTTP flow details.
         "misspelled heading should fail"
     );
     let message = suggestion["message"].as_str().unwrap();
-    assert!(message.contains("did you mean: [Community Issue Tracker]"));
+    // The steering contract: the refusal names the retry futility, offers the
+    // heading under its DE-LINKED label, and never leaks the URL form.
+    assert!(
+        message.contains("Retrying this exact zoom call will fail again"),
+        "refusal must carry the retry-unchanged signal: {message}"
+    );
+    assert!(
+        message.contains("Community Issue Tracker"),
+        "suggestion must offer the de-linked heading label: {message}"
+    );
     assert!(!message.contains("[Community Issue Tracker](https://example.com/issues)"));
 
     assert!(aft.shutdown().success());
