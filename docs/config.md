@@ -358,7 +358,7 @@ Structured `issue://` and `pr://` reads are disabled by default. Set `gh_read.en
 }
 ```
 
-This is a simple configuration value at both user and project tiers, with project configuration taking precedence. It does not affect the `gh_shim` child-process routing gate.
+This is a user-tier-only, host-wide gate; project `gh_read` blocks are dropped with a configuration warning. A project cannot vary the behavior or read-tool surface because project-specific descriptions would destabilize prompt-prefix caches within one host. While the gate is off, the read description remains byte-identical to the baseline surface and does not advertise resource spellings that would only return a refusal. The setting does not affect the `gh_shim` child-process routing gate.
 
 Every enabled GitHub resource read fetches live data; a prior read never satisfies a later request by itself. Successful live renders are retained only as a fallback copy, scoped to the resolved resource and authentication identity. If a live fetch fails and that copy exists, AFT returns it with this exact first-line disclosure before the rendered document:
 
