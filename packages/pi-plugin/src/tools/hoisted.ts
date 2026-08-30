@@ -91,8 +91,15 @@ function formatReadAttachmentText(attachment: ReadAttachment): string {
   return `Read attachment [${mime}]${size ? ` ${size}` : ""}`;
 }
 
+const ISSUE_AND_PR_READ_DESCRIPTION =
+  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
+
+function visionCapabilityForPiModel(extCtx: { model?: { input?: unknown } }): boolean | undefined {
+  return Array.isArray(extCtx.model?.input) ? extCtx.model.input.includes("image") : undefined;
+}
+
 function modelSupportsImages(extCtx: { model?: { input?: unknown } }): boolean {
-  return Array.isArray(extCtx.model?.input) && extCtx.model.input.includes("image");
+  return visionCapabilityForPiModel(extCtx) === true;
 }
 
 const NON_VISION_IMAGE_NOTE =
@@ -519,7 +526,8 @@ export function registerHoistedTools(
         name: readName,
         label: readName,
         description:
-          "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
+          "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported. " +
+          ISSUE_AND_PR_READ_DESCRIPTION,
         promptSnippet: "Read file contents (supports offset/limit for large files)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,
@@ -557,6 +565,8 @@ export function registerHoistedTools(
           if (endLine !== undefined) rawArgs.endLine = endLine;
           if (offset !== undefined) rawArgs.offset = offset;
           if (limit !== undefined) rawArgs.limit = limit;
+          const visionCapability = visionCapabilityForPiModel(extCtx);
+          if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
           const response = await callToolCall(bridge, "read", rawArgs, extCtx);
           if (response.success === false) {
             throw new Error(response.text || response.message || "read failed");

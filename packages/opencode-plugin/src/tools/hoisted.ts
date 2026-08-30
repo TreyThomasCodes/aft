@@ -15,6 +15,7 @@ import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugi
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
+import { resolvePromptContext } from "../shared/last-assistant-model.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -51,6 +52,74 @@ type ReadAttachment = {
 
 function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
   return Array.isArray(data.attachments) ? (data.attachments as ReadAttachment[]) : [];
+}
+
+const ISSUE_AND_PR_READ_DESCRIPTION =
+  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
+
+type OpenCodeModelCatalogEntry = {
+  attachment?: unknown;
+  modalities?: { input?: unknown };
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function visionCapabilityForOpenCodeModel(model: unknown): boolean | undefined {
+  const entry = model as OpenCodeModelCatalogEntry | undefined;
+  if (Array.isArray(entry?.modalities?.input)) {
+    return entry.modalities.input.includes("image");
+  }
+  return typeof entry?.attachment === "boolean" ? entry.attachment : undefined;
+}
+
+function modelFromOpenCodeProvider(provider: Record<string, unknown>, modelID: string): unknown {
+  const models = provider.models;
+  if (Array.isArray(models)) {
+    return models.find((model) => asRecord(model)?.id === modelID);
+  }
+  return asRecord(models)?.[modelID];
+}
+
+/**
+ * Resolve the current session model for this call instead of retaining a bind-time
+ * capability. A missing model catalog entry deliberately remains unspecified so
+ * the server's safe text-only default applies.
+ */
+async function currentSessionVisionCapability(
+  client: unknown,
+  sessionID: string | undefined,
+): Promise<boolean | undefined> {
+  if (!sessionID) return undefined;
+  const promptContext = await resolvePromptContext(client, sessionID);
+  const currentModel = promptContext?.model;
+  if (!currentModel) return undefined;
+
+  const providerApi = (client as { provider?: { list?: () => Promise<unknown> } }).provider;
+  if (typeof providerApi?.list !== "function") return undefined;
+
+  let listed: unknown;
+  try {
+    listed = await providerApi.list();
+  } catch {
+    return undefined;
+  }
+  const result = asRecord(listed);
+  const catalog = asRecord(result?.data) ?? result;
+  const providers = Array.isArray(catalog?.all)
+    ? catalog.all
+    : Array.isArray(catalog?.providers)
+      ? catalog.providers
+      : [];
+  const provider = providers.map(asRecord).find((entry) => entry?.id === currentModel.providerID);
+  if (!provider) return undefined;
+
+  return visionCapabilityForOpenCodeModel(
+    modelFromOpenCodeProvider(provider, currentModel.modelID),
+  );
 }
 
 /**
@@ -298,6 +367,8 @@ Behavior:
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
 - Directories return sorted entries with trailing / for subdirectories
 
+${ISSUE_AND_PR_READ_DESCRIPTION}
+
 Examples:
   Read full file: { "path": "src/app.ts" }
   Read lines 50-100: { "path": "src/app.ts", "startLine": 50, "endLine": 100 }
@@ -395,6 +466,12 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         if (endLine !== undefined) rawArgs.endLine = endLine;
         // Only send limit if we did NOT convert offset to startLine/endLine.
         if (rawLimit !== undefined && rawOffset === undefined) rawArgs.limit = rawLimit;
+
+        const visionCapability = await currentSessionVisionCapability(
+          ctx.client,
+          context.sessionID,
+        );
+        if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
 
         const response = await callToolCall(ctx, context, "read", rawArgs);
 
