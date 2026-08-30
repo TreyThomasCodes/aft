@@ -4,15 +4,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aft::github_read::{
     download_github_image_attachments, render_document, sqlite_cache_store, DownloadedGithubImage,
     GithubDocument, GithubDocumentKind, GithubFetchRequest, GithubFetcher, GithubImageDownloader,
     GithubReadClock, GithubReadCompletion, GithubReadEngine, GithubReadError, GithubReadFreshness,
-    GithubReadSelector, GithubReadStart, GithubResourceKind, GITHUB_READ_CACHE_HARD_TTL_MS,
-    GITHUB_READ_CACHE_SOFT_TTL_MS, MAX_GITHUB_IMAGE_ATTACHMENTS, MAX_GITHUB_IMAGE_ATTACHMENT_BYTES,
+    GithubReadSelector, GithubReadStart, GithubResourceKind, MAX_GITHUB_IMAGE_ATTACHMENTS,
+    MAX_GITHUB_IMAGE_ATTACHMENT_BYTES,
 };
 use parking_lot::Mutex;
 use url::Url;
@@ -45,10 +45,6 @@ impl FixtureClock {
     fn new(now_ms: i64) -> Self {
         Self(AtomicI64::new(now_ms))
     }
-
-    fn set(&self, now_ms: i64) {
-        self.0.store(now_ms, Ordering::SeqCst);
-    }
 }
 
 impl GithubReadClock for FixtureClock {
@@ -59,24 +55,12 @@ impl GithubReadClock for FixtureClock {
 
 struct ProbeFetcher {
     calls: AtomicUsize,
-    refresh_started: Option<mpsc::SyncSender<()>>,
-    refresh_release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl ProbeFetcher {
     fn ordinary() -> Self {
         Self {
             calls: AtomicUsize::new(0),
-            refresh_started: None,
-            refresh_release: Mutex::new(None),
-        }
-    }
-
-    fn gated(refresh_started: mpsc::SyncSender<()>, refresh_release: mpsc::Receiver<()>) -> Self {
-        Self {
-            calls: AtomicUsize::new(0),
-            refresh_started: Some(refresh_started),
-            refresh_release: Mutex::new(Some(refresh_release)),
         }
     }
 
@@ -88,14 +72,6 @@ impl ProbeFetcher {
 impl GithubFetcher for ProbeFetcher {
     fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call == 2 {
-            if let Some(started) = &self.refresh_started {
-                started.send(()).expect("report background refresh start");
-                if let Some(release) = self.refresh_release.lock().take() {
-                    release.recv().expect("release background refresh");
-                }
-            }
-        }
         let repository = request.resource.repository.clone().unwrap_or_else(|| {
             let context = request
                 .working_directory
@@ -115,6 +91,32 @@ impl GithubFetcher for ProbeFetcher {
             title: format!("network revision {call}"),
             state: "OPEN".to_string(),
             body: format!("network body revision {call}"),
+            ..GithubDocument::default()
+        })
+    }
+}
+
+struct FailingAfterFirstFetcher(AtomicUsize);
+
+impl GithubFetcher for FailingAfterFirstFetcher {
+    fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        if call > 1 {
+            return Err(GithubReadError::FetchFailed(
+                "fixture live fetch failed".to_string(),
+            ));
+        }
+        Ok(GithubDocument {
+            repository: request
+                .resource
+                .repository
+                .clone()
+                .unwrap_or_else(|| "owner/repo".to_string()),
+            kind: GithubDocumentKind::Issue,
+            number: request.resource.number,
+            title: "fallback seed".to_string(),
+            state: "OPEN".to_string(),
+            body: "cached fallback body".to_string(),
             ..GithubDocument::default()
         })
     }
@@ -208,56 +210,18 @@ fn complete_read(start: GithubReadStart) -> GithubReadCompletion {
     }
 }
 
-fn immediate_read(start: GithubReadStart) -> GithubReadCompletion {
-    match start {
-        GithubReadStart::Immediate(completion) => completion,
-        GithubReadStart::Deferred(_) => panic!("cache hit must not wait on a foreground worker"),
-    }
-}
-
-fn wait_for_refresh_clear(engine: &GithubReadEngine) {
-    for _ in 0..1_000 {
-        if engine.refresh_in_flight_for_test() == 0 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("background cache refresh did not finish");
-}
-
 #[test]
-fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() {
+fn sequential_reads_always_fetch_live_and_refresh_the_fallback_copy() {
     let storage = tempfile::tempdir().expect("create cache storage");
-    let (refresh_started_tx, refresh_started_rx) = mpsc::sync_channel(1);
-    let (refresh_release_tx, refresh_release_rx) = mpsc::sync_channel(1);
-    let fetcher = Arc::new(ProbeFetcher::gated(refresh_started_tx, refresh_release_rx));
-    let clock = Arc::new(FixtureClock::new(1_000));
-    let engine = Arc::new(GithubReadEngine::new(
+    let fetcher = Arc::new(ProbeFetcher::ordinary());
+    let engine = GithubReadEngine::new(
         sqlite_cache_store(storage.path().join("aft.db")),
         fetcher.clone(),
         Arc::new(ScriptedDownloader::new(BTreeMap::new())),
-        clock.clone(),
-    ));
+        Arc::new(FixtureClock::new(1_000)),
+    );
 
-    let GithubReadStart::Deferred(first_pending) = engine
-        .start_resource(
-            &enabled_gh_read(),
-            RESOURCE,
-            "/fixture/cache",
-            "principal:alice",
-            None,
-            GithubReadSelector::WholeDocument,
-        )
-        .expect("start cache-miss read")
-    else {
-        panic!("a cache miss must use pending-response execution");
-    };
-    let first = complete_read(GithubReadStart::Deferred(first_pending));
-    assert_eq!(first.freshness, GithubReadFreshness::Fetched);
-    assert!(first.content.contains("network revision 1"));
-    assert_eq!(fetcher.calls(), 1);
-
-    let fresh = immediate_read(
+    let first = complete_read(
         engine
             .start_resource(
                 &enabled_gh_read(),
@@ -267,86 +231,33 @@ fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() 
                 None,
                 GithubReadSelector::WholeDocument,
             )
-            .expect("start fresh cached read"),
+            .expect("start first live read"),
     );
-    assert_eq!(fresh.content, first.content);
-    assert_eq!(fresh.freshness, GithubReadFreshness::FreshCache);
-    assert_eq!(fresh.freshness.note(), None);
-    assert_eq!(fetcher.calls(), 1, "a soft-TTL hit must not call GitHub");
-
-    clock.set(1_000 + GITHUB_READ_CACHE_SOFT_TTL_MS + 1);
-    let barrier = Arc::new(Barrier::new(5));
-    let mut readers = Vec::new();
-    for _ in 0..4 {
-        let reader_engine = Arc::clone(&engine);
-        let reader_barrier = Arc::clone(&barrier);
-        readers.push(std::thread::spawn(move || {
-            reader_barrier.wait();
-            immediate_read(
-                reader_engine
-                    .start_resource(
-                        &enabled_gh_read(),
-                        RESOURCE,
-                        "/fixture/cache",
-                        "principal:alice",
-                        None,
-                        GithubReadSelector::WholeDocument,
-                    )
-                    .expect("start concurrent stale cached read"),
+    let second = complete_read(
+        engine
+            .start_resource(
+                &enabled_gh_read(),
+                RESOURCE,
+                "/fixture/cache",
+                "principal:alice",
+                None,
+                GithubReadSelector::WholeDocument,
             )
-        }));
-    }
-    barrier.wait();
-    for reader in readers {
-        let stale = reader.join().expect("concurrent stale reader returns");
-        assert_eq!(stale.content, first.content);
-        assert_eq!(
-            stale.freshness,
-            GithubReadFreshness::StaleCacheRefreshing,
-            "each stale reader must identify the background refresh"
-        );
-        assert_eq!(
-            stale.freshness.note(),
-            Some("Cached GitHub data is stale; a background refresh is in progress.")
-        );
-    }
-    refresh_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("one background refresh starts");
-    assert_eq!(engine.refresh_in_flight_for_test(), 1);
+            .expect("start second live read"),
+    );
+
+    assert_eq!(first.freshness, GithubReadFreshness::Fetched);
+    assert_eq!(second.freshness, GithubReadFreshness::Fetched);
+    assert!(second.content.contains("network revision 2"));
     assert_eq!(
         fetcher.calls(),
         2,
-        "concurrent stale reads must share one exact-key GitHub refresh"
+        "two sequential reads must issue two live fetches"
     );
-
-    refresh_release_tx
-        .send(())
-        .expect("release background refresh");
-    wait_for_refresh_clear(engine.as_ref());
-    clock.set(1_000 + GITHUB_READ_CACHE_SOFT_TTL_MS + 1 + GITHUB_READ_CACHE_HARD_TTL_MS);
-
-    let GithubReadStart::Deferred(hard_pending) = engine
-        .start_resource(
-            &enabled_gh_read(),
-            RESOURCE,
-            "/fixture/cache",
-            "principal:alice",
-            None,
-            GithubReadSelector::WholeDocument,
-        )
-        .expect("start hard-expired read")
-    else {
-        panic!("a hard-TTL hit must evict and refetch through pending execution");
-    };
-    let hard_refetch = complete_read(GithubReadStart::Deferred(hard_pending));
-    assert_eq!(hard_refetch.freshness, GithubReadFreshness::Fetched);
-    assert!(hard_refetch.content.contains("network revision 3"));
-    assert_eq!(fetcher.calls(), 3);
 }
 
 #[test]
-fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
+fn live_fetches_keep_authentication_and_unresolved_short_contexts_isolated() {
     let storage = tempfile::tempdir().expect("create cache storage");
     let fetcher = Arc::new(ProbeFetcher::ordinary());
     let engine = GithubReadEngine::new(
@@ -380,37 +291,8 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
             )
             .expect("start Bob read"),
     );
-    assert_eq!(
-        fetcher.calls(),
-        2,
-        "identities must not share a cache entry"
-    );
-    assert_ne!(alice.content, bob.content);
-    immediate_read(
-        engine
-            .start_resource(
-                &enabled_gh_read(),
-                RESOURCE,
-                "/fixture/authentication",
-                "principal:alice",
-                None,
-                GithubReadSelector::WholeDocument,
-            )
-            .expect("reuse Alice cache entry"),
-    );
-    immediate_read(
-        engine
-            .start_resource(
-                &enabled_gh_read(),
-                RESOURCE,
-                "/fixture/authentication",
-                "principal:bob",
-                None,
-                GithubReadSelector::WholeDocument,
-            )
-            .expect("reuse Bob cache entry"),
-    );
     assert_eq!(fetcher.calls(), 2);
+    assert_ne!(alice.content, bob.content);
 
     let first_short = complete_read(
         engine
@@ -436,51 +318,47 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
             )
             .expect("resolve second short resource"),
     );
-    assert_eq!(
-        fetcher.calls(),
-        4,
-        "unresolved short resources from different working directories must fetch independently"
-    );
+    assert_eq!(fetcher.calls(), 4);
     assert!(first_short.content.contains("Repository: owner/worktree-a"));
     assert!(second_short
         .content
         .contains("Repository: owner/worktree-b"));
-    immediate_read(
-        engine
-            .start_resource(
-                &enabled_gh_read(),
-                "issue://7",
-                "/fixture/worktree-a",
-                "principal:alice",
-                None,
-                GithubReadSelector::WholeDocument,
-            )
-            .expect("reuse first short-resource cache entry"),
+
+    for (resource, working_directory, identity) in [
+        (RESOURCE, "/fixture/authentication", "principal:alice"),
+        (RESOURCE, "/fixture/authentication", "principal:bob"),
+        ("issue://7", "/fixture/worktree-a", "principal:alice"),
+        ("issue://7", "/fixture/worktree-b", "principal:alice"),
+    ] {
+        complete_read(
+            engine
+                .start_resource(
+                    &enabled_gh_read(),
+                    resource,
+                    working_directory,
+                    identity,
+                    None,
+                    GithubReadSelector::WholeDocument,
+                )
+                .expect("repeat live read"),
+        );
+    }
+    assert_eq!(
+        fetcher.calls(),
+        8,
+        "cached fallback copies must not suppress live reads"
     );
-    immediate_read(
-        engine
-            .start_resource(
-                &enabled_gh_read(),
-                "issue://7",
-                "/fixture/worktree-b",
-                "principal:alice",
-                None,
-                GithubReadSelector::WholeDocument,
-            )
-            .expect("reuse second short-resource cache entry"),
-    );
-    assert_eq!(fetcher.calls(), 4);
 }
 
 #[test]
-fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_other_mutations() {
+fn successful_same_resource_invalidation_removes_the_disclosed_fallback_copy() {
     let storage = tempfile::tempdir().expect("create cache storage");
-    let fetcher = Arc::new(ProbeFetcher::ordinary());
+    let fetcher = Arc::new(FailingAfterFirstFetcher(AtomicUsize::new(0)));
     let engine = GithubReadEngine::new(
         sqlite_cache_store(storage.path().join("aft.db")),
         fetcher.clone(),
         Arc::new(ScriptedDownloader::new(BTreeMap::new())),
-        Arc::new(FixtureClock::new(1_000)),
+        Arc::new(FixtureClock::new(1_234)),
     );
 
     complete_read(
@@ -493,11 +371,12 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
                 None,
                 GithubReadSelector::WholeDocument,
             )
-            .expect("seed cache before mutation"),
+            .expect("seed fallback copy"),
     );
-    assert_eq!(fetcher.calls(), 1);
 
-    immediate_read(
+    // A failed mutation has no success-only invalidation call, so its fallback
+    // must remain available and visibly disclosed when the next live fetch fails.
+    let fallback = complete_read(
         engine
             .start_resource(
                 &enabled_gh_read(),
@@ -507,21 +386,20 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
                 None,
                 GithubReadSelector::WholeDocument,
             )
-            .expect("failed gh-shim mutation leaves cache intact"),
+            .expect("attempt live read after failed mutation"),
     );
-    assert_eq!(
-        fetcher.calls(),
-        1,
-        "the failure path does not invoke the success-only invalidation seam"
-    );
+    assert_eq!(fallback.freshness, GithubReadFreshness::CachedFallback);
+    assert!(fallback.content.starts_with(
+        "[cached copy from 1970-01-01T00:00:01.234Z; live fetch failed: fixture live fetch failed]\n"
+    ));
 
     assert_eq!(
         engine
             .invalidate(GithubResourceKind::Issue, "owner/repo", 8, None)
-            .expect("invalidate unrelated gh-shim mutation resource"),
+            .expect("invalidate unrelated mutation resource"),
         0
     );
-    immediate_read(
+    assert!(complete_read(
         engine
             .start_resource(
                 &enabled_gh_read(),
@@ -531,17 +409,18 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
                 None,
                 GithubReadSelector::WholeDocument,
             )
-            .expect("unrelated gh-shim mutation leaves control cached"),
-    );
-    assert_eq!(fetcher.calls(), 1);
+            .expect("unrelated mutation leaves fallback copy"),
+    )
+    .content
+    .starts_with("[cached copy from"));
 
     assert_eq!(
         engine
             .invalidate(GithubResourceKind::Issue, "owner/repo", 7, None)
-            .expect("apply successful same-resource gh-shim invalidation"),
+            .expect("apply successful same-resource mutation invalidation"),
         1
     );
-    let GithubReadStart::Deferred(refetch_pending) = engine
+    let error = match engine
         .start_resource(
             &enabled_gh_read(),
             RESOURCE,
@@ -550,13 +429,27 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
             None,
             GithubReadSelector::WholeDocument,
         )
-        .expect("read after same-resource invalidation")
-    else {
-        panic!("a successful same-resource mutation must force a pending refetch");
+        .expect("attempt read after matching invalidation")
+    {
+        GithubReadStart::Deferred(deferred) => {
+            let result = (0..1_000)
+                .find_map(|_| {
+                    let result = deferred.try_complete();
+                    if result.is_none() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    result
+                })
+                .expect("GitHub read did not complete");
+            result.expect_err("invalidated fallback must not hide fetch failure")
+        }
+        GithubReadStart::Immediate(_) => panic!("every read must attempt a live fetch"),
     };
-    let refetched = complete_read(GithubReadStart::Deferred(refetch_pending));
-    assert!(refetched.content.contains("network revision 2"));
-    assert_eq!(fetcher.calls(), 2);
+    assert_eq!(
+        error,
+        GithubReadError::FetchFailed("fixture live fetch failed".to_string())
+    );
+    assert_eq!(fetcher.0.load(Ordering::SeqCst), 4);
 }
 
 #[test]
@@ -600,7 +493,7 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
     assert!(missing_capability.attachments.is_empty());
     assert!(downloader.calls().is_empty());
 
-    let false_capability = immediate_read(
+    let false_capability = complete_read(
         engine
             .start_resource(
                 &enabled_gh_read(),
@@ -631,8 +524,8 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
     assert_eq!(explicit_vision.content, missing_capability.content);
     assert_eq!(
         fetcher.calls(),
-        1,
-        "vision must reuse canonical cached text"
+        3,
+        "each capability mode must fetch live before rendering attachments"
     );
     assert_eq!(
         explicit_vision

@@ -404,13 +404,17 @@ fn fixture_selected_markdown_is_byte_identical_across_all_transport_harnesses() 
         1,
         "standalone, subc, MCP-compatible, OpenCode, and Pi transports must agree byte-for-byte"
     );
+    let expected_calls = TransportHarness::ALL
+        .iter()
+        .flat_map(|_| ["pr view", "api graphql", "pr view", "api graphql"])
+        .collect::<Vec<_>>();
     assert_eq!(
         fs::read_to_string(&call_log)
             .expect("read fixture gh call log")
             .lines()
             .collect::<Vec<_>>(),
-        ["pr view", "api graphql"],
-        "the shared explicit-resource cache must satisfy every selected transport read after the first fetch"
+        expected_calls,
+        "every whole and selected transport read must fetch live"
     );
 }
 
@@ -485,10 +489,6 @@ impl GithubReadCacheStore for MemoryCache {
             updated_at_ms: fetched_at_ms,
         });
         Ok(())
-    }
-
-    fn evict_hard_expired_at(&self, _cutoff_ms: i64) -> Result<usize, String> {
-        Ok(0)
     }
 
     fn invalidate(
@@ -622,9 +622,9 @@ fn vision_and_text_only_fixture_requests_keep_selected_markdown_bytes_identical(
     }
     assert!(text_only.attachments.is_empty());
     assert_eq!(vision.attachments.len(), 2);
-    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     assert_eq!(downloader.0.load(Ordering::SeqCst), 2);
-    assert_eq!(vision.freshness, GithubReadFreshness::FreshCache);
+    assert_eq!(vision.freshness, GithubReadFreshness::Fetched);
 }
 
 fn live_read(harness: TransportHarness, project: &Path, storage: &Path, resource: &str) -> Value {

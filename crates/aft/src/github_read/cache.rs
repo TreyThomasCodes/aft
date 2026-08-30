@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,9 +7,9 @@ use parking_lot::Mutex;
 
 use crate::config::GhReadConfig;
 use crate::db::github_read_cache::{
-    evict_hard_expired_github_read_cache_entries, invalidate_github_read_cache_resource,
-    lookup_github_read_cache_entry, upsert_github_read_cache_entry, GithubReadCacheEntry,
-    GithubReadCacheKey, GithubReadResourceKind,
+    invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
+    upsert_github_read_cache_entry, GithubReadCacheEntry, GithubReadCacheKey,
+    GithubReadResourceKind,
 };
 
 use super::attachments::{
@@ -18,15 +18,6 @@ use super::attachments::{
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
 use super::render::render_document;
 use super::resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
-
-/// Fresh GitHub renders are served without a new network request for this long.
-/// A short window reduces redundant `gh` calls during a tool turn while still
-/// making active issue threads responsive.
-pub const GITHUB_READ_CACHE_SOFT_TTL_MS: i64 = 60_000;
-/// Cache rows reaching this age are evicted before a caller refetches. The
-/// larger hard window lets stale-while-revalidate survive a temporary GitHub
-/// failure without serving content indefinitely.
-pub const GITHUB_READ_CACHE_HARD_TTL_MS: i64 = 15 * 60_000;
 
 /// Clock seam used to make freshness boundaries deterministic in tests.
 pub trait GithubReadClock: Send + Sync {
@@ -58,7 +49,6 @@ pub trait GithubReadCacheStore: Send + Sync {
         canonical_text: &str,
         fetched_at_ms: i64,
     ) -> Result<(), String>;
-    fn evict_hard_expired_at(&self, cutoff_ms: i64) -> Result<usize, String>;
     fn invalidate(
         &self,
         kind: GithubResourceKind,
@@ -103,12 +93,6 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
         let connection = self.connection()?;
         upsert_github_read_cache_entry(&connection, key, canonical_text, fetched_at_ms)
             .map_err(|error| format!("failed to update GitHub read cache: {error}"))
-    }
-
-    fn evict_hard_expired_at(&self, cutoff_ms: i64) -> Result<usize, String> {
-        let connection = self.connection()?;
-        evict_hard_expired_github_read_cache_entries(&connection, cutoff_ms)
-            .map_err(|error| format!("failed to evict GitHub read cache: {error}"))
     }
 
     fn invalidate(
@@ -180,26 +164,19 @@ impl Default for GithubReadSelector {
     }
 }
 
-/// Freshness of the text that satisfied a request.
+/// Origin of the text that satisfied a request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GithubReadFreshness {
+    /// The response came from the live GitHub fetch.
     Fetched,
-    FreshCache,
-    /// The cache row is older than the soft TTL. A single background worker has
-    /// been scheduled (or was already scheduled) for the same exact cache key.
-    StaleCacheRefreshing,
+    /// The live fetch failed, so the response is the explicitly disclosed fallback copy.
+    CachedFallback,
 }
 
 impl GithubReadFreshness {
-    /// Agent-visible freshness context for a stale-while-revalidate response.
-    /// Kept outside canonical text so cache state cannot alter rendered bytes.
+    /// Fallback status is part of the rendered text, where every agent can see it.
     pub const fn note(self) -> Option<&'static str> {
-        match self {
-            Self::StaleCacheRefreshing => {
-                Some("Cached GitHub data is stale; a background refresh is in progress.")
-            }
-            Self::Fetched | Self::FreshCache => None,
-        }
+        None
     }
 }
 
@@ -231,8 +208,8 @@ impl GithubReadDeferred {
     }
 }
 
-/// The initial outcome for a GitHub read. A cache-only, text-only response is
-/// immediate; every path that can call `gh` or download an image is deferred.
+/// The initial outcome for a GitHub read. Every read is deferred because it
+/// performs a live GitHub fetch before considering any cached fallback.
 pub enum GithubReadStart {
     Immediate(GithubReadCompletion),
     Deferred(GithubReadDeferred),
@@ -241,7 +218,7 @@ pub enum GithubReadStart {
 #[derive(Default)]
 struct GithubReadEngineState {
     aliases: BTreeMap<ShortResourceAlias, String>,
-    refreshes: BTreeSet<CacheSlot>,
+    flights: BTreeMap<GithubReadFlightSlot, Vec<GithubReadFlightWaiter>>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -260,8 +237,23 @@ struct CacheSlot {
     authentication_identity_hash: [u8; 32],
 }
 
-/// Coordinates durable cache lookup, stale refresh single-flight, structured
-/// fetches, rendering, and deferred attachments for both issue and PR reads.
+/// A resolved resource can share a flight across equivalent explicit forms.
+/// An unresolved short form stays scoped to its worktree until GitHub resolves it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GithubReadFlightSlot {
+    Resolved(CacheSlot),
+    Unresolved(ShortResourceAlias),
+}
+
+struct GithubReadFlightWaiter {
+    request: GithubReadRequest,
+    selector: GithubReadSelector,
+    fallback: Option<GithubReadCacheEntry>,
+    sender: mpsc::SyncSender<Result<GithubReadCompletion, GithubReadError>>,
+}
+
+/// Coordinates live GitHub fetches, durable fallback copies, single-flight work,
+/// rendering, and deferred attachments for both issue and PR reads.
 pub struct GithubReadEngine {
     cache: Arc<dyn GithubReadCacheStore>,
     fetcher: Arc<dyn GithubFetcher>,
@@ -315,40 +307,8 @@ impl GithubReadEngine {
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
         self.require_enabled(gh_read)?;
-        let now_ms = self.clock.now_ms();
-        let Some((slot, key)) = self.cache_key_for_request(&request)? else {
-            return Ok(self.defer_fetch(request, selector));
-        };
-        let entry = self.cache.lookup(&key).map_err(cache_failure)?;
-        let Some(entry) = entry else {
-            return Ok(self.defer_fetch(request, selector));
-        };
-        let age_ms = now_ms.saturating_sub(entry.fetched_at_ms);
-        if age_ms < GITHUB_READ_CACHE_SOFT_TTL_MS {
-            return Ok(self.complete_or_defer_attachments(
-                request,
-                selector,
-                entry.canonical_text,
-                GithubReadFreshness::FreshCache,
-            ));
-        }
-        if age_ms < GITHUB_READ_CACHE_HARD_TTL_MS {
-            self.schedule_background_refresh(request.clone(), slot);
-            return Ok(self.complete_or_defer_attachments(
-                request,
-                selector,
-                entry.canonical_text,
-                GithubReadFreshness::StaleCacheRefreshing,
-            ));
-        }
-
-        // Hard-expired rows are evicted before the deferred refetch. Failed
-        // background refreshes never take this path, so they retain the prior
-        // stale row until an actual hard-TTL request arrives.
-        self.cache
-            .evict_hard_expired_at(now_ms.saturating_sub(GITHUB_READ_CACHE_HARD_TTL_MS))
-            .map_err(cache_failure)?;
-        Ok(self.defer_fetch(request, selector))
+        let fallback = self.cache_fallback_for_request(&request);
+        Ok(self.defer_fetch(request, selector, fallback))
     }
 
     /// Invalidate the exact resource after a successful structured `gh` mutation.
@@ -378,15 +338,7 @@ impl GithubReadEngine {
         }
     }
 
-    /// Deterministic seam for asserting stale refresh single-flight completion.
-    pub fn refresh_in_flight_for_test(&self) -> usize {
-        self.state.lock().refreshes.len()
-    }
-
-    fn cache_key_for_request(
-        &self,
-        request: &GithubReadRequest,
-    ) -> Result<Option<(CacheSlot, GithubReadCacheKey)>, GithubReadError> {
+    fn resolved_cache_slot(&self, request: &GithubReadRequest) -> Option<CacheSlot> {
         let repository = match &request.resource.repository {
             Some(repository) => Some(repository.clone()),
             None => self
@@ -395,104 +347,99 @@ impl GithubReadEngine {
                 .aliases
                 .get(&short_alias(request))
                 .cloned(),
-        };
-        let Some(repository) = repository else {
-            return Ok(None);
-        };
-        let slot = cache_slot(
+        }?;
+        Some(cache_slot(
             &request.resource,
             &repository,
             &request.effective_authentication_identity,
-        );
-        let key = github_cache_key(&slot, &request.effective_authentication_identity)?;
-        Ok(Some((slot, key)))
+        ))
+    }
+
+    fn cache_fallback_for_request(
+        &self,
+        request: &GithubReadRequest,
+    ) -> Option<GithubReadCacheEntry> {
+        let slot = self.resolved_cache_slot(request)?;
+        let key = match github_cache_key(&slot, &request.effective_authentication_identity) {
+            Some(key) => key,
+            None => return None,
+        };
+        match self.cache.lookup(&key) {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!("GitHub read cache lookup failed; live fetch will continue: {error}");
+                None
+            }
+        }
+    }
+
+    fn flight_slot_for_request(&self, request: &GithubReadRequest) -> GithubReadFlightSlot {
+        self.resolved_cache_slot(request)
+            .map(GithubReadFlightSlot::Resolved)
+            .unwrap_or_else(|| GithubReadFlightSlot::Unresolved(short_alias(request)))
     }
 
     fn defer_fetch(
         &self,
         request: GithubReadRequest,
         selector: GithubReadSelector,
+        fallback: Option<GithubReadCacheEntry>,
     ) -> GithubReadStart {
-        let cache = Arc::clone(&self.cache);
-        let fetcher = Arc::clone(&self.fetcher);
-        let downloader = Arc::clone(&self.image_downloader);
-        let clock = Arc::clone(&self.clock);
-        let state = Arc::clone(&self.state);
+        let slot = self.flight_slot_for_request(&request);
+        let fetch_request = request.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let result = fetch_render_store(
-                &request,
-                cache.as_ref(),
-                fetcher.as_ref(),
-                clock.as_ref(),
-                &state,
-            )
-            .and_then(|canonical_text| {
-                complete_with_optional_attachments(
-                    &request,
-                    selector,
-                    canonical_text,
-                    GithubReadFreshness::Fetched,
-                    downloader.as_ref(),
-                )
-            });
-            let _ = sender.send(result);
-        });
-        GithubReadStart::Deferred(GithubReadDeferred { receiver })
-    }
-
-    fn complete_or_defer_attachments(
-        &self,
-        request: GithubReadRequest,
-        selector: GithubReadSelector,
-        canonical_text: String,
-        freshness: GithubReadFreshness,
-    ) -> GithubReadStart {
-        if request.vision_capability != Some(true) {
-            return GithubReadStart::Immediate(complete(
-                canonical_text,
-                selector,
-                freshness,
-                Vec::new(),
-            ));
-        }
-        let downloader = Arc::clone(&self.image_downloader);
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let result = complete_with_optional_attachments(
-                &request,
-                selector,
-                canonical_text,
-                freshness,
-                downloader.as_ref(),
-            );
-            let _ = sender.send(result);
-        });
-        GithubReadStart::Deferred(GithubReadDeferred { receiver })
-    }
-
-    fn schedule_background_refresh(&self, request: GithubReadRequest, slot: CacheSlot) {
-        {
+        let leader = {
             let mut state = self.state.lock();
-            if !state.refreshes.insert(slot.clone()) {
-                return;
-            }
+            let waiters = state.flights.entry(slot.clone()).or_default();
+            let leader = waiters.is_empty();
+            waiters.push(GithubReadFlightWaiter {
+                request,
+                selector,
+                fallback,
+                sender,
+            });
+            leader
+        };
+        if leader {
+            let cache = Arc::clone(&self.cache);
+            let fetcher = Arc::clone(&self.fetcher);
+            let downloader = Arc::clone(&self.image_downloader);
+            let clock = Arc::clone(&self.clock);
+            let state = Arc::clone(&self.state);
+            std::thread::spawn(move || {
+                let fetched = fetch_render_store(
+                    &fetch_request,
+                    cache.as_ref(),
+                    fetcher.as_ref(),
+                    clock.as_ref(),
+                    &state,
+                );
+                let waiters = state.lock().flights.remove(&slot).unwrap_or_default();
+                for waiter in waiters {
+                    let result = match &fetched {
+                        Ok(canonical_text) => complete_with_optional_attachments(
+                            &waiter.request,
+                            waiter.selector,
+                            canonical_text.clone(),
+                            GithubReadFreshness::Fetched,
+                            downloader.as_ref(),
+                        ),
+                        Err(error) => match waiter.fallback {
+                            Some(entry) => complete_with_optional_attachments(
+                                &waiter.request,
+                                waiter.selector,
+                                cached_fallback_text(&entry, error),
+                                GithubReadFreshness::CachedFallback,
+                                downloader.as_ref(),
+                            ),
+                            None => Err(error.clone()),
+                        },
+                    };
+                    let _ = waiter.sender.send(result);
+                }
+            });
         }
-        let cache = Arc::clone(&self.cache);
-        let fetcher = Arc::clone(&self.fetcher);
-        let clock = Arc::clone(&self.clock);
-        let state = Arc::clone(&self.state);
-        std::thread::spawn(move || {
-            // A failed refresh deliberately does not touch its previous row.
-            let _ = fetch_render_store(
-                &request,
-                cache.as_ref(),
-                fetcher.as_ref(),
-                clock.as_ref(),
-                &state,
-            );
-            state.lock().refreshes.remove(&slot);
-        });
+        GithubReadStart::Deferred(GithubReadDeferred { receiver })
     }
 }
 
@@ -514,11 +461,12 @@ fn fetch_render_store(
         &repository,
         &request.effective_authentication_identity,
     );
-    let key = github_cache_key(&slot, &request.effective_authentication_identity)?;
-    // A cache-write outage should not convert a fetched document into a failed
-    // read. The response is still complete; a later read simply refetches.
-    if let Err(error) = cache.upsert(&key, &canonical_text, clock.now_ms()) {
-        log::warn!("GitHub read cache write failed: {error}");
+    // A cache outage or an unrepresentable cache key must not convert a live
+    // GitHub document into a failed read. The next request will fetch live again.
+    if let Some(key) = github_cache_key(&slot, &request.effective_authentication_identity) {
+        if let Err(error) = cache.upsert(&key, &canonical_text, clock.now_ms()) {
+            log::warn!("GitHub read cache write failed: {error}");
+        }
     }
     if request.resource.repository.is_none() {
         state
@@ -613,16 +561,17 @@ fn cache_slot(
     }
 }
 
-fn github_cache_key(
-    slot: &CacheSlot,
-    authentication_identity: &str,
-) -> Result<GithubReadCacheKey, GithubReadError> {
-    let number = i64::try_from(slot.number).map_err(|_| {
-        GithubReadError::FetchFailed(
-            "GitHub resource number exceeds cache storage range".to_string(),
-        )
-    })?;
-    Ok(GithubReadCacheKey::new(
+fn github_cache_key(slot: &CacheSlot, authentication_identity: &str) -> Option<GithubReadCacheKey> {
+    let number = match i64::try_from(slot.number) {
+        Ok(number) => number,
+        Err(_) => {
+            log::warn!(
+                "GitHub resource number exceeds cache storage range; fallback is unavailable"
+            );
+            return None;
+        }
+    };
+    Some(GithubReadCacheKey::new(
         database_kind(slot.kind),
         &slot.repository,
         number,
@@ -645,6 +594,66 @@ fn cache_failure(error: String) -> GithubReadError {
     GithubReadError::FetchFailed(format!("GitHub read cache is unavailable: {error}"))
 }
 
+fn cached_fallback_text(entry: &GithubReadCacheEntry, error: &GithubReadError) -> String {
+    format!(
+        "[cached copy from {}; live fetch failed: {}]\n{}",
+        iso8601_utc(entry.fetched_at_ms),
+        short_failure_reason(error),
+        entry.canonical_text
+    )
+}
+
+fn short_failure_reason(error: &GithubReadError) -> String {
+    const MAX_REASON_CHARS: usize = 160;
+    let reason = error
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut characters = reason.chars();
+    let mut short = characters
+        .by_ref()
+        .take(MAX_REASON_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        short.push('…');
+    }
+    if short.is_empty() {
+        "unknown fetch error".to_string()
+    } else {
+        short
+    }
+}
+
+fn iso8601_utc(unix_ms: i64) -> String {
+    let seconds = unix_ms.div_euclid(1_000);
+    let milliseconds = unix_ms.rem_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    // Convert epoch days to a civil UTC date inline to avoid adding a second
+    // wall-clock dependency just to format fallback timestamps.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
 /// Convenience constructor for the real cache location. The read integration
 /// supplies its existing `aft.db` path; this module never creates a second DB.
 pub fn sqlite_cache_store(database_path: impl AsRef<Path>) -> Arc<dyn GithubReadCacheStore> {
@@ -661,6 +670,16 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryCache(Mutex<Option<GithubReadCacheEntry>>);
+
+    impl MemoryCache {
+        fn with_entry(canonical_text: &str, fetched_at_ms: i64) -> Self {
+            Self(Mutex::new(Some(GithubReadCacheEntry {
+                canonical_text: canonical_text.to_string(),
+                fetched_at_ms,
+                updated_at_ms: fetched_at_ms,
+            })))
+        }
+    }
 
     impl GithubReadCacheStore for MemoryCache {
         fn lookup(
@@ -684,10 +703,6 @@ mod tests {
             Ok(())
         }
 
-        fn evict_hard_expired_at(&self, _cutoff_ms: i64) -> Result<usize, String> {
-            Ok(0)
-        }
-
         fn invalidate(
             &self,
             _kind: GithubResourceKind,
@@ -704,10 +719,6 @@ mod tests {
     impl FixtureClock {
         fn new(now: i64) -> Self {
             Self(AtomicI64::new(now))
-        }
-
-        fn set(&self, now: i64) {
-            self.0.store(now, Ordering::SeqCst);
         }
     }
 
@@ -739,26 +750,34 @@ mod tests {
         }
     }
 
-    struct GatedRefreshFetcher {
-        calls: AtomicUsize,
-        refresh_started: std::sync::mpsc::SyncSender<()>,
-        refresh_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    struct FailingFetcher;
+
+    impl GithubFetcher for FailingFetcher {
+        fn fetch(&self, _request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            Err(GithubReadError::FetchFailed(
+                "fixture GitHub fetch failed".to_string(),
+            ))
+        }
     }
 
-    impl GithubFetcher for GatedRefreshFetcher {
+    struct GatedFetcher {
+        calls: AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl GithubFetcher for GatedFetcher {
         fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if call == 2 {
-                let _ = self.refresh_started.send(());
-                if let Some(release) = self.refresh_release.lock().take() {
-                    let _ = release.recv();
-                }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.send(()).expect("report live fetch start");
+            if let Some(release) = self.release.lock().take() {
+                release.recv().expect("release live fetch");
             }
             Ok(GithubDocument {
                 repository: "owner/repo".to_string(),
                 kind: GithubDocumentKind::Issue,
                 number: request.resource.number,
-                title: format!("fixture {call}"),
+                title: "fixture".to_string(),
                 state: "OPEN".to_string(),
                 body: "body".to_string(),
                 ..GithubDocument::default()
@@ -857,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_capability_is_text_only_and_cache_reuse_avoids_a_second_fetch() {
+    fn every_read_fetches_live_before_optional_attachments() {
         let cache = Arc::new(MemoryCache::default());
         let fetcher = Arc::new(FixtureFetcher::default());
         let downloader = Arc::new(CountingDownloader::default());
@@ -868,108 +887,153 @@ mod tests {
             Arc::new(FixtureClock::new(1_000)),
         );
 
-        let GithubReadStart::Deferred(first) = engine
+        let first = match engine
             .start(
                 &enabled_gh_read(),
                 request(None),
                 GithubReadSelector::default(),
             )
             .unwrap()
-        else {
-            panic!("cache miss must defer its GitHub fetch");
+        {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap(),
+            GithubReadStart::Immediate(_) => panic!("every GitHub read must fetch live"),
         };
-        assert_eq!(wait_for(first).unwrap().attachments.len(), 0);
-        let GithubReadStart::Immediate(second) = engine
+        assert_eq!(first.freshness, GithubReadFreshness::Fetched);
+        assert_eq!(first.attachments.len(), 0);
+
+        let second = match engine
             .start(
                 &enabled_gh_read(),
                 request(None),
                 GithubReadSelector::default(),
             )
             .unwrap()
-        else {
-            panic!("fresh text-only cache hit must be immediate");
+        {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap(),
+            GithubReadStart::Immediate(_) => panic!("cached data must not satisfy a read"),
         };
-        assert_eq!(second.freshness, GithubReadFreshness::FreshCache);
-        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+        assert_eq!(second.freshness, GithubReadFreshness::Fetched);
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 2);
         assert_eq!(downloader.0.load(Ordering::SeqCst), 0);
 
-        let GithubReadStart::Deferred(vision) = engine
+        let vision = match engine
             .start(
                 &enabled_gh_read(),
                 request(Some(true)),
                 GithubReadSelector::default(),
             )
             .unwrap()
-        else {
-            panic!("vision attachments must run outside the request loop");
+        {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap(),
+            GithubReadStart::Immediate(_) => panic!("vision reads must fetch live"),
         };
-        assert!(wait_for(vision).unwrap().attachments.is_empty());
-        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+        assert!(vision.attachments.is_empty());
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 3);
         assert_eq!(downloader.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn stale_reads_share_one_background_refresh_and_keep_stale_text() {
-        let cache = Arc::new(MemoryCache::default());
-        let (refresh_started_tx, refresh_started_rx) = std::sync::mpsc::sync_channel(1);
-        let (refresh_release_tx, refresh_release_rx) = std::sync::mpsc::sync_channel(1);
-        let fetcher = Arc::new(GatedRefreshFetcher {
-            calls: AtomicUsize::new(0),
-            refresh_started: refresh_started_tx,
-            refresh_release: Mutex::new(Some(refresh_release_rx)),
-        });
-        let clock = Arc::new(FixtureClock::new(1_000));
+    fn failed_live_fetch_returns_a_loudly_disclosed_cached_fallback() {
         let engine = GithubReadEngine::new(
-            cache,
+            Arc::new(MemoryCache::with_entry("# Cached issue\n", 1_234)),
+            Arc::new(FailingFetcher),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+
+        let completion = match engine
+            .start(
+                &enabled_gh_read(),
+                GithubReadRequest::parse("issue://owner/repo/1", "/fixture", "identity", None)
+                    .unwrap(),
+                GithubReadSelector::default(),
+            )
+            .unwrap()
+        {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap(),
+            GithubReadStart::Immediate(_) => panic!("fallback requires a live fetch attempt"),
+        };
+
+        assert_eq!(completion.freshness, GithubReadFreshness::CachedFallback);
+        assert!(completion.content.starts_with(
+            "[cached copy from 1970-01-01T00:00:01.234Z; live fetch failed: fixture GitHub fetch failed]\n"
+        ));
+        assert!(completion.content.ends_with("# Cached issue\n"));
+    }
+
+    #[test]
+    fn failed_live_fetch_without_a_cached_copy_preserves_its_typed_error() {
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(FailingFetcher),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+
+        let error = match engine
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
+            .unwrap()
+        {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap_err(),
+            GithubReadStart::Immediate(_) => panic!("every read must attempt a live fetch"),
+        };
+
+        assert_eq!(
+            error,
+            GithubReadError::FetchFailed("fixture GitHub fetch failed".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_same_resource_reads_share_one_live_fetch() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let fetcher = Arc::new(GatedFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
             fetcher.clone(),
             Arc::new(CountingDownloader::default()),
-            clock.clone(),
+            Arc::new(FixtureClock::new(2_000)),
         );
-        let GithubReadStart::Deferred(first) = engine
-            .start(
-                &enabled_gh_read(),
-                request(None),
-                GithubReadSelector::default(),
-            )
-            .unwrap()
-        else {
-            panic!("cache miss must defer");
-        };
-        assert!(wait_for(first).unwrap().content.contains("fixture 1"));
 
-        clock.set(1_000 + GITHUB_READ_CACHE_SOFT_TTL_MS + 1);
-        let GithubReadStart::Immediate(first_stale) = engine
+        let first = engine
             .start(
                 &enabled_gh_read(),
                 request(None),
                 GithubReadSelector::default(),
             )
-            .unwrap()
-        else {
-            panic!("stale text-only cache hit must remain immediate");
-        };
-        assert_eq!(
-            first_stale.freshness,
-            GithubReadFreshness::StaleCacheRefreshing
-        );
-        assert!(first_stale.content.contains("fixture 1"));
-        refresh_started_rx
+            .unwrap();
+        started_rx
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("background refresh started");
-        assert_eq!(engine.refresh_in_flight_for_test(), 1);
-
-        let GithubReadStart::Immediate(second_stale) = engine
+            .expect("first live fetch started");
+        let second = engine
             .start(
                 &enabled_gh_read(),
                 request(None),
                 GithubReadSelector::default(),
             )
-            .unwrap()
-        else {
-            panic!("concurrent stale cache hit must remain immediate");
-        };
-        assert!(second_stale.content.contains("fixture 1"));
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
-        refresh_release_tx.send(()).unwrap();
+            .unwrap();
+        release_tx.send(()).expect("release shared fetch");
+
+        for start in [first, second] {
+            match start {
+                GithubReadStart::Deferred(deferred) => {
+                    assert_eq!(
+                        wait_for(deferred).unwrap().freshness,
+                        GithubReadFreshness::Fetched
+                    )
+                }
+                GithubReadStart::Immediate(_) => panic!("live reads must be deferred"),
+            }
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 }

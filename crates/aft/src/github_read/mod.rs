@@ -22,7 +22,7 @@ pub use cache::{
     apply_selector, sqlite_cache_store, GithubReadCacheStore, GithubReadClock,
     GithubReadCompletion, GithubReadDeferred, GithubReadEngine, GithubReadFreshness,
     GithubReadRequest, GithubReadSelector, GithubReadStart, SqliteGithubReadCacheStore,
-    SystemGithubReadClock, GITHUB_READ_CACHE_HARD_TTL_MS, GITHUB_READ_CACHE_SOFT_TTL_MS,
+    SystemGithubReadClock,
 };
 pub use fetch::{
     gh_pr_review_comments_args, gh_view_args, redact_gh_error, GhCliFetcher, GhCommandError,

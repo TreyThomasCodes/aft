@@ -1,7 +1,6 @@
 use aft::db::github_read_cache::{
-    evict_hard_expired_github_read_cache_entries, invalidate_github_read_cache_resource,
-    lookup_github_read_cache_entry, upsert_github_read_cache_entry, GithubReadCacheKey,
-    GithubReadResourceKind,
+    invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
+    upsert_github_read_cache_entry, GithubReadCacheKey, GithubReadResourceKind,
 };
 use rusqlite::Connection;
 
@@ -126,38 +125,6 @@ fn github_read_cache_never_satisfies_one_identity_with_anothers_entry() {
             .canonical_text,
         "# Bob view\n"
     );
-}
-
-#[test]
-fn github_read_cache_evicts_rows_at_the_hard_ttl_boundary() {
-    let (_dir, conn) = fixture_db();
-    let expired = key(
-        GithubReadResourceKind::Issue,
-        "cortexkit/aft",
-        373,
-        "principal:alice",
-    );
-    let fresh = key(
-        GithubReadResourceKind::Issue,
-        "cortexkit/aft",
-        374,
-        "principal:alice",
-    );
-    upsert_github_read_cache_entry(&conn, &expired, "# Expired\n", 2_000)
-        .expect("persist expired entry");
-    upsert_github_read_cache_entry(&conn, &fresh, "# Fresh\n", 2_001).expect("persist fresh entry");
-
-    assert_eq!(
-        evict_hard_expired_github_read_cache_entries(&conn, 2_000)
-            .expect("evict hard-expired cache entries"),
-        1
-    );
-    assert!(lookup_github_read_cache_entry(&conn, &expired)
-        .expect("look up expired entry")
-        .is_none());
-    assert!(lookup_github_read_cache_entry(&conn, &fresh)
-        .expect("look up fresh entry")
-        .is_some());
 }
 
 #[test]

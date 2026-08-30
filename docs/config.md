@@ -360,6 +360,14 @@ Structured `issue://` and `pr://` reads are disabled by default. Set `gh_read.en
 
 This is a simple configuration value at both user and project tiers, with project configuration taking precedence. It does not affect the `gh_shim` child-process routing gate.
 
+Every enabled GitHub resource read fetches live data; a prior read never satisfies a later request by itself. Successful live renders are retained only as a fallback copy, scoped to the resolved resource and authentication identity. If a live fetch fails and that copy exists, AFT returns it with this exact first-line disclosure before the rendered document:
+
+```text
+[cached copy from <ISO8601 UTC>; live fetch failed: <short reason>]
+```
+
+If no fallback copy exists, the live-fetch error is returned unchanged. Successful structured `gh` mutations invalidate matching fallback copies, and concurrent reads of the same resource share one in-flight live fetch.
+
 ## Git co-authorship
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. AFT selects `<storage_root>/git-hooks/prepare-commit-msg` through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The generated hook is idempotent and chains to the repository's own executable `prepare-commit-msg`, including custom local `core.hooksPath` configurations. Project config may override this attribution key because attribution is not a trust boundary.
