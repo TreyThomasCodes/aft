@@ -4539,15 +4539,13 @@ mod tests {
         // were removed because a loaded runner can deschedule either the
         // publisher thread or this thread past any tight wall-clock budget;
         // the generous budget below is a hang catch, not a timing assertion.
-        let response = with_first_search_index_load_wait_budget_for_test(
-            Duration::from_secs(30),
-            || {
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(30), || {
                 response_value(handle_semantic_search(
                     &semantic_request("waited_for_borrowed_artifact", 5),
                     &ctx,
                 ))
-            },
-        );
+            });
 
         assert_eq!(response["interpreted_as"], "lexical");
         assert!(response["results"]
