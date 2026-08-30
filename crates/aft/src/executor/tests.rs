@@ -1376,6 +1376,78 @@ fn no_dispatch_of_nonrunnable() {
 }
 
 #[test]
+fn same_actor_maintenance_commit_preserves_small_pool_interactive_slot() {
+    let executor = test_executor(2, 1, 1, 1);
+    assert_eq!(executor.pool_size(), 2);
+    assert_eq!(executor.actor_cap(), 1);
+    assert_eq!(executor.interactive_reserve(), 1);
+    assert_eq!(executor.maintenance_cap(), 1);
+    let (_dir, root) = test_root("small-pool-same-actor-reserve");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "gated-maintenance".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx
+                .send(())
+                .expect("signal maintenance start");
+            release_maintenance_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release maintenance");
+            ok("gated-maintenance")
+        }),
+    );
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("maintenance starts");
+
+    let (interactive_started_tx, interactive_started_rx) = crossbeam_channel::bounded(1);
+    let interactive = executor.submit(
+        root.clone(),
+        Lane::HeavyInit,
+        "same-actor-interactive".to_string(),
+        Box::new(move |_| {
+            interactive_started_tx
+                .send(())
+                .expect("signal interactive start");
+            ok("same-actor-interactive")
+        }),
+    );
+    let (mutation_started_tx, mutation_started_rx) = crossbeam_channel::bounded(1);
+    let mutation = executor.submit(
+        root,
+        Lane::Mutating,
+        "same-actor-mutation".to_string(),
+        Box::new(move |_| {
+            mutation_started_tx.send(()).expect("signal mutation start");
+            ok("same-actor-mutation")
+        }),
+    );
+
+    let interactive_admitted = interactive_started_rx.recv_timeout(Duration::from_secs(10));
+    let mutation_waited = mutation_started_rx.try_recv().is_err();
+    release_maintenance_tx
+        .send(())
+        .expect("release maintenance");
+    interactive_admitted.expect("interactive work admits before same-actor maintenance completes");
+    assert!(
+        mutation_waited,
+        "mutating work must still wait for the maintenance epoch reader"
+    );
+    interactive
+        .recv_timeout(Duration::from_secs(2))
+        .expect("interactive completion");
+    assert!(recv_async(maintenance, "maintenance completion").success);
+    mutation
+        .recv_timeout(Duration::from_secs(2))
+        .expect("mutation completion");
+}
+
+#[test]
 fn maintenance_cap_preserves_reserved_workers_for_interactive() {
     let executor = test_executor(4, 1, 1, 2);
     assert_eq!(executor.interactive_reserve(), 2);

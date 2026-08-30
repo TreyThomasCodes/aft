@@ -2228,12 +2228,20 @@ fn try_admit_actor(
 
     let has_epoch_reader =
         actor.read_inflight > 0 || actor.lsp_inflight || actor.maintenance_commit_inflight;
-    let actor_has_capacity = actor.actor_total_inflight < config.actor_cap;
+    // MaintenanceCommit uses the executor's global maintenance capacity and
+    // must not consume the per-actor slots reserved for interactive work. This
+    // matters when a two-worker executor has actor_cap=1: the global reserve
+    // leaves one worker idle, and this accounting makes that worker reachable
+    // by an interactive request for the same actor.
+    let actor_interactive_inflight = actor
+        .actor_total_inflight
+        .saturating_sub(usize::from(actor.maintenance_commit_inflight));
+    let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
     let runnable = match lane {
-        Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_capacity,
-        Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_capacity,
+        Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
+        Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_interactive_capacity,
         Lane::HeavyInit => {
-            if !actor_has_capacity {
+            if !actor_has_interactive_capacity {
                 false
             } else if let Some(permit) = heavy.try_acquire() {
                 heavy_permit = Some(permit);
@@ -2242,10 +2250,11 @@ fn try_admit_actor(
                 false
             }
         }
-        Lane::Mutating => !has_epoch_reader && actor_has_capacity,
-        // Overlaps reads (epoch read gate); one in flight per actor so
-        // maintenance cannot stack; a running writer blocks it like reads.
-        Lane::MaintenanceCommit => !actor.maintenance_commit_inflight && actor_has_capacity,
+        Lane::Mutating => !has_epoch_reader && actor_has_interactive_capacity,
+        // This lane has separate global and per-actor bounds: maintenance_cap
+        // reserves workers globally, and the boolean prevents same-actor
+        // maintenance from stacking without consuming an interactive slot.
+        Lane::MaintenanceCommit => !actor.maintenance_commit_inflight,
     };
 
     if !runnable {
