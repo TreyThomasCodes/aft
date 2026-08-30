@@ -3966,6 +3966,9 @@ mod read_allow_tests {
     #[cfg(unix)]
     #[test]
     fn linked_worktree_resolves_common_git_dir_and_shared_hooks() {
+        // Neutralize ambient co_author hooksPath env injection (highest git
+        // config scope) so the worktree's own hooks resolution decides.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let fixture = tempfile::tempdir().expect("fixture");
         let main = fixture.path().join("main");
         let worktree = fixture.path().join("linked");
@@ -4016,6 +4019,9 @@ mod read_allow_tests {
     #[cfg(unix)]
     #[test]
     fn configured_hooks_path_is_resolved_to_its_effective_location() {
+        // Neutralize ambient co_author hooksPath env injection (highest git
+        // config scope) so the temp repo's local core.hooksPath decides.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
         let fixture = tempfile::tempdir().expect("fixture");
         let project = fixture.path().join("project");
         std::fs::create_dir(&project).expect("project");

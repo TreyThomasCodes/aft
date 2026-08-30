@@ -122,6 +122,7 @@ pub(crate) struct HermeticGitEnvGuard {
     _lock: ProcessEnvLockGuard,
     _global: ScopedEnvVar,
     _system: ScopedEnvVar,
+    _config_count: ScopedEnvVar,
 }
 
 /// Install hermetic git-config env vars for in-process git executions during a
@@ -135,6 +136,11 @@ pub(crate) fn hermetic_git_env_guard() -> HermeticGitEnvGuard {
         _lock: lock,
         _global: ScopedEnvVar::set(global_key, global_value),
         _system: ScopedEnvVar::set(system_key, system_value),
+        // Agent children on hosts with git.co_author enabled carry
+        // GIT_CONFIG_COUNT/KEY_0/VALUE_0 (core.hooksPath injection), and git's
+        // env scope outranks a test repo's local config - zeroing the count
+        // neutralizes the whole injected block for in-process git spawns.
+        _config_count: ScopedEnvVar::set("GIT_CONFIG_COUNT", OsStr::new("0")),
     }
 }
 
