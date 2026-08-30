@@ -32,6 +32,8 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                 break;
             }
 
+            registry.evaluate_erased_watch_targets();
+
             let tasks = registry.running_tasks();
             if tasks.is_empty() {
                 continue;

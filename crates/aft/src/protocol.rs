@@ -395,6 +395,26 @@ impl BashPatternMatchFrame {
             reason: "task_exit",
         }
     }
+
+    pub fn watch_target_erased(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        watch_id: impl Into<String>,
+        match_text: impl Into<String>,
+        context: impl Into<String>,
+    ) -> Self {
+        Self {
+            frame_type: "bash_pattern_match",
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            watch_id: watch_id.into(),
+            match_text: match_text.into(),
+            match_offset: 0,
+            context: context.into(),
+            once: true,
+            reason: "task_exit",
+        }
+    }
 }
 
 /// Fallback session identifier used when a request arrives without one.

@@ -142,6 +142,41 @@ pub fn list_bash_pattern_watches_for_session(
     rows
 }
 
+pub fn list_bash_pattern_watches(
+    conn: &Connection,
+    harness: &str,
+) -> rusqlite::Result<Vec<BashPatternWatchRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
+                created_at, stdout_offset, stderr_offset, pty_offset, scanning,
+                pending_match, match_text, match_offset, match_context
+         FROM bash_pattern_watches
+         WHERE harness = ?1
+         ORDER BY created_at ASC, task_id ASC, watch_id ASC",
+    )?;
+    let rows = stmt.query_map(params![harness], map_watch_row)?.collect();
+    rows
+}
+
+pub fn list_bash_pattern_watches_by_task_id(
+    conn: &Connection,
+    harness: &str,
+    task_id: &str,
+) -> rusqlite::Result<Vec<BashPatternWatchRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
+                created_at, stdout_offset, stderr_offset, pty_offset, scanning,
+                pending_match, match_text, match_offset, match_context
+         FROM bash_pattern_watches
+         WHERE harness = ?1 AND task_id = ?2
+         ORDER BY created_at ASC, session_id ASC, watch_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![harness, task_id], map_watch_row)?
+        .collect();
+    rows
+}
+
 pub fn get_bash_pattern_watch(
     conn: &Connection,
     harness: &str,

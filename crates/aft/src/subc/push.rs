@@ -85,12 +85,15 @@ fn completed_task_id(frame: &PushFrame) -> Option<&str> {
     }
 }
 
-fn completed_bg_session_key(
+fn durable_bg_session_key(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> Option<(ProjectRootId, String)> {
     match frame {
         PushFrame::BashCompleted(completed) => Some((root.clone(), completed.session_id.clone())),
+        PushFrame::BashPatternMatch(pattern_match) => {
+            Some((root.clone(), pattern_match.session_id.clone()))
+        }
         _ => None,
     }
 }
@@ -832,7 +835,7 @@ fn process_reliable_push_frame(
     frame: PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Option<(ProjectRootId, String)> {
-    let completed_bg_session = completed_bg_session_key(&root, &frame);
+    let durable_bg_session = durable_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
     }
@@ -848,10 +851,10 @@ fn process_reliable_push_frame(
         &frame,
         lifecycle_probe,
     );
-    completed_bg_session
+    durable_bg_session
 }
 
-fn arm_completed_bg_wake(
+fn arm_durable_bg_wake(
     metrics: &DispatchPathMetrics,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut HashSet<RouteChannel>,
@@ -906,7 +909,7 @@ fn process_reliable_push_and_arm_bg_wake(
         frame,
         lifecycle_probe,
     ) {
-        arm_completed_bg_wake(
+        arm_durable_bg_wake(
             metrics,
             bg_sub_by_session,
             bg_wake_pending,
@@ -1220,6 +1223,12 @@ mod tests {
         let pattern_match = pattern_match_frame("session-c");
         assert_eq!(frame_session(&pattern_match), Some("session-c"));
         assert!(frame_is_reliable(&pattern_match));
+        let (_root_dir, root) = test_root("pattern-match-bg-wake-root");
+        assert_eq!(
+            durable_bg_session_key(&root, &pattern_match),
+            Some((root, "session-c".to_string())),
+            "a durable pattern match needs the same repeating bg_events wake as a completion"
+        );
 
         let tagged_warnings = configure_warnings_frame(Some("session-d"));
         assert_eq!(frame_session(&tagged_warnings), Some("session-d"));
@@ -2058,7 +2067,7 @@ mod tests {
         let mut bg_wake_pending = HashSet::new();
         let mut bg_wake_epoch = HashMap::new();
 
-        arm_completed_bg_wake(
+        arm_durable_bg_wake(
             &metrics,
             &bg_sub_by_session,
             &mut bg_wake_pending,
@@ -2194,7 +2203,7 @@ mod tests {
         let mut bg_wake_epoch = HashMap::new();
         super::super::health::take_bg_observability_logs_for_test();
 
-        arm_completed_bg_wake(
+        arm_durable_bg_wake(
             &metrics,
             &HashMap::new(),
             &mut bg_wake_pending,

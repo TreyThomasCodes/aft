@@ -53,8 +53,12 @@ use super::process::terminate_pid;
 use super::process::{is_process_alive, is_recorded_process_alive};
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
-use super::watches::{PatternMatch, WatchPattern, WatchRegistry};
+use super::watches::{
+    PatternMatch, WatchPattern, WatchRegistry, WATCH_TARGET_ERASED_CONTEXT,
+    WATCH_TARGET_ERASED_TEXT,
+};
 use super::{BgTaskInfo, BgTaskStatus};
+use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 /// Default timeout for background bash tasks: 30 minutes.
 /// Agents can override per-call via the `timeout` parameter (in ms).
@@ -845,22 +849,10 @@ impl BgTaskRegistry {
             &harness,
             &metadata.session_id,
             &metadata.task_id,
+            "persisted_gc_delivered_terminal",
         ) {
             crate::slog_warn!(
                 "GC bash_task DB delete failed for {}: {}",
-                metadata.task_id,
-                error
-            );
-        }
-        // Watch rows are owned by the task bundle lifetime: drop them with the task.
-        if let Err(error) = crate::db::bash_watches::delete_bash_pattern_watches_for_task(
-            &conn,
-            &harness,
-            &metadata.session_id,
-            &metadata.task_id,
-        ) {
-            crate::slog_warn!(
-                "GC bash_pattern_watches DB delete failed for {}: {}",
                 metadata.task_id,
                 error
             );
@@ -911,6 +903,169 @@ impl BgTaskRegistry {
             .ok()
             .and_then(|slot| slot.clone())?;
         Some((harness, pool))
+    }
+
+    fn redeliver_pending_watches_for_session(&self, session_id: &str) -> usize {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return 0;
+        };
+        let rows = {
+            let Ok(conn) = pool.lock() else {
+                return 0;
+            };
+            match crate::db::bash_watches::list_bash_pattern_watches_for_session(
+                &conn, &harness, session_id,
+            ) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to load pending bash watches for session {session_id}: {error}"
+                    );
+                    return 0;
+                }
+            }
+        };
+        let mut delivered = 0;
+        for row in rows.into_iter().filter(|row| row.pending_match) {
+            let Some(match_text) = row.match_text else {
+                crate::slog_warn!(
+                    "pending bash watch {}/{} has no match text",
+                    row.task_id,
+                    row.watch_id
+                );
+                continue;
+            };
+            let context = row.match_context.unwrap_or_else(|| match_text.clone());
+            if match_text == WATCH_TARGET_ERASED_TEXT {
+                self.emit_bash_watch_erased(session_id, &row.task_id, &row.watch_id);
+            } else {
+                self.emit_bash_pattern_match(
+                    session_id,
+                    PatternMatch {
+                        watch_id: row.watch_id,
+                        task_id: row.task_id,
+                        match_text,
+                        match_offset: row.match_offset.unwrap_or_default().max(0) as u64,
+                        context,
+                        once: row.once,
+                    },
+                );
+            }
+            delivered += 1;
+        }
+        delivered
+    }
+
+    fn terminal_db_status_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        storage_dir: &Path,
+    ) -> Option<BgTaskSnapshot> {
+        let (harness, pool) = self.db_harness_and_pool()?;
+        let conn = pool.lock().ok()?;
+        let row =
+            crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id).ok()??;
+        if !task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id) {
+            return None;
+        }
+        let metadata = PersistedTask::from(row.clone());
+        metadata
+            .status
+            .is_terminal()
+            .then(|| terminal_db_row_snapshot(row, metadata))
+    }
+
+    pub fn has_erased_watch_reference(&self, task_id: &str) -> bool {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return false;
+        };
+        let Ok(conn) = pool.lock() else {
+            return false;
+        };
+        let watched =
+            crate::db::bash_watches::list_bash_pattern_watches_by_task_id(&conn, &harness, task_id)
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false);
+        if !watched {
+            return false;
+        }
+        crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
+            .map(|rows| rows.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn evaluate_erased_watch_targets(&self) {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return;
+        };
+        let notifications = {
+            let Ok(conn) = pool.lock() else {
+                return;
+            };
+            let rows = match crate::db::bash_watches::list_bash_pattern_watches(&conn, &harness) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    crate::slog_warn!("failed to inspect bash watch targets: {error}");
+                    return;
+                }
+            };
+            let mut notifications = Vec::new();
+            for mut row in rows {
+                let task_exists = match crate::db::bash_tasks::get_bash_task(
+                    &conn,
+                    &harness,
+                    &row.session_id,
+                    &row.task_id,
+                ) {
+                    Ok(task) => task.is_some(),
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to inspect bash watch target {}: {error}",
+                            row.task_id
+                        );
+                        continue;
+                    }
+                };
+                if task_exists {
+                    continue;
+                }
+                let already_tombstoned = !row.scanning
+                    && row.pending_match
+                    && row.match_text.as_deref() == Some(WATCH_TARGET_ERASED_TEXT);
+                if !already_tombstoned {
+                    row.scanning = false;
+                    row.pending_match = true;
+                    row.match_text = Some(WATCH_TARGET_ERASED_TEXT.to_string());
+                    row.match_offset = Some(0);
+                    row.match_context = Some(WATCH_TARGET_ERASED_CONTEXT.to_string());
+                    if let Err(error) =
+                        crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
+                    {
+                        crate::slog_warn!(
+                            "failed to terminalize erased bash watch {}/{}: {error}",
+                            row.task_id,
+                            row.watch_id
+                        );
+                        continue;
+                    }
+                }
+                notifications.push((row.session_id, row.task_id, row.watch_id));
+            }
+            notifications
+        };
+
+        for (session_id, task_id, watch_id) in notifications {
+            let should_emit = self
+                .inner
+                .watch_registry
+                .lock()
+                .map(|mut registry| registry.terminalize_erased_task(&task_id, &watch_id))
+                .unwrap_or(false);
+            if should_emit {
+                self.emit_bash_watch_erased(&session_id, &task_id, &watch_id);
+            }
+        }
     }
 
     fn persist_watch_registration(
@@ -2399,6 +2554,8 @@ impl BgTaskRegistry {
         preview_bytes: usize,
     ) -> Option<BgTaskSnapshot> {
         validate_task_id(task_id).ok()?;
+        let terminal_db_fallback_allowed = storage_dir
+            .is_some_and(|storage_dir| task_bundle_is_absent(storage_dir, session_id, task_id));
         let mut task = self.task_for_session(task_id, session_id);
         if task.is_none() {
             if let Some(storage_dir) = storage_dir {
@@ -2411,12 +2568,20 @@ impl BgTaskRegistry {
             }
         }
         let Some(task) = task else {
+            if terminal_db_fallback_allowed {
+                if let Some(snapshot) = storage_dir.and_then(|storage_dir| {
+                    self.terminal_db_status_for_session(session_id, task_id, storage_dir)
+                }) {
+                    return Some(snapshot);
+                }
+            }
             return self.status_relaxed(
                 task_id,
                 session_id,
                 project_root?,
                 storage_dir?,
                 preview_bytes,
+                terminal_db_fallback_allowed,
             );
         };
         let _ = self.poll_task(&task);
@@ -2432,7 +2597,8 @@ impl BgTaskRegistry {
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
         match self.lookup_relaxed_task_from_db(task_id, project_root) {
-            Some(Ok(Some(metadata))) => {
+            Some(Ok(Some(row))) => {
+                let metadata = PersistedTask::from(row);
                 if let Some(task) = self.task(task_id) {
                     let matches_project = task
                         .state
@@ -2561,7 +2727,7 @@ impl BgTaskRegistry {
         &self,
         task_id: &str,
         project_root: &Path,
-    ) -> Option<Result<Option<PersistedTask>, String>> {
+    ) -> Option<Result<Option<BashTaskRow>, String>> {
         let pool = self
             .inner
             .db_pool
@@ -2586,7 +2752,6 @@ impl BgTaskRegistry {
                 &project_key,
                 task_id,
             )
-            .map(|row| row.map(PersistedTask::from))
             .map_err(|error| error.to_string()),
         )
     }
@@ -2598,10 +2763,26 @@ impl BgTaskRegistry {
         project_root: &Path,
         storage_dir: &Path,
         preview_bytes: usize,
+        allow_terminal_db_fallback: bool,
     ) -> Option<BgTaskSnapshot> {
-        let task = self.status_relaxed_task(task_id, project_root, storage_dir)?;
-        let _ = self.poll_task(&task);
-        Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
+        let fallback_row = if allow_terminal_db_fallback {
+            self.lookup_relaxed_task_from_db(task_id, project_root)
+        } else {
+            None
+        }
+        .and_then(Result::ok)
+        .flatten()
+        .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
+        if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+            let _ = self.poll_task(&task);
+            return Some(self.snapshot_with_terminal_cache(&task, preview_bytes));
+        }
+        let row = fallback_row?;
+        let metadata = PersistedTask::from(row.clone());
+        metadata
+            .status
+            .is_terminal()
+            .then(|| terminal_db_row_snapshot(row, metadata))
     }
 
     pub fn kill_relaxed(
@@ -2711,6 +2892,7 @@ impl BgTaskRegistry {
                     match delete_task_bundle(&resolved.paths) {
                         Ok(()) => {
                             self.delete_gc_task_from_db(&metadata);
+                            self.evaluate_erased_watch_targets();
                             deleted += 1;
                             log::debug!(
                                 "deleted persisted background task bundle {}",
@@ -2908,6 +3090,9 @@ impl BgTaskRegistry {
     }
 
     pub fn drain_completions_for_session(&self, session_id: Option<&str>) -> Vec<BgCompletion> {
+        if let Some(session_id) = session_id {
+            self.redeliver_pending_watches_for_session(session_id);
+        }
         let completions = match self.inner.completions.lock() {
             Ok(completions) => completions,
             Err(_) => return Vec::new(),
@@ -2959,6 +3144,33 @@ impl BgTaskRegistry {
 
         let mut delivered = Vec::new();
         for task_id in task_ids {
+            if self.has_erased_watch_reference(task_id) {
+                if let Some((harness, pool)) = self.db_harness_and_pool() {
+                    if let Ok(conn) = pool.lock() {
+                        if let Ok(rows) =
+                            crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
+                                &conn, &harness, task_id,
+                            )
+                        {
+                            for row in rows {
+                                let _ = crate::db::bash_watches::delete_bash_pattern_watch(
+                                    &conn,
+                                    &harness,
+                                    &row.session_id,
+                                    task_id,
+                                    &row.watch_id,
+                                );
+                            }
+                        }
+                    }
+                }
+                self.clear_task_watch_state(task_id);
+                if let Ok(mut registry) = self.inner.watch_registry.lock() {
+                    registry.forget_erased_task(task_id);
+                }
+                delivered.push(task_id.clone());
+                continue;
+            }
             let task = if let Some(session_id) = session_id {
                 self.task_for_session(task_id, session_id)
                     .or_else(|| {
@@ -4083,6 +4295,29 @@ impl BgTaskRegistry {
         }
     }
 
+    fn emit_bash_watch_erased(&self, session_id: &str, task_id: &str, watch_id: &str) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        let Some(sender) = progress_sender.as_ref() else {
+            return;
+        };
+        sender(PushFrame::BashPatternMatch(
+            BashPatternMatchFrame::watch_target_erased(
+                task_id,
+                session_id,
+                watch_id,
+                WATCH_TARGET_ERASED_TEXT,
+                WATCH_TARGET_ERASED_CONTEXT,
+            ),
+        ));
+    }
+
     fn emit_bash_watch_exit(&self, completion: &BgCompletion) {
         let Ok(progress_sender) = self
             .inner
@@ -5162,6 +5397,50 @@ fn read_file_tail_capped(
 ) -> std::io::Result<Vec<u8>> {
     let mut file = open_task_artifact(paths, artifact)?;
     file.tail(max_bytes).map(|(bytes, _)| bytes)
+}
+
+fn task_bundle_is_absent(storage_dir: &Path, session_id: &str, task_id: &str) -> bool {
+    let session_dir = session_tasks_dir(storage_dir, session_id);
+    !session_dir.join(task_id).exists() && !session_dir.join(format!("{task_id}.json")).exists()
+}
+
+fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTaskSnapshot {
+    let existing_path = |path: Option<String>| {
+        path.filter(|path| {
+            fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        })
+    };
+    let duration_ms = metadata.duration_ms.or_else(|| {
+        metadata
+            .finished_at
+            .map(|finished_at| finished_at.saturating_sub(metadata.started_at))
+    });
+    BgTaskSnapshot {
+        info: BgTaskInfo {
+            task_id: metadata.task_id,
+            status: metadata.status,
+            command: metadata.command,
+            mode: metadata.mode.clone(),
+            started_at: metadata.started_at,
+            duration_ms,
+            status_reason: metadata.status_reason,
+        },
+        exit_code: metadata.exit_code,
+        child_pid: metadata.child_pid,
+        workdir: metadata.workdir.display().to_string(),
+        output_preview: String::new(),
+        output_truncated: false,
+        output_path: existing_path(row.stdout_path),
+        stderr_path: existing_path(row.stderr_path),
+        pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
+        pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
+        pty_screen: None,
+        scanner_report: metadata.scanner_report,
+        sandbox_native: metadata.sandbox_native,
+        sandbox_unavailable: false,
+    }
 }
 
 impl BgTask {
@@ -7947,6 +8226,62 @@ mod tests {
             .collect()
     }
 
+    fn install_delivered_terminal_with_pending_watch(
+        registry: &BgTaskRegistry,
+        db: &Arc<Mutex<Connection>>,
+        storage: &Path,
+        task_id: &str,
+    ) -> TaskPaths {
+        let paths = task_paths(storage, "session", task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            "session".to_string(),
+            "false".to_string(),
+            storage.to_path_buf(),
+            Some(storage.to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+        metadata.completion_delivered = true;
+        write_task(&paths.json, &metadata).unwrap();
+        {
+            let conn = db.lock().unwrap();
+            crate::db::bash_tasks::upsert_bash_task(
+                &conn,
+                &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+            )
+            .unwrap();
+            crate::db::bash_watches::upsert_bash_pattern_watch(
+                &conn,
+                &BashPatternWatchRow {
+                    harness: "opencode".into(),
+                    session_id: "session".into(),
+                    task_id: task_id.into(),
+                    watch_id: "watch-00000001".into(),
+                    pattern_kind: "substring".into(),
+                    pattern: "(fail)".into(),
+                    once: true,
+                    created_at: 1,
+                    stdout_offset: 756_243,
+                    stderr_offset: 0,
+                    pty_offset: 0,
+                    scanning: false,
+                    pending_match: true,
+                    match_text: Some("(fail)".into()),
+                    match_offset: Some(756_237),
+                    match_context: Some("release output ... (fail)".into()),
+                },
+            )
+            .unwrap();
+        }
+        registry
+            .insert_rehydrated_task(metadata, paths.clone(), true, None)
+            .unwrap();
+        paths
+    }
+
     #[cfg(unix)]
     #[test]
     fn gc_refuses_to_delete_or_quarantine_a_recorded_live_process() {
@@ -8212,7 +8547,86 @@ mod tests {
     }
 
     #[test]
-    fn pattern_watch_rows_are_removed_when_task_is_gc_deleted() {
+    fn pending_watch_match_redelivers_after_terminal_cleanup_removes_task_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, frames) = registry_with_db_and_frames(storage);
+        let task_id = "bash-aaaaaaaaaaaaaaa1";
+        let paths = install_delivered_terminal_with_pending_watch(&registry, &db, storage, task_id);
+        frames.lock().unwrap().clear();
+
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(registry.task(task_id).is_none());
+        assert!(
+            !paths.json.exists(),
+            "cleanup must remove the task metadata bundle"
+        );
+
+        let _ = registry.drain_completions_for_session(Some("session"));
+        let matches = pattern_match_frames(&frames);
+        assert!(
+            matches.iter().any(|frame| {
+                frame.task_id == task_id
+                    && frame.watch_id == "watch-00000001"
+                    && frame.match_text == "(fail)"
+            }),
+            "durable pending match must redeliver without an in-memory task: {matches:?}"
+        );
+        assert!(registry
+            .ack_completions_for_session(Some("session"), &[task_id.to_string()])
+            .contains(&task_id.to_string()));
+        let rows = crate::db::bash_watches::list_bash_pattern_watches_for_task(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            task_id,
+        )
+        .unwrap();
+        assert!(rows.is_empty(), "ack must end durable redelivery");
+    }
+
+    #[test]
+    fn status_uses_intact_terminal_db_row_after_task_bundle_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage);
+        let task_id = "bash-aaaaaaaaaaaaaaa2";
+        let paths = install_delivered_terminal_with_pending_watch(&registry, &db, storage, task_id);
+
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(registry.task(task_id).is_none());
+        assert!(
+            !paths.json.exists(),
+            "cleanup must remove the task metadata bundle"
+        );
+        assert!(
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                task_id
+            )
+            .unwrap()
+            .is_some(),
+            "cleanup must retain the terminal database row"
+        );
+
+        let snapshot = registry
+            .status(
+                task_id,
+                "session",
+                Some(storage),
+                Some(storage),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .expect("intact terminal row must remain visible after artifact cleanup");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+        assert_eq!(snapshot.exit_code, Some(1));
+        assert!(snapshot.info.duration_ms.is_some());
+    }
+
+    #[test]
+    fn pattern_watch_rows_become_pending_tombstones_when_task_is_gc_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, db, _frames) = registry_with_db_and_frames(storage);
@@ -8276,9 +8690,12 @@ mod tests {
             &conn, "opencode", "session", task_id,
         )
         .unwrap();
-        assert!(
-            watches.is_empty(),
-            "task GC must remove watch rows: {watches:?}"
+        assert_eq!(watches.len(), 1, "watch tombstone must remain until ack");
+        assert!(!watches[0].scanning);
+        assert!(watches[0].pending_match);
+        assert_eq!(
+            watches[0].match_text.as_deref(),
+            Some(WATCH_TARGET_ERASED_TEXT)
         );
     }
 }

@@ -436,6 +436,33 @@ fn persisted_gc_deletes_only_old_delivered_terminal_database_rows() {
 }
 
 #[test]
+fn persisted_gc_logs_each_deleted_row_with_task_and_reason() {
+    super::test_helpers::init_test_logger();
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
+    write_gc_task(
+        &conn,
+        storage.path(),
+        project.path(),
+        "bash-00000000000003ff",
+        BgTaskStatus::Completed,
+        true,
+    );
+
+    assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 1);
+    let logs = super::test_helpers::take_logs();
+    assert!(
+        logs.iter().any(|line| {
+            line.contains("bash task row deleted")
+                && line.contains("task_id=bash-00000000000003ff")
+                && line.contains("reason=persisted_gc_delivered_terminal")
+        }),
+        "row deletion must leave attributable evidence: {logs:?}"
+    );
+}
+
+#[test]
 fn bash_tasks_dual_write_disabled_db_pool_skips_dual_write() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

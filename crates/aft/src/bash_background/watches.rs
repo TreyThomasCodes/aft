@@ -11,6 +11,10 @@ const CONTEXT_BEFORE: usize = 100;
 const CONTEXT_AFTER: usize = 500;
 const SCAN_OVERLAP_BYTES: usize = 8 * 1024;
 
+pub const WATCH_TARGET_ERASED_TEXT: &str = "watch target erased";
+pub const WATCH_TARGET_ERASED_CONTEXT: &str =
+    "watch target erased: the background task row was erased before the watch reached a normal terminal result";
+
 #[derive(Debug, Clone)]
 pub struct WatchSpec {
     pub watch_id: String,
@@ -73,6 +77,7 @@ pub struct WatchRegistry {
     scan_overlaps: HashMap<String, Vec<u8>>,
     controlled_tasks: HashSet<String>,
     matched_tasks: HashSet<String>,
+    erased_notifications: HashSet<String>,
     next_watch: u64,
 }
 
@@ -183,6 +188,18 @@ impl WatchRegistry {
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
         self.scan_overlaps
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
+    }
+
+    pub fn terminalize_erased_task(&mut self, task_id: &str, watch_id: &str) -> bool {
+        self.clear_task(task_id);
+        self.erased_notifications
+            .insert(format!("{task_id}:{watch_id}"))
+    }
+
+    pub fn forget_erased_task(&mut self, task_id: &str) {
+        let prefix = format!("{task_id}:");
+        self.erased_notifications
+            .retain(|notification| !notification.starts_with(&prefix));
     }
 
     pub fn has_controlled_task(&self, task_id: &str) -> bool {

@@ -107,6 +107,17 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+fn status(aft: &mut AftProcess, task_id: &str) -> Value {
+    aft.send(
+        &json!({
+            "id": "status-watch",
+            "command": "bash_status",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    )
+}
+
 #[test]
 fn bash_regex_match_command_uses_multiline_regex_and_byte_offsets() {
     let mut aft = AftProcess::spawn();
@@ -308,6 +319,121 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
             .all(|completion| completion["task_id"] != task_id),
         "watch-controlled task also queued a normal completion: {drained:?}"
     );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("erased-watch-release");
+    let task_id = spawn(
+        &mut aft,
+        &release_gate_command(&release, "never-reached-erased-watch"),
+    );
+    let response = notify(&mut aft, &task_id, json!({ "pattern": "not-present" }));
+    assert_eq!(response["success"], true, "notify failed: {response:?}");
+
+    let db_path = aft.cache_dir().join("aft").join("aft.db");
+    let conn = aft::db::open(&db_path).expect("open isolated test database");
+    let deleted = conn
+        .execute(
+            "DELETE FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1",
+            [&task_id],
+        )
+        .expect("erase watched task row");
+    assert_eq!(deleted, 1, "armed task row must exist before mutation");
+
+    let frame = wait_for_pattern_frame(&mut aft, &task_id);
+    assert_eq!(frame["reason"], "task_exit");
+    assert_eq!(frame["match_text"], "watch target erased");
+    assert!(
+        frame["context"]
+            .as_str()
+            .unwrap()
+            .contains("background task row was erased"),
+        "tombstone must explain the storage failure: {frame:?}"
+    );
+    let watch_state: (i64, i64, Option<String>) = conn
+        .query_row(
+            "SELECT scanning, pending_match, match_text
+             FROM bash_pattern_watches
+             WHERE harness = 'opencode' AND task_id = ?1",
+            [&task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("tombstoned watch row remains pending until ack");
+    assert_eq!(watch_state, (0, 1, Some("watch target erased".into())));
+
+    let ack = aft.send(
+        &json!({
+            "id": "ack-erased-watch",
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [&task_id] }
+        })
+        .to_string(),
+    );
+    assert_eq!(ack["success"], true, "tombstone ack failed: {ack:?}");
+    assert_eq!(ack["acked_task_ids"], json!([task_id]));
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bash_pattern_watches WHERE task_id = ?1",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "acked tombstone must be terminally removed");
+
+    release_task(&release);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn bash_status_distinguishes_erased_watched_task_from_never_existing_task() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("erased-status-release");
+    let task_id = spawn(
+        &mut aft,
+        &release_gate_command(&release, "never-reached-erased-status"),
+    );
+    let response = notify(&mut aft, &task_id, json!({ "pattern": "not-present" }));
+    assert_eq!(response["success"], true, "notify failed: {response:?}");
+
+    let conn = aft::db::open(&aft.cache_dir().join("aft").join("aft.db"))
+        .expect("open isolated test database");
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1",
+            [&task_id],
+        )
+        .expect("erase watched task row"),
+        1
+    );
+
+    let erased = status(&mut aft, &task_id);
+    assert_eq!(
+        erased["success"], false,
+        "erased status must fail: {erased:?}"
+    );
+    assert_eq!(erased["code"], "task_erased");
+    assert!(
+        erased["message"]
+            .as_str()
+            .unwrap()
+            .contains("background task row was erased"),
+        "erased error must not resemble a phantom id: {erased:?}"
+    );
+
+    let unknown = status(&mut aft, "bash-000000000000dead");
+    assert_eq!(unknown["success"], false);
+    assert_eq!(unknown["code"], "task_not_found");
+    assert!(!unknown["message"]
+        .as_str()
+        .unwrap()
+        .contains("row was erased"));
+
+    release_task(&release);
     assert!(aft.shutdown().success());
 }
 

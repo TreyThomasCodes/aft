@@ -15,6 +15,12 @@ pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
     format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
 }
 
+pub(crate) fn format_erased_task_message(task_id: &str) -> String {
+    format!(
+        "background task row was erased: {task_id}. A recently armed watch still references this task; stop polling this ID and treat the missing row as a terminal storage failure."
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct BashStatusParams {
     #[serde(default)]
@@ -62,6 +68,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    if ctx.bash_background().has_erased_watch_reference(&task_id) {
+        return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
+    }
     match ctx.bash_background().status(
         &task_id,
         req.session(),
@@ -193,7 +202,7 @@ fn maybe_render_pty_screen(
 
 #[cfg(test)]
 mod tests {
-    use super::format_unknown_task_message;
+    use super::{format_erased_task_message, format_unknown_task_message};
 
     #[test]
     fn unknown_task_message_steers_agents_to_rerun() {
@@ -201,5 +210,13 @@ mod tests {
             format_unknown_task_message("bash-unknown"),
             "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
         );
+    }
+
+    #[test]
+    fn erased_task_message_steers_agents_to_stop_polling() {
+        let message = format_erased_task_message("bash-erased");
+        assert!(message.contains("background task row was erased: bash-erased"));
+        assert!(message.contains("stop polling this ID"));
+        assert!(!message.contains(super::UNKNOWN_TASK_GUIDANCE));
     }
 }

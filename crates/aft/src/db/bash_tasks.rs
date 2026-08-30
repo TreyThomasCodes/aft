@@ -81,14 +81,21 @@ pub fn delete_delivered_terminal_bash_task(
     harness: &str,
     session_id: &str,
     task_id: &str,
+    reason: &str,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM bash_tasks
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
            AND completion_delivered = 1
            AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
         params![harness, session_id, task_id],
-    )
+    )?;
+    // A row can produce this warning only once: retries affect zero rows after
+    // the first successful DELETE, preventing a cleanup loop from flooding logs.
+    if deleted > 0 {
+        crate::slog_warn!("bash task row deleted: task_id={task_id} reason={reason}");
+    }
+    Ok(deleted)
 }
 
 pub fn get_bash_task(
