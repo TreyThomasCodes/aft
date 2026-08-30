@@ -6290,8 +6290,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let canonical_main = std::fs::canonicalize(&main).unwrap();
-        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let canonical_main = crate::inspect::job::canonicalize_normalized(&main);
+        let canonical_worktree = crate::inspect::job::canonicalize_normalized(&worktree);
         let app = App::default_shared();
         let executor = crate::executor::Executor::new();
         let owner_ctx = Arc::new(AppContext::from_app(
@@ -6302,6 +6302,7 @@ mod tests {
             },
         ));
         let owner_root = crate::path_identity::ProjectRootId::from_path(&canonical_main).unwrap();
+        let owner_memory_root = owner_root.as_path().to_path_buf();
         assert!(executor.register_actor(owner_root, Arc::clone(&owner_ctx)));
         let request = configure_semantic_with_options(
             &canonical_main,
@@ -6333,9 +6334,14 @@ mod tests {
                 .is_some_and(SemanticIndex::uses_shared_base_for_test),
             "ready resident indexes should freeze before a worktree bind arrives"
         );
+        let owner_cache_root = owner_ctx.canonical_cache_root();
         let project_key = owner_ctx
-            .cached_artifact_cache_key(&canonical_main)
+            .cached_artifact_cache_key(&owner_cache_root)
             .expect("owner artifact key");
+        // An equivalent registry spelling must still find the cache entry under
+        // the context's stored root without changing either stored path form.
+        app.unregister_memory_context(&owner_memory_root, &owner_ctx);
+        app.register_memory_context(canonical_main.join(".git").join(".."), &owner_ctx);
         let semantic_artifact = storage
             .join("semantic")
             .join(&project_key)

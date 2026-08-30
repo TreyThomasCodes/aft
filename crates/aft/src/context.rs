@@ -1386,11 +1386,29 @@ impl App {
                 .collect::<Vec<_>>()
         };
 
+        // Normalize comparison-local copies only. Context caches stay keyed by
+        // their original root spelling, so successful candidates are looked up
+        // with the context's stored cache root rather than a normalized re-key.
+        let normalized_borrower = crate::inspect::job::canonicalize_normalized(borrower_root);
         contexts
             .into_iter()
-            .filter(|(root, _)| root != borrower_root)
-            .find_map(|(root, context)| {
-                if context.cached_artifact_cache_key(&root).as_deref() != Some(artifact_cache_key)
+            .filter_map(|(registered_root, context)| {
+                let normalized_registered =
+                    crate::inspect::job::canonicalize_normalized(&registered_root);
+                if normalized_registered == normalized_borrower {
+                    return None;
+                }
+                let cache_root = context.canonical_cache_root_opt()?;
+                if normalized_registered
+                    != crate::inspect::job::canonicalize_normalized(&cache_root)
+                {
+                    return None;
+                }
+                Some((cache_root, context))
+            })
+            .find_map(|(cache_root, context)| {
+                if context.cached_artifact_cache_key(&cache_root).as_deref()
+                    != Some(artifact_cache_key)
                     || !matches!(
                         &*context
                             .semantic_index_status()
