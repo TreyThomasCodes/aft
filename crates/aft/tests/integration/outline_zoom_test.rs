@@ -989,7 +989,13 @@ function compute_total() {}
     assert_eq!(resp["code"], "symbol_not_found");
     let msg = resp["message"].as_str().unwrap();
     assert!(msg.contains("symbol 'handle_search' not found"));
-    assert!(msg.contains("did you mean:"));
+    // The steering contract: name the retry futility, then offer the close
+    // matches as a pick-one menu.
+    assert!(
+        msg.contains("Retrying this exact zoom call will fail again"),
+        "refusal must carry the retry-unchanged signal: {msg}"
+    );
+    assert!(msg.contains("Choose one of these names from the file outline"));
     assert!(msg.contains("handle_grep_search"));
     assert!(msg.contains("handle_semantic_search"));
     assert!(msg.contains("handle_semantic_or_hybrid_search"));
@@ -1025,7 +1031,18 @@ function unrelated_symbol() {}
     assert_eq!(resp["success"], false);
     assert_eq!(resp["code"], "symbol_not_found");
     let msg = resp["message"].as_str().unwrap();
-    assert_eq!(msg, "symbol 'handle_search' not found");
+    // No fuzzy-close candidates exist, so steering degrades to the single
+    // closest outline symbol - still telling the caller an unchanged retry
+    // cannot succeed.
+    assert!(msg.contains("symbol 'handle_search' not found"));
+    assert!(
+        msg.contains("Retrying this exact zoom call will fail again"),
+        "refusal must carry the retry-unchanged signal: {msg}"
+    );
+    assert!(
+        msg.contains("closest is `compute_total`"),
+        "no-close-match refusal must still name the closest symbol: {msg}"
+    );
 
     assert!(aft.shutdown().success());
 }
