@@ -79,6 +79,12 @@ struct HeartbeatRegistry {
 
 static HEARTBEAT_STATE: OnceLock<Arc<HeartbeatState>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) fn artifact_owner_test_mutex() -> &'static Mutex<()> {
+    static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    MUTEX.get_or_init(|| Mutex::new(()))
+}
+
 /// Route linked worktrees to borrowing before any same-family owner claim.
 /// `is_linked_worktree` is the configure-time Git topology result; ownership
 /// code must not probe `.git` again while opening an artifact.
@@ -688,8 +694,28 @@ pub(crate) fn write_synthetic_manifest_with_git_common_dir_for_test(
     heartbeat_at_ms: u64,
     git_common_dir: Option<&Path>,
 ) {
-    let dir = resolve_manifest_dir(Some(storage_dir), project_root, project_key);
-    fs::create_dir_all(&dir).unwrap();
+    let path =
+        resolve_manifest_dir(Some(storage_dir), project_root, project_key).join("owner.json");
+    write_synthetic_manifest_at_path_for_test(
+        &path,
+        project_root,
+        project_scope_key,
+        pid,
+        heartbeat_at_ms,
+        git_common_dir,
+    );
+}
+
+#[cfg(test)]
+fn write_synthetic_manifest_at_path_for_test(
+    path: &Path,
+    project_root: &Path,
+    project_scope_key: &str,
+    pid: u32,
+    heartbeat_at_ms: u64,
+    git_common_dir: Option<&Path>,
+) {
+    fs::create_dir_all(path.parent().expect("owner manifest parent")).unwrap();
     let now = now_ms();
     let manifest = ArtifactOwnerManifest {
         schema_version: SCHEMA_VERSION,
@@ -701,12 +727,13 @@ pub(crate) fn write_synthetic_manifest_with_git_common_dir_for_test(
         created_at_ms: now,
         heartbeat_at_ms,
     };
-    atomic_write_manifest(&dir.join("owner.json"), &manifest).unwrap();
+    atomic_write_manifest(path, &manifest).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock as StdOnceLock};
     use std::time::Instant;
 
@@ -723,6 +750,14 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -743,10 +778,30 @@ mod tests {
     }
 
     fn set_test_heartbeat_interval(ms: u64) -> EnvVarGuard {
-        let key = "AFT_TEST_ARTIFACT_OWNER_HEARTBEAT_MS";
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, ms.to_string());
-        EnvVarGuard { key, previous }
+        EnvVarGuard::set("AFT_TEST_ARTIFACT_OWNER_HEARTBEAT_MS", ms.to_string())
+    }
+
+    fn exited_owner_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived owner process");
+        #[cfg(unix)]
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived owner process");
+        #[cfg(not(any(unix, windows)))]
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived owner process");
+
+        let pid = child.id();
+        let status = child.wait().expect("wait for owner process exit");
+        assert!(status.success(), "short-lived owner exited unsuccessfully");
+        pid
     }
 
     fn claim_stale_owner(
@@ -809,6 +864,7 @@ mod tests {
 
     #[test]
     fn sibling_checkout_opens_read_only_while_owner_is_alive() {
+        let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("owner");
         let sibling = temp.path().join("sibling");
@@ -843,6 +899,7 @@ mod tests {
 
     #[test]
     fn same_checkout_reconfigure_reclaims_idempotently() {
+        let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
@@ -860,31 +917,100 @@ mod tests {
 
     #[test]
     fn dead_owner_is_reclaimed_by_different_checkout() {
+        let _artifact_guard = artifact_owner_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let configured_storage = temp.path().join("configured-storage");
+        let redirected_storage = temp.path().join("redirected-storage");
         let owner = temp.path().join("owner");
         let sibling = temp.path().join("sibling");
         fs::create_dir_all(&owner).unwrap();
         fs::create_dir_all(&sibling).unwrap();
         let key = "shared-key";
-        write_synthetic_manifest_for_test(temp.path(), &owner, key, "owner-scope", 0, 0);
+        let _storage_override = EnvVarGuard::set("AFT_STORAGE_DIR", redirected_storage.as_os_str());
 
+        // Capture the override-resolved path once. The fixture writes and reads
+        // only this path, while the lock keeps production's later resolution on
+        // the same root.
+        let manifest_path =
+            resolve_manifest_dir(Some(&configured_storage), &owner, key).join("owner.json");
+        let assumed_manifest_path = configured_storage
+            .join("artifact-owners")
+            .join(key)
+            .join("owner.json");
+        assert_ne!(manifest_path, assumed_manifest_path);
+        assert!(matches!(
+            read_manifest(&assumed_manifest_path),
+            Err(ReadManifestError::NotFound)
+        ));
+
+        let exited_owner_pid = exited_owner_pid();
+        write_synthetic_manifest_at_path_for_test(
+            &manifest_path,
+            &owner,
+            "owner-scope",
+            exited_owner_pid,
+            0,
+            None,
+        );
+
+        // The real child has already reported its terminal status. Re-read the
+        // unchanged manifest from the captured root before judging its owner.
+        let judged = read_manifest(&manifest_path).expect("owner manifest from resolved storage");
+        assert_eq!(judged.pid, exited_owner_pid);
+
+        // A replacement between the judgment and deletion must survive. This
+        // turns compare-and-delete into an observed contract rather than a
+        // timing-dependent expectation.
+        write_synthetic_manifest_at_path_for_test(
+            &manifest_path,
+            &owner,
+            "competing-scope",
+            std::process::id(),
+            0,
+            None,
+        );
+        assert!(!reclaim_manifest_if_unchanged(&manifest_path, &judged)
+            .expect("reject changed owner manifest"));
+        let competing = read_manifest(&manifest_path).expect("competing owner manifest remains");
+        assert_eq!(competing.project_scope_key, "competing-scope");
+
+        write_synthetic_manifest_at_path_for_test(
+            &manifest_path,
+            &owner,
+            "owner-scope",
+            exited_owner_pid,
+            0,
+            None,
+        );
+        let unchanged = read_manifest(&manifest_path).expect("unchanged exited owner manifest");
+        assert_eq!(unchanged.pid, exited_owner_pid);
+
+        // Claiming from the sibling performs the production liveness probe,
+        // compare-and-delete reclaim, and replacement as one lifecycle.
         let claim = claim_or_open_read_only(
-            Some(temp.path()),
+            Some(&configured_storage),
             &sibling,
             key,
             "sibling-scope",
             false,
             None,
         )
-        .unwrap();
+        .expect("replace reclaimed owner manifest");
+        let replacement = read_manifest(&manifest_path).expect("replacement from resolved storage");
 
         assert_eq!(claim.status.mode, ArtifactOwnerMode::Owner);
         assert_eq!(claim.status.owner_project_scope_key, "sibling-scope");
         assert!(claim.lease.is_some());
+        assert_eq!(replacement.project_scope_key, "sibling-scope");
+        assert_eq!(replacement.checkout_path, sibling.display().to_string());
     }
 
     #[test]
     fn linked_worktree_common_dir_routes_to_read_only_without_replacing_owner() {
+        let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("owner");
         let linked = temp.path().join("linked");
@@ -931,6 +1057,7 @@ mod tests {
     #[test]
     fn heartbeat_advances_while_mutating_lane_is_busy() {
         let _serial = heartbeat_serial_guard();
+        let _env_lock = crate::test_env::process_env_lock();
         let _interval = set_test_heartbeat_interval(25);
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -968,6 +1095,7 @@ mod tests {
     #[test]
     fn lease_release_stops_heartbeat() {
         let _serial = heartbeat_serial_guard();
+        let _env_lock = crate::test_env::process_env_lock();
         let _interval = set_test_heartbeat_interval(25);
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -983,6 +1111,7 @@ mod tests {
     #[test]
     fn context_shutdown_releases_heartbeat() {
         let _serial = heartbeat_serial_guard();
+        let _env_lock = crate::test_env::process_env_lock();
         let _interval = set_test_heartbeat_interval(25);
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
