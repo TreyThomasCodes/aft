@@ -40,6 +40,7 @@ afterAll(() => {
 
 import {
   __resetBgNotificationStateForTests,
+  __setBgNotificationHopTimeoutForTests,
   appendInTurnBgCompletions,
   consumeBgCompletion,
   formatPatternMatchReminder,
@@ -1124,6 +1125,157 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(state?.deliveringTaskIds.has("task-1")).toBe(false);
     expect(state?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
     expect(state?.pendingCompletions.some((c) => c.task_id === "task-1")).toBe(true);
+  });
+
+  test("legacy model rejection retries the same wake without model before ack", async () => {
+    const promptAsync = mock(async (input: unknown) => {
+      const body = (input as { body?: { model?: unknown } }).body;
+      if (body?.model) {
+        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+      }
+    });
+    const client = makeClient(promptAsync, [
+      {
+        info: {
+          role: "assistant",
+          agent: "build",
+          providerID: "anthropic-legacy",
+          modelID: "claude-opus-3",
+          variant: "thinking",
+        },
+      },
+    ]);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-legacy", "npm test")] }
+        : { success: true, acked_task_ids: ["task-legacy"] },
+    );
+    const { ctx } = harness(send);
+
+    await handleSubcBgEventsNudge({ ctx, directory: "/tmp/project", sessionID: "s1", client });
+    await waitForMockCallCount(promptAsync, 1);
+    await sleep(50);
+
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(
+      (promptAsync.mock.calls[0][0] as { body: { model?: unknown } }).body.model,
+    ).toBeDefined();
+    expect(
+      (promptAsync.mock.calls[1][0] as { body: { model?: unknown } }).body.model,
+    ).toBeUndefined();
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+  });
+
+  test("a fresh nudge re-arms a hard-stopped failed delivery without skip-and-re-ack loss", async () => {
+    let rejectInjection = true;
+    const promptAsync = mock(async () => {
+      if (rejectInjection) {
+        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+      }
+    });
+    const client = makeClient(promptAsync);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-stranded", "npm test")] }
+        : { success: true, acked_task_ids: ["task-stranded"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitUntil(() => sessionBgStates.get("s1")?.wakeHardStopped === true, 10_000);
+
+    const stranded = sessionBgStates.get("s1");
+    expect(stranded?.deliveringTaskIds.has("task-stranded")).toBe(false);
+    expect(stranded?.deliveredAwaitingAckTaskIds.has("task-stranded")).toBe(false);
+    expect(stranded?.pendingCompletions.some((item) => item.task_id === "task-stranded")).toBe(
+      true,
+    );
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+    expect(
+      sessionWarnSpy.mock.calls.filter(
+        (call) =>
+          (call[2] as { event?: string } | undefined)?.event ===
+          "bash_completion_wake_prompt_async_error",
+      ),
+    ).toHaveLength(1);
+
+    rejectInjection = false;
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(promptAsync, 6);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+  });
+
+  test("a hung session injection times out, clears in-flight state, and redelivers", async () => {
+    __setBgNotificationHopTimeoutForTests(50);
+    let hangInjection = true;
+    const promptAsync = mock(() =>
+      hangInjection ? new Promise<void>(() => {}) : Promise.resolve(undefined),
+    );
+    const client = makeClient(promptAsync);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-hung", "npm test")] }
+        : { success: true, acked_task_ids: ["task-hung"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+    await waitUntil(
+      () =>
+        sessionBgStates.get("s1")?.deliveringTaskIds.has("task-hung") === false &&
+        sessionBgStates
+          .get("s1")
+          ?.pendingCompletions.some((item) => item.task_id === "task-hung") === true,
+      1_000,
+    );
+
+    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-hung")).toBe(false);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+    hangInjection = false;
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(promptAsync, 2);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+  });
+
+  test("a hung drain times out and releases nudge coalescing for the next drain", async () => {
+    __setBgNotificationHopTimeoutForTests(50);
+    let hangDrain = true;
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions" && hangDrain) return new Promise(() => {});
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-after-hang", "npm test")] };
+      }
+      return { success: true, acked_task_ids: ["task-after-hang"] };
+    });
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    };
+
+    const first = handleSubcBgEventsNudge(drainCtx);
+    expect(handleSubcBgEventsNudge(drainCtx)).toBe(first);
+    await first;
+
+    hangDrain = false;
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(promptAsync, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
   });
 });
 

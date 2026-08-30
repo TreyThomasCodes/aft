@@ -132,6 +132,8 @@ const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
 const LOG_PREFIX = "[aft-pi] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
+const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
+let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
 
@@ -493,7 +495,9 @@ async function handleSubcBgEventsNudgeOnce(
   // Resolve before touching session state. A stale nudge must be a terminal,
   // side-effect-free rejection rather than a reason to create a successor.
   bridgeForDrain(drainContext);
-  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  const state = stateFor(drainContext.sessionID);
+  state.wakeDeferredTaskIds.clear();
+  rearmHardStoppedWake(state, drainContext);
   await triggerWakeIfPending(drainContext, false, true, true);
 }
 
@@ -502,7 +506,27 @@ function logSubcNudgeLifecycle(
   kind: string,
   message: string,
 ): void {
-  const key = `${kind}\u0000${drainContext.directory}\u0000${drainContext.sessionID}`;
+  logDeliveryHop(drainContext, kind, message, {
+    event: "subc_bg_nudge_delivery",
+    cause: kind,
+  });
+}
+
+function logDeliveryHop(
+  drainContext: DrainContext,
+  kind: string,
+  message: string,
+  data: Record<string, unknown>,
+  level: "info" | "warn" = "info",
+): void {
+  const sessionID = normalizeSessionID(drainContext.sessionID);
+  const taskKey =
+    typeof data.task_id === "string"
+      ? data.task_id
+      : Array.isArray(data.task_ids)
+        ? data.task_ids.join(",")
+        : "";
+  const key = `${kind}\u0000${taskKey}\u0000${drainContext.directory}\u0000${sessionID}`;
   const now = Date.now();
   const state = subcNudgeLogState.get(key);
   if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
@@ -511,12 +535,64 @@ function logSubcNudgeLifecycle(
   }
   const suppressed = state?.suppressed ?? 0;
   subcNudgeLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
-  sessionLog(drainContext.sessionID, `${LOG_PREFIX} ${message}`, {
-    event: "subc_bg_nudge_delivery",
-    cause: kind,
+  const payload = {
+    ...data,
     canonical_root: drainContext.directory,
     suppressed,
+  };
+  if (level === "warn") {
+    sessionWarn(sessionID, `${LOG_PREFIX} ${message}`, payload);
+  } else {
+    sessionLog(sessionID, `${LOG_PREFIX} ${message}`, payload);
+  }
+}
+
+function logPerTaskDeliveryHop(
+  drainContext: DrainContext,
+  kind: string,
+  message: string,
+  taskIDs: readonly string[],
+  data: Record<string, unknown>,
+  level: "info" | "warn" = "info",
+): void {
+  for (const taskID of taskIDs) {
+    logDeliveryHop(
+      drainContext,
+      kind,
+      message,
+      { ...data, task_id: taskID, task_ids: taskIDs },
+      level,
+    );
+  }
+}
+
+function rearmHardStoppedWake(state: SessionBgState, drainContext: DrainContext): void {
+  if (!state.wakeHardStopped) return;
+  state.wakeHardStopped = false;
+  state.wakeRetryAttempts = 0;
+  state.retryDelayMs = null;
+  logDeliveryHop(drainContext, "inject-rearmed", "delivery retry re-armed", {
+    event: "bash_completion_inject_rearmed",
+    task_ids: state.pendingCompletions.map((completion) => completion.task_id),
   });
+}
+
+async function withBgHopTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${bgHopTimeoutMs}ms`)),
+          bgHopTimeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function triggerWakeIfPending(
@@ -567,12 +643,34 @@ async function triggerWakeIfPending(
       // or variant fields — it just queues a content string. The next
       // turn uses Pi's currently-selected model, so there is no per-message
       // override for us to thread through.
-      drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
-      // C-#1 site 2: delivery (sendUserMessage) is synchronous and cannot fail
-      // here, so move ack-target ids to awaiting-ack before acking; a forced
-      // drain racing the ack round-trip re-acks instead of re-delivering. On ack
-      // success stop tracking; on failure keep for the C-#3 re-ack-on-drain close.
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
+      logPerTaskDeliveryHop(drainContext, "inject-start", "session inject start", ackTargetIds, {
+        event: "bash_completion_wake_send_user_message_start",
+        attempt: state.wakeRetryAttempts + 1,
+      });
+      try {
+        drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
+      } catch (err) {
+        logPerTaskDeliveryHop(
+          drainContext,
+          "inject-error",
+          "session inject failed",
+          ackTargetIds,
+          {
+            event: "bash_completion_wake_send_user_message_error",
+            attempt: state.wakeRetryAttempts + 1,
+            cause: err instanceof Error ? err.message : String(err),
+          },
+          "warn",
+        );
+        throw err;
+      }
+      logPerTaskDeliveryHop(drainContext, "inject-ok", "session inject ok", ackTargetIds, {
+        event: "bash_completion_wake_send_user_message_ok",
+        attempt: state.wakeRetryAttempts + 1,
+      });
+      // Session injection completed synchronously. Only now may these task IDs
+      // enter awaiting-ack state and become eligible for daemon acknowledgement.
       markDeliveredAwaitingAck(state, ackTargetIds);
       const acked = await ackCompletions(drainContext, deliveredCompletions);
       if (acked) confirmAcked(state, ackTargetIds);
@@ -588,12 +686,12 @@ async function triggerWakeIfPending(
         });
         return;
       }
-      sessionWarn(
-        drainContext.sessionID ?? "",
-        hardStopped
-          ? `${LOG_PREFIX} wake send failed ${MAX_WAKE_SEND_ATTEMPTS} times; stopping retries: ${err instanceof Error ? err.message : String(err)}`
-          : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      if (hardStopped) {
+        logDeliveryHop(drainContext, "inject-hard-stopped", "delivery retries paused", {
+          event: "bash_completion_inject_hard_stopped",
+          cause: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
     includeDeferredCompletions,
   );
@@ -645,6 +743,10 @@ function formatCombinedSystemReminder(
   return parts.join("\n");
 }
 
+export function __setBgNotificationHopTimeoutForTests(timeoutMs: number): void {
+  bgHopTimeoutMs = timeoutMs;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
@@ -652,6 +754,7 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
+  bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
 
 function bridgeForDrain(drainContext: DrainContext): AftProjectTransport {
@@ -678,15 +781,32 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     const bridge = bridgeForDrain(drainContext);
     const state = stateFor(drainContext.sessionID);
     const params = drainContext.sessionID ? { session_id: drainContext.sessionID } : {};
-    const response = await bridge.send("bash_drain_completions", params);
+    const response = await withBgHopTimeout(
+      bridge.send("bash_drain_completions", params, { timeoutMs: bgHopTimeoutMs }),
+      "bash_drain_completions",
+    );
     if (response.success === false) {
-      sessionWarn(
-        drainContext.sessionID ?? "",
-        `${LOG_PREFIX} drain failed: ${String(response.message ?? "unknown error")}`,
+      logDeliveryHop(
+        drainContext,
+        "drain-error",
+        "drain failed",
+        {
+          event: "bash_completion_drain_error",
+          cause: String(response.message ?? "unknown error"),
+        },
+        "warn",
       );
       return;
     }
     state.forcedDrainCompleted = true;
+    const drainedTaskIds = Array.isArray(response.bg_completions)
+      ? response.bg_completions.filter(isBgCompletion).map((completion) => completion.task_id)
+      : [];
+    logDeliveryHop(drainContext, "drain-ok", "drain ok", {
+      event: "bash_completion_drain_ok",
+      count: drainedTaskIds.length,
+      task_ids: drainedTaskIds,
+    });
     // C-#3 / R2-T3: reconcile awaiting-ack against the drain snapshot (daemon
     // truth). A task the drain still returns is held unacked → re-ack (stops the
     // nudges, self-terminating); one it no longer returns was dropped daemon-side
@@ -708,9 +828,15 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     }
   } catch (err) {
     if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
-    sessionWarn(
-      drainContext.sessionID ?? "",
-      `${LOG_PREFIX} drain failed: ${err instanceof Error ? err.message : String(err)}`,
+    logDeliveryHop(
+      drainContext,
+      "drain-error",
+      "drain failed",
+      {
+        event: "bash_completion_drain_error",
+        cause: err instanceof Error ? err.message : String(err),
+      },
+      "warn",
     );
   }
 }
@@ -726,20 +852,40 @@ async function ackCompletions(
     const params = drainContext.sessionID
       ? { session_id: drainContext.sessionID, task_ids: taskIds }
       : { task_ids: taskIds };
-    const response = await bridge.send("bash_ack_completions", params);
+    const response = await withBgHopTimeout(
+      bridge.send("bash_ack_completions", params, { timeoutMs: bgHopTimeoutMs }),
+      "bash_ack_completions",
+    );
     if (response.success === false) {
-      sessionWarn(
-        drainContext.sessionID ?? "",
-        `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
+      logPerTaskDeliveryHop(
+        drainContext,
+        "ack-error",
+        "ack failed",
+        taskIds,
+        {
+          event: "bash_completion_ack_error",
+          cause: String(response.message ?? "unknown error"),
+        },
+        "warn",
       );
       return false;
     }
+    logPerTaskDeliveryHop(drainContext, "ack-ok", "ack ok", taskIds, {
+      event: "bash_completion_ack_ok",
+    });
     return true;
   } catch (err) {
     if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
-    sessionWarn(
-      drainContext.sessionID ?? "",
-      `${LOG_PREFIX} ack failed: ${err instanceof Error ? err.message : String(err)}`,
+    logPerTaskDeliveryHop(
+      drainContext,
+      "ack-error",
+      "ack failed",
+      taskIds,
+      {
+        event: "bash_completion_ack_error",
+        cause: err instanceof Error ? err.message : String(err),
+      },
+      "warn",
     );
     return false;
   }

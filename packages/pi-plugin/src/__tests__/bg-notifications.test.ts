@@ -1,8 +1,32 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+
+const sessionLogSpy = mock((_sessionID: string, _message: string, _data?: unknown) => {});
+const sessionWarnSpy = mock((_sessionID: string, _message: string, _data?: unknown) => {});
+mock.module("../logger.js", () => ({
+  sessionLog: sessionLogSpy,
+  sessionWarn: sessionWarnSpy,
+  sessionError: () => {},
+  log: () => {},
+  warn: () => {},
+  error: () => {},
+  bridgeLogger: {
+    log: () => {},
+    warn: () => {},
+    error: () => {},
+    getLogFilePath: () => "",
+  },
+  getLogFilePath: () => "",
+}));
+
+afterAll(() => {
+  mock.restore();
+});
+
 import {
   __resetBgNotificationStateForTests,
+  __setBgNotificationHopTimeoutForTests,
   appendToolResultBgCompletions,
   cleanupIdleSessionStates,
   consumeBgCompletion,
@@ -21,6 +45,11 @@ import {
 import type { PluginContext } from "../types.js";
 
 type BridgeResponse = Record<string, unknown>;
+
+beforeEach(() => {
+  sessionLogSpy.mockClear();
+  sessionWarnSpy.mockClear();
+});
 
 afterEach(() => {
   __resetBgNotificationStateForTests();
@@ -770,6 +799,83 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
 
     expect(sendUserMessage.mock.calls.length).toBe(1); // re-acked, not re-delivered
     expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
+  });
+
+  test("a fresh nudge re-arms a hard-stopped failed delivery without skip-and-re-ack loss", async () => {
+    let rejectInjection = true;
+    const sendUserMessage = mock(() => {
+      if (rejectInjection) throw new Error("session injection unavailable");
+    });
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-stranded", "npm test")] }
+        : { success: true, acked_task_ids: ["task-stranded"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    };
+
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitUntil(() => sessionBgStates.get("s1")?.wakeHardStopped === true, 10_000);
+
+    const stranded = sessionBgStates.get("s1");
+    expect(stranded?.deliveringTaskIds.has("task-stranded")).toBe(false);
+    expect(stranded?.deliveredAwaitingAckTaskIds.has("task-stranded")).toBe(false);
+    expect(stranded?.pendingCompletions.some((item) => item.task_id === "task-stranded")).toBe(
+      true,
+    );
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+    expect(
+      sessionWarnSpy.mock.calls.filter(
+        (call) =>
+          (call[2] as { event?: string } | undefined)?.event ===
+          "bash_completion_wake_send_user_message_error",
+      ),
+    ).toHaveLength(1);
+
+    rejectInjection = false;
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(sendUserMessage, 6);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+  });
+
+  test("a hung drain times out and releases nudge coalescing for the next drain", async () => {
+    __setBgNotificationHopTimeoutForTests(50);
+    let hangDrain = true;
+    const send = mock(async (command: string) => {
+      if (command === "bash_drain_completions" && hangDrain) return new Promise(() => {});
+      if (command === "bash_drain_completions") {
+        return { success: true, bg_completions: [completion("task-after-hang", "npm test")] };
+      }
+      return { success: true, acked_task_ids: ["task-after-hang"] };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+    const drainCtx = {
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    };
+
+    const first = handleSubcBgEventsNudge(drainCtx);
+    expect(handleSubcBgEventsNudge(drainCtx)).toBe(first);
+    await first;
+
+    hangDrain = false;
+    await handleSubcBgEventsNudge(drainCtx);
+    await waitForMockCallCount(sendUserMessage, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
   });
 });
 

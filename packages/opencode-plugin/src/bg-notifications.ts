@@ -145,6 +145,8 @@ const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
 const LOG_PREFIX = "[aft-plugin] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
+const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
+let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
 
@@ -552,12 +554,33 @@ async function handleSubcBgEventsNudgeOnce(
   // Resolve before touching session state. A stale nudge must be a terminal,
   // side-effect-free rejection rather than a reason to create a successor.
   bridgeForDrain(drainContext);
-  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  const state = stateFor(drainContext.sessionID);
+  state.wakeDeferredTaskIds.clear();
+  rearmHardStoppedWake(state, drainContext);
   await triggerWakeIfPending(drainContext, false, true, true);
 }
 
 function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message: string): void {
-  const key = `${kind}\u0000${drainContext.directory}\u0000${drainContext.sessionID}`;
+  logDeliveryHop(drainContext, kind, message, {
+    event: "subc_bg_nudge_delivery",
+    cause: kind,
+  });
+}
+
+function logDeliveryHop(
+  drainContext: DrainContext,
+  kind: string,
+  message: string,
+  data: Record<string, unknown>,
+  level: "info" | "warn" = "info",
+): void {
+  const taskKey =
+    typeof data.task_id === "string"
+      ? data.task_id
+      : Array.isArray(data.task_ids)
+        ? data.task_ids.join(",")
+        : "";
+  const key = `${kind}\u0000${taskKey}\u0000${drainContext.directory}\u0000${drainContext.sessionID}`;
   const now = Date.now();
   const state = subcNudgeLogState.get(key);
   if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
@@ -566,12 +589,75 @@ function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message
   }
   const suppressed = state?.suppressed ?? 0;
   subcNudgeLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
-  sessionLog(drainContext.sessionID, `${LOG_PREFIX} ${message}`, {
-    event: "subc_bg_nudge_delivery",
-    cause: kind,
+  const payload = {
+    ...data,
     canonical_root: drainContext.directory,
     suppressed,
+  };
+  if (level === "warn") {
+    sessionWarn(drainContext.sessionID, `${LOG_PREFIX} ${message}`, payload);
+  } else {
+    sessionLog(drainContext.sessionID, `${LOG_PREFIX} ${message}`, payload);
+  }
+}
+
+function logPerTaskDeliveryHop(
+  drainContext: DrainContext,
+  kind: string,
+  message: string,
+  taskIDs: readonly string[],
+  data: Record<string, unknown>,
+  level: "info" | "warn" = "info",
+): void {
+  for (const taskID of taskIDs) {
+    logDeliveryHop(
+      drainContext,
+      kind,
+      message,
+      { ...data, task_id: taskID, task_ids: taskIDs },
+      level,
+    );
+  }
+}
+
+function rearmHardStoppedWake(state: SessionBgState, drainContext: DrainContext): void {
+  if (!state.wakeHardStopped) return;
+  state.wakeHardStopped = false;
+  state.wakeRetryAttempts = 0;
+  state.retryDelayMs = null;
+  logDeliveryHop(drainContext, "inject-rearmed", "delivery retry re-armed", {
+    event: "bash_completion_inject_rearmed",
+    task_ids: state.pendingCompletions.map((completion) => completion.task_id),
   });
+}
+
+async function withBgHopTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${bgHopTimeoutMs}ms`)),
+          bgHopTimeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function promptAsyncFailure(response: unknown): string | null {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return null;
+  const record = response as Record<string, unknown>;
+  if (record.error != null) {
+    return typeof record.error === "string" ? record.error : JSON.stringify(record.error);
+  }
+  if (record.success === false)
+    return String(record.message ?? "promptAsync returned success=false");
+  return null;
 }
 
 async function triggerWakeIfPending(
@@ -624,7 +710,8 @@ async function triggerWakeIfPending(
       };
 
       const sendPrompt = async (client: OpenCodeClient): Promise<string> => {
-        if (typeof client.session?.promptAsync !== "function") {
+        const promptAsync = client.session?.promptAsync;
+        if (typeof promptAsync !== "function") {
           throw new Error("wake client.session.promptAsync is unavailable");
         }
         // Pass the previous turn's prompt context (agent + model + variant)
@@ -665,79 +752,107 @@ async function triggerWakeIfPending(
         }
         if (promptContext?.variant) body.variant = promptContext.variant;
 
-        // Trace #3 of 7: about to call promptAsync. The deliveryID uniquely
-        // identifies this single promptAsync invocation across the rest of
-        // the trace chain (#3 start → #4 ok / #5 error → #6 ack_ok). One
-        // deliveryID = one HTTP POST to OpenCode's session prompt endpoint.
-        // When the DB shows multiple assistant children but logs show one
-        // start event with this deliveryID, the duplication is downstream
-        // of AFT.
-        const deliveryID = `aftdel_${randomUUID()}`;
-        const wakeMeta = {
-          delivery_id: deliveryID,
-          attempt: state.wakeRetryAttempts + 1,
-          task_ids: taskIDs,
-          directory: drainContext.directory,
-          reminder_sha256: hashReminder(reminder),
-          reminder_chars: reminder.length,
-          prompt_context: promptContext
-            ? {
-                agent: promptContext.agent,
-                model: promptContext.model
-                  ? {
-                      providerID: promptContext.model.providerID,
-                      modelID: promptContext.model.modelID,
-                    }
-                  : null,
-                variant: promptContext.variant ?? null,
-              }
-            : null,
-        };
-        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync start`, {
-          event: "bash_completion_wake_prompt_async_start",
-          ...wakeMeta,
-        });
-        try {
-          await client.session.promptAsync({
-            path: { id: drainContext.sessionID },
-            body,
-          });
-        } catch (err) {
-          // Trace #5 of 7: promptAsync rejected. Counted toward
-          // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake. Re-throw so
-          // the retry-with-backoff path runs.
-          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
-            event: "bash_completion_wake_prompt_async_error",
+        const attemptPrompt = async (
+          attemptBody: Record<string, unknown>,
+          mode: "mirrored-context" | "model-free-fallback",
+        ): Promise<string> => {
+          const deliveryID = `aftdel_${randomUUID()}`;
+          const wakeMeta = {
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             task_ids: taskIDs,
-            error: err instanceof Error ? err.message : String(err),
+            directory: drainContext.directory,
+            reminder_sha256: hashReminder(reminder),
+            reminder_chars: reminder.length,
+            injection_mode: mode,
+            prompt_context: promptContext
+              ? {
+                  agent: promptContext.agent,
+                  model: promptContext.model
+                    ? {
+                        providerID: promptContext.model.providerID,
+                        modelID: promptContext.model.modelID,
+                      }
+                    : null,
+                  variant: promptContext.variant ?? null,
+                }
+              : null,
+          };
+          logPerTaskDeliveryHop(
+            drainContext,
+            `inject-start-${mode}`,
+            "session inject start",
+            taskIDs,
+            { event: "bash_completion_wake_prompt_async_start", ...wakeMeta },
+          );
+          try {
+            const response = await withBgHopTimeout(
+              Promise.resolve(
+                promptAsync({
+                  path: { id: drainContext.sessionID },
+                  body: attemptBody,
+                }),
+              ),
+              "session promptAsync injection",
+            );
+            const failure = promptAsyncFailure(response);
+            if (failure) throw new Error(failure);
+          } catch (err) {
+            logPerTaskDeliveryHop(
+              drainContext,
+              "inject-error",
+              "session inject failed",
+              taskIDs,
+              {
+                event: "bash_completion_wake_prompt_async_error",
+                delivery_id: deliveryID,
+                attempt: state.wakeRetryAttempts + 1,
+                injection_mode: mode,
+                cause: err instanceof Error ? err.message : String(err),
+              },
+              "warn",
+            );
+            throw err;
+          }
+          logPerTaskDeliveryHop(drainContext, `inject-ok-${mode}`, "session inject ok", taskIDs, {
+            event: "bash_completion_wake_prompt_async_ok",
+            delivery_id: deliveryID,
+            attempt: state.wakeRetryAttempts + 1,
+            injection_mode: mode,
           });
-          throw err;
+          return deliveryID;
+        };
+
+        try {
+          return await attemptPrompt(body, "mirrored-context");
+        } catch (err) {
+          if (!promptContext?.model) throw err;
+          const fallbackBody = { ...body };
+          delete fallbackBody.model;
+          delete fallbackBody.variant;
+          return attemptPrompt(fallbackBody, "model-free-fallback");
         }
-        // Trace #4 of 7: promptAsync resolved. OpenCode has accepted the
-        // synthetic user message and will run the agent turn. A subsequent
-        // assistant child with finish="stop" should appear in OpenCode's
-        // DB for this parent user message; if MORE than one appears for
-        // the same parent + reminder_sha256, the duplication is in the
-        // OpenCode runner, not in AFT (only one promptAsync call exists
-        // with this deliveryID in the log).
-        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync ok`, {
-          event: "bash_completion_wake_prompt_async_ok",
-          delivery_id: deliveryID,
-          attempt: state.wakeRetryAttempts + 1,
-          task_ids: taskIDs,
-        });
-        return deliveryID;
       };
 
-      const client = getInProcessClient();
-      const deliveryID = await sendPrompt(client);
-      // C-#1 site 2: delivery SUCCEEDED — move from in-flight to awaiting-ack
-      // BEFORE acking, so a forced drain racing the ack round-trip still skips
-      // these (and re-acks instead of re-delivering). On ack success, stop
-      // tracking; on ack failure, KEEP them awaiting-ack so a later forced drain
-      // re-acks them (C-#3 self-terminating close).
+      let deliveryID: string;
+      try {
+        deliveryID = await sendPrompt(getInProcessClient());
+      } catch (err) {
+        logPerTaskDeliveryHop(
+          drainContext,
+          "inject-error",
+          "session inject failed",
+          taskIDs,
+          {
+            event: "bash_completion_wake_prompt_async_error",
+            cause: err instanceof Error ? err.message : String(err),
+          },
+          "warn",
+        );
+        throw err;
+      }
+      // Session injection has resolved successfully. Only now may these task IDs
+      // enter awaiting-ack state and become eligible for daemon acknowledgement.
       markDeliveredAwaitingAck(state, taskIDs);
       const acked = await ackCompletions(drainContext, deliveredCompletions, deliveryID);
       if (acked) confirmAcked(state, taskIDs);
@@ -753,12 +868,12 @@ async function triggerWakeIfPending(
         });
         return;
       }
-      sessionWarn(
-        drainContext.sessionID,
-        hardStopped
-          ? `${LOG_PREFIX} wake send failed ${MAX_WAKE_SEND_ATTEMPTS} times; stopping retries: ${err instanceof Error ? err.message : String(err)}`
-          : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      if (hardStopped) {
+        logDeliveryHop(drainContext, "inject-hard-stopped", "delivery retries paused", {
+          event: "bash_completion_inject_hard_stopped",
+          cause: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
     drainContext.sessionID,
     includeDeferredCompletions,
@@ -827,6 +942,10 @@ export function extractSessionID(value: unknown): string | undefined {
   return undefined;
 }
 
+export function __setBgNotificationHopTimeoutForTests(timeoutMs: number): void {
+  bgHopTimeoutMs = timeoutMs;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
@@ -834,6 +953,7 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
+  bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
 
 function bridgeForDrain(drainContext: DrainContext): AftProjectTransport {
@@ -859,17 +979,36 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
   try {
     const bridge = bridgeForDrain(drainContext);
     const state = stateFor(drainContext.sessionID);
-    const response = await bridge.send("bash_drain_completions", {
-      session_id: drainContext.sessionID,
-    });
+    const response = await withBgHopTimeout(
+      bridge.send(
+        "bash_drain_completions",
+        { session_id: drainContext.sessionID },
+        { timeoutMs: bgHopTimeoutMs },
+      ),
+      "bash_drain_completions",
+    );
     if (response.success === false) {
-      sessionWarn(
-        drainContext.sessionID,
-        `${LOG_PREFIX} drain failed: ${String(response.message ?? "unknown error")}`,
+      logDeliveryHop(
+        drainContext,
+        "drain-error",
+        "drain failed",
+        {
+          event: "bash_completion_drain_error",
+          cause: String(response.message ?? "unknown error"),
+        },
+        "warn",
       );
       return;
     }
     state.forcedDrainCompleted = true;
+    const drainedTaskIds = Array.isArray(response.bg_completions)
+      ? response.bg_completions.filter(isBgCompletion).map((completion) => completion.task_id)
+      : [];
+    logDeliveryHop(drainContext, "drain-ok", "drain ok", {
+      event: "bash_completion_drain_ok",
+      count: drainedTaskIds.length,
+      task_ids: drainedTaskIds,
+    });
     // C-#3 / R2-T3: reconcile the awaiting-ack set against the drain snapshot
     // (daemon truth). A task the drain still returns is held unacked → re-ack it
     // so the registry drops it and the nudges stop (self-terminating). A task the
@@ -892,9 +1031,15 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     }
   } catch (err) {
     if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
-    sessionWarn(
-      drainContext.sessionID,
-      `${LOG_PREFIX} drain failed: ${err instanceof Error ? err.message : String(err)}`,
+    logDeliveryHop(
+      drainContext,
+      "drain-error",
+      "drain failed",
+      {
+        event: "bash_completion_drain_error",
+        cause: err instanceof Error ? err.message : String(err),
+      },
+      "warn",
     );
   }
 }
@@ -908,14 +1053,25 @@ async function ackCompletions(
   if (taskIds.length === 0) return true;
   try {
     const bridge = bridgeForDrain(drainContext);
-    const response = await bridge.send("bash_ack_completions", {
-      session_id: drainContext.sessionID,
-      task_ids: taskIds,
-    });
+    const response = await withBgHopTimeout(
+      bridge.send(
+        "bash_ack_completions",
+        { session_id: drainContext.sessionID, task_ids: taskIds },
+        { timeoutMs: bgHopTimeoutMs },
+      ),
+      "bash_ack_completions",
+    );
     if (response.success === false) {
-      sessionWarn(
-        drainContext.sessionID,
-        `${LOG_PREFIX} ack failed: ${String(response.message ?? "unknown error")}`,
+      logPerTaskDeliveryHop(
+        drainContext,
+        "ack-error",
+        "ack failed",
+        taskIds,
+        {
+          event: "bash_completion_ack_error",
+          cause: String(response.message ?? "unknown error"),
+        },
+        "warn",
       );
       return false;
     }
@@ -924,17 +1080,23 @@ async function ackCompletions(
     // Note: ack also runs from appendInTurnBgCompletions without a
     // deliveryID — that path uses trace #7 (in_turn_append) instead, so
     // ack_ok carries delivery_id only when present.
-    sessionLog(drainContext.sessionID, `${LOG_PREFIX} ack ok`, {
+    logPerTaskDeliveryHop(drainContext, "ack-ok", "ack ok", taskIds, {
       event: "bash_completion_ack_ok",
       delivery_id: deliveryID ?? null,
-      task_ids: taskIds,
     });
     return true;
   } catch (err) {
     if (drainContext.nudgeRef && isTerminalNudgeError(err)) throw err;
-    sessionWarn(
-      drainContext.sessionID,
-      `${LOG_PREFIX} ack failed: ${err instanceof Error ? err.message : String(err)}`,
+    logPerTaskDeliveryHop(
+      drainContext,
+      "ack-error",
+      "ack failed",
+      taskIds,
+      {
+        event: "bash_completion_ack_error",
+        cause: err instanceof Error ? err.message : String(err),
+      },
+      "warn",
     );
     return false;
   }
