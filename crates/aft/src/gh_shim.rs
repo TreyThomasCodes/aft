@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::manifest::ProviderRole;
+
+use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
 pub const SCHEMA_FLOOR: u64 = 1;
@@ -339,8 +341,10 @@ fn run(args: &[OsString]) -> i32 {
                     Ok(request) => request,
                     Err(error) => return refuse_governed_canonicalization(&error),
                 };
+            let mutation = GithubReadMutation::from_governed_request(&request);
             let outcome =
                 route_governed(&paths, &determination.record, &agent_binding, request, now);
+            invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
             governed_outcome_status(&paths, &agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
@@ -2201,6 +2205,71 @@ struct GovernedRequest {
     edit_last: bool,
 }
 
+/// The normalized GitHub resource changed by a structured governed request.
+#[derive(Debug, Eq, PartialEq)]
+struct GithubReadMutation {
+    resource_kind: GithubReadResourceKind,
+    normalized_repository: String,
+    resource_number: i64,
+}
+
+impl GithubReadMutation {
+    fn from_governed_request(request: &GovernedRequest) -> Option<Self> {
+        let resource_kind = match request.action.as_str() {
+            "issue comment" | "issue reaction" => GithubReadResourceKind::Issue,
+            "pr comment" | "pr review" => GithubReadResourceKind::PullRequest,
+            _ => return None,
+        };
+        let normalized_repository = canonical_repository_key(request.repository.as_deref()?)?;
+        let resource_number = request.target.get("number")?.as_str()?.parse().ok()?;
+        (resource_number > 0).then_some(Self {
+            resource_kind,
+            normalized_repository,
+            resource_number,
+        })
+    }
+}
+
+/// Remove stale reads only after the structured mutation result is successful.
+///
+/// The shim runs before AFT selects standalone or subc transport, so keeping the
+/// callback here gives both execution modes identical invalidation behavior.
+fn invalidate_successful_github_read_mutation(
+    mutation: Option<&GithubReadMutation>,
+    outcome: &RouteOutcome,
+) {
+    invalidate_successful_github_read_mutation_at(
+        &crate::bash_background::storage_dir(None),
+        mutation,
+        outcome,
+    );
+}
+
+fn invalidate_successful_github_read_mutation_at(
+    storage_root: &Path,
+    mutation: Option<&GithubReadMutation>,
+    outcome: &RouteOutcome,
+) {
+    if !matches!(outcome, RouteOutcome::Result(_)) {
+        return;
+    }
+    let Some(mutation) = mutation else {
+        return;
+    };
+    let Ok(conn) = crate::db::open(&storage_root.join("aft.db")) else {
+        return;
+    };
+    // A successful mutation can change content shared by several identities, so
+    // evict every identity's cache row for the exact resource.
+    let _ = invalidate_github_read_cache_resource(
+        &conn,
+        mutation.resource_kind,
+        &mutation.normalized_repository,
+        mutation.resource_number,
+        None,
+    );
+}
+
 fn canonicalize_governed(
     args: &[OsString],
     tuple: &str,
@@ -3295,6 +3364,11 @@ mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/integration/github_read_mutation.rs"
+    ));
 
     const TEST_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
