@@ -1683,7 +1683,7 @@ fn run_initial_attach_test<F, Fut>(
     name: &'static str,
     watchdog: Duration,
     driver: F,
-) -> (Result<(), SubcError>, Duration)
+) -> (Result<(), SubcError>, Vec<SubcLifecycleEvent>)
 where
     F: FnOnce(InitialAttachInput) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
@@ -1750,17 +1750,21 @@ where
         },
     ));
     let executor = Arc::new(Executor::with_config(bridge_executor_config()));
-    let started_at = Instant::now();
-    let result = run_subc_mode_for_test(
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let result = run_subc_mode_for_test_with_lifecycle_probe(
         &conn_path,
         ctx,
         executor,
         initial_attach_dispatch,
         Some(user_config_path),
+        SubcTestLifecycleProbe::new(events_tx),
     );
-    let elapsed = started_at.elapsed();
     daemon.join().expect("fake daemon joins");
-    (result, elapsed)
+    let mut events = Vec::new();
+    while let Ok(event) = events_rx.try_recv() {
+        events.push(event);
+    }
+    (result, events)
 }
 
 async fn accept_client_hello_then_close(listener: &TcpListener) {
@@ -1826,7 +1830,7 @@ async fn complete_initial_attach(
 
 #[test]
 fn subc_initial_attach_retries_mid_handshake_closes_then_succeeds() {
-    let (result, elapsed) = run_initial_attach_test(
+    let (result, events) = run_initial_attach_test(
         "subc_initial_attach_retries_mid_handshake_closes_then_succeeds",
         Duration::from_secs(10),
         |input| async move {
@@ -1837,19 +1841,26 @@ fn subc_initial_attach_retries_mid_handshake_closes_then_succeeds() {
     );
 
     result.expect("third initial attach attempt succeeds");
-    assert!(
-        elapsed >= Duration::from_millis(500),
-        "two exponential backoffs completed too quickly: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "initial attach retry took too long: {elapsed:?}"
+    let decisions = events
+        .iter()
+        .filter_map(|event| match event {
+            SubcLifecycleEvent::AttachDecision {
+                attempt,
+                will_retry,
+            } => Some((*attempt, *will_retry)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions,
+        vec![(1, true), (2, true)],
+        "each interrupted handshake must take the retry decision before success"
     );
 }
 
 #[test]
 fn subc_initial_attach_definitive_auth_rejection_fails_immediately() {
-    let (result, elapsed) = run_initial_attach_test(
+    let (result, events) = run_initial_attach_test(
         "subc_initial_attach_definitive_auth_rejection_fails_immediately",
         Duration::from_secs(10),
         |input| async move {
@@ -1868,12 +1879,6 @@ fn subc_initial_attach_definitive_auth_rejection_fails_immediately() {
                 rejection.is_err(),
                 "client unexpectedly accepted wrong daemon id"
             );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(500), input.listener.accept())
-                    .await
-                    .is_err(),
-                "permanent auth rejection was retried"
-            );
         },
     );
 
@@ -1887,15 +1892,25 @@ fn subc_initial_attach_definitive_auth_rejection_fails_immediately() {
         ),
         "unexpected rejection result: {result:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "permanent auth rejection consumed retry budget: {elapsed:?}"
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SubcLifecycleEvent::AttachDecision {
+                    attempt,
+                    will_retry,
+                } => Some((*attempt, *will_retry)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(1, false)],
+        "a permanent authentication rejection must terminate at its decision point"
     );
 }
 
 #[test]
 fn subc_initial_attach_rereads_rewritten_connection_file() {
-    let (result, elapsed) = run_initial_attach_test(
+    let (result, events) = run_initial_attach_test(
         "subc_initial_attach_rereads_rewritten_connection_file",
         Duration::from_secs(10),
         |mut input| async move {
@@ -1937,18 +1952,19 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
     );
 
     result.expect("attach succeeds through rewritten endpoint");
-    assert!(
-        elapsed >= Duration::from_millis(150),
-        "attach did not observe the first retry backoff: {elapsed:?}"
-    );
-    // Upper bound guards against waiting out the full 60s attach budget on a
-    // stale endpoint (the bug this test exists for). It is a liveness ceiling,
-    // not a latency target: loaded CI runners have pushed a successful attach
-    // past 4s (5.7s observed on a Windows shard), so keep generous headroom
-    // below the budget rather than a tight bound that reddens under load.
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "rewritten endpoint attach took too long: {elapsed:?}"
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SubcLifecycleEvent::AttachDecision {
+                    attempt,
+                    will_retry,
+                } => Some((*attempt, *will_retry)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(1, true)],
+        "the closed old endpoint must trigger one retry before replacement success"
     );
 }
 
@@ -3407,7 +3423,6 @@ async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
-    let started = Instant::now();
     send_tool_call(
         &mut stream,
         1,
@@ -3423,14 +3438,11 @@ async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
     )
     .await;
     let frame = read_frame_timeout(&mut stream, "block-to-completion bash response").await;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(800),
-        "block_to_completion returned too early after {elapsed:?}"
-    );
     assert_eq!(frame.header.corr, 103);
     assert!(!tool_result_is_error(&frame));
     let text = tool_result_text(&frame);
+    // The late child sentinel is terminal-event proof; no elapsed lower bound is
+    // needed to show that block_to_completion waited for the process.
     assert!(
         text.contains("block-done"),
         "unexpected bash text: {text:?}"
@@ -3444,7 +3456,6 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
-    let started = Instant::now();
     send_tool_call(
         &mut stream,
         1,
@@ -3460,11 +3471,6 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
     )
     .await;
     let frame = read_frame_timeout(&mut stream, "wait:true bash response").await;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(800),
-        "wait:true returned too early after {elapsed:?}"
-    );
     assert_eq!(frame.header.corr, 117);
     assert!(!tool_result_is_error(&frame));
     let text = tool_result_text(&frame);
@@ -3472,6 +3478,8 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
         text.contains("wait-early"),
         "unexpected bash text: {text:?}"
     );
+    // Seeing the post-sleep sentinel in the response proves wait:true observed
+    // terminal output; scheduler duration is not part of the contract.
     assert!(text.contains("wait-late"), "unexpected bash text: {text:?}");
     assert!(!text.contains("promoted to background"));
     send_connection_goodbye(&mut stream).await;
@@ -3785,22 +3793,24 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let marker = root1.join("lane-bash-started");
+    let release = root1.join("lane-bash-release");
     send_tool_call(
         &mut stream,
         1,
         107,
         "bash",
         json!({
-            "command": "sleep 2; printf 'lane-done\\n'",
+            "command": hold_bash_until_release_command(&marker, &release, "lane-done"),
             "foreground_orchestrate": true,
             "block_to_completion": true,
-            "timeout": 5_000,
+            "timeout": 30_000,
             "compressed": false,
         }),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let started = Instant::now();
+    wait_for_path_event(&marker, "blocking bash admission").await;
+
     send_tool_call(&mut stream, 1, 108, "echo", json!({ "case": "fast" })).await;
     send_tool_call(
         &mut stream,
@@ -3810,29 +3820,12 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
         json!({ "marker": "lane-mutating", "seq": 1 }),
     )
     .await;
-    let first = read_frame_within(
-        &mut stream,
-        Duration::from_secs(1),
-        "lane nonoccupancy response",
-    )
-    .await
-    .expect("first lane nonoccupancy response");
-    let second = read_frame_within(
-        &mut stream,
-        Duration::from_secs(1),
-        "lane nonoccupancy response",
-    )
-    .await
-    .expect("second lane nonoccupancy response");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "lane work was blocked for {elapsed:?}"
-    );
+    let first = read_frame_timeout(&mut stream, "first lane nonoccupancy response").await;
+    let second = read_frame_timeout(&mut stream, "second lane nonoccupancy response").await;
     assert_eq!(
         HashSet::from([first.header.corr, second.header.corr]),
         HashSet::from([108, 109]),
-        "pure-read and mutating tool calls should both beat the pending bash final response"
+        "pure-read and mutating tool calls must both finish while bash is held"
     );
     assert!(
         !tool_result_is_error(&first),
@@ -3846,6 +3839,10 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
         second.header.corr,
         tool_result_text(&second)
     );
+
+    // Release only after both sibling responses. If the bash wait occupied an
+    // executor lane, neither response could satisfy this ordering proof.
+    std::fs::write(&release, b"release").expect("release lane bash task");
     let bash = read_frame_timeout(&mut stream, "lane bash final response").await;
     assert_eq!(bash.header.corr, 107);
     let text = tool_result_text(&bash);
@@ -4305,6 +4302,7 @@ async fn drive_configure_bind_benchmark_daemon(input: FakeDaemonInput) {
             [true, false]
         };
         for emulate_legacy in order {
+            // Manual benchmark sample only; elapsed time does not gate correctness.
             let started = Instant::now();
             if emulate_legacy {
                 emulate_legacy_manifest_scan(&root1);
@@ -4359,6 +4357,7 @@ async fn drive_idle_echo_benchmark_daemon(input: FakeDaemonInput) {
         let _ = read_frame_timeout(&mut stream, "warmup echo response").await;
     }
 
+    // Manual benchmark sample only; elapsed time does not gate correctness.
     let started = Instant::now();
     let mut round_trips = Vec::with_capacity(MEASURED_CALLS as usize);
     for corr in 1..=MEASURED_CALLS {
@@ -6004,6 +6003,7 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     });
     state.release_epoch_reads();
     let mut finalizer_corrs = HashSet::new();
+    // Exact response cardinality for two released requests, not a polling budget.
     for _ in 0..2 {
         let frame = read_frame_timeout(&mut stream, "concurrent finalizer response").await;
         assert_eq!(frame.header.ty, FrameType::Response);
@@ -6253,6 +6253,8 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     );
     assert_bg_events_are_coalesced(&early_bg_events);
     if early_bg_events.len() == 1 {
+        // This samples the coalescer's 150 ms product tick after an observed
+        // completion event; it is not a process-readiness deadline.
         let elapsed = early_bg_events[0].0.elapsed();
         if elapsed < Duration::from_millis(150) {
             assert_no_bg_event_for(
@@ -6645,16 +6647,44 @@ async fn call_untrusted_tool_text(
     untrusted_tool_response_text(&frame)
 }
 
-fn touch_command(path: &std::path::Path) -> String {
+fn shell_path(path: &std::path::Path) -> String {
     let rendered = path.to_string_lossy().replace('"', "\\\"");
-    let rendered = if cfg!(windows) {
+    if cfg!(windows) {
         // Git Bash treats bare Windows backslashes as escapes. Forward slashes and
-        // quoting keep the scanner-triggering command pointed at the fixture file.
+        // quoting keep commands pointed at the fixture file.
         rendered.replace('\\', "/")
     } else {
         rendered
-    };
-    format!("touch \"{rendered}\"")
+    }
+}
+
+fn touch_command(path: &std::path::Path) -> String {
+    format!("touch \"{}\"", shell_path(path))
+}
+
+fn hold_bash_until_release_command(
+    marker: &std::path::Path,
+    release: &std::path::Path,
+    terminal_text: &str,
+) -> String {
+    format!(
+        "printf started > \"{}\"; until [ -e \"{}\" ]; do sleep 0.05; done; printf '{}\\n'",
+        shell_path(marker),
+        shell_path(release),
+        terminal_text,
+    )
+}
+
+async fn wait_for_path_event(path: &std::path::Path, event: &str) {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < hang_deadline,
+            "timed out waiting for {event}: {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
@@ -6813,19 +6843,11 @@ async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
     )
     .await;
     let (_ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
-    let started = Instant::now();
     send_route_goodbye(&mut stream, 1, 402).await;
-    let frame = read_frame_within(
-        &mut stream,
-        Duration::from_secs(2),
-        "goodbye swept bash response",
-    )
-    .await
-    .expect("route GOODBYE should settle the pending ask without waiting for TTL");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "GOODBYE sweep should not wait for the 60s TTL"
-    );
+    // The correlated denial is emitted by GOODBYE settlement. Its arrival
+    // before the 30-second outer hang catch proves the 60-second TTL was not
+    // used as the completion path without imposing a scheduler latency target.
+    let frame = read_frame_timeout(&mut stream, "goodbye swept bash response").await;
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 401);
     assert_untrusted_tool_error(&frame, "cannot run shell commands", "goodbye deny");
@@ -8524,7 +8546,13 @@ async fn poll_manifest_callgraph_until_ready(
     first_corr: u64,
     arguments: Value,
 ) -> String {
-    for attempt in 0..80 {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0_u64;
+    loop {
+        assert!(
+            Instant::now() < hang_deadline,
+            "callgraph store did not become ready for manifest reachability test"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         let text = expect_manifest_tool_reaches_dispatch(
             stream,
@@ -8540,8 +8568,8 @@ async fn poll_manifest_callgraph_until_ready(
             text.to_ascii_lowercase().contains("building"),
             "callgraph should build or become ready, got {text:?}"
         );
+        attempt = attempt.saturating_add(1);
     }
-    panic!("callgraph store did not become ready for manifest reachability test");
 }
 
 async fn send_control_request(
@@ -10241,15 +10269,20 @@ fn assert_untrusted_tool_error(frame: &Frame, message_fragment: &str, label: &st
 /// response later (the window widens on slow/loaded runners). `bash_status` is
 /// excluded from finalizer attachment, so deliverability can only be observed
 /// via a non-status tool call. Poll fast reads until the mirror carries this
-/// task, so subsequent assertions observe the settled state; a genuinely
-/// never-delivered completion still fails via the bound.
+/// task; the deadline is only an outer hang catch.
 async fn settle_until_bg_completion(
     stream: &mut tokio::net::TcpStream,
     channel: u16,
     first_corr: u64,
     task_id: &str,
 ) {
-    for attempt in 0..120 {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0_u64;
+    loop {
+        assert!(
+            Instant::now() < hang_deadline,
+            "bg completion for {task_id} never became in-band deliverable"
+        );
         let corr = first_corr + attempt;
         send_tool_call(stream, channel, corr, "echo", json!({ "case": "fast" })).await;
         let frame = read_frame_timeout(stream, "bg-completion settle read").await;
@@ -10266,9 +10299,9 @@ async fn settle_until_bg_completion(
         if attached {
             return;
         }
+        attempt = attempt.saturating_add(1);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("bg completion for {task_id} never became in-band deliverable");
 }
 
 async fn wait_for_bash_completion(
@@ -10278,7 +10311,13 @@ async fn wait_for_bash_completion(
     _session_id: &str,
     task_id: &str,
 ) -> Value {
-    for attempt in 0..120 {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0_u64;
+    loop {
+        assert!(
+            Instant::now() < hang_deadline,
+            "background bash task did not complete: {task_id}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         let corr = first_corr + attempt;
         send_tool_call(
@@ -10301,8 +10340,8 @@ async fn wait_for_bash_completion(
         {
             return response;
         }
+        attempt = attempt.saturating_add(1);
     }
-    panic!("background bash task did not complete: {task_id}");
 }
 
 fn assert_no_finalizer_fields(response: &Value) {

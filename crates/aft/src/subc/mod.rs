@@ -169,6 +169,10 @@ pub use self::wire::SubcError;
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubcLifecycleEvent {
+    AttachDecision {
+        attempt: u32,
+        will_retry: bool,
+    },
     RouteDetached {
         route_channel: u16,
         route_epoch: u32,
@@ -197,6 +201,13 @@ impl SubcTestLifecycleProbe {
     #[doc(hidden)]
     pub fn new(events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>) -> Self {
         Self { events_tx }
+    }
+
+    fn attach_decision(&self, attempt: u32, will_retry: bool) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::AttachDecision {
+            attempt,
+            will_retry,
+        });
     }
 
     fn route_detached(&self, route: RouteChannel, session_id: &str) {
@@ -2364,7 +2375,8 @@ fn run_subc_mode_inner(
     let loop_result = runtime.block_on(async move {
         let shared_app = ctx.app();
         drop(ctx);
-        let stream = connect_and_authenticate(connection_file_path).await?;
+        let stream =
+            connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
         log::info!(
             "subc attach: authenticated to daemon via {}",
             connection_file_path.display()
@@ -2541,13 +2553,18 @@ fn is_transient_attach_io(kind: io::ErrorKind) -> bool {
 /// Read the connection file → resolve the first endpoint → TCP connect → HMAC
 /// handshake. Transient initial-attach failures retry on fresh sockets and reread
 /// the file so a daemon bounce can publish a new endpoint or authentication key.
-async fn connect_and_authenticate(connection_file_path: &Path) -> Result<TcpStream, SubcError> {
-    connect_and_authenticate_with_policy(connection_file_path, ATTACH_RETRY_POLICY).await
+async fn connect_and_authenticate(
+    connection_file_path: &Path,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+) -> Result<TcpStream, SubcError> {
+    connect_and_authenticate_with_policy(connection_file_path, ATTACH_RETRY_POLICY, lifecycle_probe)
+        .await
 }
 
 async fn connect_and_authenticate_with_policy(
     connection_file_path: &Path,
     policy: AttachRetryPolicy,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<TcpStream, SubcError> {
     let started_at = Instant::now();
     let deadline = started_at + policy.budget;
@@ -2562,10 +2579,14 @@ async fn connect_and_authenticate_with_policy(
             Err(error) => error,
         };
         let class = classify_attach_error(&error);
+        let will_retry = class != AttachErrorClass::Permanent;
+        if let Some(probe) = lifecycle_probe {
+            probe.attach_decision(attempt, will_retry);
+        }
         let error_text = error.to_string().lines().collect::<Vec<_>>().join(" ");
         history.push(format!("attempt {attempt} [{class}]: {error_text}"));
 
-        if class == AttachErrorClass::Permanent {
+        if !will_retry {
             log_attach_final_failure(started_at.elapsed(), &history);
             return Err(error);
         }
@@ -6668,6 +6689,7 @@ mod tests {
                 max_backoff: Duration::from_millis(10),
                 jitter_percent: 0,
             },
+            None,
         ));
         assert!(matches!(
             result,
@@ -6717,7 +6739,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let started_at = Instant::now();
-        let result = runtime.block_on(connect_and_authenticate_with_policy(&conn_path, policy));
+        let result = runtime.block_on(connect_and_authenticate_with_policy(&conn_path, policy, None));
         let elapsed = started_at.elapsed();
         let error = match result {
             Ok(_) => panic!("unreachable endpoint unexpectedly attached"),
