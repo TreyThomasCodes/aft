@@ -11,8 +11,8 @@ use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run, handle_in
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
-    FileContribution, InspectCache, InspectCategory, InspectManager, InspectScanSuccess,
-    InspectSnapshot, JobKey, JobOutcome, JobScope,
+    inspect_phase_log_for_request, FileContribution, InspectCache, InspectCategory, InspectManager,
+    InspectPhaseId, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
 };
 use aft::lsp::client::LspEvent;
 use aft::lsp::registry::ServerKind;
@@ -2350,34 +2350,75 @@ fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
     write_file(&root, "src/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
-
-    let first = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-last-run-first",
-            "command": "inspect",
-        }),
+    let manager = ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new_with_capabilities(
+        root.clone(),
+        ctx.inspect_dir(),
+        ctx.config(),
+        ctx.symbol_cache(),
+        ctx.inspect_writer(),
+        ctx.callgraph_writer(),
     );
-    assert_eq!(first["success"], true, "inspect failed: {first:#}");
-    let first_last_run = first["scanner_state"]["tier2_last_run"]
-        .as_i64()
-        .expect("first tier2_last_run");
 
-    thread::sleep(Duration::from_secs(1));
-    let second = inspect(
-        &ctx,
-        json!({
-            "id": "inspect-last-run-second",
-            "command": "inspect",
-        }),
+    let first = manager
+        .tier2_run_with_reuse_result(snapshot.clone(), InspectCategory::Duplicates, None)
+        .outcome
+        .expect("initial duplicates publish succeeds");
+    assert_eq!(
+        first.scanned_files.len(),
+        2,
+        "initial run must seed the cache"
     );
-    let second_last_run = second["scanner_state"]["tier2_last_run"]
-        .as_i64()
-        .expect("second tier2_last_run");
+    let first_last_run = InspectCache::open_readonly(ctx.inspect_dir(), root.clone())
+        .expect("open inspect cache after initial publish")
+        .expect("inspect cache exists after initial publish")
+        .last_full_run(InspectCategory::Duplicates)
+        .expect("read initial duplicates last_full_run")
+        .expect("initial duplicates last_full_run exists");
+
+    // A zero-capacity isolated limiter gates the full-rescan arm. Hash-match
+    // reuse publishes before cold-build admission, so only a missing reuse
+    // decision can reach the 30-second outer hang catch.
+    ctx.isolate_cold_build_limiter_for_test(0);
+    let completions_before = manager.reuse_completion_count();
+    let reuse_manager = Arc::clone(&manager);
+    let reuse_root = root.clone();
+    let (reuse_result_tx, reuse_result_rx) = std::sync::mpsc::sync_channel(1);
+    let reuse_driver = thread::spawn(move || {
+        let outcome = reuse_manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Duplicates,
+            JobScope::for_project(reuse_root),
+        );
+        reuse_result_tx
+            .send(outcome)
+            .expect("publish hash-match reuse outcome");
+    });
+    let outcome = reuse_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("hash-match reuse did not publish before the outer hang catch");
+    reuse_driver
+        .join()
+        .expect("hash-match reuse driver completes");
 
     assert!(
+        matches!(outcome, JobOutcome::Fresh { .. }),
+        "hash-match reuse must publish a fresh outcome: {outcome:?}"
+    );
+    assert_eq!(
+        manager.reuse_completion_count(),
+        completions_before + 1,
+        "the reuse completion event must be recorded before the waiter wakes"
+    );
+    let second_last_run = InspectCache::open_readonly(ctx.inspect_dir(), root.clone())
+        .expect("open inspect cache after reuse publish")
+        .expect("inspect cache exists after reuse publish")
+        .last_full_run(InspectCategory::Duplicates)
+        .expect("read reused duplicates last_full_run")
+        .expect("reused duplicates last_full_run exists");
+    assert!(
         second_last_run > first_last_run,
-        "hash-match reuse should refresh tier2_last_run: first={first_last_run} second={second_last_run} response={second:#}"
+        "hash-match reuse should advance tier2_last_run: first={first_last_run} second={second_last_run}"
     );
 }
 
@@ -2425,6 +2466,30 @@ fn open_with_server_status_mode(ctx: &AppContext, file: &Path, mode: &str) {
         .expect("start fake rust-analyzer");
 }
 
+fn wait_for_inspect_phase_start(request_id: &str, phase: InspectPhaseId) {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(snapshot) = inspect_phase_log_for_request(request_id) {
+            if let Some(record) = snapshot
+                .records
+                .iter()
+                .find(|record| record.entry.id == phase)
+            {
+                assert!(
+                    !record.is_completed() && record.terminal_error().is_none(),
+                    "inspect phase {phase:?} terminated before its release event: {snapshot:?}"
+                );
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < hang_deadline,
+            "timed out waiting for inspect phase {phase:?} to start for {request_id}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -2448,22 +2513,64 @@ fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
 
 #[test]
 fn rust_quiescence_promotes_latest_publish_for_warm_inspect_and_status_bar() {
+    const REQUEST_ID: &str = "inspect-diagnostics-after-settle";
+
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-settle\"\n");
     let file = write_file(&root, "src/main.rs", "fn main() {}\n");
-    let ctx = configured_context(&root);
-    open_with_server_status_mode(&ctx, &file, "publish_then_quiescent");
-    wait_for_lsp_report_state(&ctx, &file, false);
-
-    let response = inspect(
+    let ctx = Arc::new(configured_context_with_callgraph_store(&root, true));
+    tier2_run(
         &ctx,
-        json!({
-            "id": "inspect-diagnostics-after-settle",
-            "command": "inspect",
-            "sections": ["diagnostics"],
-            "topK": 10,
-        }),
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
     );
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "publish_then_quiescent");
+
+    let inspect_ctx = Arc::clone(&ctx);
+    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+    let inspector = thread::spawn(move || {
+        let response = serde_json::to_value(handle_inspect_tool_call(
+            &request(json!({
+                "id": REQUEST_ID,
+                "command": "inspect",
+                "sections": ["diagnostics"],
+                "topK": 10,
+            })),
+            &inspect_ctx,
+        ))
+        .expect("inspect response serializes");
+        response_tx
+            .send(response)
+            .expect("publish blocking inspect response");
+    });
+
+    wait_for_inspect_phase_start(REQUEST_ID, InspectPhaseId::LspQuiescence);
+    // didOpen is the deterministic release event: the fake producer publishes
+    // diagnostics and then declares quiescence in that message's handler.
+    let config = ctx.config();
+    ctx.lsp()
+        .notify_file_changed(&file, "fn main() {}\n", &config)
+        .expect("release the warming producer with didOpen");
+
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("inspect did not observe the quiescence publish before the outer hang catch");
+    inspector.join().expect("blocking inspect thread completes");
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh");
+
+    let phase_log = inspect_phase_log_for_request(REQUEST_ID).expect("retained inspect phase log");
+    let quiescence = phase_log
+        .records
+        .iter()
+        .find(|record| record.entry.id == InspectPhaseId::LspQuiescence)
+        .expect("LSP quiescence phase record");
+    assert!(
+        quiescence.is_completed() && quiescence.terminal_error().is_none(),
+        "the producer quiescence event must complete successfully: {phase_log:?}"
+    );
+
     let summary = response["summary"]["diagnostics"]
         .as_object()
         .expect("diagnostics summary");
