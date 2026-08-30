@@ -104,6 +104,36 @@ fn resolve_file_or_url(
     ctx.validate_path(&req.id, Path::new(file))
 }
 
+fn resolve_zoom_file(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+) -> Result<(PathBuf, String), Response> {
+    let path = resolve_file_or_url(req, ctx, file)?;
+    if !path.exists() {
+        return Err(Response::error(
+            &req.id,
+            "file_not_found",
+            deterministic_zoom_refusal(
+                format!("file not found: {file}"),
+                "Set `file` to an existing path or use a reachable `url`.",
+            ),
+        ));
+    }
+
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        Response::error(
+            &req.id,
+            "file_not_found",
+            deterministic_zoom_refusal(
+                format!("cannot read {file}: {error}"),
+                "Choose a readable `file` path.",
+            ),
+        )
+    })?;
+    Ok((path, source))
+}
+
 fn zoom_one_target_response(
     req: &RawRequest,
     ctx: &AppContext,
@@ -112,23 +142,9 @@ fn zoom_one_target_response(
     context_lines: usize,
     include_callgraph: bool,
 ) -> Response {
-    let path = match resolve_file_or_url(req, ctx, file) {
-        Ok(path) => path,
+    let (path, source) = match resolve_zoom_file(req, ctx, file) {
+        Ok(file) => file,
         Err(resp) => return resp,
-    };
-    if !path.exists() {
-        return Response::error(
-            &req.id,
-            "file_not_found",
-            format!("file not found: {}", file),
-        );
-    }
-
-    let source = match std::fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) => {
-            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
-        }
     };
     let lines: Vec<&str> = source.lines().collect();
 
@@ -167,7 +183,10 @@ fn handle_zoom_targets(
         return Response::error(
             &req.id,
             "invalid_request",
-            "zoom: 'targets' must be a non-empty array",
+            deterministic_zoom_refusal(
+                "zoom: 'targets' must be a non-empty array",
+                "Pass at least one `{ file, symbol }` target.",
+            ),
         );
     }
 
@@ -182,7 +201,10 @@ fn handle_zoom_targets(
             return Response::error(
                 &req.id,
                 "invalid_request",
-                format!("zoom: targets[{index}].file must be a non-empty string"),
+                deterministic_zoom_refusal(
+                    format!("zoom: targets[{index}].file must be a non-empty string"),
+                    "Provide a file path for every target.",
+                ),
             );
         };
         let Some(symbol) = obj
@@ -193,7 +215,10 @@ fn handle_zoom_targets(
             return Response::error(
                 &req.id,
                 "invalid_request",
-                format!("zoom: targets[{index}].symbol must be a non-empty string"),
+                deterministic_zoom_refusal(
+                    format!("zoom: targets[{index}].symbol must be a non-empty string"),
+                    "Provide a symbol name for every target.",
+                ),
             );
         };
         let target_label = obj
@@ -242,7 +267,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "zoom: 'targets' must be a non-empty array",
+                deterministic_zoom_refusal(
+                    "zoom: 'targets' must be a non-empty array",
+                    "Pass a non-empty `targets` array or use `file` with `symbol`.",
+                ),
             );
         };
         return handle_zoom_targets(req, ctx, targets, context_lines, include_callgraph);
@@ -259,7 +287,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "zoom: missing required param 'file'",
+                deterministic_zoom_refusal(
+                    "zoom: missing required param 'file'",
+                    "Provide `file` or `url` with the symbol to inspect.",
+                ),
             );
         }
     };
@@ -275,24 +306,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
-    let path = match resolve_file_or_url(req, ctx, file) {
-        Ok(path) => path,
-        Err(resp) => return resp,
-    };
-    if !path.exists() {
-        return Response::error(
-            &req.id,
-            "file_not_found",
-            format!("file not found: {}", file),
-        );
-    }
-
     // Read source file early because both symbol mode and line-range mode need it.
-    let source = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
-        }
+    let (path, source) = match resolve_zoom_file(req, ctx, file) {
+        Ok(file) => file,
+        Err(resp) => return resp,
     };
 
     let lines: Vec<&str> = source.lines().collect();
@@ -304,28 +321,40 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    "zoom: provide either 'symbol' OR ('start_line' and 'end_line'), not both",
+                    deterministic_zoom_refusal(
+                        "zoom: provide either 'symbol' OR ('start_line' and 'end_line'), not both",
+                        "Remove one mode and keep only the arguments it requires.",
+                    ),
                 );
             }
             if start == 0 || end == 0 {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    "zoom: 'start_line' and 'end_line' are 1-based and must be >= 1",
+                    deterministic_zoom_refusal(
+                        "zoom: 'start_line' and 'end_line' are 1-based and must be >= 1",
+                        "Use positive 1-based line numbers.",
+                    ),
                 );
             }
             if end < start {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    format!("zoom: end_line {} must be >= start_line {}", end, start),
+                    deterministic_zoom_refusal(
+                        format!("zoom: end_line {end} must be >= start_line {start}"),
+                        "Use an end line at or after the start line.",
+                    ),
                 );
             }
             if lines.is_empty() {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    format!("zoom: {} is empty", file),
+                    deterministic_zoom_refusal(
+                        format!("zoom: {file} is empty"),
+                        "Choose a non-empty file or inspect a different path.",
+                    ),
                 );
             }
 
@@ -337,11 +366,12 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                 return Response::error(
                     &req.id,
                     "invalid_request",
-                    format!(
-                        "zoom: start_line {} is past end of {} ({} lines)",
-                        start,
-                        file,
-                        lines.len()
+                    deterministic_zoom_refusal(
+                        format!(
+                            "zoom: start_line {start} is past end of {file} ({} lines)",
+                            lines.len()
+                        ),
+                        "Choose a start line inside the file.",
                     ),
                 );
             }
@@ -392,7 +422,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "zoom: provide both 'start_line' and 'end_line' for line-range mode",
+                deterministic_zoom_refusal(
+                    "zoom: provide both 'start_line' and 'end_line' for line-range mode",
+                    "Provide both 1-based line bounds or use `symbol` instead.",
+                ),
             );
         }
         (None, None) => {}
@@ -408,7 +441,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(
             &req.id,
             "invalid_request",
-            "zoom: missing required param 'symbol'",
+            deterministic_zoom_refusal(
+                "zoom: missing required param 'symbol'",
+                "Provide `symbol`, `symbols`, or both `start_line` and `end_line`.",
+            ),
         );
     }
 
@@ -449,6 +485,154 @@ fn zoom_symbol_param(params: &serde_json::Value) -> Option<&str> {
 
 fn is_heading_zoom_language(lang: Option<LangId>) -> bool {
     matches!(lang, Some(LangId::Markdown | LangId::Html))
+}
+
+const RETRY_UNCHANGED_ZOOM_MESSAGE: &str = "Retrying this exact zoom call will fail again.";
+const MAX_ZOOM_SYMBOL_SUGGESTIONS: usize = 5;
+
+fn deterministic_zoom_refusal(reason: impl AsRef<str>, action: &str) -> String {
+    format!(
+        "{}. {} {}",
+        reason.as_ref().trim_end_matches('.'),
+        RETRY_UNCHANGED_ZOOM_MESSAGE,
+        action
+    )
+}
+
+fn outline_symbol_name(symbol: &Symbol, is_heading: bool) -> String {
+    if is_heading {
+        normalize_heading_label(&symbol.name)
+    } else {
+        symbol.name.clone()
+    }
+}
+
+fn format_outline_symbol(symbol: &Symbol) -> String {
+    let start = symbol.range.start_line.saturating_add(1);
+    let end = symbol.range.end_line.saturating_add(1).max(start);
+    format!("`{}` (lines {start}-{end})", symbol.name)
+}
+
+fn nearest_outline_symbols(
+    query: &str,
+    all_symbols: &[Symbol],
+    is_heading: bool,
+    k: usize,
+) -> Vec<String> {
+    let normalized_query = if is_heading {
+        normalize_heading_label(query)
+    } else {
+        query.to_string()
+    };
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+
+    let candidates: Vec<(&Symbol, String)> = all_symbols
+        .iter()
+        .filter(|symbol| !is_heading || symbol.kind == SymbolKind::Heading)
+        .map(|symbol| (symbol, outline_symbol_name(symbol, is_heading)))
+        .filter(|(_, name)| !name.is_empty())
+        .collect();
+    let available: Vec<String> = candidates.iter().map(|(_, name)| name.clone()).collect();
+    let names = suggest_close_symbols(&normalized_query, &available, k);
+    let mut suggestions = Vec::with_capacity(names.len());
+
+    for name in names {
+        for (symbol, candidate_name) in &candidates {
+            if candidate_name == &name {
+                let rendered = format_outline_symbol(symbol);
+                if !suggestions.contains(&rendered) {
+                    suggestions.push(rendered);
+                }
+                if suggestions.len() == k {
+                    return suggestions;
+                }
+            }
+        }
+    }
+    suggestions
+}
+
+fn closest_outline_symbol<'a>(
+    query: &str,
+    all_symbols: &'a [Symbol],
+    is_heading: bool,
+) -> Option<&'a Symbol> {
+    let normalized_query = if is_heading {
+        normalize_heading_label(query)
+    } else {
+        query.to_string()
+    };
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let query_lower = normalized_query.to_lowercase();
+
+    all_symbols
+        .iter()
+        .filter(|symbol| !is_heading || symbol.kind == SymbolKind::Heading)
+        .filter(|symbol| !outline_symbol_name(symbol, is_heading).is_empty())
+        .min_by(|left, right| {
+            let left_name = outline_symbol_name(left, is_heading).to_lowercase();
+            let right_name = outline_symbol_name(right, is_heading).to_lowercase();
+            let left_is_substring =
+                left_name.contains(&query_lower) || query_lower.contains(&left_name);
+            let right_is_substring =
+                right_name.contains(&query_lower) || query_lower.contains(&right_name);
+            (!left_is_substring)
+                .cmp(&(!right_is_substring))
+                .then_with(|| {
+                    levenshtein_distance(&query_lower, &left_name)
+                        .cmp(&levenshtein_distance(&query_lower, &right_name))
+                })
+                .then_with(|| left_name.cmp(&right_name))
+        })
+}
+
+fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_heading: bool) -> String {
+    let item_label = if is_heading { "heading" } else { "symbol" };
+    let suggestions = nearest_outline_symbols(
+        symbol_name,
+        all_symbols,
+        is_heading,
+        MAX_ZOOM_SYMBOL_SUGGESTIONS,
+    );
+    if !suggestions.is_empty() {
+        let outline_label = if is_heading {
+            "document outline"
+        } else {
+            "file outline"
+        };
+        return deterministic_zoom_refusal(
+            format!("{item_label} '{symbol_name}' not found"),
+            &format!(
+                "Choose one of these names from the {outline_label}: {}.",
+                suggestions.join(", ")
+            ),
+        );
+    }
+
+    let symbol_count = all_symbols
+        .iter()
+        .filter(|symbol| !is_heading || symbol.kind == SymbolKind::Heading)
+        .count();
+    if let Some(closest) = closest_outline_symbol(symbol_name, all_symbols, is_heading) {
+        let container_label = if is_heading { "document" } else { "file" };
+        let item_plural = if is_heading { "headings" } else { "symbols" };
+        return deterministic_zoom_refusal(
+            format!("{item_label} '{symbol_name}' not found"),
+            &format!(
+                "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `file` or `symbol`.",
+                format_outline_symbol(closest)
+            ),
+        );
+    }
+
+    deterministic_zoom_refusal(
+        format!("{item_label} '{symbol_name}' not found"),
+        "Use line-range mode for a symbol-less file or choose a different `file` and `symbol`.",
+    )
 }
 
 /// Parse a JSON-stringified array of symbol names (`"[\"A\", \"B\"]"`).
@@ -650,18 +834,13 @@ fn zoom_one_symbol(
     }
 
     if matches.is_empty() {
-        let mut msg = format!("symbol '{}' not found", symbol_name);
-        if let Ok(all_symbols) = ctx.provider().list_symbols(path) {
-            let suggestions = if is_heading {
-                suggest_heading_symbols(symbol_name, &all_symbols, 5)
-            } else {
-                let available: Vec<String> = all_symbols.into_iter().map(|s| s.name).collect();
-                suggest_close_symbols(symbol_name, &available, 5)
-            };
-            if !suggestions.is_empty() {
-                msg.push_str(&format!(", did you mean: [{}]", suggestions.join(", ")));
-            }
-        }
+        let msg = match ctx.provider().list_symbols(path) {
+            Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
+            Err(_) => deterministic_zoom_refusal(
+                format!("symbol '{symbol_name}' not found"),
+                "List the file outline, then change `file` or `symbol`.",
+            ),
+        };
         return Response::error(&req.id, "symbol_not_found", msg);
     }
 
@@ -702,7 +881,11 @@ fn zoom_one_symbol(
 
     if should_return_member_menu(target, resolved_lang, container_outline.as_ref()) {
         let kind_str = symbol_kind_string(&target.kind);
-        let menu = render_container_member_menu(target, container_outline.as_ref().unwrap());
+        let menu = format!(
+            "{}. {} Pick one of the listed member names and zoom it for its body.",
+            render_container_member_menu(target, container_outline.as_ref().unwrap()),
+            RETRY_UNCHANGED_ZOOM_MESSAGE,
+        );
         let resp = ZoomResponse {
             name: target.name.clone(),
             kind: kind_str,
@@ -873,8 +1056,9 @@ fn render_ambiguous_symbol_menu(
     matches: &[crate::symbols::SymbolMatch],
 ) -> String {
     let mut lines = vec![format!(
-        "symbol '{symbol_name}' is ambiguous ({} candidates) — zoom a qualified name for its body",
-        matches.len()
+        "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names for `symbol`:",
+        matches.len(),
+        RETRY_UNCHANGED_ZOOM_MESSAGE,
     )];
 
     for candidate in matches {
@@ -1069,9 +1253,11 @@ fn resolve_json_zoom(
                 return Response::error_with_data(
                     &req.id,
                     "ambiguous_match",
-                    format!(
-                        "symbol '{}' is ambiguous: a literal key and a JSON path both resolve to different nodes",
-                        symbol_name
+                    deterministic_zoom_refusal(
+                        format!(
+                            "symbol '{symbol_name}' is ambiguous: a literal key and a JSON path both resolve to different nodes"
+                        ),
+                        "Choose either the literal key or the dotted JSON path from the listed candidates.",
                     ),
                     serde_json::json!({ "candidates": candidates }),
                 );
@@ -1127,7 +1313,14 @@ fn resolve_json_zoom(
             msg.push_str(&format!(" — nearest: [{}]", suggestions.join(", ")));
         }
     }
-    Response::error(&req.id, "symbol_not_found", msg)
+    Response::error(
+        &req.id,
+        "symbol_not_found",
+        deterministic_zoom_refusal(
+            msg,
+            "Choose a listed sibling key or change the JSON path segment that missed.",
+        ),
+    )
 }
 
 /// Walk a JSON document by a dotted path, returning the deepest resolved node.
@@ -1606,20 +1799,6 @@ fn heading_identity_has_slug(symbol: &Symbol, query_slug: &str) -> bool {
     slugify_heading_label(&normalize_heading_label(&symbol.name)) == query_slug
         || slugify_heading_label(&normalize_heading_label(&qualified_heading_name(symbol)))
             == query_slug
-}
-
-fn suggest_heading_symbols(query: &str, symbols: &[Symbol], k: usize) -> Vec<String> {
-    let available: Vec<String> = symbols
-        .iter()
-        .filter(|symbol| symbol.kind == SymbolKind::Heading)
-        .map(|symbol| normalize_heading_label(&symbol.name))
-        .filter(|name| !name.is_empty())
-        .collect();
-    let normalized_query = normalize_heading_label(query);
-    if normalized_query.is_empty() {
-        return Vec::new();
-    }
-    suggest_close_symbols(&normalized_query, &available, k)
 }
 
 fn normalize_heading_label(input: &str) -> String {
@@ -2486,8 +2665,13 @@ function helper(value: number): number {
             "search".to_string(),
             "handle_search".to_string(),
         ];
+        let original_available = available.clone();
 
         let suggestions = suggest_close_symbols("handle_search", &available, 5);
+        assert_eq!(
+            available, original_available,
+            "nearest-name matching must not mutate the file outline candidates"
+        );
         assert!(suggestions.contains(&"handle_grep_search".to_string()));
         assert!(suggestions.contains(&"handle_semantic_search".to_string()));
         assert!(suggestions.contains(&"handle_semantic_or_hybrid_search".to_string()));
@@ -2504,6 +2688,132 @@ function helper(value: number): number {
         ];
         let suggestions2 = suggest_close_symbols("totol", &available2, 5);
         assert_eq!(suggestions2, vec!["total".to_string()]);
+    }
+
+    #[test]
+    fn zoom_symbol_miss_steers_to_ranged_outline_names() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        let req = make_zoom_request("steer-symbol", path.to_str().unwrap(), "comput", None);
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let message = response["message"].as_str().unwrap();
+        assert_eq!(response["code"], "symbol_not_found");
+        assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
+        assert!(message.contains("Choose one of these names from the file outline"));
+        assert!(message.contains("`compute` (lines"));
+    }
+
+    #[test]
+    fn zoom_symbol_miss_steers_when_the_file_is_likely_wrong() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        let req = make_zoom_request(
+            "steer-wrong-file",
+            path.to_str().unwrap(),
+            "entirely_unrelated_lookup",
+            None,
+        );
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let message = response["message"].as_str().unwrap();
+        assert_eq!(response["code"], "symbol_not_found");
+        assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
+        assert!(message.contains("This file has"));
+        assert!(message.contains("closest is `"));
+        assert!(message.contains("may be in another file"));
+    }
+
+    #[test]
+    fn zoom_markdown_heading_miss_steers_to_ranged_headings() {
+        assert_heading_miss_steering("zoom_steering.md");
+    }
+
+    #[test]
+    fn zoom_html_heading_miss_steers_to_ranged_headings() {
+        assert_heading_miss_steering("zoom_steering.html");
+    }
+
+    #[test]
+    fn zoom_missing_file_steers_to_a_replacement_path() {
+        let ctx = make_ctx();
+        let path = fixture_path("does-not-exist.ts");
+        let req = make_zoom_request(
+            "steer-missing-file",
+            path.to_str().unwrap(),
+            "compute",
+            None,
+        );
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let message = response["message"].as_str().unwrap();
+        assert_eq!(response["code"], "file_not_found");
+        assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
+        assert!(message.contains("Set `file` to an existing path"));
+    }
+
+    #[test]
+    fn zoom_ambiguous_menu_says_to_pick_a_listed_name() {
+        let ctx = make_ctx();
+        let path = fixture_path("zoom_steering.ts");
+        let req = make_zoom_request("steer-ambiguous", path.to_str().unwrap(), "run", None);
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let content = response["content"].as_str().unwrap();
+        assert_eq!(response["kind"], "ambiguous_symbol");
+        assert!(
+            content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
+            "expected ambiguous-name menu, got: {content}"
+        );
+        assert!(content.contains("Pick one of these qualified names"));
+    }
+
+    #[test]
+    fn zoom_container_menu_says_to_pick_a_listed_member() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("large-container.ts");
+        std::fs::write(
+            &path,
+            format!(
+                "class LargeContainer {{\n  member(): void {{}}{}\n}}\n",
+                "\n".repeat(151)
+            ),
+        )
+        .unwrap();
+        let ctx = make_ctx();
+        let req = make_zoom_request(
+            "steer-container",
+            path.to_str().unwrap(),
+            "LargeContainer",
+            None,
+        );
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let content = response["content"].as_str().unwrap();
+        assert!(response["success"].as_bool().unwrap());
+        assert!(
+            content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
+            "expected member menu, got: {content}"
+        );
+        assert!(content.contains("Pick one of the listed member names"));
+    }
+
+    fn assert_heading_miss_steering(fixture: &str) {
+        let ctx = make_ctx();
+        let path = fixture_path(fixture);
+        let req = make_zoom_request(
+            "steer-heading",
+            path.to_str().unwrap(),
+            "Installation Gude",
+            None,
+        );
+
+        let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        let message = response["message"].as_str().unwrap();
+        assert_eq!(response["code"], "symbol_not_found");
+        assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
+        assert!(message.contains("Choose one of these names from the document outline"));
+        assert!(message.contains("`Installation Guide` (lines"));
     }
 
     // --- Helpers ---
@@ -2625,10 +2935,11 @@ function helper(value: number): number {
         let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
 
         assert_eq!(json["success"], false);
-        assert_eq!(
-            json["message"],
+        let message = json["message"].as_str().unwrap();
+        assert!(message.starts_with(
             "symbol 'agent.general.model' not found: resolved `agent`, no key `general` — nearest: [general_settings]"
-        );
+        ));
+        assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
     }
 
     #[test]
