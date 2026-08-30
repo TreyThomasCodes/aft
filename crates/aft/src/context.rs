@@ -1369,6 +1369,47 @@ impl App {
         )
     }
 
+    pub(crate) fn adopt_resident_semantic_index(
+        &self,
+        artifact_cache_key: &str,
+        borrower_root: &Path,
+        semantic_config: &crate::config::SemanticBackendConfig,
+    ) -> Option<SemanticIndex> {
+        let contexts = {
+            let mut contexts = self.memory_contexts.lock();
+            contexts.retain(|_, context| context.strong_count() > 0);
+            contexts
+                .iter()
+                .filter_map(|(root, context)| {
+                    context.upgrade().map(|context| (root.clone(), context))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        contexts
+            .into_iter()
+            .filter(|(root, _)| root != borrower_root)
+            .find_map(|(root, context)| {
+                if context.cached_artifact_cache_key(&root).as_deref() != Some(artifact_cache_key)
+                    || !matches!(
+                        &*context
+                            .semantic_index_status()
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
+                    )
+                {
+                    return None;
+                }
+                context
+                    .semantic_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()?
+                    .adopt_frozen_base_for_root(borrower_root, semantic_config)
+            })
+    }
+
     /// Return the process-shared database handle, opening it only when the
     /// requested path is not already resident. The connection mutex serializes
     /// transactions from all roots; callers never hold the App lock while using
