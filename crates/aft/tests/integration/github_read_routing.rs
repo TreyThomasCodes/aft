@@ -50,6 +50,28 @@ fn spawned_with_fake_gh(bin_dir: &Path) -> AftProcess {
     AftProcess::spawn_with_env(&[("PATH", path.as_os_str())])
 }
 
+/// Configure a throwaway project whose config enables the gh_read gate; the
+/// gate's default-off contract is pinned by the dedicated disabled-read tests.
+fn configure_gh_read_enabled(aft: &mut AftProcess, project: &Path) {
+    let config_dir = project.join(".cortexkit");
+    fs::create_dir_all(&config_dir).expect("create project config dir");
+    fs::write(
+        config_dir.join("aft.jsonc"),
+        "{\"gh_read\": {\"enabled\": true}}",
+    )
+    .expect("write gh_read project config");
+    let response = aft.send(
+        &json!({
+            "id": "configure-gh-read",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:#}");
+}
+
 fn read_response(aft: &mut AftProcess, id: &str, file: &str, params: Value) -> Value {
     let mut request = params.as_object().cloned().expect("read params object");
     request.insert("id".to_string(), Value::String(id.to_string()));
@@ -63,6 +85,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
     let temp = tempfile::tempdir().expect("create fake gh root");
     write_fake_gh(&temp.path().join("bin"));
     let mut aft = spawned_with_fake_gh(&temp.path().join("bin"));
+    configure_gh_read_enabled(&mut aft, temp.path());
 
     let issue = read_response(&mut aft, "github-issue", "issue://7", json!({}));
     assert_eq!(issue["success"], true, "issue read failed: {issue:#}");
@@ -133,6 +156,8 @@ fn github_read_returns_identical_selected_content_through_standalone_and_subc_pa
     write_fake_gh(&temp.path().join("bin"));
     let mut standalone = spawned_with_fake_gh(&temp.path().join("bin"));
     let mut subc = spawned_with_fake_gh(&temp.path().join("bin"));
+    configure_gh_read_enabled(&mut standalone, temp.path());
+    configure_gh_read_enabled(&mut subc, temp.path());
 
     let direct = read_response(
         &mut standalone,
