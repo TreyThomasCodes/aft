@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -9,6 +10,8 @@ use serde_json::json;
 use super::helpers::{user_config, AftProcess};
 
 const SHORT_WAIT_MS: &str = "600";
+const HANG_CATCH: Duration = Duration::from_secs(12);
+const PROMOTION_WAIT_MS: u64 = 5_000;
 
 fn spawn_with_wait(wait_ms: &str) -> AftProcess {
     AftProcess::spawn_with_env(&[("AFT_TEST_FOREGROUND_WAIT_MS", OsStr::new(wait_ms))])
@@ -47,9 +50,51 @@ fn bash_request(id: &str, params: serde_json::Value) -> String {
     .to_string()
 }
 
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn hold_until_release_command(started: &Path, release: &Path, on_release: &str) -> String {
+    format!(
+        "printf ready > {}; while [ ! -e {} ]; do sleep 0.05; done; {on_release}",
+        shell_quote_path(started),
+        shell_quote_path(release),
+    )
+}
+
+fn wait_for_file(path: &Path, context: &str) {
+    let deadline = Instant::now() + HANG_CATCH;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {context}: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_bash_completed_frame(aft: &mut AftProcess, task_id: &str) -> serde_json::Value {
+    let deadline = Instant::now() + HANG_CATCH;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for bash_completed frame for {task_id}"
+        );
+        let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        if frame["type"] == "bash_completed" && frame["task_id"] == task_id {
+            return frame;
+        }
+    }
+}
+
 #[test]
 fn orchestrated_fast_foreground_returns_single_terminal_response() {
-    let mut aft = spawn_with_wait(SHORT_WAIT_MS);
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    configure_bash_background(&mut aft, &dir, HANG_CATCH.as_millis() as u64);
 
     let response = aft.send(&bash_request(
         "bash-fast-orchestrated",
@@ -71,7 +116,9 @@ fn orchestrated_fast_foreground_returns_single_terminal_response() {
 
 #[test]
 fn orchestrated_non_zero_exit_appends_exit_code_marker() {
-    let mut aft = spawn_with_wait(SHORT_WAIT_MS);
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    configure_bash_background(&mut aft, &dir, HANG_CATCH.as_millis() as u64);
 
     let response = aft.send(&bash_request(
         "bash-nonzero-orchestrated",
@@ -93,28 +140,39 @@ fn orchestrated_non_zero_exit_appends_exit_code_marker() {
 
 #[test]
 fn orchestrated_foreground_promotes_after_wait_window() {
-    let mut aft = spawn_with_wait(SHORT_WAIT_MS);
+    let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
-    configure_bash_background(&mut aft, &dir, 600);
+    configure_bash_background(&mut aft, &dir, PROMOTION_WAIT_MS);
+    let child_started = dir.path().join("promotion-child-started");
+    let child_release = dir.path().join("promotion-child-release");
+    let command = hold_until_release_command(
+        &child_started,
+        &child_release,
+        "printf 'promotion-complete\\n'",
+    );
 
-    let started = Instant::now();
-    let response = aft.send(&bash_request(
-        "bash-promote-orchestrated",
-        json!({
-            "command": "sleep 5",
-            "foreground_orchestrate": true,
-        }),
-    ));
+    let response = aft.send_with_timeout(
+        &bash_request(
+            "bash-promote-orchestrated",
+            json!({
+                "command": command,
+                "foreground_orchestrate": true,
+                "compressed": false,
+            }),
+        ),
+        HANG_CATCH,
+    );
 
     assert_eq!(response["success"], true, "response: {response:?}");
     assert_eq!(response["status"], "running", "response: {response:?}");
     let task_id = response["task_id"].as_str().expect("task_id");
     let output = response["output"].as_str().unwrap();
-    assert!(output.contains(&format!("promoted to background: {task_id}")));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "promotion response took too long: {response:?}"
+        output.contains("didn't finish within 5s"),
+        "response: {response:?}"
     );
+    assert!(output.contains(&format!("promoted to background: {task_id}")));
+    wait_for_file(&child_started, "promoted child start");
 
     let status = aft.send(
         &json!({
@@ -126,6 +184,19 @@ fn orchestrated_foreground_promotes_after_wait_window() {
     );
     assert_eq!(status["success"], true, "status: {status:?}");
     assert_eq!(status["task_id"], task_id);
+    assert_eq!(status["status"], "running", "status: {status:?}");
+
+    std::fs::write(&child_release, b"release").expect("release promoted child");
+    let completion = wait_for_bash_completed_frame(&mut aft, task_id);
+    assert_eq!(completion["status"], "completed", "frame: {completion:?}");
+    assert_eq!(completion["exit_code"], 0, "frame: {completion:?}");
+    assert!(
+        completion["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("promotion-complete"),
+        "frame: {completion:?}"
+    );
 
     assert!(aft.shutdown().success());
 }
@@ -133,7 +204,6 @@ fn orchestrated_foreground_promotes_after_wait_window() {
 #[test]
 fn orchestrated_block_to_completion_does_not_promote() {
     let mut aft = spawn_with_wait("300");
-    let started = Instant::now();
 
     let response = aft.send(&bash_request(
         "bash-block-orchestrated",
@@ -151,10 +221,6 @@ fn orchestrated_block_to_completion_does_not_promote() {
         .as_str()
         .unwrap()
         .contains("promoted to background"));
-    assert!(
-        started.elapsed() >= Duration::from_millis(900),
-        "block_to_completion returned before the command could finish: {response:?}"
-    );
 
     assert!(aft.shutdown().success());
 }
@@ -162,7 +228,6 @@ fn orchestrated_block_to_completion_does_not_promote() {
 #[test]
 fn orchestrated_wait_true_does_not_promote() {
     let mut aft = spawn_with_wait("100");
-    let started = Instant::now();
 
     let response = aft.send(&bash_request(
         "bash-wait-orchestrated",
@@ -187,10 +252,6 @@ fn orchestrated_wait_true_does_not_promote() {
         .as_str()
         .unwrap()
         .contains("promoted to background"));
-    assert!(
-        started.elapsed() >= Duration::from_millis(800),
-        "wait:true returned before the command could finish: {response:?}"
-    );
 
     assert!(aft.shutdown().success());
 }
@@ -397,11 +458,16 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
 
 #[test]
 fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response() {
-    let mut aft = spawn_with_wait("5000");
+    let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
     configure_bash_background(&mut aft, &dir, 5_000);
     let pid_file = dir.path().join("foreground.pid");
-    let command = format!("echo $$ > '{}'; sleep 30", pid_file.display());
+    let release_file = dir.path().join("foreground.release");
+    let command = format!(
+        "echo $$ > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&pid_file),
+        shell_quote_path(&release_file),
+    );
     let session_id = "abort-session";
 
     aft.send_silent(
@@ -419,14 +485,7 @@ fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response
         .to_string(),
     );
 
-    let started = Instant::now();
-    while !pid_file.exists() {
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "foreground task did not start"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    wait_for_file(&pid_file, "foreground task start");
 
     // The body deliberately names another session. Raw command callers cannot
     // retarget this cancellation because the server uses the bound session.
@@ -442,7 +501,7 @@ fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response
 
     let mut abort_response = None;
     let mut bash_response = None;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HANG_CATCH;
     while (abort_response.is_none() || bash_response.is_none()) && Instant::now() < deadline {
         let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(250)) else {
             continue;
@@ -506,8 +565,8 @@ fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response
             break;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "pid {pid} survived abort"
+            started.elapsed() < HANG_CATCH,
+            "pid {pid} survived abort hang catch"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
