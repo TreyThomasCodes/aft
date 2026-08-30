@@ -4,9 +4,11 @@
 //! opencode's built-in read tool with a faster Rust implementation.
 //! For symbol-based reading and call-graph annotations, use `zoom` instead.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -17,6 +19,10 @@ use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageDecoder, Ima
 use serde_json::Value;
 
 use crate::context::AppContext;
+use crate::github_read::{
+    sqlite_cache_store, GhCliFetcher, GithubReadCompletion, GithubReadEngine, GithubReadSelector,
+    GithubReadStart, ReqwestGithubImageDownloader, SystemGithubReadClock,
+};
 use crate::protocol::{RawRequest, Response};
 
 const DEFAULT_LIMIT: u32 = 2000;
@@ -38,6 +44,9 @@ const IMAGE_PROCESS_TIMEOUT: Duration = if cfg!(debug_assertions) {
 } else {
     Duration::from_secs(10)
 };
+
+static GITHUB_READ_ENGINES: LazyLock<Mutex<BTreeMap<PathBuf, Arc<GithubReadEngine>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImageKind {
@@ -699,6 +708,150 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     )
 }
 
+fn is_github_read_target(file: &str) -> bool {
+    file.starts_with("issue://") || file.starts_with("pr://")
+}
+
+fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
+    let database_path = ctx.storage_dir().join("aft.db");
+    let mut engines = GITHUB_READ_ENGINES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    Arc::clone(engines.entry(database_path.clone()).or_insert_with(|| {
+        Arc::new(GithubReadEngine::new(
+            sqlite_cache_store(database_path),
+            Arc::new(GhCliFetcher::system()),
+            Arc::new(ReqwestGithubImageDownloader),
+            Arc::new(SystemGithubReadClock),
+        ))
+    }))
+}
+
+fn github_read_selector(req: &RawRequest) -> (GithubReadSelector, usize) {
+    let start_line = req
+        .params
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let end_line = req
+        .params
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let limit = req
+        .params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_LIMIT as u64) as usize;
+    (
+        GithubReadSelector::LineRange {
+            start_line,
+            end_line,
+            limit,
+        },
+        start_line,
+    )
+}
+
+fn wait_for_github_read(
+    engine: &GithubReadEngine,
+    file: &str,
+    working_directory: PathBuf,
+    authentication_identity: String,
+    vision_capability: Option<bool>,
+    selector: GithubReadSelector,
+) -> Result<GithubReadCompletion, crate::github_read::GithubReadError> {
+    match engine.start_resource(
+        file,
+        working_directory,
+        authentication_identity,
+        vision_capability,
+        selector,
+    )? {
+        GithubReadStart::Immediate(completion) => Ok(completion),
+        GithubReadStart::Deferred(pending) => loop {
+            if let Some(completion) = pending.try_complete() {
+                return completion;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        },
+    }
+}
+
+fn github_read_response(
+    req: &RawRequest,
+    completion: GithubReadCompletion,
+    start_line: usize,
+) -> Response {
+    let lines_read = completion.content.lines().count();
+    let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
+    let truncated = lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines);
+    let attachments = completion
+        .attachments
+        .into_iter()
+        .map(|attachment| {
+            let bytes = attachment.bytes.len();
+            let data = BASE64.encode(&attachment.bytes);
+            let base64_bytes = data.len();
+            serde_json::json!({
+                "kind": "image",
+                "mime": attachment.mime,
+                "data": data,
+                "bytes": bytes,
+                "base64_bytes": base64_bytes,
+                "source_url": attachment.source_url,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut data = serde_json::json!({
+        "content": completion.content,
+        "attachments": attachments,
+        "complete": !truncated,
+        "total_lines": completion.total_lines,
+        "lines_read": lines_read,
+        "start_line": start_line,
+        "end_line": actual_end,
+        "truncated": truncated,
+    });
+    if let (Some(note), Some(data)) = (completion.freshness.note(), data.as_object_mut()) {
+        data.insert(
+            "freshness_note".to_string(),
+            Value::String(note.to_string()),
+        );
+    }
+    Response::success(&req.id, data)
+}
+
+fn handle_github_read(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
+    if ctx.request_force_restrict(&req.id) {
+        return Response::error(
+            &req.id,
+            "external_fetch_restricted",
+            "Network-backed GitHub reads are unavailable on restricted binds.",
+        );
+    }
+    let working_directory = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+    let (selector, start_line) = github_read_selector(req);
+    let vision_capability = req.params.get("vision_capability").and_then(Value::as_bool);
+    let authentication_identity = format!("session:{}", req.session());
+    match wait_for_github_read(
+        github_read_engine(ctx).as_ref(),
+        file,
+        working_directory,
+        authentication_identity,
+        vision_capability,
+        selector,
+    ) {
+        Ok(completion) => github_read_response(req, completion, start_line),
+        Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+    }
+}
+
 /// Handle a `read` request.
 ///
 /// Params:
@@ -720,6 +873,12 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(file) = req.params.get("file").and_then(Value::as_str) {
+        if is_github_read_target(file) {
+            return handle_github_read(req, ctx, file);
+        }
+    }
+
     let mut response = handle_read_legacy(req, ctx);
     if !response.success
         || response
@@ -1416,6 +1575,45 @@ mod tests {
 
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
+
+    #[test]
+    fn github_read_response_preserves_engine_text_and_attachment_metadata() {
+        let request = RawRequest {
+            id: "github-response".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": "issue://7" }),
+        };
+        let response = github_read_response(
+            &request,
+            GithubReadCompletion {
+                content: "canonical text\n".to_string(),
+                total_lines: 1,
+                freshness: crate::github_read::GithubReadFreshness::Fetched,
+                attachments: vec![crate::github_read::GithubImageAttachment {
+                    source_url: "https://github.com/user-attachments/files/7/image.png".to_string(),
+                    mime: "image/png".to_string(),
+                    bytes: vec![137, 80, 78, 71, 13, 10, 26, 10],
+                }],
+            },
+            1,
+        );
+
+        assert!(response.success);
+        assert_eq!(response.data["content"], "canonical text\n");
+        let attachment = first_attachment(&response.data);
+        assert_eq!(
+            attachment["source_url"],
+            "https://github.com/user-attachments/files/7/image.png"
+        );
+        assert_eq!(attachment["mime"], "image/png");
+        assert_eq!(attachment["bytes"], 8);
+        assert_eq!(
+            decoded_attachment_bytes(attachment),
+            vec![137, 80, 78, 71, 13, 10, 26, 10]
+        );
+    }
 
     #[test]
     fn test_is_binary_detects_null_bytes() {

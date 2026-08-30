@@ -958,6 +958,14 @@ fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_
     );
 }
 
+fn insert_read_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
+    if file_path.starts_with("issue://") || file_path.starts_with("pr://") {
+        map.insert("file".to_string(), Value::String(file_path.to_string()));
+    } else {
+        insert_resolved_file(map, project_root, file_path);
+    }
+}
+
 pub fn subc_translate(
     bare_name: &str,
     agent_args: &Value,
@@ -1313,7 +1321,7 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
         .ok_or_else(|| invalid_request("'path' is required"))?;
 
     let mut out = Map::new();
-    insert_resolved_file(&mut out, project_root, file_path);
+    insert_read_file(&mut out, project_root, file_path);
 
     let mut start_line = map_in.get("startLine").and_then(Value::as_u64);
     let mut end_line = map_in.get("endLine").and_then(Value::as_u64);
@@ -1337,6 +1345,12 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
         if let Some(limit) = map_in.get("limit").and_then(Value::as_u64) {
             out.insert("limit".to_string(), Value::Number(limit.into()));
         }
+    }
+    if let Some(vision_capability) = map_in.get("vision_capability").and_then(Value::as_bool) {
+        out.insert(
+            "vision_capability".to_string(),
+            Value::Bool(vision_capability),
+        );
     }
 
     Ok(Translated {
