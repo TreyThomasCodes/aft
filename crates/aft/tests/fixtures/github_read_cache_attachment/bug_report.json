@@ -1,0 +1,9 @@
+{
+  "repository": "cortexkit/aft",
+  "kind": "issue",
+  "number": 73,
+  "title": "Screenshot fixture bug report",
+  "state": "OPEN",
+  "body": "The first screenshot is https://user-images.githubusercontent.com/1234/first.png\nThe second screenshot is https://github.com/user-attachments/files/73/second.png",
+  "comments": []
+}
