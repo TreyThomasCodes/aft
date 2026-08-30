@@ -8,6 +8,7 @@ pub mod backups;
 pub mod bash_tasks;
 pub mod bash_watches;
 pub mod compression_events;
+pub mod github_read_cache;
 pub mod removal;
 pub mod standing_roots;
 pub mod state;
