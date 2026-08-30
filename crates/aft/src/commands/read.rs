@@ -756,6 +756,7 @@ fn github_read_selector(req: &RawRequest) -> (GithubReadSelector, usize) {
 
 fn wait_for_github_read(
     engine: &GithubReadEngine,
+    gh_read: &crate::config::GhReadConfig,
     file: &str,
     working_directory: PathBuf,
     authentication_identity: String,
@@ -763,6 +764,7 @@ fn wait_for_github_read(
     selector: GithubReadSelector,
 ) -> Result<GithubReadCompletion, crate::github_read::GithubReadError> {
     match engine.start_resource(
+        gh_read,
         file,
         working_directory,
         authentication_identity,
@@ -839,8 +841,10 @@ fn handle_github_read(req: &RawRequest, ctx: &AppContext, file: &str) -> Respons
     let (selector, start_line) = github_read_selector(req);
     let vision_capability = req.params.get("vision_capability").and_then(Value::as_bool);
     let authentication_identity = format!("session:{}", req.session());
+    let gh_read = ctx.config().gh_read.clone();
     match wait_for_github_read(
         github_read_engine(ctx).as_ref(),
+        &gh_read,
         file,
         working_directory,
         authentication_identity,
