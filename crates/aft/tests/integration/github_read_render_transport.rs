@@ -21,6 +21,10 @@ use url::Url;
 
 use super::helpers::AftProcess;
 
+fn enabled_gh_read() -> aft::config::GhReadConfig {
+    aft::config::GhReadConfig { enabled: true }
+}
+
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/github_read_render_transport";
 const FIXTURE_ISSUE_RESOURCE: &str = "issue://cortexkit/aft/73";
 const FIXTURE_PR_RESOURCE: &str = "pr://cortexkit/aft/42";
@@ -563,6 +567,7 @@ fn vision_and_text_only_fixture_requests_keep_selected_markdown_bytes_identical(
     let text_only = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 FIXTURE_ISSUE_RESOURCE,
                 "/fixture",
                 "fixture-principal",
@@ -574,6 +579,7 @@ fn vision_and_text_only_fixture_requests_keep_selected_markdown_bytes_identical(
     let vision = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 FIXTURE_ISSUE_RESOURCE,
                 "/fixture",
                 "fixture-principal",

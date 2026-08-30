@@ -17,6 +17,10 @@ use aft::github_read::{
 use parking_lot::Mutex;
 use url::Url;
 
+fn enabled_gh_read() -> aft::config::GhReadConfig {
+    aft::config::GhReadConfig { enabled: true }
+}
+
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/github_read_cache_attachment";
 const RESOURCE: &str = "issue://owner/repo/7";
 const PNG_SIGNATURE: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
@@ -237,6 +241,7 @@ fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() 
 
     let GithubReadStart::Deferred(first_pending) = engine
         .start_resource(
+            &enabled_gh_read(),
             RESOURCE,
             "/fixture/cache",
             "principal:alice",
@@ -255,6 +260,7 @@ fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() 
     let fresh = immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/cache",
                 "principal:alice",
@@ -279,6 +285,7 @@ fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() 
             immediate_read(
                 reader_engine
                     .start_resource(
+                        &enabled_gh_read(),
                         RESOURCE,
                         "/fixture/cache",
                         "principal:alice",
@@ -321,6 +328,7 @@ fn cache_hits_are_network_free_and_stale_and_hard_ttl_paths_are_single_flight() 
 
     let GithubReadStart::Deferred(hard_pending) = engine
         .start_resource(
+            &enabled_gh_read(),
             RESOURCE,
             "/fixture/cache",
             "principal:alice",
@@ -351,6 +359,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     let alice = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/authentication",
                 "principal:alice",
@@ -362,6 +371,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     let bob = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/authentication",
                 "principal:bob",
@@ -379,6 +389,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/authentication",
                 "principal:alice",
@@ -390,6 +401,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/authentication",
                 "principal:bob",
@@ -403,6 +415,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     let first_short = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://7",
                 "/fixture/worktree-a",
                 "principal:alice",
@@ -414,6 +427,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     let second_short = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://7",
                 "/fixture/worktree-b",
                 "principal:alice",
@@ -434,6 +448,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://7",
                 "/fixture/worktree-a",
                 "principal:alice",
@@ -445,6 +460,7 @@ fn cache_keys_keep_authentication_and_unresolved_short_contexts_isolated() {
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://7",
                 "/fixture/worktree-b",
                 "principal:alice",
@@ -470,6 +486,7 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
     complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/mutation",
                 "principal:alice",
@@ -483,6 +500,7 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/mutation",
                 "principal:alice",
@@ -506,6 +524,7 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
     immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/mutation",
                 "principal:alice",
@@ -524,6 +543,7 @@ fn successful_same_resource_invalidation_refetches_without_evicting_failed_or_ot
     );
     let GithubReadStart::Deferred(refetch_pending) = engine
         .start_resource(
+            &enabled_gh_read(),
             RESOURCE,
             "/fixture/mutation",
             "principal:alice",
@@ -566,6 +586,7 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
     let missing_capability = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://cortexkit/aft/73",
                 "/fixture/vision",
                 "principal:vision",
@@ -582,6 +603,7 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
     let false_capability = immediate_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://cortexkit/aft/73",
                 "/fixture/vision",
                 "principal:vision",
@@ -597,6 +619,7 @@ fn vision_capability_preserves_bug_report_text_and_only_downloads_for_explicit_t
     let explicit_vision = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 "issue://cortexkit/aft/73",
                 "/fixture/vision",
                 "principal:vision",
@@ -701,6 +724,7 @@ fn invalid_or_failed_attachment_candidates_leave_the_text_read_complete_without_
     let completion = complete_read(
         engine
             .start_resource(
+                &enabled_gh_read(),
                 RESOURCE,
                 "/fixture/attachment-failures",
                 "principal:vision",
