@@ -507,10 +507,6 @@ fn outline_symbol_name(symbol: &Symbol, is_heading: bool) -> String {
     }
 }
 
-fn format_outline_symbol(symbol: &Symbol) -> String {
-    format_outline_symbol_labeled(symbol, false)
-}
-
 /// Heading suggestions render the DE-LINKED label (`[Label](url)` -> `Label`):
 /// zoom accepts plain-text heading queries via normalization, so the URL adds
 /// tokens without adding addressability - the long-standing suggestion
