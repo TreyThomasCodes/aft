@@ -393,7 +393,10 @@ fn github_cli_failures_are_actionable_redacted_and_missing_cli_is_immediate() {
         "missing gh response must include remediation: {response:#}"
     );
     assert!(
-        elapsed < Duration::from_secs(2),
+        // Distinguishes an immediate typed error from a deferred retry ladder
+        // (tens of seconds); generous because parallel-suite load plus the
+        // fixture's first-exec assessment tax blew tighter bounds twice.
+        elapsed < Duration::from_secs(8),
         "missing gh must return a typed error instead of hanging or queuing: {elapsed:?}"
     );
     assert!(missing.shutdown().success());
