@@ -5,7 +5,7 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError,
+    Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, TryLockError, Weak,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,9 +45,20 @@ const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 2
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const INDEX_ORPHAN_SWEEP_LIMIT: usize = 200;
+const TRANSIENT_SEARCH_CACHE_PREFIX: &str = "aft-search-cache.";
+/// A streaming build owns its temporary cache for minutes, not days. Use the
+/// same conservative age-only predicate as other interrupted-build reapers so
+/// a recycled PID can never protect abandoned data.
+const TRANSIENT_SEARCH_CACHE_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT: usize = 200;
+const TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
 static INDEX_ORPHAN_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+static TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> =
+    OnceLock::new();
+static TRANSIENT_SEARCH_CACHE_BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -97,6 +108,28 @@ struct IndexOrphanSweepSummary {
     skipped_locked: usize,
     skipped_unreadable: usize,
     budget_exhausted: bool,
+}
+
+#[derive(Default)]
+struct TransientSearchCacheSweepSummary {
+    scanned: usize,
+    removed: usize,
+    bytes: u64,
+    skipped_fresh: usize,
+    skipped_unreadable: usize,
+    budget_exhausted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TransientSearchCacheName {
+    key: String,
+    pid: u32,
+}
+
+enum TransientSearchCacheWalk {
+    Complete(u64),
+    BudgetExceeded,
+    Failed,
 }
 
 pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
@@ -801,7 +834,25 @@ impl SearchIndex {
     }
 
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
+        let started = Instant::now();
         let cache_dir = transient_search_cache_dir(root);
+        // The streaming index keeps its postings in cache.bin, so this scratch
+        // directory cannot be replaced by a purely in-memory build. A directory
+        // embeds this process's PID, so only threads in this process can share it;
+        // serialize those threads and clear the previous files before rebuilding
+        // instead of minting an unbounded timestamped path.
+        let build_lock = transient_search_cache_build_lock(&cache_dir);
+        let _build_guard = build_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = truncate_transient_search_cache_dir(&cache_dir) {
+            log::warn!(
+                "search index: could not reset transient cache {} ({}); falling back to bounded in-memory delta",
+                cache_dir.display(),
+                error
+            );
+            return Self::build_in_memory(root, max_file_size, started);
+        }
         Self::build_with_limit_to_cache_dir(root, max_file_size, &cache_dir)
     }
 
@@ -845,29 +896,32 @@ impl SearchIndex {
                     "search index: streaming build failed ({}); falling back to bounded in-memory delta",
                     error
                 );
-                let mut index = SearchIndex {
-                    project_root: fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
-                    max_file_size,
-                    ignore_rules_fingerprint: ignore_rules_fingerprint(
-                        &fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
-                    ),
-                    ..SearchIndex::new()
-                };
-                let filters = PathFilters::default();
-                let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
-                let indexed = index.ingest_paths_parallel(&paths);
-                index.git_head = current_git_head(&index.project_root);
-                index.ready = true;
-                crate::slog_info!(
-                    "search index fallback build: {} files, {} trigrams, {} ms (pool={})",
-                    indexed,
-                    index.trigram_count(),
-                    started.elapsed().as_millis(),
-                    search_index_build_pool_size()
-                );
-                index
+                Self::build_in_memory(root, max_file_size, started)
             }
         }
+    }
+
+    fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
+        let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let mut index = SearchIndex {
+            project_root: project_root.clone(),
+            max_file_size,
+            ignore_rules_fingerprint: ignore_rules_fingerprint(&project_root),
+            ..SearchIndex::new()
+        };
+        let filters = PathFilters::default();
+        let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
+        let indexed = index.ingest_paths_parallel(&paths);
+        index.git_head = current_git_head(&index.project_root);
+        index.ready = true;
+        crate::slog_info!(
+            "search index fallback build: {} files, {} trigrams, {} ms (pool={})",
+            indexed,
+            index.trigram_count(),
+            started.elapsed().as_millis(),
+            search_index_build_pool_size()
+        );
+        index
     }
 
     /// Serial cold build for tests and parity checks against [`build_with_limit`].
@@ -3299,14 +3353,282 @@ fn sweep_stale_search_build_dirs(cache_dir: &Path) {
 
 fn transient_search_cache_dir(root: &Path) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "aft-search-cache.{}.{}.{}",
+        "{TRANSIENT_SEARCH_CACHE_PREFIX}{}.{}",
         artifact_cache_key(root),
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
+        std::process::id()
     ))
+}
+
+/// Return the process-local mutex for a process/root transient cache directory.
+/// The PID in the directory name isolates separate processes, while this registry
+/// prevents two threads from truncating the same directory during concurrent builds.
+fn transient_search_cache_build_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
+    let locks = TRANSIENT_SEARCH_CACHE_BUILD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(cache_dir).and_then(Weak::upgrade) {
+        return lock;
+    }
+    if locks.len() >= 1_024 {
+        locks.retain(|_, lock| lock.strong_count() > 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(cache_dir.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Reuse one scratch directory for this process/root pair. The streaming index
+/// opens cache.bin as its postings store, so its previous files must be removed
+/// only while the process-local cache lock is held.
+fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(cache_dir)?;
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reap stale timestamped caches from older AFT versions and stable caches left
+/// by processes that exited without a future in-process rebuild. The directory
+/// name contains a PID for diagnostics, but PID liveness is intentionally not
+/// consulted: a bare PID can be recycled, while age remains trustworthy.
+pub(crate) fn sweep_transient_search_cache_dirs() {
+    let root = std::env::temp_dir();
+    let summary = sweep_transient_search_cache_dirs_with_limits(
+        &root,
+        TRANSIENT_SEARCH_CACHE_MIN_AGE,
+        TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
+        TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
+    );
+    crate::slog_info!(
+        "transient search cache sweep root={} scanned={} removed={} bytes={} skipped_fresh={} skipped_unreadable={} budget_exhausted={}",
+        root.display(),
+        summary.scanned,
+        summary.removed,
+        summary.bytes,
+        summary.skipped_fresh,
+        summary.skipped_unreadable,
+        summary.budget_exhausted
+    );
+}
+
+fn sweep_transient_search_cache_dirs_with_limits(
+    root: &Path,
+    min_age: Duration,
+    wall_clock_budget: Duration,
+    entry_limit: usize,
+) -> TransientSearchCacheSweepSummary {
+    let deadline = Instant::now() + wall_clock_budget;
+    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(root) {
+        Ok(boundary) => boundary,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TransientSearchCacheSweepSummary::default();
+        }
+        Err(error) => {
+            crate::slog_warn!(
+                "cannot establish filesystem boundary for transient search cache sweep {}: {}",
+                root.display(),
+                error
+            );
+            return TransientSearchCacheSweepSummary {
+                skipped_unreadable: 1,
+                ..TransientSearchCacheSweepSummary::default()
+            };
+        }
+    };
+    let mut entries = match fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (file_type.is_dir() && parse_transient_search_cache_name(&name).is_some())
+                    .then(|| (name, entry.path()))
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            crate::slog_warn!(
+                "cannot read transient search cache sweep directory {}: {}",
+                root.display(),
+                error
+            );
+            return TransientSearchCacheSweepSummary {
+                skipped_unreadable: 1,
+                ..TransientSearchCacheSweepSummary::default()
+            };
+        }
+    };
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let cursor_store =
+        TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let last_name = cursor_store
+        .lock()
+        .ok()
+        .and_then(|cursors| cursors.get(root).cloned());
+    if let Some(start) = last_name
+        .as_deref()
+        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
+    {
+        entries.rotate_left(start);
+    }
+
+    let now = SystemTime::now();
+    let mut summary = TransientSearchCacheSweepSummary::default();
+    let mut cursor_name = last_name;
+    for (processed, (name, path)) in entries.into_iter().enumerate() {
+        if processed >= entry_limit || Instant::now() >= deadline {
+            summary.budget_exhausted = true;
+            break;
+        }
+        summary.scanned += 1;
+        cursor_name = Some(name.clone());
+        if !boundary.should_descend(&path).unwrap_or(false) {
+            summary.skipped_unreadable += 1;
+            continue;
+        }
+        let modified = match fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(_) => {
+                summary.skipped_unreadable += 1;
+                continue;
+            }
+        };
+        if now.duration_since(modified).unwrap_or(Duration::ZERO) <= min_age {
+            summary.skipped_fresh += 1;
+            continue;
+        }
+        let bytes = match transient_search_cache_dir_bytes(&path, &boundary, deadline) {
+            TransientSearchCacheWalk::Complete(bytes) => bytes,
+            TransientSearchCacheWalk::BudgetExceeded => {
+                summary.budget_exhausted = true;
+                break;
+            }
+            TransientSearchCacheWalk::Failed => {
+                summary.skipped_unreadable += 1;
+                continue;
+            }
+        };
+        let Some(parsed) = parse_transient_search_cache_name(&name) else {
+            summary.skipped_unreadable += 1;
+            continue;
+        };
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                summary.removed += 1;
+                summary.bytes = summary.bytes.saturating_add(bytes);
+                crate::slog_info!(
+                    "transient search cache sweep reaped dir={} key={} pid={} bytes={}",
+                    path.display(),
+                    parsed.key,
+                    parsed.pid,
+                    bytes
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.exists() => {
+                summary.removed += 1;
+                summary.bytes = summary.bytes.saturating_add(bytes);
+                crate::slog_info!(
+                    "transient search cache sweep reaped dir={} key={} pid={} bytes={}",
+                    path.display(),
+                    parsed.key,
+                    parsed.pid,
+                    bytes
+                );
+            }
+            Err(_) => summary.skipped_unreadable += 1,
+        }
+    }
+
+    if let Ok(mut cursors) = cursor_store.lock() {
+        if summary.budget_exhausted {
+            if let Some(cursor_name) = cursor_name {
+                cursors.insert(root.to_path_buf(), cursor_name);
+            }
+        } else {
+            cursors.remove(root);
+        }
+    }
+    if summary.removed > 0 {
+        crate::fs_lock::sync_parent(root);
+    }
+    summary
+}
+
+fn parse_transient_search_cache_name(name: &str) -> Option<TransientSearchCacheName> {
+    let mut parts = name.strip_prefix(TRANSIENT_SEARCH_CACHE_PREFIX)?.split('.');
+    let key = parts.next()?;
+    if !artifact_key_looks_valid(key) {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok().filter(|pid| *pid != 0)?;
+    match (parts.next(), parts.next()) {
+        (None, None) => {}
+        (Some(nanos), None) if nanos.parse::<u128>().is_ok() => {}
+        _ => return None,
+    }
+    Some(TransientSearchCacheName {
+        key: key.to_owned(),
+        pid,
+    })
+}
+
+fn transient_search_cache_dir_bytes(
+    directory: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    deadline: Instant,
+) -> TransientSearchCacheWalk {
+    if Instant::now() >= deadline {
+        return TransientSearchCacheWalk::BudgetExceeded;
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return TransientSearchCacheWalk::Failed,
+    };
+    let mut bytes = 0u64;
+    for entry in entries {
+        if Instant::now() >= deadline {
+            return TransientSearchCacheWalk::BudgetExceeded;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return TransientSearchCacheWalk::Failed,
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => return TransientSearchCacheWalk::Failed,
+        };
+        let path = entry.path();
+        if file_type.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return TransientSearchCacheWalk::Failed,
+            };
+            bytes = bytes.saturating_add(metadata.len());
+        } else if file_type.is_dir() {
+            if !boundary.should_descend(&path).unwrap_or(false) {
+                return TransientSearchCacheWalk::Failed;
+            }
+            match transient_search_cache_dir_bytes(&path, boundary, deadline) {
+                TransientSearchCacheWalk::Complete(nested) => {
+                    bytes = bytes.saturating_add(nested);
+                }
+                other => return other,
+            }
+        } else {
+            return TransientSearchCacheWalk::Failed;
+        }
+    }
+    TransientSearchCacheWalk::Complete(bytes)
 }
 
 fn read_file_trigram_count_extension(
@@ -5833,6 +6155,197 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    fn transient_search_cache_test_dir(root: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        fs::create_dir_all(&path).expect("create transient cache fixture");
+        fs::write(path.join("cache.bin"), contents).expect("write transient cache fixture");
+        path
+    }
+
+    fn age_transient_search_cache_test_dir(path: &Path) {
+        let old = SystemTime::now()
+            .checked_sub(TRANSIENT_SEARCH_CACHE_MIN_AGE + Duration::from_secs(1))
+            .expect("construct aged transient cache time");
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old))
+            .expect("age transient cache fixture");
+    }
+
+    #[test]
+    fn transient_search_cache_name_parses_stable_and_legacy_layouts() {
+        let key = "0123456789abcdef";
+        let stable = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42");
+        let legacy = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42.123456789");
+        assert_eq!(
+            parse_transient_search_cache_name(&stable)
+                .expect("stable transient cache name")
+                .pid,
+            42
+        );
+        assert_eq!(
+            parse_transient_search_cache_name(&legacy)
+                .expect("legacy transient cache name")
+                .key,
+            key
+        );
+        assert!(parse_transient_search_cache_name(&format!(
+            "{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.42.not-a-nanosecond"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn transient_builds_reuse_one_cache_dir_and_truncate_previous_contents() {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let root = fs::canonicalize(project.path()).expect("canonical project root");
+        fs::write(root.join("source.rs"), "pub fn transient_cache() {}\n")
+            .expect("write project source");
+        let key = artifact_cache_key(&root);
+        let prefix = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.");
+        let temp_root = std::env::temp_dir();
+        let remove_matching = || {
+            for entry in fs::read_dir(&temp_root)
+                .expect("read system temp directory")
+                .flatten()
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        };
+        remove_matching();
+
+        let cache_dir = transient_search_cache_dir(&root);
+        let first = SearchIndex::build(&root);
+        assert!(first.ready, "first transient build must complete");
+        let stale_file = cache_dir.join("must-be-truncated");
+        fs::write(&stale_file, "old scratch data").expect("plant stale scratch file");
+        let second = SearchIndex::build(&root);
+        assert!(second.ready, "second transient build must complete");
+
+        let matching = fs::read_dir(&temp_root)
+            .expect("read system temp directory")
+            .flatten()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with(&prefix)
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            })
+            .count();
+        assert!(
+            matching <= 1,
+            "two transient builds may retain at most one process/root cache directory"
+        );
+        assert!(
+            !stale_file.exists(),
+            "reusing a transient cache directory must clear stale scratch files"
+        );
+        drop((first, second));
+        remove_matching();
+    }
+
+    #[test]
+    fn transient_search_cache_sweep_reaps_aged_legacy_dir_and_counts_bytes() {
+        let root = tempfile::tempdir().expect("temporary sweep root");
+        let legacy = transient_search_cache_test_dir(
+            root.path(),
+            "aft-search-cache.1111111111111111.4242.123456789",
+            b"legacy cache bytes",
+        );
+        age_transient_search_cache_test_dir(&legacy);
+
+        let summary = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            Duration::from_secs(1),
+            10,
+        );
+
+        assert!(
+            !legacy.exists(),
+            "an aged legacy transient cache must be reaped"
+        );
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.bytes, b"legacy cache bytes".len() as u64);
+    }
+
+    #[test]
+    fn transient_search_cache_sweep_age_guard_spares_fresh_dir_until_aged() {
+        let root = tempfile::tempdir().expect("temporary sweep root");
+        let fresh = transient_search_cache_test_dir(
+            root.path(),
+            "aft-search-cache.2222222222222222.4242",
+            b"fresh cache bytes",
+        );
+
+        let fresh_summary = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            Duration::from_secs(1),
+            10,
+        );
+        assert!(fresh.exists(), "the age guard must protect a fresh cache");
+        assert_eq!(fresh_summary.skipped_fresh, 1);
+
+        age_transient_search_cache_test_dir(&fresh);
+        let aged_summary = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            Duration::from_secs(1),
+            10,
+        );
+        assert!(
+            !fresh.exists(),
+            "aging the same directory must make the age guard reap it"
+        );
+        assert_eq!(aged_summary.removed, 1);
+    }
+
+    #[test]
+    fn transient_search_cache_sweep_resumes_after_entry_budget() {
+        let root = tempfile::tempdir().expect("temporary sweep root");
+        let first = transient_search_cache_test_dir(
+            root.path(),
+            "aft-search-cache.3333333333333333.4242",
+            b"first cache bytes",
+        );
+        let second = transient_search_cache_test_dir(
+            root.path(),
+            "aft-search-cache.4444444444444444.4242",
+            b"second cache bytes",
+        );
+        age_transient_search_cache_test_dir(&first);
+        age_transient_search_cache_test_dir(&second);
+
+        let first_pass = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            Duration::from_secs(1),
+            1,
+        );
+        assert!(
+            first_pass.budget_exhausted,
+            "the one-entry cap must stop the pass"
+        );
+        assert_eq!(first_pass.removed, 1);
+        assert_eq!(
+            [first.exists(), second.exists()]
+                .into_iter()
+                .filter(|exists| *exists)
+                .count(),
+            1,
+            "the entry budget must leave one aged directory for a later pass"
+        );
+
+        let second_pass = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            Duration::from_secs(1),
+            10,
+        );
+        assert_eq!(second_pass.removed, 1);
+        assert!(!first.exists() && !second.exists());
+    }
 
     fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {
         let dir = tempfile::tempdir().expect("create temp dir");

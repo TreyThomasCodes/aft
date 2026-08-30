@@ -3196,6 +3196,7 @@ impl CallGraphStore {
             // above never reaches.
             sweep_orphaned_build_temps_store_wide(callgraph_dir);
             sweep_orphaned_callgraph_root_dirs(callgraph_dir);
+            crate::search_index::sweep_transient_search_cache_dirs();
             if let Some(storage_root) = root_storage_dir(callgraph_dir) {
                 let inspect_root =
                     storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
