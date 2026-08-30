@@ -2208,6 +2208,7 @@ struct DbFileIndex {
     node_by_bare: HashMap<String, String>,
     node_kind_by_id: HashMap<String, String>,
     module_targets: HashMap<String, Option<String>>,
+    declared_module_targets: HashMap<String, Option<String>>,
     reexports: Vec<ReexportIndex>,
 }
 
@@ -2237,6 +2238,7 @@ trait ResolverIndex {
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
+    fn module_parent(&self, target_file: &str) -> Option<(String, String)>;
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
@@ -2264,6 +2266,24 @@ impl ResolverIndex for ProjectIndex<'_> {
 
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
         self.module_target(caller_file, module_path)
+    }
+
+    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        let mut parents = self
+            .files
+            .iter()
+            .flat_map(|(file, index)| {
+                index
+                    .declared_module_targets
+                    .iter()
+                    .filter_map(move |(module, target)| {
+                        (target.as_deref() == Some(target_file))
+                            .then(|| (file.clone(), module.clone()))
+                    })
+            })
+            .collect::<Vec<_>>();
+        parents.sort();
+        parents.into_iter().next()
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -2377,6 +2397,7 @@ impl DiskProjectIndex<'_> {
             node_by_bare: HashMap::new(),
             node_kind_by_id: HashMap::new(),
             module_targets: HashMap::new(),
+            declared_module_targets: HashMap::new(),
             reexports: Vec::new(),
         };
         let mut nodes = self
@@ -2418,8 +2439,8 @@ impl DiskProjectIndex<'_> {
             .conn
             .prepare(
                 "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
-                 FROM refs
-                 WHERE caller_file = ?1 AND kind IN ('import', 'reexport', 'export_alias')",
+                  FROM refs
+                  WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')",
             )
             .ok()?;
         let rows = refs
@@ -2448,7 +2469,12 @@ impl DiskProjectIndex<'_> {
             let Some(module_path) = module_path else {
                 continue;
             };
-            let target_file = self.disk_module_target(rel_path, &module_path).or_else(|| {
+            let target_file = if kind == "module" {
+                rust_declared_module_target(&self.project_root, rel_path, &module_path)
+            } else {
+                self.disk_module_target(rel_path, &module_path)
+            }
+            .or_else(|| {
                 self.conn
                     .query_row(
                         "SELECT d.dep_file
@@ -2468,6 +2494,12 @@ impl DiskProjectIndex<'_> {
                 .module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
+            if kind == "module" {
+                index
+                    .declared_module_targets
+                    .entry(module_path.clone())
+                    .or_insert_with(|| target_file.clone());
+            }
             if kind == "reexport" {
                 let raw = RawRef {
                     ref_id,
@@ -2520,6 +2552,28 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
         self.file_index(caller_file)
             .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
+    }
+
+    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT caller_file, module_path FROM refs
+                 WHERE kind = 'module' AND module_path IS NOT NULL
+                 ORDER BY caller_file, module_path",
+            )
+            .ok()?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()?;
+        for row in rows.flatten() {
+            if self.module_target(&row.0, &row.1).as_deref() == Some(target_file) {
+                return Some(row);
+            }
+        }
+        None
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -8097,6 +8151,14 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &data.import_block.imports,
         &line_index,
     ));
+    if lang == LangId::Rust {
+        raw_refs.extend(build_rust_module_refs(
+            project_root,
+            &abs_path,
+            &rel_path,
+            &source,
+        ));
+    }
     let mut surface_parts = reexports.surface_parts;
     surface_parts.extend(rust_reexports.surface_parts);
     surface_parts.extend(source_less_exports.surface_parts);
@@ -8337,6 +8399,156 @@ fn build_import_refs(
         });
     }
     refs
+}
+
+fn build_rust_module_refs(
+    project_root: &Path,
+    abs_path: &Path,
+    rel_path: &str,
+    source: &str,
+) -> Vec<RawRef> {
+    let grammar = grammar_for(LangId::Rust);
+    let mut parser = Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let mut refs = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "mod_item"
+            && node
+                .named_children(&mut node.walk())
+                .all(|child| child.kind() != "declaration_list")
+        {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let module_name = node_text(name_node, source).to_string();
+                let target = rust_external_module_target(abs_path, source, node, &module_name);
+                let mut dependencies = BTreeSet::new();
+                if let Some(target) = target {
+                    dependencies.insert(relative_path(project_root, &canonicalize_path(&target)));
+                }
+                refs.push(RawRef {
+                    ref_id: ref_id(&[
+                        rel_path,
+                        "module",
+                        &module_name,
+                        &node.start_byte().to_string(),
+                    ]),
+                    caller_node: None,
+                    caller_symbol: None,
+                    caller_file: rel_path.to_string(),
+                    kind: "module".to_string(),
+                    short_name: Some(module_name.clone()),
+                    full_ref: Some(module_name.clone()),
+                    module_path: Some(module_name.clone()),
+                    import_kind: Some("module".to_string()),
+                    local_name: Some(module_name.clone()),
+                    requested_name: Some(module_name),
+                    namespace_alias: None,
+                    wildcard: false,
+                    line: node.start_position().row as u32 + 1,
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    dependencies,
+                });
+            }
+        }
+
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    refs.sort_by_key(|raw| (raw.byte_start, raw.byte_end));
+    refs
+}
+
+fn rust_declared_module_target(
+    project_root: &Path,
+    caller_file: &str,
+    module_name: &str,
+) -> Option<String> {
+    let declaring_file = project_root.join(caller_file);
+    let source = std::fs::read_to_string(&declaring_file).ok()?;
+    let grammar = grammar_for(LangId::Rust);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(&source, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "mod_item"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, &source) == module_name)
+            && node
+                .named_children(&mut node.walk())
+                .all(|child| child.kind() != "declaration_list")
+        {
+            let target = rust_external_module_target(&declaring_file, &source, node, module_name)?;
+            return Some(relative_path(project_root, &canonicalize_path(&target)));
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                stack.push(cursor.node());
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn rust_external_module_target(
+    declaring_file: &Path,
+    source: &str,
+    module: Node<'_>,
+    module_name: &str,
+) -> Option<PathBuf> {
+    let parent = declaring_file.parent()?;
+    let mut previous = module.prev_sibling();
+    while let Some(attribute) = previous {
+        if attribute.kind() != "attribute_item" {
+            break;
+        }
+        let text = source.get(attribute.byte_range())?;
+        if let Some(path) = rust_path_attribute(text) {
+            let candidate = parent.join(path);
+            return candidate.is_file().then_some(candidate);
+        }
+        previous = attribute.prev_sibling();
+    }
+
+    let stem = declaring_file.file_stem().and_then(|stem| stem.to_str())?;
+    let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+        parent.to_path_buf()
+    } else {
+        parent.join(stem)
+    };
+    [
+        module_dir.join(format!("{module_name}.rs")),
+        module_dir.join(module_name).join("mod.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+fn rust_path_attribute(attribute: &str) -> Option<&str> {
+    let body = attribute.trim().strip_prefix("#[")?.strip_suffix(']')?;
+    let (name, value) = body.split_once('=')?;
+    (name.trim() == "path")
+        .then(|| value.trim().trim_matches('"'))
+        .filter(|path| !path.is_empty())
 }
 
 fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
@@ -9136,7 +9348,7 @@ fn rust_target_for_qualified<I: ResolverIndex>(
             }
         }
 
-        let module_segments = rust_resolve_segments(caller_file, &path_refs)?;
+        let module_segments = rust_resolve_segments_with_index(index, caller_file, &path_refs)?;
         if let Some(target) =
             rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
         {
@@ -9267,7 +9479,8 @@ fn rust_target_for_use<I: ResolverIndex>(
         let prefix = &path[..brace_start];
         if import.names.iter().any(|name| name == short_name) {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
-            let module_segments = rust_resolve_segments(caller_file, &prefix_segments)?;
+            let module_segments =
+                rust_resolve_segments_with_index(index, caller_file, &prefix_segments)?;
             let file = rust_file_for_segments(index, caller_file, &module_segments)?;
             return Some((file, short_name.to_string()));
         }
@@ -9286,7 +9499,8 @@ fn rust_target_for_use<I: ResolverIndex>(
     if segments.len() < 2 {
         return None;
     }
-    let module_segments = rust_resolve_segments(caller_file, &segments[..segments.len() - 1])?;
+    let module_segments =
+        rust_resolve_segments_with_index(index, caller_file, &segments[..segments.len() - 1])?;
     let file = rust_file_for_segments(index, caller_file, &module_segments)?;
     Some((file, segments.last().unwrap_or(&short_name).to_string()))
 }
@@ -9418,11 +9632,27 @@ fn rust_manifest_crate_names(manifest: &Path) -> Vec<String> {
     names
 }
 
+fn rust_resolve_segments_with_index<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    segments: &[&str],
+) -> Option<Vec<String>> {
+    let caller_segments = rust_registered_module_segments(index, caller_file)
+        .unwrap_or_else(|| rust_module_segments_for_rel(caller_file));
+    rust_resolve_segments_from(caller_segments, segments)
+}
+
 fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
+    rust_resolve_segments_from(rust_module_segments_for_rel(caller_file), segments)
+}
+
+fn rust_resolve_segments_from(
+    caller_segments: Vec<String>,
+    segments: &[&str],
+) -> Option<Vec<String>> {
     if segments.is_empty() {
         return Some(Vec::new());
     }
-    let caller_segments = rust_module_segments_for_rel(caller_file);
     match segments[0] {
         "crate" => Some(segments[1..].iter().map(|item| item.to_string()).collect()),
         "self" => {
@@ -9445,12 +9675,55 @@ fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<Str
     }
 }
 
+fn rust_registered_module_segments<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+) -> Option<Vec<String>> {
+    let mut current = caller_file.to_string();
+    let mut segments = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        let Some((parent, module)) = index.module_parent(&current) else {
+            break;
+        };
+        segments.push(module);
+        current = parent;
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        segments.reverse();
+        Some(segments)
+    }
+}
+
 fn rust_file_for_segments<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
     segments: &[String],
 ) -> Option<String> {
-    rust_file_for_src_prefix(index, &rust_src_prefix(caller_file), segments)
+    let src_prefix = rust_src_prefix(caller_file);
+    if let Some(target) = rust_file_from_module_declarations(index, &src_prefix, segments) {
+        return Some(target);
+    }
+    rust_file_for_src_prefix(index, &src_prefix, segments)
+}
+
+fn rust_file_from_module_declarations<I: ResolverIndex>(
+    index: &I,
+    src_prefix: &str,
+    segments: &[String],
+) -> Option<String> {
+    let mut current = [
+        format!("{src_prefix}/lib.rs"),
+        format!("{src_prefix}/main.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| index.contains_file(candidate))?;
+    for segment in segments {
+        current = index.module_target(&current, segment)?;
+    }
+    Some(current)
 }
 
 fn rust_file_for_src_prefix<I: ResolverIndex>(
@@ -9621,9 +9894,10 @@ impl DbFileIndex {
             }
         }
         let mut module_targets = HashMap::new();
+        let mut declared_module_targets = HashMap::new();
         let mut reexports = Vec::new();
         for raw_ref in &extract.raw_refs {
-            if !matches!(raw_ref.kind.as_str(), "import" | "reexport") {
+            if !matches!(raw_ref.kind.as_str(), "import" | "reexport" | "module") {
                 continue;
             }
             let Some(module_path) = &raw_ref.module_path else {
@@ -9633,6 +9907,11 @@ impl DbFileIndex {
             module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
+            if raw_ref.kind == "module" {
+                declared_module_targets
+                    .entry(module_path.clone())
+                    .or_insert_with(|| target_file.clone());
+            }
             if raw_ref.kind == "reexport" {
                 reexports.push(reexport_index_from_raw(raw_ref, target_file));
             }
@@ -9646,6 +9925,7 @@ impl DbFileIndex {
             node_by_bare,
             node_kind_by_id,
             module_targets,
+            declared_module_targets,
             reexports,
         }
     }
@@ -9673,6 +9953,7 @@ fn load_db_file_indexes(
                 node_by_bare: HashMap::new(),
                 node_kind_by_id: HashMap::new(),
                 module_targets: HashMap::new(),
+                declared_module_targets: HashMap::new(),
                 reexports: Vec::new(),
             },
         );
@@ -9705,6 +9986,7 @@ fn load_db_file_indexes(
                 node_by_bare: HashMap::new(),
                 node_kind_by_id: HashMap::new(),
                 module_targets: HashMap::new(),
+                declared_module_targets: HashMap::new(),
                 reexports: Vec::new(),
             });
         if exported {
@@ -9725,7 +10007,7 @@ fn load_db_file_indexes(
     let dependencies_by_file = load_file_dependencies_index(tx)?;
     let mut ref_stmt = tx.prepare(
         "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard, local_name, requested_name
-         FROM refs WHERE kind IN ('reexport', 'export_alias')",
+             FROM refs WHERE kind IN ('module', 'reexport', 'export_alias')",
     )?;
     let ref_rows = ref_stmt.query_map([], |row| {
         Ok((
@@ -9772,14 +10054,22 @@ fn load_db_file_indexes(
             &file_deps,
             &file_keys,
         );
-        let target_file = deps
-            .iter()
-            .find(|dep| file_keys.contains(*dep))
-            .map(|dep| relative_path(project_root, &canonicalize_path(&project_root.join(dep))));
+        let target_file = if kind == "module" {
+            rust_declared_module_target(project_root, &caller_file, &module_path)
+        } else {
+            deps.iter()
+                .find(|dep| file_keys.contains(*dep))
+                .map(|dep| relative_path(project_root, &canonicalize_path(&project_root.join(dep))))
+        };
         if let Some(file) = files.get_mut(&caller_file) {
             file.module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
+            if kind == "module" {
+                file.declared_module_targets
+                    .entry(module_path.clone())
+                    .or_insert_with(|| target_file.clone());
+            }
             if kind == "reexport" {
                 let raw = RawRef {
                     ref_id,
@@ -16374,6 +16664,184 @@ edition = "2021"
     }
 
     #[test]
+    fn rust_cfg_attributed_module_resolves_outgoing_calls() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "cfg-module-outgoing-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "pub fn project_range() {}\n\n#[cfg(any(test, feature = \"test-conformance\"))]\npub mod conformance;\npub mod ordinary;\n",
+        );
+        for module in ["conformance", "ordinary"] {
+            write_file(
+                root,
+                &format!("src/{module}.rs"),
+                "use crate::project_range;\n\npub fn local_target() {}\n\npub fn run() {\n    local_target();\n    project_range();\n}\n",
+            );
+        }
+
+        let (store, _) = cold_build_twice(root);
+        for module in ["conformance", "ordinary"] {
+            assert_direct_caller(
+                &store,
+                &format!("src/{module}.rs"),
+                "local_target",
+                &format!("src/{module}.rs"),
+                "run",
+            );
+            assert_direct_caller(
+                &store,
+                "src/lib.rs",
+                "project_range",
+                &format!("src/{module}.rs"),
+                "run",
+            );
+        }
+    }
+
+    #[test]
+    fn rust_registered_modules_preserve_import_alias_resolution() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "registered-module-import-control");
+        write_file(
+            root,
+            "src/main.rs",
+            "mod commands;\nmod db;\nfn main() {}\n",
+        );
+        write_file(
+            root,
+            "src/commands.rs",
+            "use crate::db;\n\npub fn run() {\n    db::helper();\n}\n",
+        );
+        write_file(root, "src/db.rs", "pub fn helper() {}\n");
+
+        let main_extract =
+            build_file_extract(root, &root.join("src/main.rs")).expect("main extract");
+        let commands_extract =
+            build_file_extract(root, &root.join("src/commands.rs")).expect("commands extract");
+        let db_extract = build_file_extract(root, &root.join("src/db.rs")).expect("db extract");
+        let files = [&main_extract, &commands_extract, &db_extract]
+            .into_iter()
+            .map(|extract| {
+                (
+                    extract.rel_path.clone(),
+                    DbFileIndex::from_extract(root, extract),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let caller_data = [&main_extract, &commands_extract, &db_extract]
+            .into_iter()
+            .map(|extract| (extract.rel_path.clone(), &extract.data))
+            .collect::<HashMap<_, _>>();
+        let index = ProjectIndex::from_parts(
+            root,
+            files,
+            caller_data,
+            WorkspaceCratePrefixCache::default(),
+        );
+        assert_eq!(
+            index.module_parent("src/commands.rs"),
+            Some(("src/main.rs".to_string(), "commands".to_string()))
+        );
+        assert_eq!(
+            index.module_target("src/main.rs", "db").as_deref(),
+            Some("src/db.rs")
+        );
+        let call = commands_extract
+            .raw_refs
+            .iter()
+            .find(|raw| raw.kind == "call" && raw.full_ref.as_deref() == Some("db::helper"))
+            .expect("db helper call")
+            .clone();
+        let resolved = resolve_ref(call, &index).expect("resolve db helper");
+        assert_eq!(resolved.target_file.as_deref(), Some("src/db.rs"));
+        assert_eq!(resolved.target_symbol.as_deref(), Some("helper"));
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/db.rs", "helper", "src/commands.rs", "run");
+    }
+
+    #[test]
+    fn rust_path_attributed_module_uses_declared_logical_parent() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "path-module-outgoing-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "pub fn project_range() {}\n\n#[cfg(test)]\n#[path = \"alternate/custom.rs\"]\npub mod conformance;\n",
+        );
+        write_file(
+            root,
+            "src/alternate/custom.rs",
+            "pub fn run() {\n    super::project_range();\n}\n",
+        );
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "project_range",
+            "src/alternate/custom.rs",
+            "run",
+        );
+    }
+
+    #[test]
+    fn rust_same_file_test_module_receiver_method_dispatch_resolves() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "same-file-test-module-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"pub struct Index(u32);
+
+impl Index {
+    pub fn shares_index_with(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Index;
+
+    #[test]
+    fn compares_indexes() {
+        let before = Index(1);
+        let after = Index(1);
+        assert!(before.shares_index_with(&after));
+    }
+}
+"#,
+        );
+
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Index::shares_index_with",
+            "src/lib.rs",
+            "tests::compares_indexes",
+        );
+        assert!(
+            snapshot.outbound_calls.iter().any(|call| {
+                call.caller_symbol == "compares_indexes"
+                    && call.line == 17
+                    && call.target.starts_with(&format!(
+                        "shares_index_with{}before.shares_index_with",
+                        crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR
+                    ))
+            }),
+            "expected projected macro receiver call; calls: {:#?}",
+            snapshot.outbound_calls
+        );
+    }
+
+    #[test]
     fn rust_generic_self_turbofish_method_dispatch_resolves() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
@@ -16690,6 +17158,7 @@ mod reexport_resolution_tests {
             node_by_bare: HashMap::new(),
             node_kind_by_id: HashMap::new(),
             module_targets: HashMap::new(),
+            declared_module_targets: HashMap::new(),
             reexports: reexport_targets
                 .iter()
                 .map(|target| ReexportIndex {

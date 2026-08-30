@@ -15,6 +15,7 @@ use crate::parser::LangId;
 // descending and treat the node as an opaque leaf. Kept well under the pool
 // stack budget (see dispatch.rs stack_size).
 const MAX_AST_WALK_DEPTH: u32 = 1_500;
+const MAX_RUST_MACRO_CALL_DEPTH: u32 = 32;
 
 /// Returns the tree-sitter node kind strings that represent call expressions
 /// for the given language.
@@ -756,7 +757,114 @@ pub fn extract_calls_full(
         &call_kinds,
         &mut results,
     );
+    if lang == LangId::Rust {
+        collect_rust_macro_calls(root, source, byte_start, byte_end, 0, &mut results);
+        results.sort_by_key(|(_, _, _, start, end)| (*start, *end));
+        results.dedup();
+    }
     results
+}
+
+fn collect_rust_macro_calls(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    depth: u32,
+    results: &mut Vec<(String, String, u32, usize, usize)>,
+) {
+    if depth >= MAX_RUST_MACRO_CALL_DEPTH
+        || node.end_byte() <= byte_start
+        || node.start_byte() >= byte_end
+    {
+        return;
+    }
+
+    if node.kind() == "macro_invocation" {
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                if child.kind() == "token_tree" {
+                    collect_rust_token_tree_calls(child, source, depth, results);
+                    break;
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_rust_macro_calls(cursor.node(), source, byte_start, byte_end, depth, results);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn collect_rust_token_tree_calls(
+    token_tree: tree_sitter::Node<'_>,
+    source: &str,
+    depth: u32,
+    results: &mut Vec<(String, String, u32, usize, usize)>,
+) {
+    let range = token_tree.byte_range();
+    if range.end <= range.start + 1 {
+        return;
+    }
+    let inner_start = range.start + 1;
+    let inner_end = range.end - 1;
+    let Some(fragment) = source.get(inner_start..inner_end) else {
+        return;
+    };
+
+    let grammar = crate::parser::grammar_for(LangId::Rust);
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(fragment, None) else {
+        return;
+    };
+
+    let mut fragment_calls = Vec::new();
+    collect_calls_full(
+        tree.root_node(),
+        fragment,
+        0,
+        fragment.len(),
+        &call_node_kinds(LangId::Rust),
+        &mut fragment_calls,
+    );
+    collect_rust_macro_calls(
+        tree.root_node(),
+        fragment,
+        0,
+        fragment.len(),
+        depth + 1,
+        &mut fragment_calls,
+    );
+
+    let token_start_row = token_tree.start_position().row as u32;
+    results.extend(
+        fragment_calls
+            .into_iter()
+            .map(|(full, short, line, call_start, call_end)| {
+                (
+                    full,
+                    short,
+                    token_start_row + line,
+                    inner_start + call_start,
+                    inner_start + call_end,
+                )
+            }),
+    );
 }
 
 fn collect_calls_full(
@@ -1007,6 +1115,44 @@ fn caller(obj: *Obj) void {
         assert_symbol_has_call(&data, "caller", "foo", "foo");
         assert_symbol_has_call(&data, "caller", "obj.method", "method");
         assert_symbol_has_call(&data, "caller", "std.debug.print", "print");
+    }
+
+    #[test]
+    fn extracts_rust_receiver_calls_inside_macro_tokens() {
+        let source = r#"fn compare(before: Index, after: Index) {
+    assert!(before.shares_index_with(&after));
+}
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        let calls = extract_calls_full(source, tree.root_node(), 0, source.len(), LangId::Rust);
+        let receiver_call = calls
+            .iter()
+            .find(|(full, _, _, _, _)| full == "before.shares_index_with")
+            .expect("receiver call inside macro tokens");
+        assert_eq!(receiver_call.1, "shares_index_with");
+        assert_eq!(receiver_call.2, 2);
+        assert_eq!(
+            &source[receiver_call.3..receiver_call.4],
+            "before.shares_index_with(&after)"
+        );
+    }
+
+    #[test]
+    fn rust_macro_definitions_do_not_fabricate_receiver_calls() {
+        let source = r#"macro_rules! compare {
+    ($before:expr, $after:expr) => {
+        $before.shares_index_with(&$after)
+    };
+}
+"#;
+        let tree = parse_source(LangId::Rust, source);
+        let calls = extract_calls_full(source, tree.root_node(), 0, source.len(), LangId::Rust);
+        assert!(
+            calls
+                .iter()
+                .all(|(full, _, _, _, _)| full != "$before.shares_index_with"),
+            "macro templates are definitions, not call sites: {calls:#?}"
+        );
     }
 
     #[test]

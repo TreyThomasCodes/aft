@@ -4030,6 +4030,73 @@ testOnly();
     }
 
     #[test]
+    fn rust_macro_receiver_call_in_cfg_test_module_is_test_only() {
+        let (temp_dir, root, paths) = fixture_project(&[
+            ("src/lib.rs", "mod index;\n"),
+            (
+                "src/index.rs",
+                r#"pub struct Index(u32);
+
+impl Index {
+    pub fn shares_index_with(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Index;
+
+    #[test]
+    fn compares_indexes() {
+        let before = Index(1);
+        let after = Index(1);
+        assert!(before.shares_index_with(&after));
+    }
+}
+"#,
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture file"))
+            .collect::<Vec<_>>();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"dead-code-test-module-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let analysis =
+            DeadCodeFileAnalyzer::default().analyze_file(&root.join("src/index.rs"), false);
+        assert!(
+            analysis
+                .cfg_test_ranges
+                .iter()
+                .any(|range| range.contains(17)),
+            "cfg(test) module should classify its receiver call line as test-only: {:?}",
+            analysis.cfg_test_ranges
+        );
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp_dir.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .expect("open callgraph store");
+        store.cold_build(&paths).expect("build callgraph store");
+        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
+            .expect("project dead-code snapshot");
+        let aggregate = scan(job(&root, paths, snapshot));
+        assert!(
+            aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_some(),
+            "receiver method should be reported only in the test-only bucket: {aggregate:#}"
+        );
+        assert!(
+            !aggregate_has_item(&aggregate, "src/index.rs", "shares_index_with"),
+            "receiver method must not remain in the dead-code headline: {aggregate:#}"
+        );
+    }
+
+    #[test]
     fn method_dispatched_by_receiver_call_is_live() {
         let (_temp_dir, root, paths) = fixture_project(&[
             ("src/service.ts", "export class Service { render() {} }\n"),
