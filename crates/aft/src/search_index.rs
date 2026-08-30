@@ -4741,7 +4741,12 @@ pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
     );
 }
 
-fn referenced_artifact_cache_keys(storage_root: &Path) -> std::io::Result<HashSet<String>> {
+/// Return durable cache keys referenced by `cache-keys.json` without deriving new
+/// identities. Maintenance sweeps use this read-only snapshot as their liveness
+/// boundary so a failed or corrupt memo leaves artifacts untouched.
+pub(crate) fn referenced_artifact_cache_keys(
+    storage_root: &Path,
+) -> std::io::Result<HashSet<String>> {
     let state = artifact_cache_key_memo_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4767,7 +4772,9 @@ fn referenced_artifact_cache_keys(storage_root: &Path) -> std::io::Result<HashSe
         .collect())
 }
 
-fn derived_artifact_cache_keys() -> HashSet<String> {
+/// Return keys derived by this process. They supplement the durable memo during
+/// maintenance, protecting an active root before its next memo write completes.
+pub(crate) fn derived_artifact_cache_keys() -> HashSet<String> {
     DERIVED_CACHE_KEYS
         .get()
         .and_then(|keys| keys.try_read().ok())

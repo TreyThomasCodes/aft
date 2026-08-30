@@ -57,6 +57,15 @@ const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 /// budget; negative values are KiB per SQLite's `cache_size` pragma.
 const CALLGRAPH_SQLITE_CACHE_KIB: i64 = -8 * 1024;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+/// A root removed from `cache-keys.json` cannot be reached by a future checkout.
+/// Wait the same seven-day grace period as cache-key eviction before deleting its
+/// callgraph directory so an interrupted configuration never loses recent data.
+const CALLGRAPH_ROOT_ORPHAN_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// One publish must not spend unbounded time walking a large artifact store. The
+/// cursor resumes after this many root-keyed directories on the next publication.
+const CALLGRAPH_ROOT_SWEEP_LIMIT: usize = 200;
+const CALLGRAPH_ROOT_SWEEP_BUDGET: Duration = Duration::from_secs(5);
+static CALLGRAPH_ROOT_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 // Cold-build working-set limits are implementation constants rather than user
 // knobs so a large non-git root cannot accidentally opt back into an OOM path.
@@ -3186,6 +3195,7 @@ impl CallGraphStore {
             // temps for roots that no longer build here, which the per-root GC
             // above never reaches.
             sweep_orphaned_build_temps_store_wide(callgraph_dir);
+            sweep_orphaned_callgraph_root_dirs(callgraph_dir);
             if let Some(storage_root) = root_storage_dir(callgraph_dir) {
                 let inspect_root =
                     storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
@@ -7869,6 +7879,426 @@ fn remove_sqlite_sidecars(path: &Path) {
     let _ = std::fs::remove_file(PathBuf::from(format!("{path_text}-wal")));
     let _ = std::fs::remove_file(PathBuf::from(format!("{path_text}-shm")));
     let _ = std::fs::remove_file(PathBuf::from(format!("{path_text}-journal")));
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CallgraphRootSweepSummary {
+    scanned: usize,
+    removed: usize,
+    bytes: u64,
+    generation_gc: usize,
+    skipped_memo: usize,
+    skipped_derived: usize,
+    skipped_fresh: usize,
+    skipped_reader: usize,
+    skipped_lease: usize,
+    skipped_unreadable: usize,
+    budget_exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CallgraphRootFileStats {
+    newest: Option<SystemTime>,
+    bytes: u64,
+}
+
+enum CallgraphRootWalk {
+    Complete(CallgraphRootFileStats),
+    BudgetExceeded,
+    Failed,
+}
+
+enum CallgraphRootCandidate {
+    Removed { bytes: u64 },
+    GenerationGc,
+    SkippedMemo,
+    SkippedDerived,
+    SkippedFresh,
+    SkippedReader,
+    SkippedLease,
+    SkippedUnreadable,
+    BudgetExceeded,
+}
+
+/// Sweep root-keyed callgraph directories that were detached when cache-key
+/// eviction forgot a checkout. Generation GC alone only runs while a root
+/// publishes, so inactive roots otherwise keep every obsolete generation forever.
+///
+/// The pass reuses the index-cache liveness boundary and takes each directory's
+/// writer lease before mutating it. A current memo entry remains eligible only for
+/// superseded-generation GC; an absent entry is eligible for whole-directory
+/// deletion after the conservative age threshold.
+fn sweep_orphaned_callgraph_root_dirs(callgraph_dir: &Path) {
+    let Some(storage_root) = root_storage_dir(callgraph_dir) else {
+        return;
+    };
+    let root_dir = storage_root.join(crate::root_cache::RootCacheDomain::Callgraph.as_str());
+    let memo_keys = match crate::search_index::referenced_artifact_cache_keys(&storage_root) {
+        Ok(keys) => keys,
+        Err(error) => {
+            crate::slog_warn!(
+                "callgraph root sweep root={} scanned=0 removed=0 bytes=0 generation_gc=0 skipped_memo=0 skipped_derived=0 skipped_fresh=0 skipped_reader=0 skipped_lease=0 skipped_unreadable=0 budget_exhausted=false memo_unreadable=true error={}",
+                root_dir.display(),
+                error
+            );
+            return;
+        }
+    };
+    let derived_keys = crate::search_index::derived_artifact_cache_keys();
+    let summary = sweep_callgraph_root_dirs_with_limits(
+        &root_dir,
+        &memo_keys,
+        &derived_keys,
+        CALLGRAPH_ROOT_SWEEP_BUDGET,
+        CALLGRAPH_ROOT_SWEEP_LIMIT,
+    );
+    crate::slog_info!(
+        "callgraph root sweep root={} scanned={} removed={} bytes={} generation_gc={} skipped_memo={} skipped_derived={} skipped_fresh={} skipped_reader={} skipped_lease={} skipped_unreadable={} budget_exhausted={}",
+        root_dir.display(),
+        summary.scanned,
+        summary.removed,
+        summary.bytes,
+        summary.generation_gc,
+        summary.skipped_memo,
+        summary.skipped_derived,
+        summary.skipped_fresh,
+        summary.skipped_reader,
+        summary.skipped_lease,
+        summary.skipped_unreadable,
+        summary.budget_exhausted
+    );
+}
+
+fn sweep_callgraph_root_dirs_with_limits(
+    root_dir: &Path,
+    memo_keys: &HashSet<String>,
+    derived_keys: &HashSet<String>,
+    wall_clock_budget: Duration,
+    entry_limit: usize,
+) -> CallgraphRootSweepSummary {
+    let started = Instant::now();
+    let deadline = started + wall_clock_budget;
+    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(root_dir) {
+        Ok(boundary) => boundary,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CallgraphRootSweepSummary::default();
+        }
+        Err(error) => {
+            crate::slog_warn!(
+                "cannot establish filesystem boundary for callgraph root sweep {}: {}",
+                root_dir.display(),
+                error
+            );
+            return CallgraphRootSweepSummary {
+                skipped_unreadable: 1,
+                ..CallgraphRootSweepSummary::default()
+            };
+        }
+    };
+    let mut entries = match std::fs::read_dir(root_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|file_type| file_type.is_dir() && artifact_key_looks_valid(&name))
+                    .map(|_| (name, entry.path()))
+            })
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            crate::slog_warn!(
+                "cannot read callgraph root sweep directory {}: {}",
+                root_dir.display(),
+                error
+            );
+            return CallgraphRootSweepSummary {
+                skipped_unreadable: 1,
+                ..CallgraphRootSweepSummary::default()
+            };
+        }
+    };
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let cursor_store = CALLGRAPH_ROOT_SWEEP_CURSORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let last_name = cursor_store
+        .lock()
+        .ok()
+        .and_then(|cursors| cursors.get(root_dir).cloned());
+    if let Some(start) = last_name
+        .as_deref()
+        .and_then(|last| entries.iter().position(|(name, _)| name.as_str() > last))
+    {
+        entries.rotate_left(start);
+    }
+
+    let mut summary = CallgraphRootSweepSummary::default();
+    let mut cursor_name = last_name;
+    for (processed, (key, cache_dir)) in entries.into_iter().enumerate() {
+        if processed >= entry_limit || Instant::now() >= deadline {
+            summary.budget_exhausted = true;
+            break;
+        }
+        summary.scanned += 1;
+        cursor_name = Some(key.clone());
+        match callgraph_root_candidate(
+            &cache_dir,
+            &key,
+            memo_keys.contains(&key),
+            derived_keys.contains(&key),
+            &boundary,
+            deadline,
+        ) {
+            CallgraphRootCandidate::Removed { bytes } => {
+                summary.removed += 1;
+                summary.bytes = summary.bytes.saturating_add(bytes);
+            }
+            CallgraphRootCandidate::GenerationGc => summary.generation_gc += 1,
+            CallgraphRootCandidate::SkippedMemo => summary.skipped_memo += 1,
+            CallgraphRootCandidate::SkippedDerived => summary.skipped_derived += 1,
+            CallgraphRootCandidate::SkippedFresh => summary.skipped_fresh += 1,
+            CallgraphRootCandidate::SkippedReader => summary.skipped_reader += 1,
+            CallgraphRootCandidate::SkippedLease => summary.skipped_lease += 1,
+            CallgraphRootCandidate::SkippedUnreadable => summary.skipped_unreadable += 1,
+            CallgraphRootCandidate::BudgetExceeded => {
+                summary.budget_exhausted = true;
+                break;
+            }
+        }
+    }
+
+    if let Ok(mut cursors) = cursor_store.lock() {
+        if summary.budget_exhausted {
+            if let Some(cursor_name) = cursor_name {
+                cursors.insert(root_dir.to_path_buf(), cursor_name);
+            }
+        } else {
+            cursors.remove(root_dir);
+        }
+    }
+    if summary.removed > 0 {
+        crate::fs_lock::sync_parent(root_dir);
+    }
+    summary
+}
+
+fn callgraph_root_candidate(
+    cache_dir: &Path,
+    project_key: &str,
+    memo_referenced: bool,
+    derived_in_process: bool,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    deadline: Instant,
+) -> CallgraphRootCandidate {
+    if !boundary.should_descend(cache_dir).unwrap_or(false) {
+        return CallgraphRootCandidate::SkippedUnreadable;
+    }
+    if memo_referenced || derived_in_process {
+        return sweep_live_callgraph_root_generations(
+            cache_dir,
+            project_key,
+            memo_referenced,
+            boundary,
+            deadline,
+        );
+    }
+
+    let stats = match callgraph_root_file_stats(cache_dir, boundary, deadline) {
+        CallgraphRootWalk::Complete(stats) => stats,
+        CallgraphRootWalk::BudgetExceeded => return CallgraphRootCandidate::BudgetExceeded,
+        CallgraphRootWalk::Failed => return CallgraphRootCandidate::SkippedUnreadable,
+    };
+    let Some(newest) = stats.newest else {
+        return CallgraphRootCandidate::SkippedUnreadable;
+    };
+    if SystemTime::now()
+        .duration_since(newest)
+        .unwrap_or(Duration::ZERO)
+        < CALLGRAPH_ROOT_ORPHAN_MIN_AGE
+    {
+        return CallgraphRootCandidate::SkippedFresh;
+    }
+
+    // Keep the writer lease held through deletion. A concurrent publisher either
+    // owns it first (and this pass skips) or starts after this directory is gone.
+    let _writer_lease = match crate::fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(cache_dir),
+        Duration::ZERO,
+    ) {
+        Ok(lease) => lease,
+        Err(_) => return CallgraphRootCandidate::SkippedLease,
+    };
+    if crate::root_cache::sweep_all_read_markers(cache_dir).protected {
+        return CallgraphRootCandidate::SkippedReader;
+    }
+
+    match std::fs::remove_dir_all(cache_dir) {
+        Ok(()) => {
+            crate::slog_info!(
+                "callgraph root sweep reaped dir={} key={} bytes={}",
+                cache_dir.display(),
+                project_key,
+                stats.bytes
+            );
+            CallgraphRootCandidate::Removed { bytes: stats.bytes }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !cache_dir.exists() => {
+            crate::slog_info!(
+                "callgraph root sweep reaped dir={} key={} bytes={}",
+                cache_dir.display(),
+                project_key,
+                stats.bytes
+            );
+            CallgraphRootCandidate::Removed { bytes: stats.bytes }
+        }
+        Err(_) => CallgraphRootCandidate::SkippedUnreadable,
+    }
+}
+
+fn sweep_live_callgraph_root_generations(
+    cache_dir: &Path,
+    project_key: &str,
+    memo_referenced: bool,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    deadline: Instant,
+) -> CallgraphRootCandidate {
+    if Instant::now() >= deadline {
+        return CallgraphRootCandidate::BudgetExceeded;
+    }
+    let stats = match callgraph_root_file_stats(cache_dir, boundary, deadline) {
+        CallgraphRootWalk::Complete(stats) => stats,
+        CallgraphRootWalk::BudgetExceeded => return CallgraphRootCandidate::BudgetExceeded,
+        CallgraphRootWalk::Failed => return CallgraphRootCandidate::SkippedUnreadable,
+    };
+    let Some(newest) = stats.newest else {
+        return CallgraphRootCandidate::SkippedUnreadable;
+    };
+    if SystemTime::now()
+        .duration_since(newest)
+        .unwrap_or(Duration::ZERO)
+        < CALLGRAPH_ROOT_ORPHAN_MIN_AGE
+    {
+        return CallgraphRootCandidate::SkippedFresh;
+    }
+    let _writer_lease = match crate::fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(cache_dir),
+        Duration::ZERO,
+    ) {
+        Ok(lease) => lease,
+        Err(_) => return CallgraphRootCandidate::SkippedLease,
+    };
+    if crate::root_cache::sweep_all_read_markers(cache_dir).protected {
+        return CallgraphRootCandidate::SkippedReader;
+    }
+    if let Some(current) = read_pointer(cache_dir, project_key) {
+        gc_old_generations(cache_dir, project_key, &current);
+        return CallgraphRootCandidate::GenerationGc;
+    }
+    if memo_referenced {
+        CallgraphRootCandidate::SkippedMemo
+    } else {
+        CallgraphRootCandidate::SkippedDerived
+    }
+}
+
+fn callgraph_root_file_stats(
+    cache_dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    deadline: Instant,
+) -> CallgraphRootWalk {
+    let metadata = match std::fs::metadata(cache_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CallgraphRootWalk::Complete(CallgraphRootFileStats::default());
+        }
+        Err(_) => return CallgraphRootWalk::Failed,
+    };
+    let mut stats = CallgraphRootFileStats {
+        newest: metadata.modified().ok(),
+        bytes: 0,
+    };
+    match callgraph_root_file_stats_inner(cache_dir, boundary, deadline, &mut stats) {
+        Ok(()) => CallgraphRootWalk::Complete(stats),
+        Err(CallgraphRootWalkError::BudgetExceeded) => CallgraphRootWalk::BudgetExceeded,
+        Err(CallgraphRootWalkError::Failed) => CallgraphRootWalk::Failed,
+    }
+}
+
+enum CallgraphRootWalkError {
+    BudgetExceeded,
+    Failed,
+}
+
+fn callgraph_root_file_stats_inner(
+    directory: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    deadline: Instant,
+    stats: &mut CallgraphRootFileStats,
+) -> std::result::Result<(), CallgraphRootWalkError> {
+    if Instant::now() >= deadline {
+        return Err(CallgraphRootWalkError::BudgetExceeded);
+    }
+    let entries = std::fs::read_dir(directory).map_err(|_| CallgraphRootWalkError::Failed)?;
+    for entry in entries {
+        if Instant::now() >= deadline {
+            return Err(CallgraphRootWalkError::BudgetExceeded);
+        }
+        let entry = entry.map_err(|_| CallgraphRootWalkError::Failed)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| CallgraphRootWalkError::Failed)?;
+        if file_type.is_symlink() {
+            return Err(CallgraphRootWalkError::Failed);
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if !boundary
+                .should_descend(&path)
+                .map_err(|_| CallgraphRootWalkError::Failed)?
+            {
+                return Err(CallgraphRootWalkError::Failed);
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|_| CallgraphRootWalkError::Failed)?;
+            merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+            callgraph_root_file_stats_inner(&path, boundary, deadline, stats)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(CallgraphRootWalkError::Failed);
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|_| CallgraphRootWalkError::Failed)?;
+        stats.bytes = stats.bytes.saturating_add(metadata.len());
+        merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+    }
+    Ok(())
+}
+
+fn merge_newest_callgraph_root_mtime(
+    stats: &mut CallgraphRootFileStats,
+    modified: Option<SystemTime>,
+) {
+    if let Some(modified) = modified {
+        if stats.newest.is_none_or(|newest| modified > newest) {
+            stats.newest = Some(modified);
+        }
+    }
+}
+
+fn artifact_key_looks_valid(key: &str) -> bool {
+    key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+fn reset_callgraph_root_sweep_cursor_for_test() {
+    if let Some(cursors) = CALLGRAPH_ROOT_SWEEP_CURSORS.get() {
+        cursors.lock().unwrap().clear();
+    }
 }
 
 /// Minimum age before a cold-build temporary is treated as orphaned and deleted.
@@ -14803,6 +15233,182 @@ mod cold_build_insert_tests {
         assert!(dir.path().join(&current).is_file());
         assert!(dir.path().join(&previous).is_file());
         assert!(!dir.path().join(&old).exists());
+    }
+
+    fn write_aged_callgraph_root(callgraph_root: &Path, key: &str) -> PathBuf {
+        let cache_dir = callgraph_root.join(key);
+        fs::create_dir_all(cache_dir.join("nested")).unwrap();
+        fs::write(
+            cache_dir.join("nested").join("payload.sqlite"),
+            b"old cache payload",
+        )
+        .unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        cache_dir
+    }
+
+    fn age_callgraph_root_tree(path: &Path) {
+        let old = SystemTime::now()
+            .checked_sub(CALLGRAPH_ROOT_ORPHAN_MIN_AGE + Duration::from_secs(60))
+            .unwrap_or(UNIX_EPOCH);
+        let entries = fs::read_dir(path)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        for entry in entries {
+            let child = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                age_callgraph_root_tree(&child);
+            } else {
+                filetime::set_file_mtime(&child, filetime::FileTime::from_system_time(old))
+                    .unwrap();
+            }
+        }
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old)).unwrap();
+    }
+
+    #[test]
+    fn callgraph_root_sweep_reaps_only_aged_unprotected_dead_roots() {
+        reset_callgraph_root_sweep_cursor_for_test();
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let dead = write_aged_callgraph_root(&callgraph_root, "f1e2d3c4b5a69788");
+        let leased = write_aged_callgraph_root(&callgraph_root, "e1d2c3b4a5968778");
+        let fresh = callgraph_root.join("d1c2b3a495867768");
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(fresh.join("payload.sqlite"), b"fresh cache payload").unwrap();
+        let marked = write_aged_callgraph_root(&callgraph_root, "c1b2a39485766758");
+
+        let writer_lease = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&leased),
+            Duration::ZERO,
+        )
+        .unwrap();
+        age_callgraph_root_tree(&leased);
+        let marker = crate::root_cache::ReadMarker::create(&marked, "generation").unwrap();
+        // Same-host marker protection is PID-authoritative, so this old mtime
+        // proves the reader guard instead of accidentally relying on freshness.
+        age_callgraph_root_tree(&marked);
+
+        let first = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+
+        assert_eq!(first.removed, 1);
+        assert!(first.bytes > 0, "the reaped byte count must be reported");
+        assert!(!dead.exists(), "an aged dead root must be reaped");
+        assert_eq!(first.skipped_lease, 1, "a held writer lease must win");
+        assert_eq!(first.skipped_reader, 1, "a live reader marker must win");
+        assert_eq!(first.skipped_fresh, 1, "a recent root must win");
+        assert!(leased.is_dir(), "the leased root must survive");
+        assert!(marked.is_dir(), "the reader-marked root must survive");
+        assert!(fresh.is_dir(), "the recent root must survive");
+
+        drop(writer_lease);
+        drop(marker);
+        // Mutation controls: removing each guard and aging each payload makes
+        // every initially protected decoy eligible for the next pass.
+        for cache_dir in [&leased, &marked, &fresh] {
+            age_callgraph_root_tree(cache_dir);
+        }
+        let second = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+
+        assert_eq!(second.removed, 3);
+        for cache_dir in [&leased, &marked, &fresh] {
+            assert!(
+                !cache_dir.exists(),
+                "the decoy must be reaped after its guard or freshness changes"
+            );
+        }
+        reset_callgraph_root_sweep_cursor_for_test();
+    }
+
+    #[test]
+    fn callgraph_root_sweep_resumes_after_entry_budget() {
+        reset_callgraph_root_sweep_cursor_for_test();
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let first = write_aged_callgraph_root(&callgraph_root, "1111111111111111");
+        let second = write_aged_callgraph_root(&callgraph_root, "2222222222222222");
+        let third = write_aged_callgraph_root(&callgraph_root, "3333333333333333");
+
+        let first_pass = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            1,
+        );
+        assert!(first_pass.budget_exhausted);
+        assert_eq!(first_pass.scanned, 1);
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(third.exists());
+
+        let second_pass = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            1,
+        );
+        assert!(second_pass.budget_exhausted);
+        assert!(!second.exists());
+        assert!(third.exists());
+
+        let third_pass = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            1,
+        );
+        assert!(!third_pass.budget_exhausted);
+        assert!(!third.exists());
+        reset_callgraph_root_sweep_cursor_for_test();
+    }
+
+    #[test]
+    fn callgraph_root_sweep_runs_generation_gc_for_memoized_root() {
+        reset_callgraph_root_sweep_cursor_for_test();
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let key = "a1b2c3d4e5f60718";
+        let cache_dir = callgraph_root.join(key);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let current = write_generation_with_age(&cache_dir, key, 400, Duration::ZERO);
+        let previous = write_generation_with_age(&cache_dir, key, 300, Duration::from_secs(1));
+        let obsolete = write_generation_with_age(&cache_dir, key, 200, Duration::from_secs(2));
+        publish_pointer(&cache_dir, key, &current).unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        let memo_keys = HashSet::from([key.to_string()]);
+
+        let summary = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &memo_keys,
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+
+        assert_eq!(summary.generation_gc, 1);
+        assert!(cache_dir.join(&current).is_file());
+        assert!(cache_dir.join(&previous).is_file());
+        assert!(
+            !cache_dir.join(&obsolete).exists(),
+            "the store-wide sweep must collect an inactive live root's obsolete generation"
+        );
+        reset_callgraph_root_sweep_cursor_for_test();
     }
 
     fn write_build_temp_with_age(dir: &Path, name: &str, age: Duration) -> PathBuf {
