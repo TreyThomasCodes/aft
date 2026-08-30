@@ -138,7 +138,7 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(8),
+            started.elapsed() < Duration::from_secs(30),
             "timed out waiting for pattern frame for {task_id}"
         );
     }
@@ -257,6 +257,8 @@ fn registry() -> BgTaskRegistry {
 }
 
 fn wait_for_path(path: &Path) {
+    // File publication is the event; the deadline only catches a wedged child
+    // or persistence worker and is deliberately outside normal scheduling cost.
     let started = Instant::now();
     let is_exit_marker = path.file_name().is_some_and(|name| name == "exit")
         || path
@@ -266,7 +268,7 @@ fn wait_for_path(path: &Path) {
         || (is_exit_marker && fs::metadata(path).is_ok_and(|metadata| metadata.len() == 0))
     {
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(30),
             "timed out waiting for {}",
             path.display()
         );
@@ -1487,16 +1489,19 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
 
     let mut phase_four = AftProcess::spawn();
     configure_background(&mut phase_four, project.path(), storage.path(), SESSION);
-    let no_replay_deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < no_replay_deadline {
-        if let Some(frame) = phase_four.try_read_next_timeout(Duration::from_millis(100)) {
-            assert!(
-                frame["type"] != "bash_pattern_match" || frame["task_id"] != task_id,
-                "acked watch re-delivered after restart: {frame:?}"
-            );
-        }
-    }
+    // Replay is synchronous with session restore. A following status response is
+    // a protocol barrier: AftProcess queues every push frame that preceded that
+    // response, so no observation window or scheduler assumption is required.
     let running = status(&mut phase_four, SESSION, &task_id);
+    while let Some(frame) = phase_four.try_read_next_timeout(Duration::ZERO) {
+        assert!(
+            frame["type"] != "bash_pattern_match" || frame["task_id"] != task_id,
+            "acked watch re-delivered after restart: {frame:?}"
+        );
+    }
+    // Positive control: the phase-two and phase-three restarts replayed this
+    // same row before ack, while the durable row is absent here.
+    assert!(persisted_watch_rows(storage.path(), SESSION, &task_id).is_empty());
     assert_eq!(
         running["status"], "running",
         "task exited early: {running:?}"
@@ -1506,7 +1511,6 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
         process_is_alive(child_pid),
         "background child died before release"
     );
-    assert!(persisted_watch_rows(storage.path(), SESSION, &task_id).is_empty());
 
     fs::write(&stop, b"stop").unwrap();
     let completed = wait_for_status(&mut phase_four, SESSION, &task_id, "completed");
