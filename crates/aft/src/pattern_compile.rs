@@ -170,23 +170,50 @@ pub fn compile(pattern: &str, opts: CompileOpts) -> CompileResult {
 }
 
 pub fn detect_unsupported_features(pattern: &str) -> Option<String> {
-    if pattern.contains("(?=")
-        || pattern.contains("(?!")
-        || pattern.contains("(?<=")
-        || pattern.contains("(?<!")
+    if ["(?=", "(?!", "(?<=", "(?<!"]
+        .iter()
+        .any(|token| contains_syntax_token(pattern, token))
     {
         return Some("lookaround".to_string());
     }
-    if pattern.contains("(?P=") || contains_numeric_backreference(pattern) {
+    if contains_syntax_token(pattern, "(?P=") || contains_numeric_backreference(pattern) {
         return Some("backreference".to_string());
     }
-    if pattern.contains("*+") || pattern.contains("++") || pattern.contains("?+") {
+    if ["*+", "++", "?+"]
+        .iter()
+        .any(|token| contains_syntax_token(pattern, token))
+    {
         return Some("possessive quantifier".to_string());
     }
-    if pattern.contains("(?>") {
+    if contains_syntax_token(pattern, "(?>") {
         return Some("atomic group".to_string());
     }
     None
+}
+
+fn contains_syntax_token(pattern: &str, token: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let token = token.as_bytes();
+    let mut index = 0;
+    let mut class_depth = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = index.saturating_add(2),
+            b'[' => {
+                class_depth = class_depth.saturating_add(1);
+                index += 1;
+            }
+            b']' if class_depth > 0 => {
+                class_depth -= 1;
+                index += 1;
+            }
+            _ if class_depth == 0 && bytes[index..].starts_with(token) => return true,
+            _ => index += 1,
+        }
+    }
+
+    false
 }
 
 fn has_regex_metachar(pattern: &str) -> bool {
@@ -319,6 +346,27 @@ mod tests {
                 ),
                 "{pattern}"
             );
+        }
+    }
+
+    #[test]
+    fn valid_regex_tokens_are_not_misclassified_as_unsupported() {
+        for (pattern, haystack) in [
+            (r"\*+", b"***".as_slice()),
+            (r"\(?=", b"(=".as_slice()),
+            (r"\(?P=", b"(P=".as_slice()),
+            (r"\(?>", b"(>".as_slice()),
+            (r"[(?=]+", b"(?=".as_slice()),
+            (r"[*+]+", b"*+".as_slice()),
+            (r"[(?>]+", b"(?>".as_slice()),
+            (r"[(?P=]+", b"(?P=".as_slice()),
+        ] {
+            match compile(pattern, CompileOpts::default()) {
+                CompileResult::Ok(CompiledPattern::Regex { compiled, .. }) => {
+                    assert!(compiled.is_match(haystack), "{pattern}");
+                }
+                other => panic!("expected valid regex for {pattern}, got {other:?}"),
+            }
         }
     }
 
