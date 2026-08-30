@@ -1828,8 +1828,12 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
             ok("interactive-edit")
         }),
     );
+    // Hang catch only: the store worker is held mid-write by the test seam
+    // until the flush below, so admission here is an ordering proof - a tight
+    // bound would just measure runner scheduling (census S-class shape; flaked
+    // at 150ms on loaded Linux CI).
     mutating_started_rx
-        .recv_timeout(Duration::from_millis(150))
+        .recv_timeout(Duration::from_secs(10))
         .expect("interactive writer should admit while store worker is mid-write");
     assert!(recv_async(mutating, "interactive edit completion").success);
     assert!(flush_callgraph_store_refreshes_with_budget(
