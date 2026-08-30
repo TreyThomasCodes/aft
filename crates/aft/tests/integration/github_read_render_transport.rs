@@ -238,15 +238,12 @@ fn spawn_fixture_aft(bin_dir: &Path, call_log: &Path) -> AftProcess {
 }
 
 fn configure_harness(aft: &mut AftProcess, project: &Path, storage: &Path, harness: &str) {
-    // The transport suites exercise an ENABLED gh_read surface; the gate's own
-    // default-off contract is covered by the dedicated disabled-read tests.
-    let project_config_dir = project.join(".cortexkit");
-    fs::create_dir_all(&project_config_dir).expect("create project config dir");
-    fs::write(
-        project_config_dir.join("aft.jsonc"),
-        "{\"gh_read\": {\"enabled\": true}}",
-    )
-    .expect("write gh_read project config");
+    // The transport suites exercise an ENABLED gh_read surface via a USER-tier
+    // config (the only tier that can enable it); the gate's default-off
+    // contract is covered by the dedicated disabled-read tests.
+    let user_config = project.join("user-aft.jsonc");
+    fs::write(&user_config, "{\"gh_read\": {\"enabled\": true}}")
+        .expect("write gh_read user config");
     let response = aft.send(
         &json!({
             "id": format!("configure-github-render-{harness}"),
@@ -254,6 +251,7 @@ fn configure_harness(aft: &mut AftProcess, project: &Path, storage: &Path, harne
             "harness": harness,
             "project_root": project,
             "storage_dir": storage,
+            "cortexkit_user_config_path": user_config,
         })
         .to_string(),
     );

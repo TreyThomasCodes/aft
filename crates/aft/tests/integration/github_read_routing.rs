@@ -73,22 +73,20 @@ fn spawned_with_slow_fake_gh(bin_dir: &Path, started: &Path) -> AftProcess {
     ])
 }
 
-/// Configure a throwaway project whose config enables the gh_read gate; the
+/// Configure a throwaway project with the gh_read gate enabled at the USER
+/// tier (the only tier that can enable it; project tiers drop the key). The
 /// gate's default-off contract is pinned by the dedicated disabled-read tests.
 fn configure_gh_read_enabled(aft: &mut AftProcess, project: &Path) {
-    let config_dir = project.join(".cortexkit");
-    fs::create_dir_all(&config_dir).expect("create project config dir");
-    fs::write(
-        config_dir.join("aft.jsonc"),
-        "{\"gh_read\": {\"enabled\": true}}",
-    )
-    .expect("write gh_read project config");
+    let user_config = project.join("user-aft.jsonc");
+    fs::write(&user_config, "{\"gh_read\": {\"enabled\": true}}")
+        .expect("write gh_read user config");
     let response = aft.send(
         &json!({
             "id": "configure-gh-read",
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
+            "cortexkit_user_config_path": user_config,
         })
         .to_string(),
     );

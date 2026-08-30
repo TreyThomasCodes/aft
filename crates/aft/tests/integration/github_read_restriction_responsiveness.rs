@@ -18,7 +18,6 @@ use aft::github_read::{
     sqlite_cache_store, DownloadedGithubImage, GithubDocument, GithubDocumentKind,
     GithubFetchRequest, GithubFetcher, GithubImageDownloader, GithubReadClock,
     GithubReadCompletion, GithubReadEngine, GithubReadError, GithubReadSelector, GithubReadStart,
-    GITHUB_READ_CACHE_HARD_TTL_MS, GITHUB_READ_CACHE_SOFT_TTL_MS,
 };
 use aft::harness::Harness;
 use aft::protocol::RawRequest;
@@ -90,19 +89,18 @@ fn path_with(bin_dir: &Path) -> std::ffi::OsString {
 }
 
 fn configure_gh_read(aft: &mut AftProcess, project: &Path, harness: &str) {
-    let config_dir = project.join(".cortexkit");
-    fs::create_dir_all(&config_dir).expect("create project config directory");
-    fs::write(
-        config_dir.join("aft.jsonc"),
-        r#"{"gh_read":{"enabled":true}}"#,
-    )
-    .expect("write enabled GitHub-read config");
+    // gh_read.enabled is USER-tier only (project tiers drop it), so tests
+    // enable through an injected user config file.
+    let user_config = project.join("user-aft.jsonc");
+    fs::write(&user_config, r#"{"gh_read":{"enabled":true}}"#)
+        .expect("write enabled GitHub-read user config");
     let configured = aft.send(
         &json!({
             "id": format!("configure-{harness}"),
             "command": "configure",
             "harness": harness,
             "project_root": project,
+            "cortexkit_user_config_path": user_config,
         })
         .to_string(),
     );
@@ -483,21 +481,13 @@ fn complete_deferred(start: GithubReadStart) -> GithubReadCompletion {
     }
 }
 
-fn wait_for_refresh_to_finish(engine: &GithubReadEngine) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while engine.refresh_in_flight_for_test() != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "background GitHub refresh did not finish"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
 #[test]
-fn cache_miss_hard_ttl_refresh_and_image_download_paths_use_deferred_responses() {
+fn cache_miss_repeat_read_and_image_download_paths_use_deferred_responses() {
+    // Fetch-always contract: every read is a live fetch through the deferred
+    // machinery; the cache exists only as a fetch-failure fallback, so repeat
+    // reads fetch again rather than serving TTL-fresh or stale-refresh copies.
     let storage = tempfile::tempdir().expect("create deferred-path cache storage");
-    let (refresh_started_tx, refresh_started_rx) = mpsc::sync_channel(1);
+    let (refresh_started_tx, _refresh_started_rx) = mpsc::sync_channel(1);
     let fetcher = Arc::new(InstrumentedFetcher::new(refresh_started_tx));
     let downloader = Arc::new(FixtureImageDownloader(AtomicUsize::new(0)));
     let clock = Arc::new(FixtureClock::new(1_000));
@@ -522,8 +512,8 @@ fn cache_miss_hard_ttl_refresh_and_image_download_paths_use_deferred_responses()
     );
     assert!(first.content.contains("fixture fetch 1"));
 
-    clock.set(1_000 + GITHUB_READ_CACHE_HARD_TTL_MS + 1);
-    let hard_ttl = engine
+    clock.set(2_000);
+    let repeat = engine
         .start_resource(
             &enabled_gh_read(),
             RESOURCE,
@@ -532,29 +522,12 @@ fn cache_miss_hard_ttl_refresh_and_image_download_paths_use_deferred_responses()
             None,
             GithubReadSelector::WholeDocument,
         )
-        .expect("start hard-TTL refetch");
-    let hard_ttl = complete_deferred(hard_ttl);
-    assert!(hard_ttl.content.contains("fixture fetch 2"));
-
-    clock.set(1_000 + GITHUB_READ_CACHE_HARD_TTL_MS + GITHUB_READ_CACHE_SOFT_TTL_MS + 2);
-    let stale = engine
-        .start_resource(
-            &enabled_gh_read(),
-            RESOURCE,
-            "/fixture/deferred",
-            "principal:deferred",
-            None,
-            GithubReadSelector::WholeDocument,
-        )
-        .expect("start stale read");
+        .expect("start repeat read");
+    let repeat = complete_deferred(repeat);
     assert!(
-        matches!(stale, GithubReadStart::Immediate(_)),
-        "stale text must return immediately while its refresh runs in the background"
+        repeat.content.contains("fixture fetch 2"),
+        "a repeat read must live-fetch, never serve the cached copy"
     );
-    refresh_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("background refresh begins outside the request path");
-    wait_for_refresh_to_finish(&engine);
 
     let vision = engine
         .start_resource(
