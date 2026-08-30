@@ -8147,7 +8147,12 @@ mod tests {
             }),
         );
 
-        let search_admission = search_admitted_rx.recv_timeout(Duration::from_millis(100));
+        // The decision under test is ORDERING, not latency: this recv happens
+        // while the maintenance gate is still held, so a search that could only
+        // admit after maintenance completes can never satisfy it. The budget is
+        // a hang catch - a tight bound here just measures runner scheduling
+        // (the census S-class shape) and flaked on loaded macOS CI at 100ms.
+        let search_admission = search_admitted_rx.recv_timeout(Duration::from_secs(10));
         let admission_elapsed = admission_started.elapsed();
         let mutation_waited = mutation_started_rx.try_recv().is_err();
         release_maintenance
