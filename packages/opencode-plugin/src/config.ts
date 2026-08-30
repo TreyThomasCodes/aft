@@ -330,6 +330,11 @@ const GhShimConfigSchema = z.object({
     .optional(),
 });
 
+const GhReadConfigSchema = z.object({
+  /** Operator opt-in for structured issue:// and pr:// reads. Default: false. */
+  enabled: z.boolean().optional(),
+});
+
 const GitCoAuthorSchema = z
   .string()
   .trim()
@@ -522,6 +527,8 @@ const AftConfigFieldsSchema = z.object({
   subc: SubcConfigSchema.optional(),
   /** `gh` routing shim gate and binary location; user configuration only, enabled by default. */
   gh_shim: GhShimConfigSchema.optional(),
+  /** Structured GitHub resource reads. Project config overrides user config. Default: disabled. */
+  gh_read: GhReadConfigSchema.optional(),
   /** Agent-child Git attribution. Project config may override user config. */
   git: GitConfigSchema.optional(),
 });
@@ -712,6 +719,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
+  if (config.gh_read !== undefined) overrides.gh_read = config.gh_read;
   if (config.git !== undefined) overrides.git = config.git;
 
   return overrides;
@@ -1515,6 +1523,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_chunk_size",
   "inspect",
   "worktree",
+  // GitHub resource reads execute the user's own gh authentication, so either
+  // tier may select the local opt-in and the project value takes precedence.
+  "gh_read",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",

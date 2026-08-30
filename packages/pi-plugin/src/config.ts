@@ -108,6 +108,11 @@ export interface GhShimConfig {
   binary_path?: string;
 }
 
+export interface GhReadConfig {
+  /** Operator opt-in for structured issue:// and pr:// reads. Default: false. */
+  enabled?: boolean;
+}
+
 export interface GitConfig {
   /** "off" (default), "auto", or an explicit "Name <email>" identity. */
   co_author?: string;
@@ -318,6 +323,7 @@ export interface AftConfig {
   bridge?: BridgeConfig;
   subc?: SubcConfig;
   gh_shim?: GhShimConfig;
+  gh_read?: GhReadConfig;
   git?: GitConfig;
   /** Per-harness config overrides; nested harnesses are ignored. */
   harnesses?: Record<string, Omit<AftConfig, "harnesses">>;
@@ -656,6 +662,11 @@ const GhShimConfigSchema = z.object({
     .optional(),
 });
 
+const GhReadConfigSchema = z.object({
+  /** Operator opt-in for structured issue:// and pr:// reads. Default: false. */
+  enabled: z.boolean().optional(),
+});
+
 const GitCoAuthorSchema = z
   .string()
   .trim()
@@ -764,6 +775,7 @@ const AftConfigFieldsSchema = z.object({
   bridge: BridgeConfigSchema.optional(),
   subc: SubcConfigSchema.optional(),
   gh_shim: GhShimConfigSchema.optional(),
+  gh_read: GhReadConfigSchema.optional(),
   git: GitConfigSchema.optional(),
 });
 
@@ -901,6 +913,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
+  if (config.gh_read !== undefined) overrides.gh_read = config.gh_read;
   if (config.git !== undefined) overrides.git = config.git;
 
   return overrides;
@@ -1474,6 +1487,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_chunk_size",
   "inspect",
   "worktree",
+  // GitHub resource reads execute the user's own gh authentication, so either
+  // tier may select the local opt-in and the project value takes precedence.
+  "gh_read",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",

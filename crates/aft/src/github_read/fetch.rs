@@ -29,6 +29,7 @@ pub trait GithubFetcher: Send + Sync {
 /// The typed failures returned by the GitHub read engine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GithubReadError {
+    GithubReadDisabled,
     InvalidResource(String),
     GithubCliMissing,
     FetchFailed(String),
@@ -38,6 +39,7 @@ pub enum GithubReadError {
 impl GithubReadError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::GithubReadDisabled => "gh_read_disabled",
             Self::InvalidResource(_) => "invalid_resource",
             Self::GithubCliMissing => "github_cli_missing",
             Self::FetchFailed(_) | Self::InvalidStructuredResponse(_) => "github_fetch_failed",
@@ -52,6 +54,8 @@ impl GithubReadError {
 impl fmt::Display for GithubReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GithubReadDisabled => formatter
+                .write_str("GitHub reads are disabled; set gh_read.enabled: true in aft.jsonc"),
             Self::InvalidResource(message)
             | Self::FetchFailed(message)
             | Self::InvalidStructuredResponse(message) => formatter.write_str(message),

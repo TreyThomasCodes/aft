@@ -317,10 +317,10 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   // Git co-authorship for commits made by AFT-spawned agent children.
   // "off" (default) | "auto" | an explicit "Name <email>" identity.
   // User and project tiers are accepted; normal project-over-user precedence applies.
-  "git": {
-    "co_author": "off"
+    "git": {
+      "co_author": "off"
+    }
   }
-}
 ```
 
 On Pi versions that expose the live default-tool registry, AFT hoists `powershell` only when Pi has enabled its optional built-in tool. If that registry is unavailable, set `bash.powershell_tool` to `true` to mirror Pi's setting explicitly. The default is `false`; this key does not register a tool on OpenCode.
@@ -345,6 +345,20 @@ Hashline mode needs the host's unprefixed `edit` slot. If final surface selectio
 ## `gh` routing shim
 
 AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to first-party bash and PTY child processes. The entry dispatches to the running AFT image by default; `gh_shim.binary_path` can select an absolute development or deployed image. The shim routes governed invocations through the daemon seam and passes eligible commands to the first real `gh` later on `PATH`. Set `gh_shim.enabled` to `false` in user config to remove the managed entry and skip child `PATH` injection entirely. The operator's shell startup files and terminal `PATH` are never changed.
+
+## GitHub resource reads
+
+Structured `issue://` and `pr://` reads are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
+
+```jsonc
+{
+  "gh_read": {
+    "enabled": true
+  }
+}
+```
+
+This is a simple configuration value at both user and project tiers, with project configuration taking precedence. It does not affect the `gh_shim` child-process routing gate.
 
 ## Git co-authorship
 

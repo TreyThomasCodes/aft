@@ -442,6 +442,16 @@ const CASES: ParityCase[] = [
     user: { gh_shim: { binary_path: "/tmp/aft-dev-profile/aft" } },
   },
   {
+    name: "gh_read_project_enabled",
+    user: { gh_read: { enabled: false } },
+    project: { gh_read: { enabled: true } },
+  },
+  {
+    name: "gh_read_project_disabled",
+    user: { gh_read: { enabled: true } },
+    project: { gh_read: { enabled: false } },
+  },
+  {
     name: "git_co_author_auto",
     user: { git: { co_author: "auto" } },
   },

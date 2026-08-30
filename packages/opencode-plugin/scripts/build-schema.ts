@@ -663,6 +663,21 @@ function buildSchema(): Record<string, unknown> {
           "gh routing shim operator gate. User-scoped only — a project config cannot disable the shim for the user's host.",
       },
 
+      gh_read: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: false,
+            description:
+              "Enable structured issue:// and pr:// reads. Default false; both user and project tiers are accepted with project precedence.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "GitHub resource-read operator gate. Reads are disabled unless gh_read.enabled is true.",
+      },
+
       git: {
         type: "object",
         properties: {

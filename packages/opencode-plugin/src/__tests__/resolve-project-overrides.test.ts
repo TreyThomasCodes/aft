@@ -57,6 +57,7 @@ describe("resolveProjectOverridesForConfigure", () => {
       semantic_search: true,
       callgraph_store: false,
       callgraph_chunk_size: 3,
+      gh_read: { enabled: true },
       experimental: {
         bash: { rewrite: true, compress: true, background: false },
         lsp_ty: true,
@@ -75,6 +76,7 @@ describe("resolveProjectOverridesForConfigure", () => {
       semantic_search: true,
       callgraph_store: false,
       callgraph_chunk_size: 3,
+      gh_read: { enabled: true },
       experimental_bash_rewrite: true,
       experimental_bash_compress: true,
       experimental_bash_background: false,

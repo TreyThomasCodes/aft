@@ -255,6 +255,21 @@ impl Default for GhShimConfig {
     }
 }
 
+/// Operator opt-in for structured GitHub resource reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GhReadConfig {
+    /// When false, `issue://` and `pr://` reads refuse before any cache, `gh`,
+    /// or network activity. Default false keeps the in-flight feature opt-in.
+    pub enabled: bool,
+}
+
+impl Default for GhReadConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 /// Git behavior applied only to AFT-spawned agent children.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -443,6 +458,8 @@ pub struct Config {
     pub worktree: WorktreeConfig,
     /// `gh` routing shim operator gate. Default on; see [`GhShimConfig`].
     pub gh_shim: GhShimConfig,
+    /// Structured GitHub resource read gate. Default off; see [`GhReadConfig`].
+    pub gh_read: GhReadConfig,
     /// Git attribution for AFT-spawned agent children. Default off.
     pub git: GitConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
@@ -537,6 +554,7 @@ impl Default for Config {
             backup: BackupConfig::default(),
             worktree: WorktreeConfig::default(),
             gh_shim: GhShimConfig::default(),
+            gh_read: GhReadConfig::default(),
             git: GitConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),

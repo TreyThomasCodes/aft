@@ -67,6 +67,23 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("gh_read accepts both tiers and lets the project override the user", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome };
+
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
+    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
+      gh_read: { enabled: true },
+    });
+
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
+    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
+      gh_read: { enabled: false },
+    });
+  });
+
   test("enabled defaults to true when not configured", () => {
     const fixture = createConfigFixture();
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -1143,6 +1160,12 @@ describe("resolveProjectOverridesForConfigure", () => {
   test("forwards the project-settable host fallback gate", () => {
     expect(resolveProjectOverridesForConfigure({ bash: { host_fallback: true } })).toMatchObject({
       bash: { host_fallback: true },
+    });
+  });
+
+  test("forwards gh_read to Rust configure", () => {
+    expect(resolveProjectOverridesForConfigure({ gh_read: { enabled: true } })).toMatchObject({
+      gh_read: { enabled: true },
     });
   });
 

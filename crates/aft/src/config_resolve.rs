@@ -119,6 +119,7 @@ pub struct RawAftConfig {
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
     pub gh_shim: Option<RawGhShim>,
+    pub gh_read: Option<RawGhRead>,
     pub git: Option<RawGit>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
@@ -482,6 +483,12 @@ pub struct RawGhShim {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawGhRead {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawGit {
     #[serde(deserialize_with = "deserialize_opt_git_co_author")]
     pub co_author: Option<String>,
@@ -818,6 +825,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.gh_shim.is_some() {
         base.gh_shim = override_config.gh_shim;
     }
+    if override_config.gh_read.is_some() {
+        base.gh_read = override_config.gh_read;
+    }
     if override_config.git.is_some() {
         base.git = override_config.git;
     }
@@ -895,6 +905,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
+    if project.gh_read.is_some() {
+        base.gh_read = project.gh_read;
+    }
     if project.git.is_some() {
         base.git = project.git;
     }
@@ -1345,6 +1358,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
+    config.gh_read = resolve_gh_read_config(raw.gh_read.as_ref());
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
@@ -1549,6 +1563,14 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
     gh_shim
+}
+
+fn resolve_gh_read_config(raw: Option<&RawGhRead>) -> crate::config::GhReadConfig {
+    let mut gh_read = crate::config::GhReadConfig::default();
+    if let Some(value) = raw.and_then(|raw| raw.enabled) {
+        gh_read.enabled = value;
+    }
+    gh_read
 }
 
 fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
@@ -2292,6 +2314,23 @@ mod tests {
         ] {
             assert!(keys.contains(&key.to_string()), "missing dropped key {key}");
         }
+    }
+
+    #[test]
+    fn gh_read_resolves_at_both_tiers_with_project_precedence() {
+        let enabled = resolve_config(&[
+            tier("user", r#"{"gh_read":{"enabled":false}}"#),
+            tier("project", r#"{"gh_read":{"enabled":true}}"#),
+        ]);
+        assert!(enabled.config.gh_read.enabled);
+        assert!(enabled.dropped.is_empty());
+
+        let disabled = resolve_config(&[
+            tier("user", r#"{"gh_read":{"enabled":true}}"#),
+            tier("project", r#"{"gh_read":{"enabled":false}}"#),
+        ]);
+        assert!(!disabled.config.gh_read.enabled);
+        assert!(disabled.dropped.is_empty());
     }
 
     #[test]

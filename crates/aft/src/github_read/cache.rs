@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
+use crate::config::GhReadConfig;
 use crate::db::github_read_cache::{
     evict_hard_expired_github_read_cache_entries, invalidate_github_read_cache_resource,
     lookup_github_read_cache_entry, upsert_github_read_cache_entry, GithubReadCacheEntry,
@@ -288,12 +289,14 @@ impl GithubReadEngine {
     /// Begin a resource-string read with strict parser validation.
     pub fn start_resource(
         &self,
+        gh_read: &GhReadConfig,
         resource: &str,
         working_directory: impl Into<PathBuf>,
         effective_authentication_identity: impl Into<String>,
         vision_capability: Option<bool>,
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
+        self.require_enabled(gh_read)?;
         let request = GithubReadRequest::parse(
             resource,
             working_directory,
@@ -301,15 +304,17 @@ impl GithubReadEngine {
             vision_capability,
         )
         .map_err(|error| GithubReadError::invalid_resource(error.to_string()))?;
-        self.start(request, selector)
+        self.start(gh_read, request, selector)
     }
 
     /// Start a read without blocking on GitHub or an image host.
     pub fn start(
         &self,
+        gh_read: &GhReadConfig,
         request: GithubReadRequest,
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
+        self.require_enabled(gh_read)?;
         let now_ms = self.clock.now_ms();
         let Some((slot, key)) = self.cache_key_for_request(&request)? else {
             return Ok(self.defer_fetch(request, selector));
@@ -363,6 +368,14 @@ impl GithubReadEngine {
                 effective_authentication_identity,
             )
             .map_err(cache_failure)
+    }
+
+    fn require_enabled(&self, gh_read: &GhReadConfig) -> Result<(), GithubReadError> {
+        if gh_read.enabled {
+            Ok(())
+        } else {
+            Err(GithubReadError::GithubReadDisabled)
+        }
     }
 
     /// Deterministic seam for asserting stale refresh single-flight completion.
@@ -767,6 +780,10 @@ mod tests {
         }
     }
 
+    fn enabled_gh_read() -> GhReadConfig {
+        GhReadConfig { enabled: true }
+    }
+
     fn request(vision_capability: Option<bool>) -> GithubReadRequest {
         GithubReadRequest::parse("issue://1", "/fixture", "identity", vision_capability).unwrap()
     }
@@ -782,6 +799,64 @@ mod tests {
     }
 
     #[test]
+    fn disabled_read_refuses_before_the_fetch_seam_runs() {
+        let fetcher = Arc::new(FixtureFetcher::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+
+        let error = match engine.start_resource(
+            &GhReadConfig::default(),
+            "issue://1",
+            "/fixture",
+            "identity",
+            None,
+            GithubReadSelector::default(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("disabled GitHub reads must refuse"),
+        };
+
+        assert_eq!(error.code(), "gh_read_disabled");
+        assert_eq!(
+            error.to_string(),
+            "GitHub reads are disabled; set gh_read.enabled: true in aft.jsonc"
+        );
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn enabled_read_reaches_the_fixture_fetcher() {
+        let fetcher = Arc::new(FixtureFetcher::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+
+        let GithubReadStart::Deferred(deferred) = engine
+            .start_resource(
+                &enabled_gh_read(),
+                "issue://1",
+                "/fixture",
+                "identity",
+                None,
+                GithubReadSelector::default(),
+            )
+            .expect("enabled GitHub reads should proceed")
+        else {
+            panic!("a cache miss must defer its GitHub fetch");
+        };
+
+        assert!(wait_for(deferred).unwrap().content.contains("# Issue #1"));
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn missing_capability_is_text_only_and_cache_reuse_avoids_a_second_fetch() {
         let cache = Arc::new(MemoryCache::default());
         let fetcher = Arc::new(FixtureFetcher::default());
@@ -794,14 +869,22 @@ mod tests {
         );
 
         let GithubReadStart::Deferred(first) = engine
-            .start(request(None), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("cache miss must defer its GitHub fetch");
         };
         assert_eq!(wait_for(first).unwrap().attachments.len(), 0);
         let GithubReadStart::Immediate(second) = engine
-            .start(request(None), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("fresh text-only cache hit must be immediate");
@@ -811,7 +894,11 @@ mod tests {
         assert_eq!(downloader.0.load(Ordering::SeqCst), 0);
 
         let GithubReadStart::Deferred(vision) = engine
-            .start(request(Some(true)), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(Some(true)),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("vision attachments must run outside the request loop");
@@ -839,7 +926,11 @@ mod tests {
             clock.clone(),
         );
         let GithubReadStart::Deferred(first) = engine
-            .start(request(None), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("cache miss must defer");
@@ -848,7 +939,11 @@ mod tests {
 
         clock.set(1_000 + GITHUB_READ_CACHE_SOFT_TTL_MS + 1);
         let GithubReadStart::Immediate(first_stale) = engine
-            .start(request(None), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("stale text-only cache hit must remain immediate");
@@ -864,7 +959,11 @@ mod tests {
         assert_eq!(engine.refresh_in_flight_for_test(), 1);
 
         let GithubReadStart::Immediate(second_stale) = engine
-            .start(request(None), GithubReadSelector::default())
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
             .unwrap()
         else {
             panic!("concurrent stale cache hit must remain immediate");
