@@ -19,8 +19,10 @@ fn process_exists(pid: i32) -> bool {
 
 #[cfg(unix)]
 fn wait_until_process_exits(pid: i32) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
+    // Process disappearance is the assertion; this deadline only catches a
+    // wedged process-group kill without charging runner scheduling to it.
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < hang_deadline {
         if !process_exists(pid) {
             return true;
         }
@@ -159,7 +161,7 @@ fn wait_for_bash_completed_frame(aft: &mut AftProcess, task_id: &str) -> Value {
             return frame;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(8),
+            started.elapsed() < Duration::from_secs(30),
             "timed out waiting for bash_completed frame for {task_id}; last frame: {frame:?}"
         );
     }
@@ -235,6 +237,18 @@ fn hold_until_release_command(marker: &Path, release: &Path) -> String {
         shell_quote_path(marker),
         shell_quote_path(release)
     )
+}
+
+fn cross_platform_hold_until_release_command(marker: &Path, release: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "Set-Content -NoNewline -Path {} -Value ready; while (-not (Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}",
+            cmd_quote_path(marker),
+            cmd_quote_path(release)
+        )
+    } else {
+        hold_until_release_command(marker, release)
+    }
 }
 
 #[cfg(unix)]
@@ -1033,59 +1047,63 @@ fn background_completion_metadata_is_attached_to_next_response() {
 #[test]
 fn background_completion_delivery_is_scoped_by_session_id() {
     let mut aft = AftProcess::spawn();
-    let _dir = configure_background(&mut aft);
+    let dir = configure_background(&mut aft);
+    let marker = dir.path().join("session-a-started");
+    let release = dir.path().join("session-a-release");
+    let command = cross_platform_hold_until_release_command(&marker, &release);
 
     let spawn = aft.send(
         &json!({
             "id": "spawn-session-a",
             "session_id": "session-a",
             "command": "bash",
-            "params": { "command": "echo session-a", "background": true }
+            "params": { "command": command, "background": true }
         })
         .to_string(),
     );
     assert_eq!(spawn["success"], true, "spawn failed: {spawn:?}");
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(1) {
-        let session_b = aft.send(
-            &json!({
-                "id": "ping-session-b",
-                "session_id": "session-b",
-                "command": "ping"
-            })
-            .to_string(),
-        );
-        assert_eq!(session_b["success"], true);
-        assert!(
-            session_b["bg_completions"]
-                .as_array()
-                .is_none_or(|items| items.is_empty()),
-            "session B drained session A completion: {session_b:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_file(&marker);
+    std::fs::write(&release, "release").expect("release session A task");
 
-    let started = Instant::now();
-    let completions = loop {
-        let session_a = aft.send(
-            &json!({
-                "id": "ping-session-a",
-                "session_id": "session-a",
-                "command": "ping"
-            })
-            .to_string(),
-        );
-        assert_eq!(session_a["success"], true);
-        if let Some(completions) = session_a["bg_completions"].as_array() {
-            break completions.clone();
-        }
-        assert!(started.elapsed() < Duration::from_secs(4));
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert!(completions
-        .iter()
-        .any(|completion| completion["task_id"] == task_id));
+    // The completion frame is emitted only after the authoritative completion
+    // queue has admitted the task. Query the foreign session after that event,
+    // which deterministically presents the interleaving that an unscoped drain
+    // would mishandle.
+    let terminal = wait_for_bash_completed_frame(&mut aft, &task_id);
+    assert_eq!(terminal["session_id"], "session-a");
+    let session_b = aft.send(
+        &json!({
+            "id": "ping-session-b",
+            "session_id": "session-b",
+            "command": "ping"
+        })
+        .to_string(),
+    );
+    assert_eq!(session_b["success"], true);
+    assert!(
+        session_b["bg_completions"]
+            .as_array()
+            .is_none_or(|items| items.is_empty()),
+        "session B drained session A completion: {session_b:?}"
+    );
+
+    // Positive control: the same admitted completion is visible immediately
+    // through its owning session, so the foreign-session absence is meaningful.
+    let session_a = aft.send(
+        &json!({
+            "id": "ping-session-a",
+            "session_id": "session-a",
+            "command": "ping"
+        })
+        .to_string(),
+    );
+    assert_eq!(session_a["success"], true);
+    assert!(session_a["bg_completions"]
+        .as_array()
+        .is_some_and(|completions| completions
+            .iter()
+            .any(|completion| completion["task_id"] == task_id)));
 
     assert!(aft.shutdown().success());
 }
