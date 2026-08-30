@@ -626,7 +626,7 @@ fn render_attachment_and_cache_data_do_not_expose_raw_authentication_identity() 
 }
 
 #[test]
-#[ignore = "pending deferred standalone read dispatch - see wait_for_github_read busy-wait"]
+
 fn slow_github_fetch_does_not_block_sibling_status_or_ordinary_read_on_standalone() {
     let fixture = tempfile::tempdir().expect("create slow-gh fixture root");
     let bin_dir = fixture.path().join("bin");
