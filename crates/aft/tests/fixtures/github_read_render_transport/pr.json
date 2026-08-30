@@ -1,0 +1,57 @@
+{
+  "number": 42,
+  "title": "Render structured pull requests end to end",
+  "state": "MERGED",
+  "author": { "login": "author" },
+  "createdAt": "2026-08-23T09:00:00Z",
+  "updatedAt": "2026-08-24T18:30:00Z",
+  "labels": { "nodes": [{ "name": "transport" }] },
+  "assignees": { "nodes": [{ "login": "reviewer" }] },
+  "milestone": { "title": "0.56" },
+  "body": "The full pull-request body has a checklist.\n\n- [x] canonical render\n- [x] transport parity",
+  "reactionGroups": [
+    { "content": "HEART", "users": { "totalCount": 3 } },
+    { "content": "THUMBS_DOWN", "users": { "totalCount": 1 } }
+  ],
+  "minimizedCommentsCount": 1,
+  "comments": {
+    "totalCount": 53,
+    "nodes": [
+      {
+        "author": { "login": "discussion-one" },
+        "body": "The first visible pull-request comment.",
+        "createdAt": "2026-08-23T10:00:00Z",
+        "isMinimized": true
+      },
+      {
+        "author": { "login": "discussion-two" },
+        "body": "The latest visible pull-request comment.",
+        "createdAt": "2026-08-24T10:00:00Z",
+        "isMinimized": false
+      }
+    ]
+  },
+  "files": {
+    "nodes": [
+      { "path": "crates/aft/src/github_read/render.rs", "additions": 80, "deletions": 3, "status": "modified" },
+      { "path": "crates/aft/tests/fixtures/github_read_render_transport/pr.json", "additions": 120, "deletions": 0, "status": "added" }
+    ]
+  },
+  "reviews": {
+    "nodes": [
+      {
+        "author": { "login": "approver" },
+        "body": "Approved after checking the transport bytes.",
+        "state": "APPROVED",
+        "submittedAt": "2026-08-24T16:00:00Z"
+      },
+      {
+        "author": { "login": "commenter" },
+        "body": "Please preserve the selected markdown exactly.",
+        "state": "COMMENTED",
+        "submittedAt": "2026-08-24T17:00:00Z"
+      }
+    ]
+  },
+  "url": "https://github.com/cortexkit/aft/pull/42"
+}
