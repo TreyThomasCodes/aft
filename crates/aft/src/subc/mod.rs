@@ -6739,7 +6739,9 @@ mod tests {
             .build()
             .expect("test runtime");
         let started_at = Instant::now();
-        let result = runtime.block_on(connect_and_authenticate_with_policy(&conn_path, policy, None));
+        let result = runtime.block_on(connect_and_authenticate_with_policy(
+            &conn_path, policy, None,
+        ));
         let elapsed = started_at.elapsed();
         let error = match result {
             Ok(_) => panic!("unreachable endpoint unexpectedly attached"),

@@ -1087,10 +1087,7 @@ fn inspect_blocking_reuse_waits_for_slow_category_completion() {
     let (_temp_dir, root) = fixture_project();
     let gate_ready = root.join("tier2-reuse-gate-ready");
     let gate_release = root.join("tier2-reuse-gate-release");
-    let _gate_root = EnvVarGuard::set(
-        "AFT_TEST_TIER2_REUSE_GATE_ROOT",
-        &root.to_string_lossy(),
-    );
+    let _gate_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &root.to_string_lossy());
     let _gate_ready = EnvVarGuard::set(
         "AFT_TEST_TIER2_REUSE_GATE_READY",
         &gate_ready.to_string_lossy(),
@@ -1114,17 +1111,17 @@ fn inspect_blocking_reuse_waits_for_slow_category_completion() {
 
     thread::scope(|scope_thread| {
         scope_thread.spawn(move || {
-            let outcome = manager.tier2_run_with_reuse_blocking(
-                snapshot,
-                InspectCategory::Duplicates,
-                scope,
-            );
+            let outcome =
+                manager.tier2_run_with_reuse_blocking(snapshot, InspectCategory::Duplicates, scope);
             outcome_tx.send(outcome).expect("publish Tier-2 outcome");
         });
 
         wait_for_path_event(&gate_ready, "Tier-2 worker gate admission");
         assert!(
-            matches!(outcome_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            matches!(
+                outcome_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
             "blocking reuse returned before the worker release event"
         );
         fs::write(&gate_release, b"release").expect("release Tier-2 worker");
@@ -3109,15 +3106,14 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
 
     wait_for_inspect_phase_start(REQUEST_ID, InspectPhaseId::LspQuiescence);
     assert!(
-        matches!(response_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        matches!(
+            response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
         "blocking inspect returned before producer settlement"
     );
     ctx.lsp()
-        .notify_file_changed(
-            &file,
-            "fn main() { let _settled = 1; }\n",
-            &config,
-        )
+        .notify_file_changed(&file, "fn main() { let _settled = 1; }\n", &config)
         .expect("settle the producer via an edit");
     let response = response_rx
         .recv_timeout(Duration::from_secs(30))
