@@ -27,9 +27,10 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
     subc_protocol::SUBC_LAUNCH_NONCE_ENV,
 ];
 
-/// The generated hook is POSIX `sh`, including on Git for Windows. It appends
-/// AFT's attribution before handing control to a repository hook with the same
-/// arguments Git supplied.
+/// The generated hook is POSIX `sh`, including on Git for Windows. Git's
+/// trailer parser owns newline normalization before AFT adds attribution, then
+/// the hook hands control to a repository hook with the same arguments Git
+/// supplied.
 const PREPARE_COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
 # AFT selects this hook through the agent child's environment. It does not alter
 # the repository or the user's Git configuration.
@@ -51,18 +52,9 @@ case "$mode" in
 esac
 
 if [ -n "$line" ]; then
-  trailers=$(git interpret-trailers --parse "$msg_file" 2>/dev/null || :)
   identity=${line#Co-authored-by: }
-  email=$(printf '%s\n' "$identity" | sed -n 's/.*<\([^<>]*\)>$/\1/p')
-  present=false
-  if printf '%s\n' "$trailers" | grep -i -F -x "$line" >/dev/null 2>&1; then
-    present=true
-  elif [ -n "$email" ] && printf '%s\n' "$trailers" | grep -i '^Co-authored-by:' | grep -i -F "<$email>" >/dev/null 2>&1; then
-    present=true
-  fi
-  if [ "$present" = false ]; then
-    printf '\n%s\n' "$line" >> "$msg_file"
-  fi
+  git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Co-authored-by=$identity" "$msg_file" 2>/dev/null || :
 fi
 
 repo_hooks=$(git config --local --get core.hooksPath 2>/dev/null || :)
@@ -650,6 +642,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
 
+    #[cfg(unix)]
+    const TEST_CO_AUTHOR: &str = "Pair Agent <pair@example.test>";
+
     #[test]
     fn disabled_features_leave_the_requested_environment_byte_identical() {
         let mut config = Config::default();
@@ -859,6 +854,11 @@ mod tests {
         assert!(!PREPARE_COMMIT_MSG_HOOK.contains("function "));
         assert!(!PREPARE_COMMIT_MSG_HOOK.contains("mason:*)"));
         assert!(PREPARE_COMMIT_MSG_HOOK.contains("do not\n# receive an attribution exemption"));
+        assert!(PREPARE_COMMIT_MSG_HOOK
+            .contains("git interpret-trailers --in-place --if-exists doNothing"));
+        assert!(PREPARE_COMMIT_MSG_HOOK
+            .contains("--trailer \"Co-authored-by=$identity\" \"$msg_file\""));
+        assert!(!PREPARE_COMMIT_MSG_HOOK.contains(">> \"$msg_file\""));
     }
 
     #[cfg(unix)]
@@ -888,14 +888,68 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn prepare_merge_fixture(repo: &Path) {
+        let environment = HashMap::new();
+        initialize_repo(repo);
+        run_git(repo, &["commit", "--quiet", "-m", "initial"], &environment);
+        run_git(repo, &["checkout", "--quiet", "-b", "topic"], &environment);
+        fs::write(repo.join("topic.txt"), "topic\n").unwrap();
+        run_git(repo, &["add", "topic.txt"], &environment);
+        run_git(repo, &["commit", "--quiet", "-m", "topic"], &environment);
+        run_git(repo, &["checkout", "--quiet", "-"], &environment);
+    }
+
+    #[cfg(unix)]
     fn commit_message(repo: &Path) -> String {
         let output = std::process::Command::new("git")
-            .args(["log", "-1", "--format=%B"])
+            .args(["cat-file", "commit", "HEAD"])
             .current_dir(repo)
             .output()
             .unwrap();
         assert!(output.status.success());
-        String::from_utf8(output.stdout).unwrap()
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_once("\n\n")
+            .unwrap()
+            .1
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn co_author_environment(storage: &Path) -> HashMap<String, String> {
+        let mut config = Config::default();
+        config.gh_shim.enabled = false;
+        config.git.co_author = TEST_CO_AUTHOR.to_string();
+        let mut environment = HashMap::new();
+        inject(&config, storage, &mut environment).unwrap();
+        environment
+    }
+
+    #[cfg(unix)]
+    fn expected_co_author_message(subject: &str) -> String {
+        format!("{subject}\n\nCo-authored-by: {TEST_CO_AUTHOR}\n")
+    }
+
+    #[cfg(unix)]
+    fn assert_single_co_author_message(message: &str, subject: &str) {
+        assert_eq!(message, expected_co_author_message(subject));
+        assert_eq!(message.matches("Co-authored-by:").count(), 1);
+    }
+
+    #[cfg(unix)]
+    fn run_generated_hook(
+        repo: &Path,
+        hook: &Path,
+        message_file: &Path,
+        environment: &HashMap<String, String>,
+    ) {
+        let status = std::process::Command::new(hook)
+            .arg(message_file)
+            .current_dir(repo)
+            .envs(environment)
+            .status()
+            .unwrap();
+        assert!(status.success(), "generated hook failed: {status}");
     }
 
     #[cfg(unix)]
@@ -942,6 +996,122 @@ mod tests {
             Some(value) => std::env::set_var(STORAGE_DIR_ENV, value),
             None => std::env::remove_var(STORAGE_DIR_ENV),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_separates_a_merge_subject_without_a_final_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        prepare_merge_fixture(&repo);
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "--quiet",
+                "-m",
+                "merge subject",
+                "topic",
+            ],
+            &environment,
+        );
+
+        assert_single_co_author_message(&commit_message(&repo), "merge subject");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_keeps_plain_commit_m_messages_in_trailer_form() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "plain subject"],
+            &environment,
+        );
+
+        assert_single_co_author_message(&commit_message(&repo), "plain subject");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_does_not_duplicate_a_trailer_when_rerun() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        let environment = co_author_environment(&storage);
+        let hook = storage.join(GIT_HOOKS_DIR_NAME).join(PREPARE_COMMIT_MSG);
+        let message_file = repo.join("message");
+        fs::write(&message_file, "rerun subject").unwrap();
+
+        run_generated_hook(&repo, &hook, &message_file, &environment);
+        run_generated_hook(&repo, &hook, &message_file, &environment);
+
+        assert_single_co_author_message(
+            &fs::read_to_string(message_file).unwrap(),
+            "rerun subject",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_does_nothing_when_another_co_author_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        let environment = co_author_environment(&storage);
+        let hook = storage.join(GIT_HOOKS_DIR_NAME).join(PREPARE_COMMIT_MSG);
+        let message_file = repo.join("message");
+        let original = "existing subject\n\nCo-authored-by: Other Agent <other@example.test>\n";
+        fs::write(&message_file, original).unwrap();
+
+        run_generated_hook(&repo, &hook, &message_file, &environment);
+
+        assert_eq!(fs::read_to_string(message_file).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_hook_and_chained_sibling_add_only_one_matching_trailer() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        prepare_merge_fixture(&repo);
+        let local_hook = repo.join(".git/hooks/prepare-commit-msg");
+        write_executable(
+            &local_hook,
+            "#!/bin/sh\nprintf '%s\\n' invoked > sibling-hook-ran\ngit interpret-trailers --in-place --if-exists doNothing --trailer \"Co-authored-by=Pair Agent <pair@example.test>\" \"$1\"\n",
+        );
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "--quiet",
+                "-m",
+                "chained merge subject",
+                "topic",
+            ],
+            &environment,
+        );
+
+        assert_eq!(
+            fs::read_to_string(repo.join("sibling-hook-ran")).unwrap(),
+            "invoked\n"
+        );
+        assert_single_co_author_message(&commit_message(&repo), "chained merge subject");
     }
 
     #[cfg(unix)]
