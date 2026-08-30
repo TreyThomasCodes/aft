@@ -609,12 +609,20 @@ fn slow_github_fetch_does_not_block_sibling_status_or_ordinary_read_on_standalon
     let fixture = tempfile::tempdir().expect("create slow-gh fixture root");
     let bin_dir = fixture.path().join("bin");
     let slow_started = fixture.path().join("slow-gh-started");
+    let slow_release = fixture.path().join("slow-gh-release");
     fs::create_dir_all(&bin_dir).expect("create slow-gh bin directory");
+    // The fetch blocks on a release file rather than a sleep so the pending
+    // window is gated, not timed: siblings answering while the release file is
+    // absent is a pure ordering proof, immune to runner load (census S-class).
     write_executable(
         &bin_dir.join("gh"),
         r#"#!/bin/sh
 : > "$AFT_SLOW_GH_STARTED"
-sleep 2
+waited=0
+while [ ! -e "$AFT_SLOW_GH_RELEASE" ] && [ "$waited" -lt 300 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
 printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow body","url":"https://github.com/owner/repo/issues/7","comments":[]}'
 "#,
     );
@@ -624,6 +632,7 @@ printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow bo
     let mut aft = AftProcess::spawn_with_env(&[
         ("PATH", path.as_os_str()),
         ("AFT_SLOW_GH_STARTED", slow_started.as_os_str()),
+        ("AFT_SLOW_GH_RELEASE", slow_release.as_os_str()),
     ]);
     configure_gh_read(&mut aft, fixture.path(), "runner");
 
@@ -635,7 +644,9 @@ printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow bo
         })
         .to_string(),
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // Hang catch only: under parallel-suite load the fixture's first exec can
+    // pay the fresh-inode assessment tax well past 1s.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !slow_started.exists() {
         assert!(Instant::now() < deadline, "slow gh fixture did not start");
         thread::sleep(Duration::from_millis(10));
@@ -677,11 +688,15 @@ printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow bo
         ordinary["id"], "sibling-ordinary-read",
         "sibling read must answer before the slow GitHub read: {ordinary:#}"
     );
+    let _ = siblings_started;
+    // Both siblings answered while the release file was still absent, so the
+    // slow fetch was provably pending the whole time - the ordering proof
+    // needs no elapsed bound. Release the fixture so shutdown can drain the
+    // deferred response.
     assert!(
-        siblings_started.elapsed() < Duration::from_secs(2),
-        "both siblings must complete inside the slow fetch's 2s window - \
-         ordering proof that the loop was never blocked (elapsed {:?})",
-        siblings_started.elapsed()
+        !slow_release.exists(),
+        "release file must not exist before the test creates it"
     );
+    fs::write(&slow_release, "").expect("release the slow gh fixture");
     assert!(aft.shutdown().success());
 }
