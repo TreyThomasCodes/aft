@@ -3,7 +3,7 @@
   "artifact_id": "ART-V049-S6-RELEASE-MANIFEST-001",
   "artifact_version": "0.49.0",
   "manifest_id": "MAN-V049-S6-RELEASE-001",
-  "source_commit": "1ed61dc61b1db6b69542fbf0ffd9e5dd05ade069",
+  "source_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68",
   "source_surface_manifest": "docs/v0.49-agent-surface-manifest.json",
   "distribution_manifest": "MAN-V049-DISTRIBUTION-ARTIFACTS-001",
   "hash_rule": "Hash exact UTF-8 bytes and binary bytes; do not normalize newlines, reserialize JSON, or use test-only normalization.",
@@ -306,5 +306,6 @@
       },
       "health_digest_agent_tool_description_change": false
     }
-  ]
+  ],
+  "surface_manifest_commit": "6ac70c6af6c13d4cf3093c183199b0e668fcfa68"
 }
