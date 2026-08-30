@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use aft::cache_freshness;
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
-use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call};
+use aft::commands::inspect::{
+    handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call,
+    handle_inspect_warm_for_test,
+};
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
@@ -66,7 +69,8 @@ fn file_uri(path: &Path) -> String {
 }
 
 fn collect_lsp_notifications(ctx: &AppContext, method: &str, expected: usize) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Notification count is the assertion; this only catches a wedged fake LSP.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut notifications = Vec::new();
 
     while Instant::now() < deadline && notifications.len() < expected {
@@ -98,6 +102,18 @@ fn collect_lsp_notifications(ctx: &AppContext, method: &str, expected: usize) ->
 
 fn request(payload: Value) -> RawRequest {
     serde_json::from_value(payload).expect("request parses")
+}
+
+fn wait_for_path_event(path: &Path, event: &str) {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < hang_deadline,
+            "timed out waiting for {event}: {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn env_serial_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -311,6 +327,11 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
     }
     let response = handle_inspect(&request(payload), ctx);
     serde_json::to_value(response).expect("inspect response serializes")
+}
+
+fn inspect_warm_event_driven(ctx: &AppContext, payload: Value) -> Value {
+    let response = handle_inspect_warm_for_test(&request(payload), ctx);
+    serde_json::to_value(response).expect("event-driven warm inspect response serializes")
 }
 
 fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {
@@ -1064,33 +1085,57 @@ fn inspect_blocking_reuse_attaches_to_in_flight_background_category() {
 fn inspect_blocking_reuse_waits_for_slow_category_completion() {
     let _env_lock = env_serial_lock();
     let (_temp_dir, root) = fixture_project();
-    let _delay_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_ROOT", &root.to_string_lossy());
-    let _delay = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_DELAY_MS", "150");
+    let gate_ready = root.join("tier2-reuse-gate-ready");
+    let gate_release = root.join("tier2-reuse-gate-release");
+    let _gate_root = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_ROOT",
+        &root.to_string_lossy(),
+    );
+    let _gate_ready = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_READY",
+        &gate_ready.to_string_lossy(),
+    );
+    let _gate_release = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+        &gate_release.to_string_lossy(),
+    );
     write_file(&root, "src/foo.ts", duplicate_fixture_source());
     write_file(&root, "src/bar.ts", duplicate_fixture_source());
     let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
     let snapshot = InspectSnapshot::new(
         root.clone(),
         ctx.inspect_dir(),
         ctx.config(),
         ctx.symbol_cache(),
     );
+    let scope = aft::inspect::JobScope::for_project(root);
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel(1);
 
-    let started = Instant::now();
-    let outcome = ctx.inspect_manager().tier2_run_with_reuse_blocking(
-        snapshot,
-        InspectCategory::Duplicates,
-        aft::inspect::JobScope::for_project(root),
-    );
+    thread::scope(|scope_thread| {
+        scope_thread.spawn(move || {
+            let outcome = manager.tier2_run_with_reuse_blocking(
+                snapshot,
+                InspectCategory::Duplicates,
+                scope,
+            );
+            outcome_tx.send(outcome).expect("publish Tier-2 outcome");
+        });
 
-    assert!(
-        matches!(outcome, JobOutcome::Fresh { .. }),
-        "slow Tier-2 work must complete instead of becoming pending: {outcome:?}"
-    );
-    assert!(
-        started.elapsed() >= Duration::from_millis(150),
-        "the blocking path must wait for the worker rather than applying a return budget"
-    );
+        wait_for_path_event(&gate_ready, "Tier-2 worker gate admission");
+        assert!(
+            matches!(outcome_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "blocking reuse returned before the worker release event"
+        );
+        fs::write(&gate_release, b"release").expect("release Tier-2 worker");
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("Tier-2 outcome did not arrive before the outer hang catch");
+        assert!(
+            matches!(outcome, JobOutcome::Fresh { .. }),
+            "gated Tier-2 work must complete instead of becoming pending: {outcome:?}"
+        );
+    });
 }
 
 #[test]
@@ -2434,7 +2479,7 @@ fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
         .expect("notify file changed");
     let diagnostics = ctx
         .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(2));
+        .wait_for_diagnostics(file, &config, Duration::from_secs(30));
     assert!(
         !diagnostics.is_empty(),
         "fake LSP should publish diagnostics for {file:?}"
@@ -2446,7 +2491,7 @@ fn close_with_lsp(ctx: &AppContext, file: &Path) {
     ctx.lsp().notify_file_closed(file).expect("close file");
     let diagnostics = ctx
         .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(2));
+        .wait_for_diagnostics(file, &config, Duration::from_secs(30));
     assert!(
         diagnostics.is_empty(),
         "fake LSP close should publish checked-clean diagnostics"
@@ -2491,7 +2536,8 @@ fn wait_for_inspect_phase_start(request_id: &str, phase: InspectPhaseId) {
 }
 
 fn wait_for_lsp_report_state(ctx: &AppContext, file: &Path, provisional: bool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Report state is authoritative; this deadline only catches a wedged server.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let ready = {
             let mut lsp = ctx.lsp();
@@ -3041,33 +3087,42 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
         .expect("open document");
     wait_for_lsp_report_state(&ctx, &file, true);
 
-    // While the blocking inspect waits, an edit settles the producer: the
-    // quiescence declaration and the authoritative publish arrive together.
-    let edit_ctx = Arc::clone(&ctx);
-    let edit_file = file.clone();
-    let edit_config = config.clone();
-    let editor = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        edit_ctx
-            .lsp()
-            .notify_file_changed(
-                &edit_file,
-                "fn main() { let _settled = 1; }\n",
-                &edit_config,
-            )
-            .expect("settle the producer via an edit");
+    // Start inspect first, then release the producer only after its quiescence
+    // phase is observably waiting. This makes the post-start publish ordering
+    // deterministic without charging a fixed sleep to correctness.
+    const REQUEST_ID: &str = "inspect-blocking-wait";
+    let inspect_ctx = Arc::clone(&ctx);
+    let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+    let inspector = thread::spawn(move || {
+        let response = serde_json::to_value(handle_inspect_tool_call(
+            &request(json!({
+                "id": REQUEST_ID,
+                "command": "inspect",
+            })),
+            &inspect_ctx,
+        ))
+        .expect("inspect response serializes");
+        response_tx
+            .send(response)
+            .expect("publish blocking inspect response");
     });
 
-    let started = Instant::now();
-    let response = serde_json::to_value(handle_inspect_tool_call(
-        &request(json!({
-            "id": "inspect-blocking-wait",
-            "command": "inspect",
-        })),
-        &ctx,
-    ))
-    .expect("inspect response serializes");
-    editor.join().expect("editor thread completes");
+    wait_for_inspect_phase_start(REQUEST_ID, InspectPhaseId::LspQuiescence);
+    assert!(
+        matches!(response_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "blocking inspect returned before producer settlement"
+    );
+    ctx.lsp()
+        .notify_file_changed(
+            &file,
+            "fn main() { let _settled = 1; }\n",
+            &config,
+        )
+        .expect("settle the producer via an edit");
+    let response = response_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("inspect did not settle before the outer hang catch");
+    inspector.join().expect("blocking inspector completes");
 
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["inspect_terminal"], "fresh");
@@ -3081,10 +3136,6 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
             .iter()
             .any(|item| item["message"] == "test diagnostic after change"),
         "the settled publish must be part of the payload: {response:#}"
-    );
-    assert!(
-        started.elapsed() >= Duration::from_millis(250),
-        "the wait must block until the producer settles, not return the warming store"
     );
 }
 
@@ -3247,7 +3298,7 @@ fn scoped_diagnostics_drain_events_before_the_warm_collection() {
     }
     assert_eq!(ctx.lsp().pending_event_count_for_test(), SEEDED_EVENTS);
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-drains-events",
@@ -3305,7 +3356,7 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
     let pre_open_events = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     assert_eq!(pre_open_events[0]["uri"], file_uri(&pre_opened));
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-opens-nothing",
@@ -3352,7 +3403,7 @@ fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
         PathBuf::from("/definitely/missing/fake-lsp-server"),
     );
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-missing-server",
@@ -3391,7 +3442,7 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
     write_file(&root, "docs/readme.md", "# Title\n\nsome prose\n");
     let ctx = configured_context(&root);
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-no-server",
@@ -3465,7 +3516,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         fake_server_path(),
     );
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-inapplicable-marker",
@@ -3502,7 +3553,7 @@ fn inspect_command_diagnostics_details_honor_top_k() {
     open_with_lsp(&ctx, &main_rs, "fn main() {}\n");
     open_with_lsp(&ctx, &lib_rs, "pub fn lib() {}\n");
 
-    let response = inspect(
+    let response = inspect_warm_event_driven(
         &ctx,
         json!({
             "id": "inspect-diagnostics-top-k",

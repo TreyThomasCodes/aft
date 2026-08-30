@@ -219,6 +219,16 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_inspect_payload(req, ctx, false, false, &[], &[], None)
 }
 
+/// Test-only warm-path entry that preserves nonblocking diagnostics semantics
+/// while waiting on scanner completion events with the normal phase hang catch.
+/// Integration fixtures use it when their assertion is unrelated to the
+/// one-second interactive soft deadline.
+#[doc(hidden)]
+pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+    let phase_log = InspectPhaseLog::for_request(req.id.clone());
+    handle_inspect_payload(req, ctx, false, false, &[], &[], Some(&phase_log))
+}
+
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
     let snapshot = match inspect_preflight(req, ctx) {

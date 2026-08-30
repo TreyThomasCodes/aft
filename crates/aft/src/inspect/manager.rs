@@ -2714,6 +2714,27 @@ fn delay_tier2_reuse_for_debug(project_root: &Path) {
     let _ = project_root;
     #[cfg(debug_assertions)]
     {
+        if std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_ROOT").is_some()
+            && env_project_root_matches("AFT_TEST_TIER2_REUSE_GATE_ROOT", project_root)
+        {
+            let ready = std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_READY").map(PathBuf::from);
+            let release = std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_RELEASE").map(PathBuf::from);
+            if let (Some(ready), Some(release)) = (ready, release) {
+                let _ = std::fs::write(&ready, b"ready");
+                // The release file controls correctness ordering. This deadline
+                // only prevents a broken fixture from wedging the test process.
+                let hang_deadline = Instant::now() + Duration::from_secs(30);
+                while !release.exists() {
+                    assert!(
+                        Instant::now() < hang_deadline,
+                        "timed out waiting for Tier-2 reuse gate release"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+        }
+
         if !env_project_root_matches("AFT_TEST_TIER2_REUSE_DELAY_ROOT", project_root) {
             return;
         }
