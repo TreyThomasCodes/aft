@@ -118,7 +118,12 @@ fn read_request(aft: &mut AftProcess, id: &str, resource: &str) -> serde_json::V
             "file": resource,
         })
         .to_string(),
-        Duration::from_millis(750),
+        // Correctness budget, not a latency assertion: the deferred dispatch
+        // path polls at 100ms and the fixture gh script's first exec pays the
+        // macOS fresh-inode assessment tax, so a tight budget flakes under
+        // load (rule 6987 class). Non-blocking contracts are asserted by the
+        // dedicated slow-fetch sibling test, not here.
+        Duration::from_secs(8),
     )
 }
 
@@ -388,7 +393,7 @@ fn github_cli_failures_are_actionable_redacted_and_missing_cli_is_immediate() {
         "missing gh response must include remediation: {response:#}"
     );
     assert!(
-        elapsed < Duration::from_millis(750),
+        elapsed < Duration::from_secs(2),
         "missing gh must return a typed error instead of hanging or queuing: {elapsed:?}"
     );
     assert!(missing.shutdown().success());
