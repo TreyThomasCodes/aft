@@ -367,8 +367,6 @@ Behavior:
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
 - Directories return sorted entries with trailing / for subdirectories
 
-${ISSUE_AND_PR_READ_DESCRIPTION}
-
 Examples:
   Read full file: { "path": "src/app.ts" }
   Read lines 50-100: { "path": "src/app.ts", "startLine": 50, "endLine": 100 }
@@ -376,13 +374,18 @@ Examples:
   List directory: { "path": "src/" }
 `;
 
+function readDescription(ghReadEnabled: boolean): string {
+  if (!ghReadEnabled) return READ_DESCRIPTION;
+  return READ_DESCRIPTION.replace("\nExamples:", `\n${ISSUE_AND_PR_READ_DESCRIPTION}\n\nExamples:`);
+}
+
 /**
  * Creates the simple read tool. Registers as "read" when hoisted, "aft_read" when not.
  */
 export function createReadTool(ctx: PluginContext): ToolDefinition {
   return prepareToolMap({
     read: {
-      description: READ_DESCRIPTION,
+      description: readDescription(ctx.config.gh_read?.enabled === true),
       args: {
         // OpenCode-only exception to the canonical `path` vocabulary: the
         // hoisted read/write/edit trio overrides OpenCode's built-in tools,

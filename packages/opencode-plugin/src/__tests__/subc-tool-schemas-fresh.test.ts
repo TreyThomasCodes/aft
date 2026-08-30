@@ -29,6 +29,9 @@ describe("subc tool schemas artifact", () => {
       expect((parsed[name].description as string).length).toBeGreaterThan(0);
     }
     expect(Object.keys(parsed).sort()).toEqual([...SUBC_BARE_TOOL_NAMES].sort());
+    // The manifest is shared by trusted and untrusted subc consumers, so it must
+    // retain the global gate-off surface and never advertise denied GitHub reads.
+    expect(parsed.read.description).not.toContain("issue://NUMBER");
   });
 
   test("schemas are not bare placeholders (except status empty-object contract)", () => {

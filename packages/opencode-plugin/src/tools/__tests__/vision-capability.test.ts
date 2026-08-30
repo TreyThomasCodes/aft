@@ -17,7 +17,7 @@ type ModelConfig = {
   attachment?: boolean;
 };
 
-function makeHarness(models: ModelConfig[]) {
+function makeHarness(models: ModelConfig[], ghReadEnabled = false) {
   let currentModelID = models[0]?.id ?? "missing";
   const calls: RecordedCall[] = [];
   let messageLookups = 0;
@@ -67,7 +67,7 @@ function makeHarness(models: ModelConfig[]) {
   const pluginContext = {
     pool: { getBridge: () => bridge },
     client,
-    config: {},
+    config: { gh_read: { enabled: ghReadEnabled } },
     storageDir: "/tmp/aft-vision-capability",
   } as unknown as PluginContext;
   const tool = createReadTool(pluginContext);
@@ -132,14 +132,22 @@ Behavior:
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
 - Directories return sorted entries with trailing / for subdirectories
 
-GitHub issues and pull requests can be read with \`issue://NUMBER\` and \`pr://NUMBER\` (or \`issue://OWNER/REPO/NUMBER\` and \`pr://OWNER/REPO/NUMBER\`).
-
 Examples:
   Read full file: { "path": "src/app.ts" }
   Read lines 50-100: { "path": "src/app.ts", "startLine": 50, "endLine": 100 }
   Read 30 lines from line 200: { "path": "src/app.ts", "offset": 200, "limit": 30 }
   List directory: { "path": "src/" }
 `);
+  });
+
+  test("advertises GitHub resource spellings only when the user gate is enabled", () => {
+    const enabled = makeHarness([{ id: "text" }], true).tool.description;
+    const disabled = makeHarness([{ id: "text" }], false).tool.description;
+
+    expect(enabled).toContain(
+      "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER`",
+    );
+    expect(disabled).not.toContain("issue://NUMBER");
   });
 
   test("injects false for a vision-less current model", async () => {

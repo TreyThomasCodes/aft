@@ -94,6 +94,13 @@ function formatReadAttachmentText(attachment: ReadAttachment): string {
 const ISSUE_AND_PR_READ_DESCRIPTION =
   "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
 
+const READ_DESCRIPTION =
+  "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
+
+function readDescription(ghReadEnabled: boolean): string {
+  return ghReadEnabled ? `${READ_DESCRIPTION} ${ISSUE_AND_PR_READ_DESCRIPTION}` : READ_DESCRIPTION;
+}
+
 function visionCapabilityForPiModel(extCtx: { model?: { input?: unknown } }): boolean | undefined {
   return Array.isArray(extCtx.model?.input) ? extCtx.model.input.includes("image") : undefined;
 }
@@ -525,9 +532,7 @@ export function registerHoistedTools(
       withPathAliasPreparation({
         name: readName,
         label: readName,
-        description:
-          "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported. " +
-          ISSUE_AND_PR_READ_DESCRIPTION,
+        description: readDescription(ctx.config.gh_read?.enabled === true),
         promptSnippet: "Read file contents (supports offset/limit for large files)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,

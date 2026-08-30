@@ -331,7 +331,7 @@ const GhShimConfigSchema = z.object({
 });
 
 const GhReadConfigSchema = z.object({
-  /** Operator opt-in for structured issue:// and pr:// reads. Default: false. */
+  /** User-tier operator opt-in for structured issue:// and pr:// reads. Default: false. */
   enabled: z.boolean().optional(),
 });
 
@@ -1523,9 +1523,6 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_chunk_size",
   "inspect",
   "worktree",
-  // GitHub resource reads execute the user's own gh authentication, so either
-  // tier may select the local opt-in and the project value takes precedence.
-  "gh_read",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",
@@ -1547,6 +1544,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
+  // "gh_read" — USER ONLY because it changes the global tool description.
+  // Advertising disabled resource spellings wastes prompt tokens and confuses
+  // steering; project-specific surface changes also destabilize prefix caches.
 ]);
 
 function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
@@ -1574,6 +1574,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
+  if (override.gh_read !== undefined) stripped.push("gh_read");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
   return stripped;
 }

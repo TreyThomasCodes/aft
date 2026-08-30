@@ -359,6 +359,15 @@ mod tests {
             );
         }
 
+        // The module manifest is shared across trusted and untrusted routes.
+        // Keep its committed, default-gate description free of GitHub resource
+        // spellings because untrusted consumers are never granted that feature.
+        assert!(!by_name["read"]
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issue://NUMBER"));
+
         let read = by_name["read"]
             .schema
             .get("properties")

@@ -256,6 +256,12 @@ impl Default for GhShimConfig {
 }
 
 /// Operator opt-in for structured GitHub resource reads.
+///
+/// This gate is user-tier only because it changes the globally registered read
+/// surface. Most users leave it disabled, so advertising issue and pull-request
+/// spellings that can only return a refusal would waste prompt tokens and confuse
+/// tool steering. Project-specific surfaces would also destabilize prompt-prefix
+/// caches within one host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GhReadConfig {

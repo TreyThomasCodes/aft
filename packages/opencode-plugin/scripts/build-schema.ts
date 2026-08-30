@@ -670,12 +670,12 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: false,
             description:
-              "Enable structured issue:// and pr:// reads. Default false; both user and project tiers are accepted with project precedence.",
+              "Enable structured issue:// and pr:// reads. Default false; user-scoped only because it changes the globally registered read-tool surface.",
           },
         },
         additionalProperties: false,
         description:
-          "GitHub resource-read operator gate. Reads are disabled unless gh_read.enabled is true.",
+          "GitHub resource-read operator gate. User-scoped only — a project config cannot change host-wide behavior or tool descriptions.",
       },
 
       git: {

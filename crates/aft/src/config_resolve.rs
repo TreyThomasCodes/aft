@@ -905,9 +905,6 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
-    if project.gh_read.is_some() {
-        base.gh_read = project.gh_read;
-    }
     if project.git.is_some() {
         base.git = project.git;
     }
@@ -1228,6 +1225,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
+    }
+    if raw.gh_read.is_some() {
+        push_drop(dropped, "gh_read", tier, USER_ONLY_REASON);
     }
     if raw
         .index
@@ -2317,20 +2317,22 @@ mod tests {
     }
 
     #[test]
-    fn gh_read_resolves_at_both_tiers_with_project_precedence() {
-        let enabled = resolve_config(&[
+    fn gh_read_is_user_only_and_records_project_drops() {
+        let remains_disabled = resolve_config(&[
             tier("user", r#"{"gh_read":{"enabled":false}}"#),
             tier("project", r#"{"gh_read":{"enabled":true}}"#),
         ]);
-        assert!(enabled.config.gh_read.enabled);
-        assert!(enabled.dropped.is_empty());
+        assert!(!remains_disabled.config.gh_read.enabled);
+        assert_eq!(drop_keys(&remains_disabled), vec!["gh_read"]);
+        assert_eq!(remains_disabled.dropped[0].tier, "project");
+        assert_eq!(remains_disabled.dropped[0].reason, USER_ONLY_REASON);
 
-        let disabled = resolve_config(&[
+        let remains_enabled = resolve_config(&[
             tier("user", r#"{"gh_read":{"enabled":true}}"#),
             tier("project", r#"{"gh_read":{"enabled":false}}"#),
         ]);
-        assert!(!disabled.config.gh_read.enabled);
-        assert!(disabled.dropped.is_empty());
+        assert!(remains_enabled.config.gh_read.enabled);
+        assert_eq!(drop_keys(&remains_enabled), vec!["gh_read"]);
     }
 
     #[test]

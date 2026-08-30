@@ -11,16 +11,20 @@ import {
 } from "../../__tests__/tool-test-utils.js";
 import { registerHoistedTools } from "../hoisted.js";
 
-function registerReadHarness() {
+function registerReadHarness(ghReadEnabled = false) {
   const { api, tools } = makeMockApi();
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "read result" }));
-  registerHoistedTools(api, makePluginContext(bridge), {
-    hoistRead: true,
-    hoistWrite: false,
-    hoistEdit: false,
-    hoistGrep: false,
-    restrictToProjectRoot: true,
-  });
+  registerHoistedTools(
+    api,
+    makePluginContext(bridge, { config: { gh_read: { enabled: ghReadEnabled } } }),
+    {
+      hoistRead: true,
+      hoistWrite: false,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: true,
+    },
+  );
   return { tool: tools.get("read")!, calls };
 }
 
@@ -52,8 +56,18 @@ describe("Pi read vision capability", () => {
     ]);
     expect(parameters.properties).not.toHaveProperty("vision_capability");
     expect(tool.description).toBe(
-      "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported. GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).",
+      "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
     );
+  });
+
+  test("advertises GitHub resource spellings only when the user gate is enabled", () => {
+    const enabled = registerReadHarness(true).tool.description;
+    const disabled = registerReadHarness(false).tool.description;
+
+    expect(enabled).toContain(
+      "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER`",
+    );
+    expect(disabled).not.toContain("issue://NUMBER");
   });
 
   test("injects false for a vision-less current model", async () => {

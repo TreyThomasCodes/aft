@@ -442,7 +442,8 @@ const CASES: ParityCase[] = [
     user: { gh_shim: { binary_path: "/tmp/aft-dev-profile/aft" } },
   },
   {
-    name: "gh_read_project_enabled",
+    // The gate controls a host-wide tool description, so the project attempt is dropped.
+    name: "gh_read_project_dropped",
     user: { gh_read: { enabled: false } },
     project: { gh_read: { enabled: true } },
   },

@@ -67,21 +67,21 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
-  test("gh_read accepts both tiers and lets the project override the user", () => {
+  test("gh_read honors only the user tier and warns for project overrides", () => {
     const fixture = createConfigFixture();
     const env = { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome };
 
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
-    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
-      gh_read: { enabled: true },
-    });
+    const disabled = runConfigLoader(fixture.projectDirectory, env);
+    expect(JSON.parse(disabled.stdout)).toMatchObject({ gh_read: { enabled: false } });
+    expect(disabled.stderr).toContain("Ignoring gh_read from project config");
 
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
-    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout)).toMatchObject({
-      gh_read: { enabled: false },
-    });
+    const enabled = runConfigLoader(fixture.projectDirectory, env);
+    expect(JSON.parse(enabled.stdout)).toMatchObject({ gh_read: { enabled: true } });
+    expect(enabled.stderr).toContain("Ignoring gh_read from project config");
   });
 
   test("enabled defaults to true when not configured", () => {
