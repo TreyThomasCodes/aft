@@ -34,6 +34,12 @@
   // an AFT outage - deliberately enabled only on this repo and subconscious's.
   "bash": { "host_fallback": true },
 
+  // Keep this repo's established co-author identity (predates the fleet-wide
+  // "auto" manifest-derived default in the user-tier config).
+  "git": {
+    "co_author": "alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"
+  },
+
   "inspect": {
     "duplicates": {
       // The OpenCode and Pi plugins are deliberate parity trees (same tool
