@@ -56,7 +56,21 @@ acquire_box_gate() {
   while :; do
     if [ -f "$box_gate_lock" ]; then
       local started
-      started=$(python3 -c "import json,sys;print(json.load(open('$box_gate_lock')).get('started_at',0))" 2>/dev/null || echo 0)
+      # started_at is epoch seconds by convention, but other seats have
+      # written ISO-8601 strings (MC, 2026-08-30 incident: bash arithmetic on
+      # "2026-08..." dies on octal "08"). Coerce both forms to epoch here and
+      # print 0 for anything unparseable so the staleness floor treats a
+      # malformed lock as stale instead of crashing the gate.
+      started=$(python3 -c "
+import json, datetime
+try:
+    raw = json.load(open('$box_gate_lock')).get('started_at', 0)
+    if isinstance(raw, str):
+        raw = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
+    print(int(raw))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
       local now age
       now=$(date +%s)
       age=$((now - started))
