@@ -47,6 +47,7 @@ mod fs_lock_audit_test;
 mod github_read_cache_attachment;
 mod github_read_persistence;
 mod github_read_render_transport;
+mod github_read_restriction_responsiveness;
 mod github_read_routing;
 mod grep_glob_multi_path_test;
 mod grep_glob_test;
