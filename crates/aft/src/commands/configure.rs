@@ -8193,7 +8193,8 @@ mod tests {
     }
 
     fn artifact_owner_test_mutex() -> &'static std::sync::Mutex<()> {
-        crate::artifact_owner::artifact_owner_test_mutex()
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
