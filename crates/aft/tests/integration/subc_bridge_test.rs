@@ -6667,12 +6667,26 @@ fn hold_bash_until_release_command(
     release: &std::path::Path,
     terminal_text: &str,
 ) -> String {
-    format!(
-        "printf started > \"{}\"; until [ -e \"{}\" ]; do sleep 0.05; done; printf '{}\\n'",
-        shell_path(marker),
-        shell_path(release),
-        terminal_text,
-    )
+    if cfg!(windows) {
+        // Windows bash routes through the PowerShell wrapper, where POSIX
+        // `printf`/`until`/`sleep` do not exist - the marker would never be
+        // written and the hold could never release (fired as a 30s hang-catch
+        // timeout on Windows CI). Same pattern as bash_background_test.rs's
+        // cross_platform_hold_until_release_command.
+        format!(
+            "Set-Content -NoNewline -Path \"{}\" -Value started; while (-not (Test-Path \"{}\")) {{ Start-Sleep -Milliseconds 50 }}; Write-Output '{}'",
+            shell_path(marker),
+            shell_path(release),
+            terminal_text,
+        )
+    } else {
+        format!(
+            "printf started > \"{}\"; until [ -e \"{}\" ]; do sleep 0.05; done; printf '{}\\n'",
+            shell_path(marker),
+            shell_path(release),
+            terminal_text,
+        )
+    }
 }
 
 async fn wait_for_path_event(path: &std::path::Path, event: &str) {
