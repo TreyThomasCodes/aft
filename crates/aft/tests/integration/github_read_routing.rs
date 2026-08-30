@@ -1,13 +1,17 @@
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use aft::commands::read::handle_read;
+use aft::commands::read::build_read_outcome;
 use aft::config::Config;
 use aft::context::{default_language_provider_factory, AppContext};
 use aft::protocol::RawRequest;
+use aft::response_finalize::DispatchOutcome;
 use aft::subc_translate::{subc_translate_with_context, TranslateContext};
 use serde_json::{json, Value};
 
@@ -19,6 +23,12 @@ fn write_fake_gh(bin_dir: &Path) {
     fs::write(
         &script,
         r#"#!/bin/sh
+if [ -n "${AFT_TEST_GH_STARTED:-}" ]; then
+  : > "$AFT_TEST_GH_STARTED"
+fi
+if [ -n "${AFT_TEST_GH_DELAY_SECONDS:-}" ]; then
+  sleep "$AFT_TEST_GH_DELAY_SECONDS"
+fi
 case "$1" in
   issue)
     printf '%s\n' '{"number":7,"title":"Fixture issue","state":"OPEN","body":"one\ntwo\nthree\nhttps://github.com/user-attachments/files/7/screenshot.png","url":"https://github.com/owner/repo/issues/7","comments":[]}'
@@ -48,6 +58,19 @@ fn spawned_with_fake_gh(bin_dir: &Path) -> AftProcess {
     )
     .expect("join fake gh path entries");
     AftProcess::spawn_with_env(&[("PATH", path.as_os_str())])
+}
+
+fn spawned_with_slow_fake_gh(bin_dir: &Path, started: &Path) -> AftProcess {
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin_dir.to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )
+    .expect("join fake gh path entries");
+    AftProcess::spawn_with_env(&[
+        ("PATH", path.as_os_str()),
+        ("AFT_TEST_GH_STARTED", started.as_os_str()),
+        ("AFT_TEST_GH_DELAY_SECONDS", OsStr::new("2")),
+    ])
 }
 
 /// Configure a throwaway project whose config enables the gh_read gate; the
@@ -113,6 +136,59 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
         Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\n")
     );
 
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn standalone_deferred_github_read_keeps_interleaved_request_responsive() {
+    let temp = tempfile::tempdir().expect("create slow fake gh root");
+    let bin_dir = temp.path().join("bin");
+    write_fake_gh(&bin_dir);
+    let fetch_started = temp.path().join("gh-fetch-started");
+    let mut aft = spawned_with_slow_fake_gh(&bin_dir, &fetch_started);
+    configure_gh_read_enabled(&mut aft, temp.path());
+
+    aft.send_silent(
+        &json!({
+            "id": "slow-github-read",
+            "command": "read",
+            "file": "issue://7",
+        })
+        .to_string(),
+    );
+    let fetch_deadline = Instant::now() + Duration::from_secs(5);
+    while !fetch_started.exists() {
+        assert!(
+            Instant::now() < fetch_deadline,
+            "slow GitHub fetch did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let sibling = aft.send_with_timeout(
+        &json!({
+            "id": "interleaved-ping",
+            "command": "ping",
+        })
+        .to_string(),
+        Duration::from_millis(500),
+    );
+    assert_eq!(sibling["id"], "interleaved-ping");
+    assert_eq!(sibling["success"], true);
+
+    let github = loop {
+        let frame = aft
+            .try_read_next_timeout(Duration::from_secs(3))
+            .expect("deferred GitHub read completes");
+        if frame["id"] == "slow-github-read" {
+            break frame;
+        }
+        assert!(
+            frame.get("type").is_some() && frame.get("id").is_none(),
+            "unexpected frame before deferred GitHub response: {frame:#}"
+        );
+    };
+    assert_eq!(github["success"], true, "GitHub read failed: {github:#}");
     assert!(aft.shutdown().success());
 }
 
@@ -227,7 +303,11 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
         params: json!({ "file": "issue://7" }),
     };
 
-    let response = ctx.with_force_restrict(&request.id, || handle_read(&request, &ctx));
+    let request_id = request.id.clone();
+    let outcome = ctx.with_force_restrict(&request_id, || build_read_outcome(request, &ctx));
+    let DispatchOutcome::Immediate(response) = outcome else {
+        panic!("restricted GitHub read must refuse synchronously");
+    };
     assert!(!response.success);
     assert_eq!(response.data["code"], "external_fetch_restricted");
     assert!(

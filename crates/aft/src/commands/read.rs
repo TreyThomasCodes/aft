@@ -24,6 +24,7 @@ use crate::github_read::{
     GithubReadStart, ReqwestGithubImageDownloader, SystemGithubReadClock,
 };
 use crate::protocol::{RawRequest, Response};
+use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
 
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -754,23 +755,44 @@ fn github_read_selector(req: &RawRequest) -> (GithubReadSelector, usize) {
     )
 }
 
-fn wait_for_github_read(
-    engine: &GithubReadEngine,
-    gh_read: &crate::config::GhReadConfig,
+fn start_github_read(
+    req: &RawRequest,
+    ctx: &AppContext,
     file: &str,
-    working_directory: PathBuf,
-    authentication_identity: String,
-    vision_capability: Option<bool>,
-    selector: GithubReadSelector,
+) -> Result<(GithubReadStart, usize), Response> {
+    if ctx.request_force_restrict(&req.id) {
+        return Err(Response::error(
+            &req.id,
+            "external_fetch_restricted",
+            "Network-backed GitHub reads are unavailable on restricted binds.",
+        ));
+    }
+    let working_directory = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+    let (selector, start_line) = github_read_selector(req);
+    let vision_capability = req.params.get("vision_capability").and_then(Value::as_bool);
+    let authentication_identity = format!("session:{}", req.session());
+    let gh_read = ctx.config().gh_read.clone();
+    github_read_engine(ctx)
+        .start_resource(
+            &gh_read,
+            file,
+            working_directory,
+            authentication_identity,
+            vision_capability,
+            selector,
+        )
+        .map(|start| (start, start_line))
+        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
+}
+
+fn wait_for_github_read(
+    start: GithubReadStart,
 ) -> Result<GithubReadCompletion, crate::github_read::GithubReadError> {
-    match engine.start_resource(
-        gh_read,
-        file,
-        working_directory,
-        authentication_identity,
-        vision_capability,
-        selector,
-    )? {
+    match start {
         GithubReadStart::Immediate(completion) => Ok(completion),
         GithubReadStart::Deferred(pending) => loop {
             if let Some(completion) = pending.try_complete() {
@@ -826,34 +848,58 @@ fn github_read_response(
 }
 
 fn handle_github_read(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
-    if ctx.request_force_restrict(&req.id) {
-        return Response::error(
-            &req.id,
-            "external_fetch_restricted",
-            "Network-backed GitHub reads are unavailable on restricted binds.",
-        );
-    }
-    let working_directory = ctx
-        .config()
-        .project_root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
-    let (selector, start_line) = github_read_selector(req);
-    let vision_capability = req.params.get("vision_capability").and_then(Value::as_bool);
-    let authentication_identity = format!("session:{}", req.session());
-    let gh_read = ctx.config().gh_read.clone();
-    match wait_for_github_read(
-        github_read_engine(ctx).as_ref(),
-        &gh_read,
-        file,
-        working_directory,
-        authentication_identity,
-        vision_capability,
-        selector,
-    ) {
+    let (start, start_line) = match start_github_read(req, ctx, file) {
+        Ok(start) => start,
+        Err(response) => return response,
+    };
+    match wait_for_github_read(start) {
         Ok(completion) => github_read_response(req, completion, start_line),
         Err(error) => Response::error(&req.id, error.code(), error.to_string()),
     }
+}
+
+/// Build a standalone `read` outcome without waiting on network-backed GitHub work.
+pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome {
+    let Some(file) = req
+        .params
+        .get("file")
+        .and_then(Value::as_str)
+        .filter(|file| is_github_read_target(file))
+        .map(str::to_owned)
+    else {
+        return DispatchOutcome::Immediate(handle_read(&req, ctx));
+    };
+    let (start, start_line) = match start_github_read(&req, ctx, &file) {
+        Ok(start) => start,
+        Err(response) => return DispatchOutcome::Immediate(response),
+    };
+    let pending = match start {
+        GithubReadStart::Immediate(completion) => {
+            return DispatchOutcome::Immediate(github_read_response(&req, completion, start_line));
+        }
+        GithubReadStart::Deferred(pending) => pending,
+    };
+
+    let request_id = req.id.clone();
+    let session_id = req.session().to_string();
+    let mut poll: PendingResponsePoll = Box::new(move |_| {
+        pending.try_complete().map(|completion| match completion {
+            Ok(completion) => github_read_response(&req, completion, start_line),
+            Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+        })
+    });
+    if let Some(response) = poll(ctx) {
+        return DispatchOutcome::Immediate(response);
+    }
+
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id,
+        session_id,
+        attach_command: "read".to_string(),
+        poll,
+        cancellation: None,
+        on_shutdown: None,
+    })
 }
 
 /// Handle a `read` request.

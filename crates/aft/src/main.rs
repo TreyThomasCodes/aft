@@ -987,6 +987,9 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
         let spawn_response = aft::commands::bash::handle(&req, ctx);
         return aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response);
     }
+    if req.command == "read" {
+        return aft::commands::read::build_read_outcome(req, ctx);
+    }
     DispatchOutcome::Immediate(dispatch(req, ctx))
 }
 
