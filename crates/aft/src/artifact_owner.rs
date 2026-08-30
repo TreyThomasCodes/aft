@@ -80,9 +80,14 @@ struct HeartbeatRegistry {
 static HEARTBEAT_STATE: OnceLock<Arc<HeartbeatState>> = OnceLock::new();
 
 #[cfg(test)]
-pub(crate) fn artifact_owner_test_mutex() -> &'static Mutex<()> {
+fn artifact_owner_test_mutex() -> &'static Mutex<()> {
     static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn artifact_owner_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_env::lock_test_mutex(artifact_owner_test_mutex())
 }
 
 /// Route linked worktrees to borrowing before any same-family owner claim.
@@ -917,9 +922,7 @@ mod tests {
 
     #[test]
     fn dead_owner_is_reclaimed_by_different_checkout() {
-        let _artifact_guard = artifact_owner_test_mutex()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let configured_storage = temp.path().join("configured-storage");

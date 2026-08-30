@@ -17,6 +17,16 @@ fn process_env_mutex() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Acquire a test-only serialization mutex without cascading a prior test panic.
+/// These locks serialize test setup rather than protect data invariants, so the
+/// next test must proceed after a poisoned holder instead of manufacturing a
+/// wall of unrelated failures.
+pub(crate) fn lock_test_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 thread_local! {
     static PROCESS_ENV_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
     static PROCESS_ENV_LOCK_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
@@ -53,9 +63,7 @@ impl Drop for ProcessEnvLockGuard {
 pub(crate) fn process_env_lock() -> ProcessEnvLockGuard {
     PROCESS_ENV_LOCK_DEPTH.with(|depth| {
         if depth.get() == 0 {
-            let guard = process_env_mutex()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = lock_test_mutex(process_env_mutex());
             PROCESS_ENV_LOCK_GUARD.with(|slot| {
                 *slot.borrow_mut() = Some(guard);
             });
@@ -127,5 +135,46 @@ pub(crate) fn hermetic_git_env_guard() -> HermeticGitEnvGuard {
         _lock: lock,
         _global: ScopedEnvVar::set(global_key, global_value),
         _system: ScopedEnvVar::set(system_key, system_value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mutex_lock_recovers_after_a_panicking_holder() {
+        let mutex = Mutex::new(());
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = lock_test_mutex(&mutex);
+            panic!("deliberately poison the test serialization mutex");
+        });
+        assert!(panic.is_err());
+        assert!(mutex.is_poisoned());
+
+        drop(lock_test_mutex(&mutex));
+    }
+
+    #[test]
+    fn swept_test_mutexes_do_not_bare_unwrap_locks() {
+        fn without_whitespace(source: &str) -> String {
+            source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect()
+        }
+
+        let test_env = without_whitespace(include_str!("test_env.rs"));
+        let artifact_owner = without_whitespace(include_str!("artifact_owner.rs"));
+        let configure = without_whitespace(include_str!("commands/configure.rs"));
+
+        assert!(test_env.contains("lock_test_mutex(process_env_mutex())"));
+        let process_env_bare_unwrap = ["process_env_mutex()", ".lock()", ".unwrap()"].concat();
+        assert!(!test_env.contains(&process_env_bare_unwrap));
+        assert!(artifact_owner.contains("lock_test_mutex(artifact_owner_test_mutex())"));
+        let artifact_owner_bare_unwrap =
+            ["artifact_owner_test_mutex()", ".lock()", ".unwrap()"].concat();
+        assert!(!artifact_owner.contains(&artifact_owner_bare_unwrap));
+        assert!(!configure.contains(&artifact_owner_bare_unwrap));
     }
 }

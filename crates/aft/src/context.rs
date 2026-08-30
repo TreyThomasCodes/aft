@@ -1965,10 +1965,9 @@ impl Drop for CallgraphBuildWaitMsGuard {
 /// share this with query-op tests so they cannot clobber each other's env.
 #[cfg(test)]
 pub(crate) fn override_callgraph_build_wait_ms_for_test(ms: u64) -> CallgraphBuildWaitMsGuard {
-    let guard = CALLGRAPH_BUILD_WAIT_MS_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let guard = crate::test_env::lock_test_mutex(
+        CALLGRAPH_BUILD_WAIT_MS_LOCK.get_or_init(|| std::sync::Mutex::new(())),
+    );
     let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
     // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK and restored on drop.
     unsafe {
@@ -1992,7 +1991,7 @@ fn wait_on_callgraph_build_start_gate(root: &Path) {
     drop(slot);
     if let Some(gate) = gate {
         let _ = gate.reached.send(());
-        let _ = gate.release.recv_timeout(Duration::from_secs(5));
+        let _ = gate.release.recv();
     }
 }
 

@@ -5861,7 +5861,7 @@ mod tests {
 
     #[test]
     fn sibling_clone_same_artifact_key_opens_shared_artifacts_read_only() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -5964,7 +5964,7 @@ mod tests {
 
     #[test]
     fn worktree_then_main_claim_sequence_ends_with_main_owner() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -6055,7 +6055,7 @@ mod tests {
 
     #[test]
     fn persisted_search_cache_reconfigures_max_file_size_on_same_head() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let storage = temp.path().join("storage");
@@ -6116,7 +6116,7 @@ mod tests {
 
     #[test]
     fn main_then_worktree_keeps_main_owner_and_worktree_borrows_read_only() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -6164,7 +6164,7 @@ mod tests {
 
     #[test]
     fn main_bind_self_heals_live_worktree_owner_manifest() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -6220,7 +6220,7 @@ mod tests {
 
     #[test]
     fn matching_semantic_reconfigure_adopts_the_live_builder() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let server = CountingEmbeddingServer::start();
@@ -6263,7 +6263,7 @@ mod tests {
 
     #[test]
     fn semantic_build_progress_is_monotonic_and_visible_while_embedding() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let server = CountingEmbeddingServer::start();
@@ -6335,7 +6335,7 @@ mod tests {
 
     #[test]
     fn superseded_semantic_build_stops_after_its_current_batch() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         super::reset_semantic_stale_generation_discards_for_test();
@@ -6386,7 +6386,7 @@ mod tests {
 
     #[test]
     fn semantic_catchup_refreshes_never_embed_more_than_two_roots_concurrently() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
         let config = semantic_refresh_test_config(&server.base_url);
@@ -6436,7 +6436,7 @@ mod tests {
 
     #[test]
     fn unbound_semantic_refresh_worker_never_takes_a_queued_slot() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let server = CountingEmbeddingServer::start();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -6483,7 +6483,7 @@ mod tests {
 
     #[test]
     fn equivalent_reconfigure_reloads_evicted_semantic_index_from_disk() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6617,7 +6617,7 @@ mod tests {
 
     #[test]
     fn semantic_query_reloads_evicted_index_once_without_reconfigure() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6694,7 +6694,7 @@ mod tests {
 
     #[test]
     fn grep_query_reloads_evicted_trigram_index_from_cache() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6768,7 +6768,7 @@ mod tests {
 
     #[test]
     fn linked_worktree_configure_defers_read_only_artifact_loads_without_cold_builds() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6995,7 +6995,7 @@ mod tests {
 
     #[test]
     fn read_only_borrowed_load_continuation_reaches_ready_without_another_query() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -7054,7 +7054,7 @@ mod tests {
 
     #[test]
     fn semantic_refresh_disconnect_restart_installs_replacement_loaders() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -7160,7 +7160,7 @@ mod tests {
 
     #[test]
     fn configure_artifact_loads_start_only_from_post_ack_maintenance() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7215,8 +7215,8 @@ mod tests {
         // resolve Ready on the first call. Configure maintenance runs on the
         // transport loop; if it inherited that wait, stdin EOF would not be
         // observed until the cold build finished or the window expired.
-        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(2_000);
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(60_000);
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7224,7 +7224,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(root.path());
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
-        let ctx = test_context();
+        let ctx = Arc::new(test_context());
         ctx.isolate_cold_build_limiter_for_test(1);
         let req = configure_request_with_params(json!({
             "project_root": root.path(),
@@ -7242,25 +7242,79 @@ mod tests {
         let canonical_root = ctx.canonical_cache_root();
         let (reached, release) =
             crate::context::install_callgraph_build_start_gate_for_test(canonical_root);
+        let release_after_hang = release.clone();
+        let (drain_returned_tx, drain_returned_rx) = crossbeam_channel::bounded(1);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            super::drain_deferred_configure_maintenance(&drain_ctx);
+            let _ = drain_returned_tx.send(());
+        });
 
-        let started = Instant::now();
-        super::drain_deferred_configure_maintenance(&ctx);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "configure maintenance waited {elapsed:?} for a callgraph cold build; \
-             the transport loop must return immediately so stdin EOF stays observable"
-        );
+        let completion_ctx = Arc::clone(&ctx);
+        let (outcome_tx, outcome_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                drain_returned_rx.recv().map_err(|error| {
+                    format!("configure maintenance drain disconnected before returning: {error}")
+                })?;
 
-        reached
-            .recv_timeout(Duration::from_secs(2))
-            .expect("callgraph worker must start so this test actually covers the wait skip");
-        release.send(()).unwrap();
+                // Reaching the start gate means the worker is held. An empty
+                // channel means the drain returned before the worker was even
+                // scheduled. Either event ordering proves the transport-loop
+                // drain returned without waiting for the cold build.
+                let worker_was_held = match reached.try_recv() {
+                    Ok(()) => true,
+                    Err(crossbeam_channel::TryRecvError::Empty) => false,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        return Err("callgraph build-start gate disconnected".to_string());
+                    }
+                };
+
+                release
+                    .send(())
+                    .map_err(|error| format!("release callgraph build-start gate: {error}"))?;
+                // If the drain beat worker scheduling, wait until the queued
+                // release lets that worker enter its cold build.
+                if !worker_was_held {
+                    reached.recv().map_err(|error| {
+                        format!("callgraph worker never reached its gate: {error}")
+                    })?;
+                }
+
+                let receiver = completion_ctx
+                    .callgraph_store_rx()
+                    .lock()
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "cold build did not install a completion receiver".to_string()
+                    })?;
+                receiver.recv().map_err(|error| {
+                    format!("cold build did not proceed after gate release: {error}")
+                })?;
+                drain
+                    .join()
+                    .map_err(|_| "configure maintenance drain thread panicked".to_string())?;
+                Ok(())
+            })();
+            let _ = outcome_tx.send(outcome);
+        });
+
+        match outcome_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("configure maintenance gate assertion failed: {error}"),
+            Err(error) => {
+                // Ensure a regression cannot leave its gated worker behind after
+                // the one generous hang catch fires.
+                let _ = release_after_hang.send(());
+                panic!("configure maintenance gate assertion timed out: {error}");
+            }
+        }
     }
 
     #[test]
     fn non_git_configure_defers_callgraph_until_navigation_and_reports_trip_terminally() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let root = tempfile::tempdir().unwrap();
@@ -7402,7 +7456,7 @@ mod tests {
 
     #[test]
     fn unbound_configure_cancellation_clears_gated_loaders_and_rebind_can_retry() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7459,7 +7513,7 @@ mod tests {
 
     #[test]
     fn artifact_worker_rechecks_lifecycle_after_its_start_gate() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7522,7 +7576,7 @@ mod tests {
 
     #[test]
     fn superseded_configure_tail_does_not_cancel_current_artifact_receiver() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7580,7 +7634,7 @@ mod tests {
 
     #[test]
     fn unbind_during_configure_tail_delay_does_not_release_artifact_loader() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7688,7 +7742,7 @@ mod tests {
 
     #[test]
     fn matching_callgraph_rebinds_adopt_epoch_across_generation_churn() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -7987,7 +8041,7 @@ mod tests {
 
     #[test]
     fn dead_artifact_owner_manifest_is_taken_over_on_configure() {
-        let _artifact_guard = artifact_owner_test_mutex().lock().unwrap();
+        let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
@@ -8192,8 +8246,8 @@ mod tests {
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
-    fn artifact_owner_test_mutex() -> &'static std::sync::Mutex<()> {
-        crate::artifact_owner::artifact_owner_test_mutex()
+    fn artifact_owner_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::artifact_owner::artifact_owner_test_lock()
     }
 
     #[test]
