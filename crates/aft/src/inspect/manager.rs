@@ -203,13 +203,8 @@ impl BuilderStateEntry {
         self.suspension = Some(suspension);
     }
 
-    fn detail(&self) -> String {
+    fn detail_at(&self, now_ms: u64) -> String {
         if let Some(suspension) = self.suspension.as_ref() {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64;
             return format!(
                 "suspended domain={} deaths={} age_s={} reason={}",
                 suspension.domain.as_str(),
@@ -236,11 +231,16 @@ impl BuilderStateEntry {
     }
 }
 
-fn unix_now_secs() -> u64 {
+fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn unix_now_secs() -> u64 {
+    unix_millis_now() / 1_000
 }
 
 enum BuilderAttemptTerminal {
@@ -563,10 +563,18 @@ impl InspectManager {
     }
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
+        self.tier2_builder_state_detail_at(category, unix_millis_now())
+    }
+
+    pub(crate) fn tier2_builder_state_detail_at(
+        &self,
+        category: InspectCategory,
+        now_ms: u64,
+    ) -> String {
         let key = JobKey::for_project_category(category);
         if let Ok(states) = self.builder_states.lock() {
             if let Some(entry) = states.get(&key) {
-                return entry.detail();
+                return entry.detail_at(now_ms);
             }
         }
         self.tier2_builder_state(category).as_str().to_string()

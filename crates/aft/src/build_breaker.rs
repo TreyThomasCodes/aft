@@ -789,30 +789,26 @@ mod tests {
             BuildDomain::CallgraphCold,
             "corpus-a",
         );
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        for _ in 0..3 {
-            let attempt = admitted(&breaker, &key, now);
-            breaker
-                .record_attributed_death_at(&key, &attempt.attempt_id, 10, 0, now)
+        let trip_at = 1_000_000;
+        let mut trip_decision = None;
+        for death_at in (trip_at - 2)..=trip_at {
+            let attempt = admitted(&breaker, &key, death_at);
+            trip_decision = breaker
+                .record_attributed_death_at(&key, &attempt.attempt_id, 10, 0, death_at)
                 .unwrap();
         }
-        let snapshot_at = now + 5_000;
-        let suspension = breaker
+        let trip_decision = trip_decision.expect("third zero-credit death trips the breaker");
+        let snapshot_at = trip_at + 5_000;
+        let durable_rows = breaker
             .active_suspensions_for_root_at(&root.display().to_string(), snapshot_at)
-            .unwrap()
-            .pop()
-            .expect("tripped durable row");
-        assert_eq!(suspension.domain, BuildDomain::CallgraphCold);
-        assert_eq!(suspension.death_count, 3);
-        assert_eq!(suspension.age_seconds_at(snapshot_at), 5);
+            .unwrap();
+        assert_eq!(durable_rows, vec![trip_decision.clone()]);
+        let suspension = &durable_rows[0];
 
         let navigation = crate::commands::callgraph_store_adapter::suspended_response_at(
             "surface-agreement",
             "callers",
-            &suspension,
+            suspension,
             snapshot_at,
         );
         assert_eq!(navigation.data["code"], "build_suspended");
@@ -826,10 +822,13 @@ mod tests {
             crate::inspect::InspectCategory::DeadCode,
             suspension.clone(),
         );
-        let inspect_detail =
-            manager.tier2_builder_state_detail(crate::inspect::InspectCategory::DeadCode);
-        assert!(inspect_detail.starts_with("suspended domain=callgraph_cold deaths=3 age_s="));
-        assert!(inspect_detail.ends_with("reason=zero_credit_death_limit"));
+        assert_eq!(
+            manager.tier2_builder_state_detail_at(
+                crate::inspect::InspectCategory::DeadCode,
+                snapshot_at,
+            ),
+            "suspended domain=callgraph_cold deaths=3 age_s=5 reason=zero_credit_death_limit"
+        );
 
         let config = crate::config::Config {
             project_root: Some(root.clone()),
@@ -840,11 +839,11 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         );
-        // These tests use contexts without a bound project or root, so disable
-        // expensive root work before taking the non-blocking health snapshot.
+        // Contexts without a bound root must not start unrelated heavy work while
+        // this test reads the cached health projection of the durable breaker row.
         context.set_heavy_root_work_allowed(false);
         assert_eq!(context.storage_dir(), storage.path());
-        context.refresh_build_suspensions_for_health(&root, Some(&project_key));
+        context.refresh_build_suspensions_for_health_at(&root, Some(&project_key), snapshot_at);
         let health = context.try_health_snapshot(&root);
         assert_eq!(health.suspended_domains.len(), 1);
         assert_eq!(health.suspended_domains[0].domain, "callgraph_cold");
@@ -853,14 +852,16 @@ mod tests {
             "zero_credit_death_limit"
         );
         assert_eq!(health.suspended_domains[0].death_count, 3);
-        assert!(health.suspended_domains[0].age_s <= 1);
+        assert_eq!(health.suspended_domains[0].age_s, 5);
 
         assert!(breaker
-            .active_suspensions_for_root_at(&root.display().to_string(), now + TRIP_TTL_MS + 5)
+            .active_suspensions_for_root_at(&root.display().to_string(), trip_at + TRIP_TTL_MS + 5,)
             .unwrap()
             .is_empty());
         assert!(matches!(
-            breaker.admit_at(&key, 10, now + TRIP_TTL_MS + 5).unwrap(),
+            breaker
+                .admit_at(&key, 10, trip_at + TRIP_TTL_MS + 5)
+                .unwrap(),
             BreakerAdmission::Admitted(_)
         ));
     }

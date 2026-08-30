@@ -3727,6 +3727,15 @@ impl AppContext {
             .unwrap_or_default()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
+        self.refresh_build_suspensions_for_health_at(project_root, project_key, now_ms);
+    }
+
+    pub(crate) fn refresh_build_suspensions_for_health_at(
+        &self,
+        project_root: &Path,
+        project_key: Option<&str>,
+        now_ms: u64,
+    ) {
         let suspended_domains = project_key
             .and_then(|key| {
                 let path = self
