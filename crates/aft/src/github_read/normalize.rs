@@ -336,6 +336,7 @@ mod tests {
             kind: GithubResourceKind::Issue,
             number: 7,
             repository: None,
+            comment_selector: None,
         };
         let document = normalize_structured_document(
             &resource,

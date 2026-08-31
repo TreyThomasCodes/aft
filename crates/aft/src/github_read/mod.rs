@@ -6,6 +6,7 @@
 //! durable-cache coordination, deferred network work, and vision-gated images.
 
 mod attachments;
+mod bot_compress;
 mod cache;
 mod fetch;
 mod model;
@@ -35,4 +36,7 @@ pub use model::{
 };
 pub use normalize::{normalize_structured_document, NormalizeError};
 pub use render::{render_document, MAX_RENDERED_COMMENTS_PER_SECTION};
-pub use resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
+pub use resource::{
+    parse_resource, GithubCommentSelector, GithubResource, GithubResourceKind,
+    InvalidGithubResource,
+};

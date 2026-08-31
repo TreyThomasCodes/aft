@@ -16,7 +16,7 @@ use super::attachments::{
     download_github_image_attachments, GithubImageAttachment, GithubImageDownloader,
 };
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
-use super::render::render_document;
+use super::render::render_document_for_resource;
 use super::resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
 
 /// Clock seam used to make freshness boundaries deterministic in tests.
@@ -359,6 +359,12 @@ impl GithubReadEngine {
         &self,
         request: &GithubReadRequest,
     ) -> Option<GithubReadCacheEntry> {
+        // Cache rows contain the default compressed document. A discussion
+        // drill-down promises structurally stripped full bodies, so a stale
+        // default render cannot honestly stand in for that request.
+        if request.resource.comment_selector.is_some() {
+            return None;
+        }
         let slot = self.resolved_cache_slot(request)?;
         let key = match github_cache_key(&slot, &request.effective_authentication_identity) {
             Some(key) => key,
@@ -407,7 +413,7 @@ impl GithubReadEngine {
             let clock = Arc::clone(&self.clock);
             let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
-                let fetched = fetch_render_store(
+                let fetched = fetch_store(
                     &fetch_request,
                     cache.as_ref(),
                     fetcher.as_ref(),
@@ -417,13 +423,18 @@ impl GithubReadEngine {
                 let waiters = state.lock().flights.remove(&slot).unwrap_or_default();
                 for waiter in waiters {
                     let result = match &fetched {
-                        Ok(canonical_text) => complete_with_optional_attachments(
-                            &waiter.request,
-                            waiter.selector,
-                            canonical_text.clone(),
-                            GithubReadFreshness::Fetched,
-                            downloader.as_ref(),
-                        ),
+                        Ok(document) => {
+                            render_document_for_resource(document, &waiter.request.resource)
+                                .and_then(|canonical_text| {
+                                    complete_with_optional_attachments(
+                                        &waiter.request,
+                                        waiter.selector,
+                                        canonical_text,
+                                        GithubReadFreshness::Fetched,
+                                        downloader.as_ref(),
+                                    )
+                                })
+                        }
                         Err(error) => match waiter.fallback {
                             Some(entry) => complete_with_optional_attachments(
                                 &waiter.request,
@@ -443,19 +454,26 @@ impl GithubReadEngine {
     }
 }
 
-fn fetch_render_store(
+fn fetch_store(
     request: &GithubReadRequest,
     cache: &dyn GithubReadCacheStore,
     fetcher: &dyn GithubFetcher,
     clock: &dyn GithubReadClock,
     state: &Mutex<GithubReadEngineState>,
-) -> Result<String, GithubReadError> {
+) -> Result<super::model::GithubDocument, GithubReadError> {
     let document = fetcher.fetch(&GithubFetchRequest {
         resource: request.resource.clone(),
         working_directory: request.working_directory.clone(),
     })?;
     let repository = document.repository.clone();
-    let canonical_text = render_document(&document);
+    let cache_resource = super::resource::GithubResource {
+        kind: request.resource.kind,
+        number: request.resource.number,
+        repository: Some(repository.clone()),
+        comment_selector: None,
+    };
+    let canonical_text = render_document_for_resource(&document, &cache_resource)
+        .expect("cache rendering has no discussion selector");
     let slot = cache_slot(
         &request.resource,
         &repository,
@@ -474,7 +492,7 @@ fn fetch_render_store(
             .aliases
             .insert(short_alias(request), repository);
     }
-    Ok(canonical_text)
+    Ok(document)
 }
 
 fn complete_with_optional_attachments(

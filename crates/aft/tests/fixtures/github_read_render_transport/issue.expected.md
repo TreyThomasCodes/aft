@@ -23,16 +23,18 @@ The URL must remain visible to text-only readers.
 
 50 earlier comments omitted
 
-### @first · 2026-08-21T11:00:00Z
+### [1] @first · 2026-08-21T11:00:00Z
 
 The oldest fetched comment is minimized.
 
-### @second · 2026-08-21T12:00:00Z
+### [2] @second · 2026-08-21T12:00:00Z
 
 A complete visible issue comment.
 
-### @latest · 2026-08-22T12:00:00Z
+### [3] @latest · 2026-08-22T12:00:00Z
 
 The newest fetched issue comment includes https://github.com/user-attachments/files/73/comment.png
 
 Minimized comments: 2
+
+Discussion drill-down: issue://cortexkit/aft/73/comments/<sel> (for example 3, 3-5, or 3,7).

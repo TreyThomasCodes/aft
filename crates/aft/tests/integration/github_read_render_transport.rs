@@ -159,8 +159,8 @@ fn assert_omp_shape_with_aft_metadata(rendered: &str, document: &GithubDocument)
             "OMP-shaped issue discussion comments must have their own section"
         );
         assert!(
-            body_and_sections.contains("### @"),
-            "OMP-shaped comments must use author/date blocks"
+            body_and_sections.contains("### [1] @"),
+            "OMP-shaped comments must expose ordinal author/date blocks"
         );
     }
     if document.kind == aft::github_read::GithubDocumentKind::PullRequest {
@@ -170,7 +170,7 @@ fn assert_omp_shape_with_aft_metadata(rendered: &str, document: &GithubDocument)
                 "OMP-shaped pull requests must include {section:?}"
             );
         }
-        assert!(body_and_sections.contains("#### @inline-one ·"));
+        assert!(body_and_sections.contains("@inline-one ·"));
     }
 }
 

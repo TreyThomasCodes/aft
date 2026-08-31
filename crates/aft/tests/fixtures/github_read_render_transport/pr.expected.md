@@ -22,11 +22,11 @@ The full pull-request body has a checklist.
 
 51 earlier comments omitted
 
-### @discussion-one · 2026-08-23T10:00:00Z
+### [1] @discussion-one · 2026-08-23T10:00:00Z
 
 The first visible pull-request comment.
 
-### @discussion-two · 2026-08-24T10:00:00Z
+### [2] @discussion-two · 2026-08-24T10:00:00Z
 
 The latest visible pull-request comment.
 
@@ -40,13 +40,13 @@ Minimized comments: 1
 
 ## Reviews
 
-### @approver · 2026-08-24T16:00:00Z
+### [3] @approver · 2026-08-24T16:00:00Z
 
 State: APPROVED
 
 Approved after checking the transport bytes.
 
-### @commenter · 2026-08-24T17:00:00Z
+### [4] @commenter · 2026-08-24T17:00:00Z
 
 State: COMMENTED
 
@@ -55,16 +55,16 @@ Please preserve the selected markdown exactly.
 
 ## Review comments
 
-### @approver · 2026-08-24T16:00:00Z
+52 earlier comments omitted from @approver's review
 
-52 earlier comments omitted
-
-#### @inline-one · 2026-08-24T15:00:00Z
+### [5] @inline-one · 2026-08-24T15:00:00Z
 
 The oldest fetched inline comment.
 
-#### @inline-two · 2026-08-24T15:30:00Z
+### [6] @inline-two · 2026-08-24T15:30:00Z
 
 The latest inline comment remains complete.
 
 Minimized comments: 1
+
+Discussion drill-down: pr://cortexkit/aft/42/comments/<sel> (for example 3, 3-5, or 3,7).

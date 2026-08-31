@@ -31,6 +31,7 @@ pub trait GithubFetcher: Send + Sync {
 pub enum GithubReadError {
     GithubReadDisabled,
     InvalidResource(String),
+    InvalidCommentSelector(String),
     GithubCliMissing,
     FetchFailed(String),
     InvalidStructuredResponse(String),
@@ -41,6 +42,7 @@ impl GithubReadError {
         match self {
             Self::GithubReadDisabled => "gh_read_disabled",
             Self::InvalidResource(_) => "invalid_resource",
+            Self::InvalidCommentSelector(_) => "invalid_comment_selector",
             Self::GithubCliMissing => "github_cli_missing",
             Self::FetchFailed(_) | Self::InvalidStructuredResponse(_) => "github_fetch_failed",
         }
@@ -57,6 +59,7 @@ impl fmt::Display for GithubReadError {
             Self::GithubReadDisabled => formatter
                 .write_str("GitHub reads are disabled; set gh_read.enabled: true in aft.jsonc"),
             Self::InvalidResource(message)
+            | Self::InvalidCommentSelector(message)
             | Self::FetchFailed(message)
             | Self::InvalidStructuredResponse(message) => formatter.write_str(message),
             Self::GithubCliMissing => formatter.write_str(
@@ -347,6 +350,7 @@ mod tests {
             kind: GithubResourceKind::Issue,
             number: 1,
             repository: None,
+            comment_selector: None,
         };
         let explicit = GithubResource {
             repository: Some("owner/repo".to_string()),
@@ -397,6 +401,7 @@ mod tests {
                 kind: GithubResourceKind::Issue,
                 number: 1,
                 repository: None,
+                comment_selector: None,
             },
             working_directory: PathBuf::from("/fixture"),
         };
