@@ -10,13 +10,48 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 
 pub const SHIMS_DIR_NAME: &str = "shims";
 pub const GIT_HOOKS_DIR_NAME: &str = "git-hooks";
+const GIT_HOOKS_QUARANTINE_DIR_NAME: &str = "quarantine";
 const PREPARE_COMMIT_MSG: &str = "prepare-commit-msg";
+// This is the complete hook inventory documented by `githooks(5)`, including
+// receive-side and specialized hooks. Agent Git can operate on bare repositories
+// and invoke less-common porcelain, so limiting dispatch to commit hooks would
+// silently disable repository policy for those operations.
+const MANAGED_GIT_HOOK_NAMES: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    PREPARE_COMMIT_MSG,
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-receive",
+    "update",
+    "proc-receive",
+    "post-receive",
+    "post-update",
+    "push-to-checkout",
+    "pre-auto-gc",
+    "post-rewrite",
+    "sendemail-validate",
+    "fsmonitor-watchman",
+    "p4-changelist",
+    "p4-prepare-changelist",
+    "p4-post-changelist",
+    "p4-pre-submit",
+    "post-index-change",
+    "reference-transaction",
+];
 const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
 const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
@@ -27,17 +62,62 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
     subc_protocol::SUBC_LAUNCH_NONCE_ENV,
 ];
 
-/// The generated hook is POSIX `sh`, including on Git for Windows. Git's
-/// trailer parser owns newline normalization before AFT adds attribution, then
-/// the hook hands control to a repository hook with the same arguments Git
-/// supplied.
-const PREPARE_COMMIT_MSG_HOOK: &str = r#"#!/bin/sh
+/// Git for Windows runs shebang hooks through its bundled POSIX shell, so the
+/// same dispatcher bytes work there and on Unix. Dispatch never reads stdin and
+/// ends with `exec`, preserving Git's arguments, stdin, and the repository hook's
+/// exit status.
+const GIT_HOOK_DISPATCHER_TEMPLATE: &str = r#"#!/bin/sh
 # AFT selects this hook through the agent child's environment. It does not alter
 # the repository or the user's Git configuration.
-# Agent-labeled commits are joint work too, so subjects such as "mason:" do not
-# receive an attribution exemption.
+hook_name=@HOOK_NAME@
+@PRE_DISPATCH@
+dispatch_candidate() {
+  candidate=$1
+  shift
+  if [ -x "$candidate" ]; then
+    # A repository may explicitly point core.hooksPath back at AFT's managed
+    # directory. Identity comparison also catches symlink and hard-link loops.
+    if [ "$candidate" -ef "$0" ] 2>/dev/null; then
+      return
+    fi
+    exec "$candidate" "$@"
+  fi
+}
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || git rev-parse --absolute-git-dir 2>/dev/null || :)
+if [ -z "$repo_root" ]; then
+  exit 0
+fi
+
+repo_hooks=$(git config --local core.hooksPath 2>/dev/null || :)
+if [ -n "$repo_hooks" ]; then
+  case "$repo_hooks" in
+    /*|[A-Za-z]:[\\/]*) candidate="$repo_hooks/$hook_name" ;;
+    \~/*) candidate="${HOME:-}${repo_hooks#\~}/$hook_name" ;;
+    *) candidate="$repo_root/$repo_hooks/$hook_name" ;;
+  esac
+  dispatch_candidate "$candidate" "$@"
+fi
+
+# Do not use `git rev-parse --git-path hooks/...` here: it honors the injected
+# core.hooksPath and resolves this dispatcher back to itself.
+git_dir=$(git rev-parse --git-dir 2>/dev/null || :)
+if [ -n "$git_dir" ]; then
+  case "$git_dir" in
+    /*|[A-Za-z]:[\\/]*) candidate="$git_dir/hooks/$hook_name" ;;
+    *) candidate="$repo_root/$git_dir/hooks/$hook_name" ;;
+  esac
+  dispatch_candidate "$candidate" "$@"
+fi
+
+dispatch_candidate "$repo_root/.githooks/$hook_name" "$@"
+exit 0
+"#;
+
+const PREPARE_COMMIT_MSG_PRE_DISPATCH: &str = r#"# Agent-labeled commits are joint work too, so subjects such as "mason:" do not
+# receive an attribution exemption. Attribution runs before the repository hook
+# so that hook can validate or amend the resulting message.
 msg_file=$1
-hook_name=prepare-commit-msg
 mode=${AFT_GIT_CO_AUTHOR:-off}
 line=
 
@@ -56,32 +136,18 @@ if [ -n "$line" ]; then
   git interpret-trailers --in-place --if-exists doNothing \
     --trailer "Co-authored-by=$identity" "$msg_file" 2>/dev/null || :
 fi
-
-repo_hooks=$(git config --local --get core.hooksPath 2>/dev/null || :)
-if [ -n "$repo_hooks" ]; then
-  case "$repo_hooks" in
-    /*|[A-Za-z]:[\\/]*) candidate="$repo_hooks/$hook_name" ;;
-    \~/*) candidate="${HOME:-}${repo_hooks#\~}/$hook_name" ;;
-    *) candidate="$PWD/$repo_hooks/$hook_name" ;;
-  esac
-else
-  git_dir=${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null || :)}
-  case "$git_dir" in
-    /*|[A-Za-z]:[\\/]*) candidate="$git_dir/hooks/$hook_name" ;;
-    *) candidate="$PWD/$git_dir/hooks/$hook_name" ;;
-  esac
-fi
-
-if [ -x "$candidate" ]; then
-  candidate_dir=$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P)
-  self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)
-  if [ -z "$candidate_dir" ] || [ -z "$self_dir" ] || [ "$candidate_dir/$hook_name" != "$self_dir/$hook_name" ]; then
-    exec "$candidate" "$@"
-  fi
-fi
-
-exit 0
 "#;
+
+fn managed_git_hook_contents(hook_name: &str) -> String {
+    let pre_dispatch = if hook_name == PREPARE_COMMIT_MSG {
+        PREPARE_COMMIT_MSG_PRE_DISPATCH
+    } else {
+        ""
+    };
+    GIT_HOOK_DISPATCHER_TEMPLATE
+        .replace("@HOOK_NAME@", hook_name)
+        .replace("@PRE_DISPATCH@", pre_dispatch)
+}
 
 /// Refresh files selected by the resolved configuration. This runs during
 /// configure and is also cheap enough to repair a stale entry immediately
@@ -113,7 +179,7 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     }
 
     if config.git.co_author != "off" {
-        ensure_prepare_commit_msg_hook(&storage_root.join(GIT_HOOKS_DIR_NAME))?;
+        ensure_managed_git_hooks(&storage_root.join(GIT_HOOKS_DIR_NAME))?;
     }
     Ok(())
 }
@@ -461,18 +527,200 @@ fn existing_gh_entry_is_valid(_shims_dir: &Path) -> bool {
     false
 }
 
-fn ensure_prepare_commit_msg_hook(hooks_dir: &Path) -> Result<(), String> {
+fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(hooks_dir).map_err(|error| {
         format!(
             "failed to create child Git hooks directory {}: {error}",
             hooks_dir.display()
         )
     })?;
-    let hook = hooks_dir.join(PREPARE_COMMIT_MSG);
-    write_if_changed(&hook, PREPARE_COMMIT_MSG_HOOK.as_bytes())?;
-    #[cfg(unix)]
-    set_executable(&hook)?;
+    let expected = MANAGED_GIT_HOOK_NAMES
+        .iter()
+        .map(|name| (*name, managed_git_hook_contents(name)))
+        .collect::<Vec<_>>();
+    quarantine_foreign_hook_entries(hooks_dir, &expected)?;
+    for (name, contents) in expected {
+        let hook = hooks_dir.join(name);
+        write_if_changed(&hook, contents.as_bytes())?;
+        #[cfg(unix)]
+        set_executable(&hook)?;
+    }
     Ok(())
+}
+
+fn quarantine_foreign_hook_entries(
+    hooks_dir: &Path,
+    expected: &[(&str, String)],
+) -> Result<(), String> {
+    let mut foreign = Vec::new();
+    for entry in fs::read_dir(hooks_dir).map_err(|error| {
+        format!(
+            "failed to inspect AFT-owned Git hooks directory {}: {error}",
+            hooks_dir.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect an entry in AFT-owned Git hooks directory {}: {error}",
+                hooks_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let is_quarantine_dir = name == GIT_HOOKS_QUARANTINE_DIR_NAME
+            && fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+            });
+        if is_quarantine_dir {
+            continue;
+        }
+        let expected_contents = name
+            .to_str()
+            .and_then(|name| expected.iter().find(|(expected, _)| *expected == name))
+            .map(|(_, contents)| contents.as_bytes());
+        let is_expected_file = expected_contents.is_some_and(|contents| {
+            fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && fs::read(&path).is_ok_and(|actual| actual == contents)
+            })
+        });
+        if !is_expected_file {
+            foreign.push(path);
+        }
+    }
+    if foreign.is_empty() {
+        return Ok(());
+    }
+
+    let quarantine = hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME);
+    let mut moved = Vec::new();
+    if fs::symlink_metadata(&quarantine)
+        .is_ok_and(|metadata| !metadata.file_type().is_dir() || metadata.file_type().is_symlink())
+    {
+        let staging = hooks_dir.join(format!(
+            ".quarantine-stage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&staging).map_err(|error| {
+            format!(
+                "failed to stage the Git hook quarantine directory {}: {error}",
+                staging.display()
+            )
+        })?;
+        let destination_name = quarantine_entry_name(&quarantine, 0);
+        fs::rename(&quarantine, staging.join(&destination_name)).map_err(|error| {
+            format!(
+                "failed to quarantine reserved entry {}: {error}",
+                quarantine.display()
+            )
+        })?;
+        fs::rename(&staging, &quarantine).map_err(|error| {
+            format!(
+                "failed to install Git hook quarantine directory {}: {error}",
+                quarantine.display()
+            )
+        })?;
+        moved.push(quarantine.join(destination_name));
+        foreign.retain(|path| path != &quarantine);
+    } else {
+        fs::create_dir_all(&quarantine).map_err(|error| {
+            format!(
+                "failed to create Git hook quarantine directory {}: {error}",
+                quarantine.display()
+            )
+        })?;
+    }
+
+    for (index, source) in foreign.into_iter().enumerate() {
+        let destination = quarantine.join(quarantine_entry_name(&source, index + 1));
+        match fs::rename(&source, &destination) {
+            Ok(()) => moved.push(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to quarantine foreign Git hook {} as {}: {error}",
+                    source.display(),
+                    destination.display()
+                ));
+            }
+        }
+    }
+    if !moved.is_empty() {
+        log_quarantined_hook_entries(hooks_dir, &moved);
+    }
+    Ok(())
+}
+
+fn quarantine_entry_name(source: &Path, index: usize) -> String {
+    let original = source
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{timestamp}-{}-{index}-{original}", std::process::id())
+}
+
+fn log_quarantined_hook_entries(hooks_dir: &Path, moved: &[PathBuf]) {
+    const WINDOW: Duration = Duration::from_secs(60);
+    static LAST_WARNING: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    let now = Instant::now();
+    let should_log = match LAST_WARNING
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .try_lock()
+    {
+        Ok(mut warnings) => {
+            if warnings.len() > 512 {
+                warnings.retain(|_, last| now.duration_since(*last) < WINDOW);
+            }
+            match warnings.get(hooks_dir) {
+                Some(last) if now.duration_since(*last) < WINDOW => false,
+                _ => {
+                    warnings.insert(hooks_dir.to_path_buf(), now);
+                    true
+                }
+            }
+        }
+        Err(_) => true,
+    };
+    if !should_log {
+        return;
+    }
+
+    let destinations = moved
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let message = format!(
+        "[agent_child_env] quarantined foreign content from AFT-owned Git hooks directory {}: {destinations}",
+        hooks_dir.display()
+    );
+    crate::slog_warn!("{message}");
+    #[cfg(test)]
+    quarantine_test_logs().lock().unwrap().push(message);
+}
+
+#[cfg(test)]
+fn quarantine_test_logs() -> &'static Mutex<Vec<String>> {
+    static LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    LOGS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[cfg(unix)]
@@ -849,16 +1097,15 @@ mod tests {
 
     #[test]
     fn generated_hook_stays_posix_and_documents_joint_agent_attribution() {
-        assert!(PREPARE_COMMIT_MSG_HOOK.starts_with("#!/bin/sh\n"));
-        assert!(!PREPARE_COMMIT_MSG_HOOK.contains("[["));
-        assert!(!PREPARE_COMMIT_MSG_HOOK.contains("function "));
-        assert!(!PREPARE_COMMIT_MSG_HOOK.contains("mason:*)"));
-        assert!(PREPARE_COMMIT_MSG_HOOK.contains("do not\n# receive an attribution exemption"));
-        assert!(PREPARE_COMMIT_MSG_HOOK
-            .contains("git interpret-trailers --in-place --if-exists doNothing"));
-        assert!(PREPARE_COMMIT_MSG_HOOK
-            .contains("--trailer \"Co-authored-by=$identity\" \"$msg_file\""));
-        assert!(!PREPARE_COMMIT_MSG_HOOK.contains(">> \"$msg_file\""));
+        let hook = managed_git_hook_contents(PREPARE_COMMIT_MSG);
+        assert!(hook.starts_with("#!/bin/sh\n"));
+        assert!(!hook.contains("[["));
+        assert!(!hook.contains("function "));
+        assert!(!hook.contains("mason:*)"));
+        assert!(hook.contains("do not\n# receive an attribution exemption"));
+        assert!(hook.contains("git interpret-trailers --in-place --if-exists doNothing"));
+        assert!(hook.contains("--trailer \"Co-authored-by=$identity\" \"$msg_file\""));
+        assert!(!hook.contains(">> \"$msg_file\""));
     }
 
     #[cfg(unix)]
@@ -870,6 +1117,41 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed: {status}");
+    }
+
+    #[cfg(unix)]
+    fn run_git_with_timeout(
+        repo: &Path,
+        args: &[&str],
+        environment: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> std::process::Output {
+        use std::process::Stdio;
+
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .envs(environment)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "git {args:?} exceeded {timeout:?}; stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -1155,6 +1437,352 @@ mod tests {
             "Co-authored-by: aft-alfonso[bot] <318960130+aft-alfonso[bot]@users.noreply.github.com>"
         ));
         assert_eq!(message.matches("Local-Hook: default").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_generates_the_complete_posix_dispatcher_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let mut config = Config::default();
+        config.gh_shim.enabled = false;
+        config.git.co_author = TEST_CO_AUTHOR.to_string();
+
+        maintain(&config, &storage).unwrap();
+
+        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
+        let mut generated = fs::read_dir(&hooks_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        generated.sort();
+        let mut expected = MANAGED_GIT_HOOK_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(generated, expected);
+        for name in MANAGED_GIT_HOOK_NAMES {
+            let body = fs::read_to_string(hooks_dir.join(name)).unwrap();
+            assert!(
+                body.starts_with("#!/bin/sh\n"),
+                "{name} is not a POSIX hook"
+            );
+            assert!(body.contains(&format!("hook_name={name}\n")));
+            assert!(!body.lines().any(|line| {
+                !line.trim_start().starts_with('#') && line.contains("rev-parse --git-path")
+            }));
+            assert!(body.contains("rev-parse --git-dir"));
+            assert!(body.contains("-ef \"$0\""));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_quarantines_contamination_logs_and_regenerates() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
+        let mut config = Config::default();
+        config.gh_shim.enabled = false;
+        config.git.co_author = TEST_CO_AUTHOR.to_string();
+        maintain(&config, &storage).unwrap();
+        fs::write(
+            hooks_dir.join("pre-commit"),
+            "#!/bin/sh\necho foreign lefthook fallback\n",
+        )
+        .unwrap();
+        fs::write(hooks_dir.join("unknown-manager-hook"), "foreign\n").unwrap();
+
+        maintain(&config, &storage).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(hooks_dir.join("pre-commit")).unwrap(),
+            managed_git_hook_contents("pre-commit")
+        );
+        let quarantined = fs::read_dir(hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 2);
+        assert!(quarantined.iter().any(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("pre-commit")
+                && fs::read_to_string(path)
+                    .unwrap()
+                    .contains("foreign lefthook fallback")
+        }));
+        assert!(quarantined.iter().any(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("unknown-manager-hook")
+        }));
+        let hook_dir_text = hooks_dir.display().to_string();
+        let warning_count = quarantine_test_logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.contains(&hook_dir_text))
+            .count();
+        assert_eq!(warning_count, 1, "the contamination sweep did not log once");
+
+        fs::write(hooks_dir.join("another-foreign-hook"), "foreign again\n").unwrap();
+        maintain(&config, &storage).unwrap();
+        let warning_count = quarantine_test_logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.contains(&hook_dir_text))
+            .count();
+        assert_eq!(
+            warning_count, 1,
+            "quarantine warnings were not rate-limited"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_content_guard_detects_a_one_byte_managed_hook_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
+        let mut config = Config::default();
+        config.gh_shim.enabled = false;
+        config.git.co_author = TEST_CO_AUTHOR.to_string();
+        maintain(&config, &storage).unwrap();
+        assert!(!hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME).exists());
+
+        let hook = hooks_dir.join("commit-msg");
+        let mut mutated = fs::read(&hook).unwrap();
+        mutated.push(b' ');
+        fs::write(&hook, mutated).unwrap();
+        maintain(&config, &storage).unwrap();
+
+        let quarantine = hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME);
+        assert_eq!(fs::read_dir(quarantine).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_to_string(hook).unwrap(),
+            managed_git_hook_contents("commit-msg")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_hooks_path_without_a_hook_does_not_reenter_the_dispatcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", ".githooks"],
+            &HashMap::new(),
+        );
+        fs::create_dir_all(repo.join(".githooks")).unwrap();
+        let environment = co_author_environment(&storage);
+
+        let output = run_git_with_timeout(
+            &repo,
+            &["commit", "--quiet", "-m", "no repository hook"],
+            &environment,
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_hooks_path_pointing_to_managed_directory_does_not_reenter() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        let environment = co_author_environment(&storage);
+        let managed = storage.join(GIT_HOOKS_DIR_NAME);
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", managed.to_str().unwrap()],
+            &HashMap::new(),
+        );
+
+        let output = run_git_with_timeout(
+            &repo,
+            &["commit", "--quiet", "-m", "self guard"],
+            &environment,
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_commit_msg_adds_attribution_before_repository_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        write_executable(
+            &repo.join(".git/hooks/prepare-commit-msg"),
+            "#!/bin/sh\ngrep -q '^Co-authored-by: Pair Agent <pair@example.test>$' \"$1\" || exit 91\nprintf '%s\\n' 'Local-Hook: after-attribution' >> \"$1\"\n",
+        );
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "ordered chain"],
+            &environment,
+        );
+
+        let message = commit_message(&repo);
+        let co_author = message.find("Co-authored-by:").unwrap();
+        let local = message.find("Local-Hook: after-attribution").unwrap();
+        assert!(co_author < local);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dot_githooks_fallback_runs_when_other_candidates_are_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        fs::create_dir_all(repo.join(".githooks")).unwrap();
+        write_executable(
+            &repo.join(".githooks/pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' invoked > dot-githooks-ran\n",
+        );
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "fallback"],
+            &environment,
+        );
+
+        assert_eq!(
+            fs::read_to_string(repo.join("dot-githooks-ran")).unwrap(),
+            "invoked\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_hooks_dispatch_repository_pre_push_and_preserve_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "initial"],
+            &HashMap::new(),
+        );
+        run_git(
+            temp.path(),
+            &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+            &HashMap::new(),
+        );
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+            &HashMap::new(),
+        );
+        write_executable(
+            &repo.join(".git/hooks/pre-push"),
+            "#!/bin/sh\nprintf '%s\\n' invoked > pre-push-ran\ncat > pre-push-stdin\n",
+        );
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+            &environment,
+        );
+
+        assert_eq!(
+            fs::read_to_string(repo.join("pre-push-ran")).unwrap(),
+            "invoked\n"
+        );
+        assert!(
+            fs::read_to_string(repo.join("pre-push-stdin"))
+                .unwrap()
+                .contains("refs/heads/main"),
+            "the repository hook did not receive Git's original stdin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_hooks_preserve_failing_pre_commit_exit_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        write_executable(
+            &repo.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' invoked > pre-commit-ran\nexit 73\n",
+        );
+
+        let status = Command::new("git")
+            .args(["commit", "--quiet", "-m", "blocked"])
+            .current_dir(&repo)
+            .envs(co_author_environment(&storage))
+            .status()
+            .unwrap();
+
+        assert!(
+            !status.success(),
+            "a failing repository hook must block commit"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("pre-commit-ran")).unwrap(),
+            "invoked\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_hooks_respect_repo_local_lefthook_style_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", ".lefthook"],
+            &HashMap::new(),
+        );
+        fs::create_dir_all(repo.join(".lefthook")).unwrap();
+        write_executable(
+            &repo.join(".lefthook/pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' invoked > lefthook-pre-commit-ran\n",
+        );
+
+        let environment = co_author_environment(&storage);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "custom hooks path"],
+            &environment,
+        );
+
+        assert_eq!(
+            fs::read_to_string(repo.join("lefthook-pre-commit-ran")).unwrap(),
+            "invoked\n"
+        );
     }
 
     #[cfg(unix)]
