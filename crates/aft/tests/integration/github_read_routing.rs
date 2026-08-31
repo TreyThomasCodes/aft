@@ -110,7 +110,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
 
     let issue = read_response(&mut aft, "github-issue", "issue://7", json!({}));
     assert_eq!(issue["success"], true, "issue read failed: {issue:#}");
-    assert_eq!(issue["content"].as_str(), Some("# Issue #7: Fixture issue\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\none\ntwo\nthree\nhttps://github.com/user-attachments/files/7/screenshot.png\n\n"));
+    assert_eq!(issue["content"].as_str(), Some("# Issue #7: Fixture issue\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\none\ntwo\nthree\nhttps://github.com/user-attachments/files/7/screenshot.png\n\nDiscussion drill-down: issue://7/comments/<sel> (for example 3, 3-5, or 3,7).\n\n"));
     assert_eq!(
         issue["attachments"],
         json!([]),
@@ -131,7 +131,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
     );
     assert_eq!(
         pull_request["content"].as_str(),
-        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\n")
+        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, or 3,7).\n\n")
     );
 
     assert!(aft.shutdown().success());

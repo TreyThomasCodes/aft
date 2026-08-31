@@ -380,23 +380,35 @@ mod tests {
         line
     }
 
-    fn cubic_thread_findings(document: &GithubDocument) -> Vec<(String, String)> {
+    fn fixture_cubic_location(body: &str) -> Option<String> {
+        body.split_once(". At ")
+            .and_then(|(_, tail)| tail.split_once(", line "))
+            .and_then(|(path, tail)| tail.split(':').next().map(|line| format!("{path}:{line}")))
+            .or_else(|| {
+                body.split_once("location=\"")
+                    .and_then(|(_, tail)| tail.split_once('\"'))
+                    .map(|(location, _)| location.to_string())
+            })
+    }
+
+    fn cubic_thread_findings(document: &GithubDocument) -> Vec<(String, Option<String>)> {
         document
             .review_comment_sections
             .iter()
             .flat_map(|section| &section.comments)
-            .filter_map(|comment| {
-                let finding = comment
+            .filter(|comment| comment.body.contains("<!-- cubic:"))
+            .flat_map(|comment| {
+                let location = fixture_cubic_location(&comment.body);
+                comment
                     .body
                     .lines()
-                    .find(|line| matches!(line.as_bytes(), [b'P', b'0'..=b'3', b':', ..]))?;
-                let (_, location_tail) = comment.body.split_once(". At ")?;
-                let (path, line_tail) = location_tail.split_once(", line ")?;
-                let line = line_tail.split(':').next()?;
-                Some((
-                    fixture_first_sentence(finding).to_string(),
-                    format!("{path}:{line}"),
-                ))
+                    .filter(|line| matches!(line.as_bytes(), [b'P', b'0'..=b'3', b':', ..]))
+                    .map(move |finding| {
+                        (
+                            fixture_first_sentence(finding).to_string(),
+                            location.clone(),
+                        )
+                    })
             })
             .collect()
     }
@@ -445,11 +457,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         for (finding, location) in &findings {
-            let expected = format!("{finding} ({location})");
             assert!(
-                cubic_segments.contains(&expected),
-                "compressed cubic items lost the verbatim first sentence or location: {expected}"
+                cubic_segments.contains(finding),
+                "compressed cubic items lost the verbatim first sentence: {finding}"
             );
+            if let Some(location) = location {
+                let expected = format!("{finding} ({location})");
+                assert!(
+                    cubic_segments.contains(&expected),
+                    "compressed cubic item lost its details-block location: {expected}"
+                );
+            }
         }
 
         let trey_replies = document
@@ -465,8 +483,8 @@ mod tests {
         );
         for reply in trey_replies {
             assert!(
-                rendered.contains(&reply.body),
-                "a TreyThomasCodes reply did not survive byte-for-byte"
+                rendered.contains(&structural_strip(&reply.body)),
+                "a TreyThomasCodes reply did not survive byte-for-byte after structural stripping"
             );
         }
 
@@ -482,8 +500,8 @@ mod tests {
         );
         for comment in human_comments {
             assert!(
-                rendered.contains(&comment.body),
-                "a human discussion comment did not survive byte-for-byte"
+                rendered.contains(&structural_strip(&comment.body)),
+                "a human discussion comment did not survive byte-for-byte after structural stripping"
             );
         }
 
@@ -503,7 +521,21 @@ mod tests {
             .expect("fixture render has both review sections");
         assert!(!reviews.contains("@TreyThomasCodes"));
         assert!(!reviews.contains("@greptile-apps"));
-        assert_eq!(reviews.matches("State: COMMENTED").count(), 11);
+        let nonempty_commented_reviews = document
+            .reviews
+            .iter()
+            .filter(|review| {
+                review.state.as_deref() == Some("COMMENTED") && !review.body.is_empty()
+            })
+            .count();
+        assert_eq!(
+            nonempty_commented_reviews, 11,
+            "the visible COMMENTED review count changed"
+        );
+        assert_eq!(
+            reviews.matches("State: COMMENTED").count(),
+            nonempty_commented_reviews
+        );
 
         let raw_codesmith_markers = PR_270_JSON.matches("<!-- codesmith:footer -->").count()
             + PR_283_JSON.matches("<!-- codesmith:footer -->").count();
@@ -574,6 +606,27 @@ mod tests {
         let cubic_ordinal = cubic_index + 1;
         assert_eq!(cubic_ordinal, 16, "the pinned first cubic ordinal changed");
         let cubic_body = bodies[cubic_index];
+        let default_render = render_document_for_resource(
+            &document,
+            &parse_resource("pr://cortexkit/aft/270").unwrap(),
+        )
+        .unwrap();
+        let cubic_finding = fixture_first_sentence(
+            cubic_body
+                .lines()
+                .find(|line| matches!(line.as_bytes(), [b'P', b'0'..=b'3', b':', ..]))
+                .expect("fixture cubic item includes a finding"),
+        );
+        let rendered_cubic_item = default_render
+            .split("### [")
+            .find(|item| item.contains(cubic_finding))
+            .expect("default render includes the compressed cubic finding");
+        assert!(
+            rendered_cubic_item.contains(&format!(
+                "[compressed; full: pr://cortexkit/aft/270/comments/{cubic_ordinal}]"
+            )),
+            "the compressed default item must point to the selector ordinal that retrieves it"
+        );
         let selected = render_document_for_resource(
             &document,
             &parse_resource(&format!("pr://cortexkit/aft/270/comments/{cubic_ordinal}")).unwrap(),
@@ -599,6 +652,8 @@ mod tests {
             &parse_resource("pr://cortexkit/aft/270/comments/1-2").unwrap(),
         )
         .unwrap();
+        assert!(range.contains("### [1] @greptile-apps ·"));
+        assert!(range.contains("### [2] @TreyThomasCodes ·"));
         assert!(range.contains(&structural_strip(document.comments[0].body.as_str())));
         assert!(range.contains(&document.comments[1].body));
         assert!(!range.contains("[compressed"));
