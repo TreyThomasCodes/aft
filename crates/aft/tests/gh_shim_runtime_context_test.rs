@@ -298,7 +298,7 @@ fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option
 
 fn unclassified_refusal(manifest_version: u64) -> String {
     format!(
-        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest {manifest_version})\n"
+        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest {manifest_version}); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration\n"
     )
 }
 
@@ -811,6 +811,67 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
         fs::read_to_string(&recorder).expect("read mechanical GET invocation record"),
         "api repos/cortexkit/insula --jq .name\n"
     );
+}
+
+#[test]
+fn gh_shim_operator_bypass_does_not_lift_unclassified_refusal_and_keeps_admin_message_unchanged() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_v9_manifest(&state_home, now);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 9);
+    write_user_config(&config_home, &connection_file, None);
+
+    let unclassified = shim_command(
+        &[
+            "api",
+            "-X",
+            "DELETE",
+            "repos/cortexkit/insula/actions/runs/123",
+        ],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env("GH_SHIM_BYPASS", "operator")
+    .output()
+    .expect("spawn operator-bypassed unclassified invocation");
+    assert_eq!(unclassified.status.code(), Some(86));
+    assert!(unclassified.stdout.is_empty());
+    let unclassified_stderr = String::from_utf8_lossy(&unclassified.stderr);
+    assert!(unclassified_stderr.contains(
+        "GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+    ));
+    assert_eq!(unclassified_stderr, unclassified_refusal(9));
+
+    let admin = shim_command(
+        &["repo", "edit", "cortexkit/insula", "--visibility", "public"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn non-bypassed admin invocation");
+    assert_eq!(admin.status.code(), Some(86));
+    assert!(admin.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&admin.stderr),
+        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n"
+    );
+    assert!(!recorder.exists());
 }
 
 #[test]

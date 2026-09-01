@@ -279,9 +279,7 @@ fn run(args: &[OsString]) -> i32 {
             }
             GovernanceDisposition::Unclassified { manifest_version } => refuse(
                 RefusalCode::Unclassified,
-                &format!(
-                    "no manifest declaration for this invocation (manifest {manifest_version})"
-                ),
+                &unclassified_refusal_text(manifest_version),
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
                 match invalid_manifest_problem.as_ref() {
@@ -349,12 +347,15 @@ fn run(args: &[OsString]) -> i32 {
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
-            &format!(
-                "no manifest declaration for this invocation (manifest {})",
-                manifest.manifest_version
-            ),
+            &unclassified_refusal_text(manifest.manifest_version),
         ),
     }
+}
+
+fn unclassified_refusal_text(manifest_version: u64) -> String {
+    format!(
+        "no manifest declaration for this invocation (manifest {manifest_version}); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+    )
 }
 
 fn refuse_governed_canonicalization(error: &str) -> i32 {
