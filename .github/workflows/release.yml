@@ -534,6 +534,34 @@ jobs:
           cp artifacts/darwin-arm64-dsym/aft-darwin-arm64-dsym.zip release-assets/
           cp artifacts/darwin-x64-dsym/aft-darwin-x64-dsym.zip release-assets/
 
+      # Alpha-distribution asset contract (ck setup): <binary>-<os>-<arch>.zip
+      # with the binary at the archive root, beside <name>.zip.sha256 holding
+      # the shasum -a 256 line for the ZIP bytes. Additive: the bare-binary
+      # assets above stay untouched for existing consumers (npm resolver,
+      # binary downloader, fleet staging).
+      - name: Package alpha distribution zips
+        run: |
+          cd release-assets
+          for target in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            mkdir -p "zip-stage-$target"
+            cp "aft-$target" "zip-stage-$target/aft"
+            chmod +x "zip-stage-$target/aft"
+            (cd "zip-stage-$target" && zip -q "../aft-$target.zip" aft)
+            rm -rf "zip-stage-$target"
+            shasum -a 256 "aft-$target.zip" > "aft-$target.zip.sha256"
+          done
+          # The ck-setup resolver spells Windows targets windows-<arch> (the
+          # component answers were wired verbatim); the bare-binary assets keep
+          # their historical win32-<arch> names.
+          for arch in arm64 x64; do
+            mkdir -p "zip-stage-windows-$arch"
+            cp "aft-win32-$arch.exe" "zip-stage-windows-$arch/aft.exe"
+            (cd "zip-stage-windows-$arch" && zip -q "../aft-windows-$arch.zip" aft.exe)
+            rm -rf "zip-stage-windows-$arch"
+            shasum -a 256 "aft-windows-$arch.zip" > "aft-windows-$arch.zip.sha256"
+          done
+          ls -la ./*.zip ./*.zip.sha256
+
       - name: Generate checksums
         run: |
           cd release-assets
