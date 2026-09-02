@@ -10,7 +10,7 @@ use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidat
 use crate::context::SubcLifecycleAdmission;
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
-use crate::parser::{grammar_for, LangId};
+use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
 use crate::symbols::{Range, SymbolKind};
 use rayon::prelude::*;
 use rusqlite::{
@@ -2479,7 +2479,12 @@ impl DiskProjectIndex<'_> {
                 continue;
             };
             let target_file = if kind == "module" {
-                rust_declared_module_target(&self.project_root, rel_path, &module_path)
+                rust_declared_module_target(
+                    self.project_root,
+                    rel_path,
+                    &module_path,
+                    self.module_resolution_memo,
+                )
             } else {
                 self.disk_module_target(rel_path, &module_path)
             }
@@ -8907,25 +8912,39 @@ fn rust_declared_module_target(
     project_root: &Path,
     caller_file: &str,
     module_name: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Option<String> {
+    memo.rust_declared_module_target(caller_file, module_name, || {
+        rust_declared_module_targets(project_root, caller_file)
+    })
+}
+
+fn rust_declared_module_targets(
+    project_root: &Path,
+    caller_file: &str,
+) -> HashMap<String, Option<String>> {
     let declaring_file = project_root.join(caller_file);
-    let source = std::fs::read_to_string(&declaring_file).ok()?;
-    let grammar = grammar_for(LangId::Rust);
-    let mut parser = Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(&source, None)?;
+    let Ok(source) = std::fs::read_to_string(&declaring_file) else {
+        return HashMap::new();
+    };
+    let Ok(tree) = parse_source_with_cached_parser(&declaring_file, &source, LangId::Rust) else {
+        return HashMap::new();
+    };
+    let mut targets = HashMap::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         if node.kind() == "mod_item"
             && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, &source) == module_name)
-            && node
                 .named_children(&mut node.walk())
                 .all(|child| child.kind() != "declaration_list")
         {
-            let target = rust_external_module_target(&declaring_file, &source, node, module_name)?;
-            return Some(relative_path(project_root, &canonicalize_path(&target)));
+            if let Some(name) = node.child_by_field_name("name") {
+                let module_name = node_text(name, &source);
+                let target =
+                    rust_external_module_target(&declaring_file, &source, node, module_name)
+                        .map(|target| relative_path(project_root, &canonicalize_path(&target)));
+                targets.entry(module_name.to_string()).or_insert(target);
+            }
         }
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
@@ -8937,7 +8956,7 @@ fn rust_declared_module_target(
             }
         }
     }
-    None
+    targets
 }
 
 fn rust_external_module_target(
@@ -10248,7 +10267,10 @@ impl<'a> ProjectIndex<'a> {
         caller_extracts: &'a HashMap<String, FileExtract>,
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
     ) -> Result<Self> {
-        let mut files = load_db_file_indexes(tx, project_root)?;
+        // Incremental refreshes get a fresh snapshot memo so a watcher rewrite can
+        // never observe declarations retained by an earlier refresh generation.
+        let module_resolution_memo = callgraph::ModuleResolutionMemo::default();
+        let mut files = load_db_file_indexes(tx, project_root, &module_resolution_memo)?;
         let mut caller_data = HashMap::new();
         for (rel_path, extract) in caller_extracts {
             files.insert(
@@ -10365,6 +10387,7 @@ impl DbFileIndex {
 fn load_db_file_indexes(
     tx: &Transaction<'_>,
     project_root: &Path,
+    module_resolution_memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<HashMap<String, DbFileIndex>> {
     let mut files = HashMap::new();
     let mut stmt = tx.prepare("SELECT path, lang FROM files")?;
@@ -10486,7 +10509,12 @@ fn load_db_file_indexes(
             &file_keys,
         );
         let target_file = if kind == "module" {
-            rust_declared_module_target(project_root, &caller_file, &module_path)
+            rust_declared_module_target(
+                project_root,
+                &caller_file,
+                &module_path,
+                module_resolution_memo,
+            )
         } else {
             deps.iter()
                 .find(|dep| file_keys.contains(*dep))
@@ -16422,6 +16450,185 @@ export function leaf() {}
         );
     }
 
+    #[test]
+    fn rust_declared_module_memo_parses_each_declaring_file_once_and_preserves_edges() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let files = write_rust_declared_module_memo_fixture(&project_root, 10);
+
+        let negative_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        for _ in 0..3 {
+            assert_eq!(
+                rust_declared_module_target(
+                    &project_root,
+                    "src/lib.rs",
+                    "undeclared",
+                    &negative_memo,
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            negative_memo
+                .rust_declaration_parses_for_test()
+                .get("src/lib.rs"),
+            Some(&1),
+            "an undeclared module must be retained as a file-level negative result"
+        );
+
+        let uncached_memo = callgraph::ModuleResolutionMemo::new_for_test(false, true);
+        let uncached = CallGraphStore::open(
+            dir.path().join("rust-store-uncached"),
+            project_root.to_path_buf(),
+        )
+        .expect("open uncached Rust store");
+        let uncached_stats = uncached
+            .cold_build_chunked_with_resolution_memo_for_test(&files, 3, 11, &uncached_memo)
+            .expect("uncached Rust build");
+
+        let cached_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let cached = CallGraphStore::open(
+            dir.path().join("rust-store-cached"),
+            project_root.to_path_buf(),
+        )
+        .expect("open cached Rust store");
+        let cached_stats = cached
+            .cold_build_chunked_with_resolution_memo_for_test(&files, 3, 11, &cached_memo)
+            .expect("cached Rust build");
+
+        assert!(
+            cached_stats.refs >= 60,
+            "fixture must exercise repeated qualified and undeclared paths"
+        );
+        assert_cold_build_stats_match_except_elapsed(&uncached_stats, &cached_stats);
+        assert_eq!(
+            uncached.edge_snapshot().expect("uncached edge snapshot"),
+            cached.edge_snapshot().expect("cached edge snapshot"),
+            "memoized Rust declarations must preserve the public edge set"
+        );
+        assert_eq!(
+            graph_table_rows(&uncached, "edges"),
+            graph_table_rows(&cached, "edges"),
+            "source, symbol, target, and provenance rows must be byte-identical"
+        );
+
+        let expected_declaring_files = [
+            "src/lib.rs",
+            "src/module_0.rs",
+            "src/module_1.rs",
+            "src/module_2.rs",
+            "src/module_3.rs",
+            "src/module_4.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+        let cached_parses = cached_memo.rust_declaration_parses_for_test();
+        assert_eq!(
+            cached_parses.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_declaring_files,
+            "the fixture must traverse exactly its six distinct declaring files"
+        );
+        assert!(
+            cached_parses.values().all(|count| *count == 1),
+            "each declaring file must be parsed once per cold build: {cached_parses:?}"
+        );
+
+        let uncached_parses = uncached_memo.rust_declaration_parses_for_test();
+        let uncached_parse_total: usize = uncached_parses.values().sum();
+        let cached_parse_total: usize = cached_parses.values().sum();
+        println!(
+            "RUST_DECLARATION_PARSE_COUNTS memo=off:{uncached_parse_total} memo=on:{cached_parse_total} distinct={}",
+            cached_parses.len()
+        );
+        assert!(
+            uncached_parse_total > 100,
+            "mutation control: disabling memo insertion must repeat declaration parses; got {uncached_parse_total}"
+        );
+        let cached_missing_refs = cached
+            .conn
+            .lock()
+            .expect("callgraph store mutex poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM refs
+                 WHERE full_ref = 'crate::undeclared::missing' AND target_file IS NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .expect("count unresolved negative refs");
+        assert_eq!(
+            cached_missing_refs, 10,
+            "all negative-result references must remain unresolved without reparsing"
+        );
+    }
+
+    #[test]
+    fn refresh_after_adding_rust_module_declaration_uses_fresh_snapshot() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(project_root.join("src/custom")).expect("create Rust fixture");
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"refresh-declaration-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Rust manifest");
+        let lib = project_root.join("src/lib.rs");
+        let existing = project_root.join("src/existing.rs");
+        let added = project_root.join("src/custom/added.rs");
+        fs::write(
+            &lib,
+            "mod existing;\npub fn run() { crate::added::target(); }\n",
+        )
+        .expect("write initial lib");
+        fs::write(&existing, "pub fn existing() {}\n").expect("write existing module");
+        fs::write(&added, "pub fn target() {}\n").expect("write added module target");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let lib = project_root.join("src/lib.rs");
+        let existing = project_root.join("src/existing.rs");
+        let added = project_root.join("src/custom/added.rs");
+
+        let store = CallGraphStore::open(
+            dir.path().join("refresh-declaration-store"),
+            project_root.to_path_buf(),
+        )
+        .expect("open refresh store");
+        store
+            .cold_build(&[lib.clone(), existing.clone(), added])
+            .expect("initial cold build");
+        assert!(
+            store
+                .direct_callers_of(Path::new("src/custom/added.rs"), "target")
+                .expect("initial callers")
+                .is_empty(),
+            "the custom-path module must be unresolved before its declaration exists"
+        );
+
+        fs::write(&existing, "pub fn existing() { let _ = 1; }\n").expect("touch existing module");
+        store
+            .refresh_files(std::slice::from_ref(&existing))
+            .expect("warm refresh declaration loading");
+        fs::write(
+            &lib,
+            "mod existing;\n#[path = \"custom/added.rs\"]\nmod added;\npub fn run() { crate::added::target(); }\n",
+        )
+        .expect("add custom-path module declaration");
+        store
+            .refresh_files(std::slice::from_ref(&lib))
+            .expect("refresh declaring file");
+
+        let callers = store
+            .direct_callers_of(Path::new("src/custom/added.rs"), "target")
+            .expect("refreshed callers");
+        assert!(
+            callers
+                .iter()
+                .any(|site| { site.caller.file == "src/lib.rs" && site.caller.symbol == "run" }),
+            "a fresh refresh generation must resolve the newly declared module: {callers:#?}"
+        );
+    }
+
     // Benchmark the cold resolver with and without memoization. The generated
     // workspace has hundreds of TypeScript files below a deep package-manifest
     // ladder and enough imported calls for filesystem resolution to dominate
@@ -16469,6 +16676,98 @@ export function leaf() {}
                 stats.edges,
                 wall_ms,
                 cpu_ms
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_rust_declared_module_memo_real_corpus() {
+        let project_root = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+            .expect("canonical agent-file-tools crate root");
+        let files = [
+            "src/main.rs",
+            "src/cli/mod.rs",
+            "src/cli/index.rs",
+            "src/cli/sandbox_launch.rs",
+            "src/cli/warmup.rs",
+        ]
+        .into_iter()
+        .map(|path| project_root.join(path))
+        .collect::<Vec<_>>();
+        assert!(
+            files.iter().all(|path| path.is_file()),
+            "real-corpus benchmark sources must exist"
+        );
+        let dir = tempdir().expect("benchmark temp dir");
+        let mut baseline_edges = None;
+        let mut baseline_stats = None;
+        let enabled_modes = match std::env::var("AFT_RUST_DECL_MEMO").as_deref() {
+            Ok("off") => vec![false],
+            Ok("on") => vec![true],
+            _ => vec![false, true],
+        };
+
+        for enabled in enabled_modes {
+            let memo = callgraph::ModuleResolutionMemo::new_for_test(enabled, true);
+            let store = CallGraphStore::open(
+                dir.path().join(if enabled {
+                    "rust-real-cached"
+                } else {
+                    "rust-real-uncached"
+                }),
+                project_root.to_path_buf(),
+            )
+            .expect("open real-corpus store");
+            let phase_times = Arc::new(Mutex::new((None, None)));
+            let observer_times = Arc::clone(&phase_times);
+            set_cold_build_phase_observer(Some(Arc::new(move |phase| {
+                let mut times = observer_times.lock().expect("phase timing mutex poisoned");
+                match phase {
+                    "resolution" if times.0.is_none() => times.0 = Some(Instant::now()),
+                    "publication" if times.1.is_none() => times.1 = Some(Instant::now()),
+                    _ => {}
+                }
+            })));
+            let build = store.cold_build_chunked_with_resolution_memo_for_test(
+                &files,
+                COLD_BUILD_EXTRACT_BATCH_FILES,
+                COLD_BUILD_RESOLVE_WINDOW,
+                &memo,
+            );
+            set_cold_build_phase_observer(None);
+            let stats = build.expect("real-corpus cold build");
+            let times = phase_times.lock().expect("phase timing mutex poisoned");
+            let resolution_elapsed = times
+                .1
+                .expect("publication phase timestamp")
+                .duration_since(times.0.expect("resolution phase timestamp"));
+            drop(times);
+            let edges = graph_table_rows(&store, "edges");
+            if let Some(expected) = &baseline_edges {
+                assert_eq!(
+                    &edges, expected,
+                    "real-corpus edge rows, including provenance, must be byte-identical"
+                );
+            } else {
+                baseline_edges = Some(edges);
+            }
+            let stats_tuple = (stats.files, stats.nodes, stats.refs, stats.edges);
+            if let Some(expected) = baseline_stats {
+                assert_eq!(stats_tuple, expected, "real-corpus build counts must match");
+            } else {
+                baseline_stats = Some(stats_tuple);
+            }
+            let parses = memo.rust_declaration_parses_for_test();
+            println!(
+                "BENCH_RUST_DECLARED_MODULE_MEMO memo={} files={} refs={} edges={} resolution_wall_ms={} declaration_parses={} distinct_declaring_files={}",
+                if enabled { "on" } else { "off" },
+                stats.files,
+                stats.refs,
+                stats.edges,
+                resolution_elapsed.as_millis(),
+                parses.values().sum::<usize>(),
+                parses.len()
             );
         }
     }
@@ -16782,6 +17081,52 @@ export function leaf() {}
             target_symbol: Some("helper".to_string()),
             dependencies,
         }
+    }
+
+    fn write_rust_declared_module_memo_fixture(
+        project_root: &Path,
+        calls_per_module: usize,
+    ) -> Vec<PathBuf> {
+        fs::create_dir_all(project_root.join("src")).expect("create Rust fixture root");
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"rust-declaration-memo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Rust fixture manifest");
+
+        let modules = (0..5)
+            .map(|index| format!("module_{index}"))
+            .collect::<Vec<_>>();
+        let mut lib_source = modules
+            .iter()
+            .map(|module| format!("pub mod {module};\n"))
+            .collect::<String>();
+        lib_source.push_str("\npub fn dispatch() {\n");
+        for call in 0..calls_per_module {
+            for (index, module) in modules.iter().enumerate() {
+                lib_source.push_str(&format!(
+                    "    crate::{module}::leaf::target_{index}(); // call {call}\n"
+                ));
+            }
+            lib_source.push_str("    crate::undeclared::missing();\n");
+        }
+        lib_source.push_str("}\n");
+        let lib = project_root.join("src/lib.rs");
+        fs::write(&lib, lib_source).expect("write Rust fixture lib");
+        let mut files = vec![lib];
+
+        for (index, module) in modules.iter().enumerate() {
+            let declaring_file = project_root.join(format!("src/{module}.rs"));
+            fs::write(&declaring_file, "pub mod leaf;\n").expect("write nested module declaration");
+            let target_file = project_root.join(format!("src/{module}/leaf.rs"));
+            fs::create_dir_all(target_file.parent().expect("nested module parent"))
+                .expect("create nested module directory");
+            fs::write(&target_file, format!("pub fn target_{index}() {{}}\n"))
+                .expect("write nested module target");
+            files.push(declaring_file);
+            files.push(target_file);
+        }
+        files
     }
 
     fn write_ts_resolution_memo_fixture(

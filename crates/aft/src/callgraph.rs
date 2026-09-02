@@ -43,15 +43,18 @@ static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
 // entry and retained-weight ceilings keep that speedup inside the bounded-build
 // working-set contract: at most 9 MiB of estimated keys/values are retained.
 const MODULE_RESOLUTION_MEMO_MAX_ENTRIES: usize = 32_768;
-const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 3 * 1024 * 1024;
 const JSON_VALUE_MEMO_MAX_ENTRIES: usize = 8_192;
-const JSON_VALUE_MEMO_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+const JSON_VALUE_MEMO_MAX_RETAINED_BYTES: usize = 3 * 1024 * 1024;
 const WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES: usize = 2_048;
 const WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES: usize = 1024 * 1024;
+const RUST_DECLARED_MODULE_MEMO_MAX_ENTRIES: usize = 8_192;
+const RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES: usize = 2 * 1024 * 1024;
 const MEMO_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 type ModuleResolutionKey = (PathBuf, String);
 type WorkspacePackageKey = (PathBuf, String);
+type RustDeclaredModuleMap = HashMap<String, Option<String>>;
 
 struct BoundedMemo<K, V> {
     entries: HashMap<K, V>,
@@ -99,12 +102,15 @@ pub(crate) struct ModuleResolutionMemo {
     module_paths: RefCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
     json_values: RefCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: RefCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
+    rust_declared_modules: RefCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
     #[cfg(test)]
     collect_metrics: bool,
     #[cfg(test)]
     module_computations: RefCell<HashMap<ModuleResolutionKey, usize>>,
     #[cfg(test)]
     json_probes: RefCell<HashMap<PathBuf, usize>>,
+    #[cfg(test)]
+    rust_declaration_parses: RefCell<HashMap<String, usize>>,
 }
 
 impl Default for ModuleResolutionMemo {
@@ -123,12 +129,18 @@ impl Default for ModuleResolutionMemo {
                 WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES,
                 WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES,
             )),
+            rust_declared_modules: RefCell::new(BoundedMemo::new(
+                RUST_DECLARED_MODULE_MEMO_MAX_ENTRIES,
+                RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES,
+            )),
             #[cfg(test)]
             collect_metrics: false,
             #[cfg(test)]
             module_computations: RefCell::new(HashMap::new()),
             #[cfg(test)]
             json_probes: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            rust_declaration_parses: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -181,6 +193,32 @@ impl ModuleResolutionMemo {
         parsed
     }
 
+    pub(crate) fn rust_declared_module_target(
+        &self,
+        caller_file: &str,
+        module_name: &str,
+        populate: impl FnOnce() -> RustDeclaredModuleMap,
+    ) -> Option<String> {
+        if self.enabled {
+            if let Some(cached) = self.rust_declared_modules.borrow().get(caller_file) {
+                return cached.get(module_name).cloned().flatten();
+            }
+        }
+
+        self.note_rust_declaration_parse(caller_file);
+        let declared_modules = Arc::new(populate());
+        let resolved = declared_modules.get(module_name).cloned().flatten();
+        if self.enabled {
+            let retained_weight = rust_declared_module_entry_weight(caller_file, &declared_modules);
+            self.rust_declared_modules.borrow_mut().insert(
+                caller_file.to_string(),
+                declared_modules,
+                retained_weight,
+            );
+        }
+        resolved
+    }
+
     fn workspace_package(&self, key: &WorkspacePackageKey) -> Option<Option<PathBuf>> {
         self.enabled
             .then(|| self.workspace_packages.borrow().get(key).cloned())
@@ -217,6 +255,11 @@ impl ModuleResolutionMemo {
     }
 
     #[cfg(test)]
+    pub(crate) fn rust_declaration_parses_for_test(&self) -> HashMap<String, usize> {
+        self.rust_declaration_parses.borrow().clone()
+    }
+
+    #[cfg(test)]
     fn note_module_computation(&self, key: &ModuleResolutionKey) {
         if self.collect_metrics {
             *self
@@ -243,6 +286,20 @@ impl ModuleResolutionMemo {
 
     #[cfg(not(test))]
     fn note_json_probe(&self, _path: &Path) {}
+
+    #[cfg(test)]
+    fn note_rust_declaration_parse(&self, caller_file: &str) {
+        if self.collect_metrics {
+            *self
+                .rust_declaration_parses
+                .borrow_mut()
+                .entry(caller_file.to_string())
+                .or_default() += 1;
+        }
+    }
+
+    #[cfg(not(test))]
+    fn note_rust_declaration_parse(&self, _caller_file: &str) {}
 }
 
 fn module_resolution_entry_weight(key: &(PathBuf, String), resolved: Option<&Path>) -> usize {
@@ -254,6 +311,22 @@ fn module_resolution_entry_weight(key: &(PathBuf, String), resolved: Option<&Pat
 
 fn path_retained_weight(path: &Path) -> usize {
     path.to_string_lossy().len()
+}
+
+fn rust_declared_module_entry_weight(
+    caller_file: &str,
+    declared_modules: &RustDeclaredModuleMap,
+) -> usize {
+    MEMO_ENTRY_OVERHEAD_BYTES
+        + caller_file.len()
+        + declared_modules
+            .iter()
+            .map(|(module_name, target)| {
+                MEMO_ENTRY_OVERHEAD_BYTES
+                    + module_name.len()
+                    + target.as_deref().map(str::len).unwrap_or_default()
+            })
+            .sum::<usize>()
 }
 
 fn json_retained_weight(value: &Value) -> usize {
