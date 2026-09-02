@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Operator tooling runs through the real GitHub CLI (gh); the shim is only for AI agent commands.
 # Wait for the GitHub Actions release workflow to complete for a given tag.
 # Usage: ./scripts/wait-release.sh v0.7.5 [--max-wait <seconds>] [--no-fail-fast] [--run-id <id>]
 # Polls every 5 seconds, exits 0 on success, 1 on failure, 2 on timeout.
@@ -39,7 +40,7 @@ RUN_ID_OVERRIDE=""
 TAG_SHA=""
 
 # Jobs allowed to fail without rolling back the release.
-# This is a substring match against the job name in `gh run view --json jobs`.
+# This is a substring match against the job name in `"$OPERATOR_GH" run view --json jobs`.
 # Keep this list narrow — only jobs with `continue-on-error: true` that are
 # definitionally non-blocking belong here.
 JOB_FAILURE_ALLOWLIST=(
@@ -95,8 +96,10 @@ else
   echo "⏳ Waiting for release workflow on ${TAG} (max ${MAX_WAIT}s, fail-fast off)..."
 fi
 
-if ! GH_AUTH_OUTPUT=$(gh auth status --hostname github.com 2>&1); then
-  echo "ERROR: gh auth status failed:" >&2
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/operator-gh.sh" || exit 1
+
+if ! GH_AUTH_OUTPUT=$("$OPERATOR_GH" auth status --hostname github.com 2>&1); then
+  echo "ERROR: ${OPERATOR_GH##*/} auth status failed:" >&2
   echo "$GH_AUTH_OUTPUT" >&2
   exit 1
 fi
@@ -122,12 +125,12 @@ MAX_GH_API_FAILURES=3
 PRINTED_STATES=""
 
 gh_run_list() {
-  gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 20 --json status,conclusion,databaseId,createdAt,headBranch,headSha
+  "$OPERATOR_GH" run list --repo "$REPO" --workflow release.yml --branch "$TAG" --limit 20 --json status,conclusion,databaseId,createdAt,headBranch,headSha
 }
 
 gh_run_view() {
   local run_id="$1"
-  gh run view --repo "$REPO" "$run_id" --json status,conclusion,jobs
+  "$OPERATOR_GH" run view --repo "$REPO" "$run_id" --json status,conclusion,jobs
 }
 
 select_matching_run() {
@@ -200,7 +203,7 @@ print_job_transitions() {
 cancel_run() {
   local run_id="$1"
   echo "🛑 Cancelling run ${run_id} to fail fast..." >&2
-  gh run cancel --repo "$REPO" "$run_id" >/dev/null 2>&1 || true
+  "$OPERATOR_GH" run cancel --repo "$REPO" "$run_id" >/dev/null 2>&1 || true
   # Wait briefly for cancellation to register so the final state reflects it.
   local cancel_start
   cancel_start=$(date +%s)
@@ -236,7 +239,7 @@ while true; do
   else
     if ! RUN_JSON=$(gh_run_list 2>&1); then
       GH_API_FAILURES=$((GH_API_FAILURES + 1))
-      echo "ERROR: gh run list failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
+      echo "ERROR: ${OPERATOR_GH##*/} run list failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
       echo "$RUN_JSON" >&2
       if (( GH_API_FAILURES >= MAX_GH_API_FAILURES )); then
         exit 1
@@ -258,7 +261,7 @@ while true; do
 
   if ! RUN_VIEW_JSON=$(gh_run_view "$RUN_ID" 2>&1); then
     GH_API_FAILURES=$((GH_API_FAILURES + 1))
-    echo "ERROR: gh run view failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
+    echo "ERROR: ${OPERATOR_GH##*/} run view failed (attempt ${GH_API_FAILURES}/${MAX_GH_API_FAILURES}):" >&2
     echo "$RUN_VIEW_JSON" >&2
     if (( GH_API_FAILURES >= MAX_GH_API_FAILURES )); then
       exit 1

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Operator tooling runs through the real GitHub CLI (gh); the shim is only for AI agent commands.
 # Gated PR merge - the ONLY sanctioned way to merge a contributor PR.
 #
 # Exists because of #234 (2026-08-17): a P1 bot finding landed at 12:10, the
@@ -28,7 +29,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-OWNER_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/operator-gh.sh" || exit 1
+
+OWNER_REPO=$("$OPERATOR_GH" repo view --json nameWithOwner --jq .nameWithOwner)
 OWNER="${OWNER_REPO%%/*}"
 REPO="${OWNER_REPO##*/}"
 
@@ -42,7 +45,7 @@ refuse() {
 }
 
 # --- 1. Unresolved review threads ------------------------------------------
-UNRESOLVED=$(gh api graphql -f query='
+UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
   query($owner:String!,$repo:String!,$pr:Int!){
     repository(owner:$owner,name:$repo){
       pullRequest(number:$pr){
@@ -54,12 +57,12 @@ UNRESOLVED=$(gh api graphql -f query='
 [ "$UNRESOLVED" -eq 0 ] || refuse "$UNRESOLVED unresolved review thread(s); resolve or let the author finish"
 
 # --- 2. Findings newer than the head commit --------------------------------
-HEAD_SHA=$(gh pr view "$PR" --json headRefOid --jq .headRefOid)
-HEAD_TS=$(gh api "repos/$OWNER_REPO/commits/$HEAD_SHA" --jq .commit.committer.date)
+HEAD_SHA=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
+HEAD_TS=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$HEAD_SHA" --jq .commit.committer.date)
 NEWER=$(
   {
-    gh api "repos/$OWNER_REPO/pulls/$PR/comments" --paginate --jq '.[].created_at'
-    gh api "repos/$OWNER_REPO/pulls/$PR/reviews" --paginate --jq '.[] | select(.state != "APPROVED" and .state != "PENDING") | .submitted_at'
+    "$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/comments" --paginate --jq '.[].created_at'
+    "$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/reviews" --paginate --jq '.[] | select(.state != "APPROVED" and .state != "PENDING") | .submitted_at'
   } | awk -v head="$HEAD_TS" '$0 > head' | wc -l | tr -d ' '
 )
 if [ "$NEWER" -ne 0 ]; then
@@ -81,10 +84,8 @@ HEAD_EPOCH=$(python3 -c "import datetime;print(int(datetime.datetime.fromisoform
 AGE_MIN=$(( (NOW_EPOCH - HEAD_EPOCH) / 60 ))
 [ "$AGE_MIN" -ge "$SETTLE_MIN" ] || refuse "head commit is ${AGE_MIN}m old (< ${SETTLE_MIN}m settle window) - author may be mid-iteration"
 
-# --- 4. Merge (gh enforces its own check-state gate) -----------------------
+# --- 4. Merge (upstream gh enforces its own check-state gate) --------------
 echo "merge-pr: gates green (threads=0, newer-findings=0, head ${AGE_MIN}m settled) - merging #$PR at $HEAD_SHA"
-# Admin-tier action under the gh shim: merges sign as the OPERATOR by doctrine
-# (authority is the agent's per the identity-room fold; identity is never a
-# bot's - the Apps deliberately lack contents:write). The explicit bypass is
-# the audit-visible deliberate act; without it a bound repo refuses the merge.
-GH_SHIM_BYPASS=operator gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
+# Admin merges use the real GitHub CLI directly, bypassing the shim used for
+# AI agent commands.
+GH_SHIM_BYPASS=operator "$OPERATOR_GH" pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"

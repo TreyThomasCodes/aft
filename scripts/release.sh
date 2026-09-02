@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Operator tooling runs through the real GitHub CLI (gh); the shim is only for AI agent commands.
 set -euo pipefail
 
 # release.sh — Tag and push a new AFT release
@@ -295,8 +296,9 @@ fi
 # coverage (3 OS × unit + e2e). Verified, never assumed: gh must report a
 # completed successful run for HEAD's SHA.
 if [ "${TRUST_CI:-}" = "1" ]; then
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/operator-gh.sh" || exit 1
   head_sha=$(git rev-parse HEAD)
-  ci_ok=$(gh run list --commit "$head_sha" --workflow Tests --json status,conclusion \
+  ci_ok=$("$OPERATOR_GH" run list --commit "$head_sha" --workflow Tests --json status,conclusion \
     --jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' 2>/dev/null || echo 0)
   if [ "${ci_ok:-0}" -ge 1 ]; then
     echo "  TRUST_CI: CI is green on $head_sha — skipping local Rust/JS/docker test re-run"
