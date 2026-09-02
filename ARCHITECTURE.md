@@ -462,7 +462,7 @@
 **Release automation entry point:**
 - Location: `.github/workflows/release.yml`
 - Triggers: Git tag pushes matching `v*`
-- Responsibilities: Test the workspace, build platform binaries, publish crates and npm packages, and create a GitHub release
+- Responsibilities: Test the workspace, build platform binaries and alpha distribution zip assets with SHA-256 sidecars, publish crates and npm packages, and create a GitHub release
 
 ## Error Handling
 

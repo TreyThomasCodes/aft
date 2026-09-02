@@ -156,7 +156,7 @@ opencode-aft/
 **`scripts/`:**
 - Purpose: Automate release, validation, and version synchronization tasks.
 - Contains: Shell and Node scripts, Windows VM helpers
-- Key files: `scripts/release.sh`, `scripts/version-sync.mjs`, `scripts/validate-packages.mjs`, `scripts/windows-vm/`
+- Key files: `scripts/release.sh`, `scripts/version-sync.mjs`, `scripts/validate-packages.mjs`, `scripts/align-governed-docs.sh`, `scripts/windows-vm/`
 
 **`tests/`:**
 - Purpose: Host cross-platform end-to-end test suites.
