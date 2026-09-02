@@ -46,6 +46,13 @@ const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
 const V9_ADMIN_TUPLES: &[&str] = &["repo edit", "run delete"];
+// v11 keeps the four thread-state verbs on the admin allowlist so a still-live
+// v11 manifest (no canonicalization) continues to refuse them as admin until a
+// signed v12 artifact moves them to governed.
+const V11_ADMIN_TUPLES: &[&str] = &["issue reopen", "pr reopen"];
+const V12_GOVERNED_TUPLES: &[&str] = &["issue close", "issue reopen", "pr close", "pr reopen"];
+const TARGET_AND_STATE_FORM: &str = "target-and-state";
+const ISSUE_CLOSE_REASONS: &[&str] = &["completed", "not_planned"];
 // These v10 tuples are explicitly reviewed for the operator-only bypass and
 // still require a matching signed manifest declaration. A rerun is
 // administration rather than governed bot speech: it has no public attribution
@@ -85,10 +92,12 @@ pub enum RefusalCode {
     GovernanceUnavailable,
     SeamUnavailable,
     SeamRefusal,
+    MissingReason,
+    DestructiveFlag,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -100,6 +109,8 @@ impl RefusalCode {
         Self::GovernanceUnavailable,
         Self::SeamUnavailable,
         Self::SeamRefusal,
+        Self::MissingReason,
+        Self::DestructiveFlag,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -115,6 +126,8 @@ impl RefusalCode {
             Self::GovernanceUnavailable => "gh_shim_governance_unavailable",
             Self::SeamUnavailable => "gh_shim_seam_unavailable",
             Self::SeamRefusal => "gh_shim_seam_refusal",
+            Self::MissingReason => "gh_shim_missing_reason",
+            Self::DestructiveFlag => "gh_shim_destructive_flag",
         }
     }
 }
@@ -358,8 +371,8 @@ fn unclassified_refusal_text(manifest_version: u64) -> String {
     )
 }
 
-fn refuse_governed_canonicalization(error: &str) -> i32 {
-    refuse(RefusalCode::Unclassified, error)
+fn refuse_governed_canonicalization(error: &CanonicalizeError) -> i32 {
+    refuse(error.code, &error.text)
 }
 
 fn governed_outcome_status(
@@ -372,6 +385,10 @@ fn governed_outcome_status(
         RouteOutcome::Result(output) => {
             print!("{output}");
             0
+        }
+        RouteOutcome::StateAppliedCommentFailed(output) => {
+            print!("{output}");
+            UPSTREAM_FAILURE_EXIT_STATUS
         }
         RouteOutcome::UpstreamError(body) => {
             eprintln!("{body}");
@@ -2023,6 +2040,19 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
     V1_ADMIN_TUPLES.contains(&tuple)
         || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 11 && V11_ADMIN_TUPLES.contains(&tuple))
+}
+
+fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
+    V1_GOVERNED_TUPLES.contains(&tuple)
+        || (manifest_version >= 12 && V12_GOVERNED_TUPLES.contains(&tuple))
+}
+
+fn is_target_and_state(canonical: &Canonicalization) -> bool {
+    canonical
+        .argv_forms
+        .iter()
+        .any(|form| form == TARGET_AND_STATE_FORM)
 }
 
 fn is_reviewed_edit_last_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -2080,12 +2110,14 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         Some(Tier::Admin) if is_reviewed_admin_tuple(manifest.manifest_version, &tuple) => {
             Classification::Admin { tuple }
         }
-        Some(Tier::Governed) if V1_GOVERNED_TUPLES.contains(&tuple.as_str()) => manifest
-            .canonicalization
-            .get(&tuple)
-            .cloned()
-            .map(|canonical| Classification::Governed { tuple, canonical })
-            .unwrap_or(Classification::Unclassified),
+        Some(Tier::Governed) if is_reviewed_governed_tuple(manifest.manifest_version, &tuple) => {
+            manifest
+                .canonicalization
+                .get(&tuple)
+                .cloned()
+                .map(|canonical| Classification::Governed { tuple, canonical })
+                .unwrap_or(Classification::Unclassified)
+        }
         // Only tuples named by the manifest and a generation-specific classifier
         // allowlist can be governed or admin. Command names alone do not opt an
         // entry in; a new write shape needs both a manifest declaration and a
@@ -2196,6 +2228,56 @@ fn is_api_field_argument(value: &str) -> bool {
         || value.starts_with("-f")
 }
 
+/// Pre-routing refusal produced while turning argv into a governed request.
+/// Typed codes stay distinct from unclassified flag errors so callers can parse
+/// the identifier rather than the prose.
+#[derive(Debug)]
+struct CanonicalizeError {
+    code: RefusalCode,
+    text: String,
+}
+
+impl CanonicalizeError {
+    fn unclassified(text: impl Into<String>) -> Self {
+        Self {
+            code: RefusalCode::Unclassified,
+            text: text.into(),
+        }
+    }
+
+    fn typed(code: RefusalCode, text: impl Into<String>) -> Self {
+        Self {
+            code,
+            text: text.into(),
+        }
+    }
+}
+
+impl From<String> for CanonicalizeError {
+    fn from(text: String) -> Self {
+        Self::unclassified(text)
+    }
+}
+
+impl PartialEq<&str> for CanonicalizeError {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl std::fmt::Display for CanonicalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for CanonicalizeError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
 #[derive(Clone, Debug)]
 struct GovernedRequest {
     action: String,
@@ -2217,8 +2299,12 @@ struct GithubReadMutation {
 impl GithubReadMutation {
     fn from_governed_request(request: &GovernedRequest) -> Option<Self> {
         let resource_kind = match request.action.as_str() {
-            "issue comment" | "issue reaction" => GithubReadResourceKind::Issue,
-            "pr comment" | "pr review" => GithubReadResourceKind::PullRequest,
+            "issue comment" | "issue reaction" | "issue close" | "issue reopen" => {
+                GithubReadResourceKind::Issue
+            }
+            "pr comment" | "pr review" | "pr close" | "pr reopen" => {
+                GithubReadResourceKind::PullRequest
+            }
             _ => return None,
         };
         let normalized_repository = canonical_repository_key(request.repository.as_deref()?)?;
@@ -2251,7 +2337,10 @@ fn invalidate_successful_github_read_mutation_at(
     mutation: Option<&GithubReadMutation>,
     outcome: &RouteOutcome,
 ) {
-    if !matches!(outcome, RouteOutcome::Result(_)) {
+    if !matches!(
+        outcome,
+        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+    ) {
         return;
     }
     let Some(mutation) = mutation else {
@@ -2276,42 +2365,55 @@ fn canonicalize_governed(
     tuple: &str,
     canonical: &Canonicalization,
     manifest_version: u64,
-) -> Result<GovernedRequest, String> {
-    let (_, _, head_index) =
-        command_head(args).ok_or_else(|| "missing command head".to_string())?;
+) -> Result<GovernedRequest, CanonicalizeError> {
+    let (_, _, head_index) = command_head(args)
+        .ok_or_else(|| CanonicalizeError::unclassified("missing command head"))?;
     let subcommand_index = if tuple.starts_with("api ") {
         head_index
     } else {
         head_index + 1
     };
+    let target_and_state = is_target_and_state(canonical);
     let mut positional = Vec::new();
     let mut body = Map::new();
     let mut review_event = None;
     let mut explicit_repository = None;
+    let mut close_reason = None;
     let mut edit_last = false;
     let mut index = subcommand_index + 1;
     while index < args.len() {
-        let value = args[index]
-            .to_str()
-            .ok_or_else(|| "non-UTF-8 governed arguments are undeclared".to_string())?;
+        let value = args[index].to_str().ok_or_else(|| {
+            CanonicalizeError::unclassified("non-UTF-8 governed arguments are undeclared")
+        })?;
         if tuple == "pr review" {
             if let Some(event) = declared_review_event(value) {
                 if review_event.replace(event.to_string()).is_some() {
-                    return Err(
-                        "pr review accepts only one of --approve, --comment, or --request-changes"
-                            .to_string(),
-                    );
+                    return Err(CanonicalizeError::unclassified(
+                        "pr review accepts only one of --approve, --comment, or --request-changes",
+                    ));
                 }
                 index += 1;
                 continue;
             }
         }
+        if target_and_state && (value == "--delete-branch" || value == "-d") {
+            // Branch deletion is a distinct undeclared mutation. Refuse it in
+            // the argv scan so it never becomes a field on the routed request.
+            return Err(CanonicalizeError::typed(
+                RefusalCode::DestructiveFlag,
+                format!("{value}: branch deletion stays undeclared"),
+            ));
+        }
         if value == "--edit-last" {
             if !is_reviewed_edit_last_tuple(manifest_version, tuple) {
-                return Err("undeclared flag --edit-last".to_string());
+                return Err(CanonicalizeError::unclassified(
+                    "undeclared flag --edit-last",
+                ));
             }
             if edit_last {
-                return Err("--edit-last may be provided only once".to_string());
+                return Err(CanonicalizeError::unclassified(
+                    "--edit-last may be provided only once",
+                ));
             }
             edit_last = true;
         } else if value == "--repo" || value == "-R" {
@@ -2319,10 +2421,34 @@ fn canonicalize_governed(
             let repository = args
                 .get(index)
                 .and_then(|arg| arg.to_str())
-                .ok_or_else(|| "--repo requires a value".to_string())?;
+                .ok_or_else(|| CanonicalizeError::unclassified("--repo requires a value"))?;
             explicit_repository = Some(repository.to_string());
         } else if let Some(repository) = value.strip_prefix("--repo=") {
             explicit_repository = Some(repository.to_string());
+        } else if target_and_state {
+            if let Some(supplied) = declared_reason_value(value, args.get(index + 1), tuple)? {
+                if close_reason.replace(supplied).is_some() {
+                    return Err(CanonicalizeError::unclassified(
+                        "--reason may be provided only once",
+                    ));
+                }
+                if !value.contains('=') {
+                    index += 1;
+                }
+            } else if let Some((field, supplied)) =
+                declared_body_value(value, canonical, args.get(index + 1))?
+            {
+                body.insert(field, Value::String(supplied));
+                if !value.contains('=') {
+                    index += 1;
+                }
+            } else if value.starts_with('-') {
+                return Err(CanonicalizeError::unclassified(format!(
+                    "undeclared flag {value}"
+                )));
+            } else {
+                positional.push(value.to_string());
+            }
         } else if let Some((field, supplied)) =
             declared_body_value(value, canonical, args.get(index + 1))?
         {
@@ -2335,7 +2461,9 @@ fn canonicalize_governed(
                 index += 1;
             }
         } else if value.starts_with('-') {
-            return Err(format!("undeclared flag {value}"));
+            return Err(CanonicalizeError::unclassified(format!(
+                "undeclared flag {value}"
+            )));
         } else {
             positional.push(value.to_string());
         }
@@ -2343,7 +2471,9 @@ fn canonicalize_governed(
     }
 
     if positional.len() != canonical.target_fields.len() {
-        return Err("target positional form is undeclared".to_string());
+        return Err(CanonicalizeError::unclassified(
+            "target positional form is undeclared",
+        ));
     }
     if canonical
         .body_fields
@@ -2358,9 +2488,28 @@ fn canonicalize_governed(
                 .as_deref()
                 .is_some_and(|event| event != "COMMENT")
             && canonical.body_fields.iter().all(|field| field == "body");
-        if !body_optional_for_review {
-            return Err("required declared body field is absent".to_string());
+        // Thread-state verbs may close or reopen without a comment; the comment
+        // field is declared so --comment/--comment-file/-c reuse body plumbing.
+        let body_optional_for_state =
+            target_and_state && canonical.body_fields.iter().all(|field| field == "comment");
+        if !body_optional_for_review && !body_optional_for_state {
+            return Err(CanonicalizeError::unclassified(
+                "required declared body field is absent",
+            ));
         }
+    }
+    if tuple == "issue close" && target_and_state {
+        let Some(reason) = close_reason else {
+            return Err(CanonicalizeError::typed(
+                RefusalCode::MissingReason,
+                "issue close requires --reason completed|not_planned because those are distinct public statements",
+            ));
+        };
+        body.insert("reason".to_string(), Value::String(reason));
+    } else if close_reason.is_some() {
+        return Err(CanonicalizeError::unclassified(
+            "--reason is only valid for issue close",
+        ));
     }
     if let Some(event) = review_event {
         body.insert("event".to_string(), Value::String(event));
@@ -2402,6 +2551,7 @@ fn declared_body_value(
         let short = match field.as_str() {
             "body" => Some("-b"),
             "reaction" => Some("-r"),
+            "comment" => Some("-c"),
             _ => None,
         };
         if value == long || short == Some(value) {
@@ -2436,8 +2586,56 @@ fn declared_body_value(
                 return Ok(Some((field.clone(), supplied)));
             }
         }
+
+        // Thread-state verbs take an optional comment via --comment-file, including
+        // the stdin path `-`, matching the body-file plumbing used for speech.
+        if field == "comment" {
+            let file = if value == "--comment-file" {
+                Some(
+                    next.and_then(|arg| arg.to_str())
+                        .ok_or_else(|| format!("{value} requires a value"))?,
+                )
+            } else {
+                value.strip_prefix("--comment-file=")
+            };
+            if let Some(file) = file {
+                let supplied =
+                    read_body_file(Path::new(file)).map_err(|error| format!("{value}: {error}"))?;
+                return Ok(Some((field.clone(), supplied)));
+            }
+        }
     }
     Ok(None)
+}
+
+fn declared_reason_value(
+    value: &str,
+    next: Option<&OsString>,
+    tuple: &str,
+) -> Result<Option<String>, CanonicalizeError> {
+    let supplied = if value == "--reason" {
+        Some(
+            next.and_then(|arg| arg.to_str())
+                .ok_or_else(|| CanonicalizeError::unclassified("--reason requires a value"))?
+                .to_string(),
+        )
+    } else {
+        value.strip_prefix("--reason=").map(str::to_string)
+    };
+    let Some(supplied) = supplied else {
+        return Ok(None);
+    };
+    if tuple != "issue close" {
+        return Err(CanonicalizeError::unclassified(
+            "--reason is only valid for issue close",
+        ));
+    }
+    if !ISSUE_CLOSE_REASONS.contains(&supplied.as_str()) {
+        return Err(CanonicalizeError::unclassified(
+            "--reason must be completed or not_planned",
+        ));
+    }
+    Ok(Some(supplied))
 }
 
 fn read_body_file(path: &Path) -> Result<String, String> {
@@ -2492,6 +2690,7 @@ fn infer_repository_from_git() -> Option<String> {
 #[derive(Debug)]
 enum RouteOutcome {
     Result(String),
+    StateAppliedCommentFailed(String),
     UpstreamError(String),
     Refusal(String),
     UnboundIdentity,
@@ -2686,6 +2885,33 @@ fn governed_wire_request(
     agent_id: &str,
     request: GovernedRequest,
 ) -> Value {
+    let metadata = json!({
+        "agent_id": agent_id,
+        "pid": std::process::id(),
+    });
+    if V12_GOVERNED_TUPLES.contains(&request.action.as_str()) {
+        // Thread-state verbs use verb/repository/number/reason/comment instead of
+        // action/target/body so a delete-branch flag cannot appear on the wire.
+        let mut wire = json!({
+            "operation": ROUTING_OPERATION,
+            "gh_route_schema": 1,
+            "verb": request.action,
+            "repository": request.repository,
+            "number": request.target.get("number").cloned().unwrap_or(Value::Null),
+            "manifest_version": request.manifest_version,
+            "rung_as_of_unix_secs": determination.as_of_unix_secs,
+            "metadata": metadata,
+        });
+        if request.action == "issue close" {
+            if let Some(reason) = request.body.get("reason").cloned() {
+                wire["reason"] = reason;
+            }
+        }
+        if let Some(comment) = request.body.get("comment").cloned() {
+            wire["comment"] = comment;
+        }
+        return wire;
+    }
     let edit_last = request.edit_last;
     let mut wire = json!({
         "operation": ROUTING_OPERATION,
@@ -2696,10 +2922,7 @@ fn governed_wire_request(
         "repository": request.repository,
         "manifest_version": request.manifest_version,
         "rung_as_of_unix_secs": determination.as_of_unix_secs,
-        "metadata": {
-            "agent_id": agent_id,
-            "pid": std::process::id(),
-        },
+        "metadata": metadata,
     });
     // Keep the create wire shape byte-for-byte compatible. The explicit marker
     // lets the route holder perform the same authenticated-user-only mutation
@@ -2760,6 +2983,10 @@ fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
             Ok(RouteOutcome::Refusal(refusal_code.to_string()))
         }
         Some("unbound_identity") => Ok(RouteOutcome::UnboundIdentity),
+        Some("applied") => Ok(RouteOutcome::Result(render_applied_state(object)?)),
+        Some("state_applied_comment_failed") => Ok(RouteOutcome::StateAppliedCommentFailed(
+            render_state_applied_comment_failed(object)?,
+        )),
         _ => Err(RouteOutcome::SchemaMismatch(
             "governance seam returned an unknown outcome".to_string(),
         )),
@@ -2787,6 +3014,73 @@ fn upstream_error_body(response: &Map<String, Value>, result: &Value) -> Option<
         Value::String(body) => body.clone(),
         _ => serde_json::to_string(body).unwrap_or_else(|_| body.to_string()),
     })
+}
+
+fn returned_state_fields(
+    object: &Map<String, Value>,
+) -> Result<(String, Option<String>), RouteOutcome> {
+    let state = object
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RouteOutcome::SchemaMismatch("governance seam omitted returned state".to_string())
+        })?
+        .to_string();
+    let state_reason = object
+        .get("state_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((state, state_reason))
+}
+
+fn render_applied_state(object: &Map<String, Value>) -> Result<String, RouteOutcome> {
+    let (state, state_reason) = returned_state_fields(object)?;
+    let mut output = state;
+    output.push('\n');
+    if let Some(reason) = state_reason {
+        output.push_str(&reason);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn render_state_applied_comment_failed(
+    object: &Map<String, Value>,
+) -> Result<String, RouteOutcome> {
+    let (state, state_reason) = returned_state_fields(object)?;
+    let comment_error = object
+        .get("comment_error")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RouteOutcome::SchemaMismatch(
+                "governance seam omitted comment_error on partial state apply".to_string(),
+            )
+        })?;
+    let code = comment_error_code(comment_error.get("code"))
+        .ok_or_else(|| RouteOutcome::SchemaMismatch("comment_error omitted code".to_string()))?;
+    let detail = comment_error
+        .get("detail")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RouteOutcome::SchemaMismatch("comment_error omitted detail".to_string()))?;
+    let mut output = format!("APPLIED {state}\n");
+    if let Some(reason) = state_reason {
+        output.push_str(&reason);
+        output.push('\n');
+    }
+    output.push_str("comment_error: ");
+    output.push_str(&code);
+    output.push_str(": ");
+    output.push_str(detail);
+    output.push('\n');
+    Ok(output)
+}
+
+fn comment_error_code(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(code) => Some(code.clone()),
+        Value::Number(code) => Some(code.to_string()),
+        _ => None,
+    }
 }
 
 fn render_governed_response(result: &Value, field_order: &[Value]) -> Result<String, RouteOutcome> {
@@ -3406,6 +3700,20 @@ mod tests {
             .expect("v10 manifest fixture")
     }
 
+    fn v11_fixture_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v11-manifest.json"))
+            .expect("v11 manifest fixture")
+    }
+
+    fn v12_fixture_manifest() -> Manifest {
+        serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v12-manifest.json"))
+            .expect("v12 manifest fixture")
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
     fn edit_last_vectors_fixture() -> Value {
         // JSON has no comment syntax, so strip the human-readable provenance
         // header before parsing the copied producer fixture.
@@ -3720,6 +4028,16 @@ mod tests {
     }
 
     #[test]
+    fn v11_and_v12_thread_state_manifests_validate() {
+        v11_fixture_manifest()
+            .validate()
+            .expect("v11 keeps the four thread-state verbs at admin without canonicalization");
+        v12_fixture_manifest()
+            .validate()
+            .expect("v12 governed target-and-state tuples must satisfy the canonicalization check");
+    }
+
+    #[test]
     fn v9_admin_tuple_fixture_differentiates_native_writes_from_raw_api_delete() {
         let manifest = v9_fixture_manifest();
         assert_eq!(manifest.manifest_version, 9);
@@ -3890,6 +4208,320 @@ mod tests {
             classify(&run_cancel, &manifest, "macos"),
             Classification::Unclassified
         ));
+    }
+
+    #[test]
+    fn v12_thread_state_verbs_route_target_and_state_and_v11_stays_admin() {
+        let v12 = v12_fixture_manifest();
+        let v11 = v11_fixture_manifest();
+        v12.validate().expect("valid v12 manifest");
+        v11.validate().expect("valid v11 manifest");
+        assert_eq!(v12.manifest_version, 12);
+        assert_eq!(v11.manifest_version, 11);
+
+        let determination =
+            RungDetermination::r3(1_700_000_000, v12.manifest_version, &test_rung_provenance());
+        let body_file = fixture_dir().join("governed-speech.md");
+        let expected_comment = fs::read_to_string(&body_file).expect("speech body fixture");
+
+        let close_args = os_args(&[
+            "issue",
+            "close",
+            "42",
+            "--reason",
+            "completed",
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed {
+            tuple: close_tuple,
+            canonical: close_canonical,
+        } = classify(&close_args, &v12, "macos")
+        else {
+            panic!("v12 issue close must be governed");
+        };
+        assert_eq!(close_tuple, "issue close");
+        assert!(close_canonical
+            .argv_forms
+            .iter()
+            .any(|form| form == TARGET_AND_STATE_FORM));
+        let close_request = canonicalize_governed(
+            &close_args,
+            &close_tuple,
+            &close_canonical,
+            v12.manifest_version,
+        )
+        .expect("issue close with --reason should canonicalize");
+        let close_wire = governed_wire_request(&determination.record, "alfonso-aft", close_request);
+        assert_eq!(close_wire["verb"], "issue close");
+        assert_eq!(close_wire["repository"], "cortexkit/aft");
+        assert_eq!(close_wire["number"], "42");
+        assert_eq!(close_wire["reason"], "completed");
+        assert!(close_wire.get("comment").is_none());
+        assert!(close_wire.get("action").is_none());
+        assert!(close_wire.get("target").is_none());
+        assert!(close_wire.get("body").is_none());
+        assert!(close_wire.get("delete-branch").is_none());
+        assert!(close_wire.get("delete_branch").is_none());
+
+        let reopen_args = os_args(&["pr", "reopen", "7", "--repo", "cortexkit/aft"]);
+        let Classification::Governed {
+            tuple: reopen_tuple,
+            canonical: reopen_canonical,
+        } = classify(&reopen_args, &v12, "macos")
+        else {
+            panic!("v12 pr reopen must be governed");
+        };
+        assert_eq!(reopen_tuple, "pr reopen");
+        let reopen_request = canonicalize_governed(
+            &reopen_args,
+            &reopen_tuple,
+            &reopen_canonical,
+            v12.manifest_version,
+        )
+        .expect("pr reopen should canonicalize without --reason");
+        let reopen_wire =
+            governed_wire_request(&determination.record, "alfonso-aft", reopen_request);
+        assert_eq!(reopen_wire["verb"], "pr reopen");
+        assert_eq!(reopen_wire["repository"], "cortexkit/aft");
+        assert_eq!(reopen_wire["number"], "7");
+        assert!(reopen_wire.get("reason").is_none());
+        assert!(reopen_wire.get("comment").is_none());
+        assert!(reopen_wire.get("delete-branch").is_none());
+
+        for (args, expected_tuple) in [
+            (
+                os_args(&["issue", "close", "42", "--reason", "not_planned"]),
+                "issue close",
+            ),
+            (os_args(&["issue", "reopen", "42"]), "issue reopen"),
+            (os_args(&["pr", "close", "7"]), "pr close"),
+            (os_args(&["pr", "reopen", "7"]), "pr reopen"),
+        ] {
+            assert!(
+                matches!(
+                    classify(&args, &v12, "macos"),
+                    Classification::Governed { ref tuple, .. } if tuple == expected_tuple
+                ),
+                "v12 must govern {expected_tuple}"
+            );
+            assert!(
+                matches!(
+                    classify(&args, &v11, "macos"),
+                    Classification::Admin { ref tuple } if tuple == expected_tuple
+                ),
+                "v11 must keep {expected_tuple} on the admin tier"
+            );
+        }
+
+        let missing_reason = os_args(&["issue", "close", "42", "--repo", "cortexkit/aft"]);
+        let Classification::Governed { tuple, canonical } =
+            classify(&missing_reason, &v12, "macos")
+        else {
+            panic!("missing --reason is still the governed issue close tuple");
+        };
+        let missing =
+            canonicalize_governed(&missing_reason, &tuple, &canonical, v12.manifest_version)
+                .expect_err("issue close without --reason must refuse");
+        assert_eq!(missing.code, RefusalCode::MissingReason);
+        assert_eq!(missing.code.as_str(), "gh_shim_missing_reason");
+        assert!(
+            missing.contains("--reason"),
+            "missing-reason refusal must name --reason: {missing}"
+        );
+        assert_eq!(
+            refuse_governed_canonicalization(&missing),
+            REFUSAL_EXIT_STATUS
+        );
+
+        for flag in ["--delete-branch", "-d"] {
+            let args = os_args(&["pr", "close", "7", flag, "--repo", "cortexkit/aft"]);
+            let Classification::Governed { tuple, canonical } = classify(&args, &v12, "macos")
+            else {
+                panic!("pr close with {flag} must still classify as governed");
+            };
+            let error = canonicalize_governed(&args, &tuple, &canonical, v12.manifest_version)
+                .expect_err("pr close {flag} must refuse before routing");
+            assert_eq!(error.code, RefusalCode::DestructiveFlag);
+            assert_eq!(error.code.as_str(), "gh_shim_destructive_flag");
+            assert!(
+                error.contains(flag),
+                "destructive refusal must name {flag}: {error}"
+            );
+            assert!(
+                error.contains("branch deletion stays undeclared"),
+                "destructive refusal must say branch deletion stays undeclared: {error}"
+            );
+            assert_eq!(
+                refuse_governed_canonicalization(&error),
+                REFUSAL_EXIT_STATUS
+            );
+        }
+
+        let reason_on_reopen = os_args(&[
+            "issue",
+            "reopen",
+            "42",
+            "--reason",
+            "completed",
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed { tuple, canonical } =
+            classify(&reason_on_reopen, &v12, "macos")
+        else {
+            panic!("issue reopen remains governed");
+        };
+        let rejected_reason =
+            canonicalize_governed(&reason_on_reopen, &tuple, &canonical, v12.manifest_version)
+                .expect_err("--reason is issue close only");
+        assert_eq!(rejected_reason.code, RefusalCode::Unclassified);
+        assert!(rejected_reason.contains("--reason"));
+
+        let inline_comment = os_args(&[
+            "issue",
+            "close",
+            "42",
+            "--reason",
+            "completed",
+            "--comment",
+            "Closing as done.",
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed { tuple, canonical } =
+            classify(&inline_comment, &v12, "macos")
+        else {
+            panic!("issue close with --comment must be governed");
+        };
+        let commented =
+            canonicalize_governed(&inline_comment, &tuple, &canonical, v12.manifest_version)
+                .expect("--comment should canonicalize");
+        assert_eq!(commented.body["comment"], "Closing as done.");
+        let commented_wire = governed_wire_request(&determination.record, "alfonso-aft", commented);
+        assert_eq!(commented_wire["comment"], "Closing as done.");
+
+        let short_comment = os_args(&[
+            "pr",
+            "close",
+            "7",
+            "-c",
+            "Closing the pull request.",
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&short_comment, &v12, "macos")
+        else {
+            panic!("pr close with -c must be governed");
+        };
+        let short = canonicalize_governed(&short_comment, &tuple, &canonical, v12.manifest_version)
+            .expect("-c should canonicalize");
+        assert_eq!(short.body["comment"], "Closing the pull request.");
+
+        let file_comment = os_args(&[
+            "issue",
+            "reopen",
+            "42",
+            "--comment-file",
+            body_file.to_str().expect("utf-8 body file path"),
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&file_comment, &v12, "macos")
+        else {
+            panic!("issue reopen with --comment-file must be governed");
+        };
+        let from_file =
+            canonicalize_governed(&file_comment, &tuple, &canonical, v12.manifest_version)
+                .expect("--comment-file should reuse body-file plumbing");
+        assert_eq!(from_file.body["comment"], expected_comment);
+
+        let mut stdin = std::io::Cursor::new("comment supplied through stdin");
+        assert_eq!(
+            read_body_file_from(Path::new("-"), &mut stdin).unwrap(),
+            "comment supplied through stdin"
+        );
+    }
+
+    #[test]
+    fn thread_state_holder_applied_and_partial_comment_outcomes_render_returned_state() {
+        let applied_close = json!({
+            "outcome": "applied",
+            "state": "closed",
+            "state_reason": "not_planned"
+        });
+        let applied = parse_governed_response(&serde_json::to_vec(&applied_close).unwrap())
+            .expect("applied close should parse");
+        let RouteOutcome::Result(text) = applied else {
+            panic!("applied close must be a successful result, got {applied:?}");
+        };
+        assert!(
+            text.contains("not_planned"),
+            "returned state_reason must be printed: {text:?}"
+        );
+        assert!(
+            !text.contains("completed"),
+            "request reason must not be echoed: {text:?}"
+        );
+        assert!(
+            text.contains("closed"),
+            "returned state must be printed: {text:?}"
+        );
+
+        let partial = json!({
+            "outcome": "state_applied_comment_failed",
+            "state": "closed",
+            "state_reason": "completed",
+            "comment_error": {
+                "code": "rate_limited",
+                "detail": "secondary rate limit on issue comments"
+            }
+        });
+        let partial_outcome = parse_governed_response(&serde_json::to_vec(&partial).unwrap())
+            .expect("partial comment failure should parse");
+        let RouteOutcome::StateAppliedCommentFailed(partial_text) = &partial_outcome else {
+            panic!("partial must not be a seam refusal or full success, got {partial_outcome:?}");
+        };
+        assert!(
+            partial_text.contains("APPLIED"),
+            "partial must print an APPLIED line: {partial_text:?}"
+        );
+        assert!(
+            partial_text.contains("rate_limited"),
+            "partial must print comment_error code: {partial_text:?}"
+        );
+        assert!(
+            partial_text.contains("secondary rate limit on issue comments"),
+            "partial must print comment_error detail: {partial_text:?}"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let binding = AgentBinding {
+            repo: "owner/repo".to_string(),
+            agent_id: "agent-7".to_string(),
+        };
+        assert_eq!(
+            governed_outcome_status(&paths, &binding, 123, partial_outcome),
+            UPSTREAM_FAILURE_EXIT_STATUS
+        );
+
+        let applied_reopen = json!({
+            "outcome": "applied",
+            "state": "open"
+        });
+        let reopen = parse_governed_response(&serde_json::to_vec(&applied_reopen).unwrap())
+            .expect("applied reopen should parse");
+        let RouteOutcome::Result(reopen_text) = reopen else {
+            panic!("applied reopen must be a successful result, got {reopen:?}");
+        };
+        assert!(
+            reopen_text.contains("open"),
+            "reopen must print returned state: {reopen_text:?}"
+        );
+        assert_eq!(
+            governed_outcome_status(&paths, &binding, 123, RouteOutcome::Result(reopen_text)),
+            0
+        );
     }
 
     #[test]
@@ -5016,7 +5648,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 11);
+        assert_eq!(RefusalCode::ALL.len(), 13);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));

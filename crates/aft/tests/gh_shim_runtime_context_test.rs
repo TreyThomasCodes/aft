@@ -113,6 +113,24 @@ fn write_fresh_v10_manifest(state_home: &Path, now: u64, manifest_version: u64) 
     );
 }
 
+fn write_fresh_v11_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/v11-manifest.json"),
+        11,
+    );
+}
+
+fn write_fresh_v12_manifest(state_home: &Path, now: u64) {
+    write_fresh_manifest_from_fixture(
+        state_home,
+        now,
+        include_str!("fixtures/gh_shim/v12-manifest.json"),
+        12,
+    );
+}
+
 fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
     write_fresh_manifest_from_fixture(
         state_home,
@@ -1629,6 +1647,115 @@ fn co_author_line_resolves_a_missing_numeric_id_once_and_caches_it() {
     )
     .expect("parse numeric id cache");
     assert_eq!(ids["alfonso-aft"], 289616620);
+}
+
+#[test]
+fn gh_shim_v11_thread_state_verbs_stay_admin_and_v12_refuses_reason_and_delete_branch() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let home = temp.path().join("home");
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let project = write_project_repo(temp.path());
+    write_upstream_gh(&upstream_bin);
+    write_user_config(&config_home, &connection_file, None);
+    let now = unix_seconds();
+
+    let v11_state = temp.path().join("v11-state");
+    let v11_recorder = temp.path().join("v11-upstream-invocations.txt");
+    write_fresh_v11_manifest(&v11_state, now);
+    write_fresh_r3_cache_for_manifest(&v11_state, now, 11);
+    let expected_admin_refusal =
+        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    for args in [
+        &["issue", "close", "42"][..],
+        &["issue", "reopen", "42"][..],
+        &["pr", "close", "7"][..],
+        &["pr", "reopen", "7"][..],
+    ] {
+        let output = shim_command(
+            args,
+            &project,
+            &config_home,
+            &v11_state,
+            &home,
+            &upstream_bin,
+            &v11_recorder,
+        )
+        .output()
+        .expect("spawn v11 admin thread-state invocation");
+        assert_eq!(output.status.code(), Some(86));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected_admin_refusal
+        );
+    }
+    assert!(
+        !v11_recorder.exists(),
+        "v11 admin thread-state verbs must not reach upstream gh"
+    );
+
+    let v12_state = temp.path().join("v12-state");
+    let v12_recorder = temp.path().join("v12-upstream-invocations.txt");
+    write_fresh_v12_manifest(&v12_state, now);
+    write_fresh_r3_cache_for_manifest(&v12_state, now, 12);
+
+    let missing_reason = shim_command(
+        &["issue", "close", "42", "--repo", "cortexkit/aft"],
+        &project,
+        &config_home,
+        &v12_state,
+        &home,
+        &upstream_bin,
+        &v12_recorder,
+    )
+    .output()
+    .expect("spawn v12 issue close without --reason");
+    assert_eq!(missing_reason.status.code(), Some(86));
+    assert!(missing_reason.stdout.is_empty());
+    let missing_stderr = String::from_utf8_lossy(&missing_reason.stderr);
+    assert!(
+        missing_stderr.contains("gh_shim_missing_reason"),
+        "missing --reason must use the typed refusal: {missing_stderr}"
+    );
+    assert!(
+        missing_stderr.contains("--reason"),
+        "missing-reason refusal must name --reason: {missing_stderr}"
+    );
+
+    for flag in ["--delete-branch", "-d"] {
+        let output = shim_command(
+            &["pr", "close", "7", flag, "--repo", "cortexkit/aft"],
+            &project,
+            &config_home,
+            &v12_state,
+            &home,
+            &upstream_bin,
+            &v12_recorder,
+        )
+        .output()
+        .expect("spawn v12 pr close with destructive flag");
+        assert_eq!(output.status.code(), Some(86));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("gh_shim_destructive_flag"),
+            "{flag} must use gh_shim_destructive_flag: {stderr}"
+        );
+        assert!(
+            stderr.contains(flag),
+            "destructive refusal must name {flag}: {stderr}"
+        );
+        assert!(
+            stderr.contains("branch deletion stays undeclared"),
+            "destructive refusal must keep branch deletion undeclared: {stderr}"
+        );
+    }
+    assert!(
+        !v12_recorder.exists(),
+        "v12 pre-routing refusals must not reach upstream gh"
+    );
 }
 
 #[test]
