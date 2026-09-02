@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+  "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -949,7 +949,7 @@
             }
           },
           "aft_inspect": {
-            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics; it does not change collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
+            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -969,7 +969,7 @@
                   ]
                 },
                 "scope": {
-                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not change the diagnostic collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
                   "anyOf": [
                     {
                       "type": "string"
@@ -1061,7 +1061,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1918,7 +1918,7 @@
             }
           },
           "aft_inspect": {
-            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics; it does not change collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
+            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1938,7 +1938,7 @@
                   ]
                 },
                 "scope": {
-                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not change the diagnostic collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
                   "anyOf": [
                     {
                       "type": "string"
@@ -2090,7 +2090,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2281,7 +2281,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -2943,7 +2943,7 @@
           "aft_inspect": {
             "name": "aft_inspect",
             "label": "inspect",
-            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics; it does not change collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
+            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -2973,7 +2973,7 @@
                       }
                     }
                   ],
-                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not change the diagnostic collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result."
+                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result."
                 },
                 "topK": {
                   "type": "integer",
@@ -3249,7 +3249,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "a18a77a597a853203673526dcd27a53aebaa6438",
+      "source_commit": "d0ca7843f3d1edb438fb518d672c890ec418a6a9",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -3915,7 +3915,7 @@
           "aft_inspect": {
             "name": "aft_inspect",
             "label": "inspect",
-            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics; it does not change collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
+            "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -3945,7 +3945,7 @@
                       }
                     }
                   ],
-                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not change the diagnostic collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result."
+                  "description": "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result."
                 },
                 "topK": {
                   "type": "integer",
