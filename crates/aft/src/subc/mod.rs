@@ -5696,8 +5696,15 @@ pub(crate) mod test_support {
     }
 
     fn inspect_context(root: &Path) -> Arc<AppContext> {
+        inspect_context_with_timeout(root, None)
+    }
+
+    fn inspect_context_with_timeout(root: &Path, timeout_ms: Option<u64>) -> Arc<AppContext> {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.to_path_buf());
+        if let Some(timeout_ms) = timeout_ms {
+            config.inspect.diagnostics_timeout_ms = timeout_ms;
+        }
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
@@ -5884,6 +5891,34 @@ pub(crate) mod test_support {
             terminal.data.get("inspect_terminal").is_some(),
             "inspect must still produce its terminal: {:?}",
             terminal.data
+        );
+    }
+
+    #[test]
+    fn deferred_inspect_honors_the_shared_request_deadline() {
+        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("deferred-inspect-deadline");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
+        let ctx = inspect_context_with_timeout(dir.path(), Some(10_000));
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started_rx, _release_tx) =
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+        let started = Instant::now();
+        let (mut pending, _cancellation) =
+            submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-deadline");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deferred inspect body starts");
+
+        let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
+        assert_eq!(terminal.data["inspect_terminal"], "phase_failed");
+        assert_eq!(terminal.data["failure_reason"], "inspect_request_timeout");
+        assert_eq!(terminal.data["failed_phase"], "tier2_rescan");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "deferred inspect missed its terminal reserve: {:?}",
+            started.elapsed()
         );
     }
 

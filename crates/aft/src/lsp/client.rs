@@ -362,6 +362,21 @@ impl LspClient {
         workspace_root: &Path,
         initialization_options: Option<serde_json::Value>,
     ) -> Result<lsp_types::InitializeResult, LspError> {
+        self.initialize_with_timeout(
+            workspace_root,
+            initialization_options,
+            HANDSHAKE_REQUEST_TIMEOUT,
+        )
+    }
+
+    /// Initialize within a caller-owned deadline rather than extending it with
+    /// the normal standalone handshake budget.
+    pub(crate) fn initialize_with_timeout(
+        &mut self,
+        workspace_root: &Path,
+        initialization_options: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<lsp_types::InitializeResult, LspError> {
         self.ensure_can_send()?;
         self.state = ServerState::Initializing;
 
@@ -440,7 +455,7 @@ impl LspClient {
         let result_value = self.send_request_value_with_timeout(
             <lsp_types::request::Initialize as lsp_types::request::Request>::METHOD,
             params,
-            HANDSHAKE_REQUEST_TIMEOUT,
+            timeout.min(HANDSHAKE_REQUEST_TIMEOUT),
         )?;
         let result: lsp_types::InitializeResult = serde_json::from_value(result_value.clone())?;
 

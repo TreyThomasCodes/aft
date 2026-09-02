@@ -113,6 +113,7 @@ struct ApplicableServerCandidate {
 #[derive(Clone, Debug)]
 pub enum ApplicabilityResolutionError {
     RootUnreadable { root: PathBuf, reason: String },
+    RequestDeadline { root: PathBuf },
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +132,9 @@ impl ApplicableServerFailure {
 pub struct ApplicableServerStartOutcomes {
     pub successful: Vec<ServerKey>,
     pub failures: Vec<ApplicableServerFailure>,
+    /// The first producer whose startup could not complete before the inspect
+    /// request's shared work deadline.
+    pub deadline_exceeded: Option<ServerKey>,
 }
 
 impl ServerAttemptResult {
@@ -494,15 +498,34 @@ impl LspManager {
     }
 
     /// Resolve every configured server applicable to a root without starting it.
-    ///
-    /// This is intentionally separate from `ensure_server_for_file_detailed`:
-    /// an inspect call must bind its applicability snapshot before a process can
-    /// spawn, initialize, or receive a document. The scan ignores its caller's
-    /// result scope because scope does not reduce diagnostic obligations.
     pub fn resolve_applicable_servers_for_root(
         &self,
         project_root: &Path,
         config: &Config,
+    ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+        self.resolve_applicable_servers(project_root, None, config, None)
+    }
+
+    /// Resolve inspect producers within the request deadline. A scoped inspect
+    /// may start rust-analyzer only for the Cargo workspace that owns each scope;
+    /// an unrelated nested workspace must not gain a process merely because it
+    /// lives elsewhere under the configured project root.
+    pub fn resolve_applicable_servers_for_inspect(
+        &self,
+        project_root: &Path,
+        scope_roots: Option<&[PathBuf]>,
+        config: &Config,
+        deadline: std::time::Instant,
+    ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+        self.resolve_applicable_servers(project_root, scope_roots, config, Some(deadline))
+    }
+
+    fn resolve_applicable_servers(
+        &self,
+        project_root: &Path,
+        scope_roots: Option<&[PathBuf]>,
+        config: &Config,
+        deadline: Option<std::time::Instant>,
     ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
         if !project_root.is_dir() {
             return Err(ApplicabilityResolutionError::RootUnreadable {
@@ -527,6 +550,11 @@ impl LspManager {
             .build();
 
         for entry in walker {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(ApplicabilityResolutionError::RequestDeadline {
+                    root: project_root.to_path_buf(),
+                });
+            }
             let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
                 root: project_root.to_path_buf(),
                 reason: error.to_string(),
@@ -578,6 +606,28 @@ impl LspManager {
             }
         }
 
+        if let Some(scope_roots) = scope_roots.filter(|roots| !roots.is_empty()) {
+            let rust_roots = candidates
+                .keys()
+                .chain(producer_failures.keys())
+                .filter(|key| key.kind == ServerKind::Rust)
+                .map(|key| key.root.clone())
+                .collect::<HashSet<_>>();
+            let mut owners = HashSet::new();
+            for scope_root in scope_roots {
+                if let Some(owner) = rust_roots
+                    .iter()
+                    .filter(|root| scope_root.starts_with(root))
+                    .max_by_key(|root| root.components().count())
+                {
+                    owners.insert(owner.clone());
+                }
+            }
+            candidates.retain(|key, _| key.kind != ServerKind::Rust || owners.contains(&key.root));
+            producer_failures
+                .retain(|key, _| key.kind != ServerKind::Rust || owners.contains(&key.root));
+        }
+
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
         candidates.sort_by(|left, right| server_key_sort(&left.key, &right.key));
         let mut producer_failures = producer_failures.into_values().collect::<Vec<_>>();
@@ -610,20 +660,64 @@ impl LspManager {
         snapshot: &ApplicableServerSnapshot,
         config: &Config,
     ) -> ApplicableServerStartOutcomes {
+        self.start_applicable_servers_inner(snapshot, config, None)
+    }
+
+    /// Start one inspect producer without extending the request's shared deadline.
+    /// Calling this per key lets the inspect phase log begin a phase only while
+    /// request budget remains to attempt that producer.
+    pub fn start_applicable_server_until(
+        &mut self,
+        snapshot: &ApplicableServerSnapshot,
+        server: &ServerKey,
+        config: &Config,
+        deadline: std::time::Instant,
+    ) -> ApplicableServerStartOutcomes {
+        let single = ApplicableServerSnapshot {
+            server_keys: vec![server.clone()],
+            candidates: snapshot
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.key == *server)
+                .cloned()
+                .collect(),
+            producer_failures: snapshot
+                .producer_failures
+                .iter()
+                .filter(|failure| failure.server_key == *server)
+                .cloned()
+                .collect(),
+        };
+        self.start_applicable_servers_inner(&single, config, Some(deadline))
+    }
+
+    fn start_applicable_servers_inner(
+        &mut self,
+        snapshot: &ApplicableServerSnapshot,
+        config: &Config,
+        deadline: Option<std::time::Instant>,
+    ) -> ApplicableServerStartOutcomes {
         let mut outcomes = ApplicableServerStartOutcomes {
             failures: snapshot.producer_failures.clone(),
             ..ApplicableServerStartOutcomes::default()
         };
         for candidate in &snapshot.candidates {
+            let initialize_timeout = deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            if initialize_timeout.is_some_and(|remaining| remaining.is_zero()) {
+                outcomes.deadline_exceeded = Some(candidate.key.clone());
+                break;
+            }
             if self.clients.contains_key(&candidate.key) {
                 outcomes.successful.push(candidate.key.clone());
                 continue;
             }
-            match self.spawn_server(
+            match self.spawn_server_with_timeout(
                 &candidate.definition,
                 &candidate.key.root,
                 &candidate.source_file,
                 config,
+                initialize_timeout,
             ) {
                 Ok(client) => {
                     self.clients.insert(candidate.key.clone(), client);
@@ -633,6 +727,12 @@ impl LspManager {
                     outcomes.successful.push(candidate.key.clone());
                 }
                 Err(error) => {
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        // A request-owned timeout says nothing durable about the
+                        // producer; a later call with a fresh budget may retry it.
+                        outcomes.deadline_exceeded = Some(candidate.key.clone());
+                        break;
+                    }
                     let result = classify_spawn_error(&candidate.definition.binary, &error);
                     self.failed_spawns
                         .insert(candidate.key.clone(), result.clone());
@@ -2433,6 +2533,17 @@ impl LspManager {
         source_file: &Path,
         config: &Config,
     ) -> Result<LspClient, LspError> {
+        self.spawn_server_with_timeout(def, root, source_file, config, None)
+    }
+
+    fn spawn_server_with_timeout(
+        &self,
+        def: &ServerDef,
+        root: &Path,
+        source_file: &Path,
+        config: &Config,
+        initialize_timeout: Option<std::time::Duration>,
+    ) -> Result<LspClient, LspError> {
         let initialization_options =
             initialization_options_for_spawn(def, source_file, root, config)?;
         let binary = self.resolve_binary(def, root, config)?;
@@ -2466,7 +2577,11 @@ impl LspManager {
             self.child_registry.clone(),
             Some(&reclaim_root),
         )?;
-        if let Err(err) = client.initialize(root, initialization_options) {
+        let initialize = match initialize_timeout {
+            Some(timeout) => client.initialize_with_timeout(root, initialization_options, timeout),
+            None => client.initialize(root, initialization_options),
+        };
+        if let Err(err) = initialize {
             wait_for_stderr_tail(&mut client);
             let stderr_tail = client.stderr_tail();
             let reason = if client.child_exited() || !stderr_tail.is_empty() {

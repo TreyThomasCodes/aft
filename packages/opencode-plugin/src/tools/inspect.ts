@@ -6,8 +6,9 @@ import { callToolCall, isEmptyParam, resolvePathArg } from "./_shared.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
-// The Rust diagnostics phase may block until its configured deadline. Keep the
-// transport alive long enough to receive that terminal response.
+// `diagnostics_timeout_ms` is the server's whole-request terminal deadline.
+// Transport adds egress headroom so the server always answers before the client
+// gives up; headroom is never available to server-side inspect work.
 const INSPECT_TRANSPORT_HEADROOM_MS = 30_000;
 
 type ToolArg = ToolDefinition["args"][string];
@@ -310,7 +311,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
   const inspectTool: ToolDefinition = {
     description:
       "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
-      "Use `scope=` to narrow returned results. Scope filters rendered diagnostics; it does not change collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
+      "Use `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     args: {
@@ -327,7 +328,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results; it does not change the diagnostic collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+            "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
           ),
       ),
       topK: arg(

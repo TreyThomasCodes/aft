@@ -182,9 +182,9 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     ctx
 }
 
-/// `configured_context` with an explicit inspect diagnostics deadline. The
-/// blocking quiescence wait is bounded by this value, and its timeout error
-/// text must carry the configured budget.
+/// `configured_context` with an explicit whole-inspect deadline. The server
+/// reserves terminal-egress time inside this value, and timeout detail still
+/// carries the configured budget.
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
@@ -2842,6 +2842,64 @@ fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
     assert_eq!(gap["file"], "src/main.rs");
 }
 
+/// Producer discovery may see nested Cargo workspaces, but a scoped blocking
+/// inspect starts rust-analyzer only for the workspace that owns the scope.
+#[test]
+fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/aft\"]\nresolver = \"2\"\n",
+    );
+    write_file(
+        &root,
+        "crates/aft/Cargo.toml",
+        "[package]\nname = \"scoped-owner\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "crates/aft/src/lib.rs", "pub fn owned() {}\n");
+    write_file(
+        &root,
+        "spikes/foreign/Cargo.toml",
+        "[workspace]\n[package]\nname = \"foreign\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "spikes/foreign/src/lib.rs", "pub fn foreign() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-scoped-owning-workspace",
+            "command": "inspect",
+            "scope": "crates/aft",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    let active = ctx.lsp().active_server_keys();
+    assert_eq!(active.len(), 1, "response: {response:#}");
+    assert_eq!(active[0].kind, ServerKind::Rust);
+    assert_eq!(
+        active[0].root,
+        crate::helpers::canonicalize_like_product(&root)
+    );
+
+    let unscoped = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-unscoped-all-workspaces",
+            "command": "inspect",
+        })),
+        &ctx,
+    ))
+    .expect("unscoped inspect response serializes");
+    let active = ctx.lsp().active_server_keys();
+    assert_eq!(active.len(), 2, "response: {unscoped:#}");
+    assert!(active.iter().any(|key| {
+        key.root == crate::helpers::canonicalize_like_product(&root.join("spikes/foreign"))
+    }));
+}
+
 /// A scoped call over a warm root returns only scope-matching findings, and
 /// the same findings appear in the unscoped call.
 #[test]
@@ -3135,10 +3193,11 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
     );
 }
 
-/// A producer that never settles bounds the blocking wait at the configured
-/// deadline: the terminal is PHASE-FAILED attributed to the quiescence phase.
+/// A producer that never settles is cut off by the shared request deadline.
+/// The terminal reserve keeps the PHASE-FAILED response inside the configured
+/// budget and attributes it to the unfinished quiescence phase.
 #[test]
-fn blocking_inspect_expires_at_the_configured_quiescence_deadline() {
+fn blocking_inspect_returns_before_the_configured_request_deadline() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -3164,11 +3223,12 @@ fn blocking_inspect_expires_at_the_configured_quiescence_deadline() {
 
     assert_eq!(response["success"], false, "response: {response:#}");
     assert_eq!(response["inspect_terminal"], "phase_failed");
-    assert_eq!(response["failure_reason"], "lsp_quiescence_timeout");
+    assert_eq!(response["failure_reason"], "inspect_request_timeout");
     assert_eq!(response["failed_phase"], "lsp_quiescence");
     assert!(
-        started.elapsed() >= Duration::from_secs(9),
-        "the wait must run until the configured deadline instead of failing early"
+        started.elapsed() < Duration::from_secs(8),
+        "the terminal reserve must return well before the 10s request budget: {:?}",
+        started.elapsed()
     );
 }
 
@@ -3197,7 +3257,7 @@ fn blocking_inspect_deadline_error_names_the_configured_budget() {
     .expect("inspect response serializes");
 
     assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["failure_reason"], "lsp_quiescence_timeout");
+    assert_eq!(response["failure_reason"], "inspect_request_timeout");
     let detail = response["failure_detail"]
         .as_str()
         .unwrap_or_else(|| panic!("failure_detail missing: {response:#}"));

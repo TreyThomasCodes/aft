@@ -7,9 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::context::AppContext;
-use crate::inspect::diagnostics_category::{
-    check_diagnostics_phase_boundary, diagnostics_phase_timeout, run_diagnostics_category,
-};
+use crate::inspect::diagnostics_category::{inspect_request_timeout, run_diagnostics_category};
 #[cfg(test)]
 use crate::inspect::InspectBuilderState;
 use crate::inspect::{
@@ -27,6 +25,58 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
 const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Reserve time inside the configured request budget for terminal assembly and
+/// egress. The server always answers before the client gives up: server work
+/// stops before `diagnostics_timeout_ms`, while the client waits for that budget
+/// plus its transport headroom.
+const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+struct InspectRequestDeadline {
+    budget: Duration,
+    terminal_at: Instant,
+    work_at: Instant,
+}
+
+impl InspectRequestDeadline {
+    fn from_config(config: &crate::config::Config) -> Self {
+        Self::new(inspect_request_timeout(config), INSPECT_TERMINAL_MARGIN)
+    }
+
+    fn new(budget: Duration, terminal_margin: Duration) -> Self {
+        let started = Instant::now();
+        let terminal_at = started + budget;
+        let work_at = started + budget.saturating_sub(terminal_margin);
+        Self {
+            budget,
+            terminal_at,
+            work_at,
+        }
+    }
+
+    fn work_at(self) -> Instant {
+        self.work_at
+    }
+
+    fn phase_deadline(self, phase_limit: Duration) -> Instant {
+        (Instant::now() + phase_limit).min(self.work_at)
+    }
+
+    fn has_work_budget(self) -> bool {
+        Instant::now() < self.work_at
+    }
+
+    fn timeout_detail(self, phase: InspectPhaseId) -> String {
+        format!(
+            "inspect_request_timeout: {} could not complete within the {}ms request budget ({}ms terminal reserve)",
+            phase.as_str(),
+            self.budget.as_millis(),
+            self.terminal_at
+                .saturating_duration_since(self.work_at)
+                .as_millis(),
+        )
+    }
+}
 
 static DEFERRED_INSPECT_ROOTS: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
@@ -84,7 +134,7 @@ pub(crate) fn deferred_inspect_root_count_for_test() -> usize {
 }
 
 #[cfg(test)]
-fn wait_at_deferred_inspect_body_gate_for_test() {
+fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline) {
     let gate = DEFERRED_INSPECT_BODY_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -93,9 +143,12 @@ fn wait_at_deferred_inspect_body_gate_for_test() {
         return;
     };
     let _ = gate.started.send(());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let hang_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if inspect_cancellation_requested() || Instant::now() >= deadline {
+        if inspect_cancellation_requested()
+            || Instant::now() >= hang_deadline
+            || !deadline.has_work_budget()
+        {
             return;
         }
         match gate.release.recv_timeout(Duration::from_millis(5)) {
@@ -106,7 +159,7 @@ fn wait_at_deferred_inspect_body_gate_for_test() {
 }
 
 #[cfg(not(test))]
-fn wait_at_deferred_inspect_body_gate_for_test() {}
+fn wait_at_deferred_inspect_body_gate_for_test(_deadline: InspectRequestDeadline) {}
 
 #[cfg(test)]
 fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
@@ -123,21 +176,23 @@ struct DeferredInspectRootPermit {
 }
 
 impl DeferredInspectRootPermit {
-    fn acquire(root: PathBuf) -> Option<Self> {
+    fn acquire(root: PathBuf, deadline: InspectRequestDeadline) -> Option<Self> {
         let (roots, changed) = &*DEFERRED_INSPECT_ROOTS;
         let mut active = roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while active.contains(&root) {
-            if inspect_cancellation_requested() {
+            if inspect_cancellation_requested() || !deadline.has_work_budget() {
                 return None;
             }
+            let wait = Duration::from_millis(50)
+                .min(deadline.work_at().saturating_duration_since(Instant::now()));
             let (next, _) = changed
-                .wait_timeout(active, Duration::from_millis(50))
+                .wait_timeout(active, wait)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             active = next;
         }
-        if inspect_cancellation_requested() {
+        if inspect_cancellation_requested() || !deadline.has_work_budget() {
             return None;
         }
         active.insert(root.clone());
@@ -159,9 +214,17 @@ impl Drop for DeferredInspectRootPermit {
 #[derive(Debug, Eq, PartialEq)]
 struct InspectRootStatSnapshot(Vec<(PathBuf, u64, SystemTime)>);
 
-fn capture_inspect_root_stats(root: &Path) -> Result<InspectRootStatSnapshot, String> {
+fn capture_inspect_root_stats_until(
+    root: &Path,
+    deadline: Option<InspectRequestDeadline>,
+) -> Result<InspectRootStatSnapshot, String> {
     let mut files = Vec::new();
     for file in crate::callgraph::walk_project_files(root) {
+        if deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
+            return Err(deadline
+                .expect("checked request deadline")
+                .timeout_detail(InspectPhaseId::StatVerification));
+        }
         match std::fs::metadata(&file) {
             Ok(metadata) => files.push((
                 file,
@@ -187,12 +250,16 @@ fn verify_final_root_stats(
     project_root: &Path,
     initial_stats: &InspectRootStatSnapshot,
     phase_log: &InspectPhaseLog,
+    deadline: InspectRequestDeadline,
 ) -> Result<(), InspectTerminal> {
-    let stat_phase = phase_log.start(
+    let phase_entry =
         InspectPhaseEntry::category(InspectPhaseId::StatVerification, InspectCategory::Metrics)
-            .with_also_satisfied(InspectCategory::active().iter().copied()),
-    );
-    match capture_inspect_root_stats(project_root) {
+            .with_also_satisfied(InspectCategory::active().iter().copied());
+    if !deadline.has_work_budget() {
+        return Err(request_deadline_terminal(Some(phase_entry), deadline));
+    }
+    let stat_phase = phase_log.start(phase_entry);
+    match capture_inspect_root_stats_until(project_root, Some(deadline)) {
         Ok(final_stats) if final_stats == *initial_stats => {
             stat_phase.complete();
             Ok(())
@@ -200,6 +267,17 @@ fn verify_final_root_stats(
         Ok(_) => {
             stat_phase.fail("project files changed while inspect was running");
             Err(InspectTerminal::Interrupted)
+        }
+        Err(detail) if detail.contains("inspect_request_timeout") => {
+            stat_phase.fail(&detail);
+            Err(InspectTerminal::PhaseFailed {
+                failed_phase: Some(InspectPhaseEntry::category(
+                    InspectPhaseId::StatVerification,
+                    InspectCategory::Metrics,
+                )),
+                failure_reason: "inspect_request_timeout",
+                failure_detail: Some(detail),
+            })
         }
         Err(detail) => {
             stat_phase.fail(&detail);
@@ -216,7 +294,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], None)
+    handle_inspect_payload(req, ctx, false, false, &[], &[], None, None)
 }
 
 /// Test-only warm-path entry that preserves nonblocking diagnostics semantics
@@ -226,11 +304,12 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 #[doc(hidden)]
 pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
-    handle_inspect_payload(req, ctx, false, false, &[], &[], Some(&phase_log))
+    handle_inspect_payload(req, ctx, false, false, &[], &[], Some(&phase_log), None)
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
+    let deadline = InspectRequestDeadline::from_config(&ctx.config());
     let snapshot = match inspect_preflight(req, ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
@@ -250,12 +329,22 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
             );
         }
     };
+    let scope = parse_scope(req, ctx, &snapshot.project_root)
+        .expect("inspect preflight already validated the request scope");
+    let scoped_roots = scope_was_provided(req.params.get("scope")).then_some(scope.roots());
     let applicability = {
         let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_root(&snapshot.project_root, &snapshot.config)
+        lsp.resolve_applicable_servers_for_inspect(
+            &snapshot.project_root,
+            scoped_roots,
+            &snapshot.config,
+            deadline.work_at(),
+        )
     };
     match applicability {
-        Ok(applicability) => run_blocking_inspect_body(req, ctx, applicability, phase_log),
+        Ok(applicability) => {
+            run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
+        }
         Err(error) => build_inspect_terminal(
             &req.id,
             &phase_log,
@@ -280,6 +369,7 @@ fn handle_inspect_payload(
     producer_failures: &[ApplicableServerFailure],
     expected_producers: &[ServerKey],
     phase_log: Option<&InspectPhaseLog>,
+    request_deadline: Option<InspectRequestDeadline>,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -305,8 +395,12 @@ fn handle_inspect_payload(
     }
 
     let manager = ctx.inspect_manager();
-    let blocking_tier1_deadline =
-        phase_log.map(|_| Instant::now() + diagnostics_phase_timeout(snapshot.config.as_ref()));
+    let blocking_tier1_deadline = phase_log.map(|_| {
+        request_deadline.map_or_else(
+            || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
+            InspectRequestDeadline::work_at,
+        )
+    });
     let mut outcomes = BTreeMap::new();
     if blocking_tier1_deadline.is_none() {
         // The nonblocking path gives each Tier-1 scan a short soft deadline. Join
@@ -333,6 +427,17 @@ fn handle_inspect_payload(
     {
         if !ctx.inspect_writer() {
             continue;
+        }
+        let phase_entry = InspectPhaseEntry::category(InspectPhaseId::Tier2Rescan, category);
+        if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
+            return phase_failure_response(
+                &req.id,
+                &phase_entry,
+                "inspect_request_timeout",
+                request_deadline
+                    .expect("checked request deadline")
+                    .timeout_detail(InspectPhaseId::Tier2Rescan),
+            );
         }
         let manager = manager.clone();
         let snapshot = snapshot.clone();
@@ -374,7 +479,10 @@ fn handle_inspect_payload(
             category,
             (
                 rx,
-                std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT,
+                request_deadline.map_or_else(
+                    || std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT,
+                    |deadline| deadline.phase_deadline(BLOCKING_TIER2_PHASE_TIMEOUT),
+                ),
                 callgraph_phase,
                 tier2_phase,
             ),
@@ -405,9 +513,34 @@ fn handle_inspect_payload(
             if let Some((rx, deadline, callgraph_phase, tier2_phase)) =
                 tier2_receivers.remove(category)
             {
-                match receive_tier2_completion_until(rx, manager.as_ref(), *category, deadline) {
+                match receive_tier2_completion_until(
+                    rx,
+                    manager.as_ref(),
+                    *category,
+                    deadline,
+                    request_deadline,
+                ) {
                     Some(outcome) => {
+                        let request_timed_out = outcome.payload().is_none()
+                            && matches!(
+                                &outcome,
+                                JobOutcome::Failed { message }
+                                    if message.contains("inspect_request_timeout")
+                            );
                         finish_tier2_phases(&outcome, callgraph_phase, tier2_phase);
+                        if request_timed_out {
+                            return phase_failure_response(
+                                &req.id,
+                                &InspectPhaseEntry::category(
+                                    InspectPhaseId::Tier2Rescan,
+                                    *category,
+                                ),
+                                "inspect_request_timeout",
+                                request_deadline
+                                    .expect("request timeout requires a shared deadline")
+                                    .timeout_detail(InspectPhaseId::Tier2Rescan),
+                            );
+                        }
                         outcome
                     }
                     None => return inspect_interrupted_response(&req.id),
@@ -454,6 +587,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
 ) -> DispatchOutcome {
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
+    let deadline = InspectRequestDeadline::from_config(&ctx.config());
     let snapshot = match inspect_preflight(req, &ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
@@ -476,9 +610,17 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
             );
         }
     };
+    let scope = parse_scope(req, &ctx, &snapshot.project_root)
+        .expect("inspect preflight already validated the request scope");
+    let scoped_roots = scope_was_provided(req.params.get("scope")).then_some(scope.roots());
     let applicability = {
         let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_root(&snapshot.project_root, &snapshot.config)
+        lsp.resolve_applicable_servers_for_inspect(
+            &snapshot.project_root,
+            scoped_roots,
+            &snapshot.config,
+            deadline.work_at(),
+        )
     };
     let applicability = match applicability {
         Ok(snapshot) => snapshot,
@@ -518,9 +660,18 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         // Queueing instead of sharing a response keeps request-specific scopes,
         // phase logs, and terminals independent while bounding expensive work to
         // one detached inspect body per root.
-        let response = match DeferredInspectRootPermit::acquire(root) {
-            Some(_permit) => run_blocking_inspect_body(&request, &ctx, applicability, phase_log),
-            None => build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted),
+        let response = match DeferredInspectRootPermit::acquire(root, deadline) {
+            Some(_permit) => {
+                run_blocking_inspect_body(&request, &ctx, applicability, phase_log, deadline)
+            }
+            None if inspect_cancellation_requested() => {
+                build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
+            }
+            None => build_inspect_terminal(
+                &request.id,
+                &phase_log,
+                request_deadline_terminal(next_phase(&applicability), deadline),
+            ),
         };
         let _ = tx.send(response);
     });
@@ -649,9 +800,17 @@ fn run_blocking_inspect_body(
     ctx: &AppContext,
     applicability: ApplicableServerSnapshot,
     phase_log: InspectPhaseLog,
+    deadline: InspectRequestDeadline,
 ) -> Response {
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    if !deadline.has_work_budget() {
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            request_deadline_terminal(next_phase(&applicability), deadline),
+        );
     }
     let project_root = match build_snapshot(ctx) {
         Ok(snapshot) => snapshot.project_root,
@@ -671,8 +830,15 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    let initial_stats = match capture_inspect_root_stats(&project_root) {
+    let initial_stats = match capture_inspect_root_stats_until(&project_root, Some(deadline)) {
         Ok(snapshot) => snapshot,
+        Err(detail) if detail.contains("inspect_request_timeout") => {
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                request_deadline_terminal(next_phase(&applicability), deadline),
+            );
+        }
         Err(detail) => {
             return build_inspect_terminal(
                 &req.id,
@@ -685,42 +851,79 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    wait_at_deferred_inspect_body_gate_for_test();
+    wait_at_deferred_inspect_body_gate_for_test(deadline);
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
+    if !deadline.has_work_budget() {
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            request_deadline_terminal(next_phase(&applicability), deadline),
+        );
+    }
     if take_deferred_inspect_stat_short_circuit_for_test() {
-        let terminal = match verify_final_root_stats(&project_root, &initial_stats, &phase_log) {
-            Ok(()) => InspectTerminal::Fresh(serde_json::json!({})),
-            Err(terminal) => terminal,
-        };
+        let terminal =
+            match verify_final_root_stats(&project_root, &initial_stats, &phase_log, deadline) {
+                Ok(()) => InspectTerminal::Fresh(serde_json::json!({})),
+                Err(terminal) => terminal,
+            };
         return build_inspect_terminal(&req.id, &phase_log, terminal);
     }
 
-    let starts = applicability
-        .server_keys
-        .iter()
-        .map(|server| {
-            (
-                server.clone(),
-                phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server)),
-            )
-        })
-        .collect::<Vec<_>>();
-    let start_outcomes = {
-        let mut lsp = ctx.lsp();
-        lsp.start_applicable_servers(&applicability, &ctx.config())
-    };
-    if inspect_cancellation_requested() {
-        for (_, phase) in starts {
-            phase.fail("inspect request cancelled");
+    let mut start_outcomes = ApplicableServerStartOutcomes::default();
+    for server in &applicability.server_keys {
+        let phase_entry = InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server);
+        if !deadline.has_work_budget() {
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                request_deadline_terminal(Some(phase_entry), deadline),
+            );
         }
-        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+        let phase = phase_log.start(phase_entry.clone());
+        let outcome = {
+            let mut lsp = ctx.lsp();
+            lsp.start_applicable_server_until(
+                &applicability,
+                server,
+                &ctx.config(),
+                deadline.work_at(),
+            )
+        };
+        if inspect_cancellation_requested() {
+            phase.fail("inspect request cancelled");
+            return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+        }
+        let deadline_exceeded = outcome.deadline_exceeded.is_some();
+        finish_start_phases(vec![(server.clone(), phase)], &outcome);
+        start_outcomes.successful.extend(outcome.successful);
+        start_outcomes.failures.extend(outcome.failures);
+        if deadline_exceeded {
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                request_deadline_terminal(Some(phase_entry), deadline),
+            );
+        }
     }
-    finish_start_phases(starts, &start_outcomes);
 
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    if !deadline.has_work_budget() {
+        let failed_phase = start_outcomes
+            .successful
+            .first()
+            .map(|server| InspectPhaseEntry::lsp(InspectPhaseId::LspQuiescence, server));
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            request_deadline_terminal(
+                failed_phase.or_else(|| next_phase(&applicability)),
+                deadline,
+            ),
+        );
     }
     let quiescence = start_outcomes
         .successful
@@ -736,7 +939,7 @@ fn run_blocking_inspect_body(
     // store holds their settled view before the payload reads it. The wait is
     // root-level — producers fill the warm store by publishing while events
     // are drained — and never per-file: a request scope cannot change it.
-    let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful);
+    let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline);
     if inspect_cancellation_requested() {
         for phase in quiescence {
             phase.fail("inspect request cancelled");
@@ -760,12 +963,13 @@ fn run_blocking_inspect_body(
             for phase in quiescence {
                 phase.fail(&message);
             }
+            let failure_reason = quiescence_failure_reason(&message);
             return build_inspect_terminal(
                 &req.id,
                 &phase_log,
                 InspectTerminal::PhaseFailed {
                     failed_phase,
-                    failure_reason: quiescence_failure_reason(&message),
+                    failure_reason,
                     failure_detail: Some(message),
                 },
             );
@@ -783,12 +987,40 @@ fn run_blocking_inspect_body(
         &start_outcomes.failures,
         &start_outcomes.successful,
         Some(&phase_log),
+        Some(deadline),
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
+    if !response.success && inspect_failure_reason(&response) == "inspect_request_timeout" {
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            InspectTerminal::PhaseFailed {
+                failed_phase: failed_phase_from_response(&response)
+                    .or_else(|| phase_log.in_flight_entry()),
+                failure_reason: "inspect_request_timeout",
+                failure_detail: response
+                    .data
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        );
+    }
+    if !deadline.has_work_budget() {
+        let failed_phase =
+            InspectPhaseEntry::category(InspectPhaseId::StatVerification, InspectCategory::Metrics);
+        return build_inspect_terminal(
+            &req.id,
+            &phase_log,
+            request_deadline_terminal(Some(failed_phase), deadline),
+        );
+    }
 
-    if let Err(terminal) = verify_final_root_stats(&project_root, &initial_stats, &phase_log) {
+    if let Err(terminal) =
+        verify_final_root_stats(&project_root, &initial_stats, &phase_log, deadline)
+    {
         return build_inspect_terminal(&req.id, &phase_log, terminal);
     }
     if let Some(inspect_snapshot) = &inspect_snapshot {
@@ -804,7 +1036,8 @@ fn run_blocking_inspect_body(
             &req.id,
             &phase_log,
             InspectTerminal::PhaseFailed {
-                failed_phase: phase_log.in_flight_entry(),
+                failed_phase: failed_phase_from_response(&response)
+                    .or_else(|| phase_log.in_flight_entry()),
                 failure_reason: inspect_failure_reason(&response),
                 failure_detail: response
                     .data
@@ -821,25 +1054,27 @@ fn run_blocking_inspect_body(
 /// authoritative (non-stale, non-provisional) report or stops warming
 /// (declares quiescence). Events are drained with the manager lock held only
 /// for the drain itself, so producers keep publishing while the wait ticks.
-/// Bounded by the configured diagnostics deadline; cancellation and the
-/// deadline are checked at every tick. Returns the accepted producer
-/// snapshots drained during the wait plus whether the wait ever blocked.
+/// Cancellation and the shared request deadline are checked at every tick.
 fn wait_for_root_quiescence(
     ctx: &AppContext,
     expected: &[ServerKey],
+    deadline: InspectRequestDeadline,
 ) -> Result<(Vec<AcceptedDiagnosticSnapshot>, bool), String> {
-    let timeout = diagnostics_phase_timeout(&ctx.config());
-    let deadline = Instant::now() + timeout;
     let mut accepted_snapshots = Vec::new();
     let mut blocked = false;
     loop {
-        check_diagnostics_phase_boundary(deadline, timeout)?;
+        if inspect_cancellation_requested() {
+            return Err("inspect request cancelled during LSP quiescence".to_string());
+        }
+        if !deadline.has_work_budget() {
+            return Err(deadline.timeout_detail(InspectPhaseId::LspQuiescence));
+        }
         accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
         if root_producers_settled(ctx, expected) {
             return Ok((accepted_snapshots, blocked));
         }
         blocked = true;
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.work_at().saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_millis(50).min(remaining));
     }
 }
@@ -854,8 +1089,74 @@ fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
     ctx.lsp().producers_settled(expected)
 }
 
+fn next_phase(applicability: &ApplicableServerSnapshot) -> Option<InspectPhaseEntry> {
+    applicability
+        .server_keys
+        .first()
+        .map(|server| InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server))
+        .or_else(|| {
+            InspectCategory::active()
+                .iter()
+                .copied()
+                .find(|category| category.is_tier2())
+                .map(|category| InspectPhaseEntry::category(InspectPhaseId::Tier2Rescan, category))
+        })
+}
+
+fn request_deadline_terminal(
+    failed_phase: Option<InspectPhaseEntry>,
+    deadline: InspectRequestDeadline,
+) -> InspectTerminal {
+    let phase = failed_phase
+        .as_ref()
+        .map(|entry| entry.id)
+        .unwrap_or(InspectPhaseId::Tier2Rescan);
+    InspectTerminal::PhaseFailed {
+        failed_phase,
+        failure_reason: "inspect_request_timeout",
+        failure_detail: Some(deadline.timeout_detail(phase)),
+    }
+}
+
+fn phase_failure_response(
+    request_id: &str,
+    phase: &InspectPhaseEntry,
+    failure_reason: &'static str,
+    detail: String,
+) -> Response {
+    let mut data = serde_json::json!({
+        "code": failure_reason,
+        "message": detail,
+        "failed_phase": phase.id,
+    });
+    if let Some(producer) = &phase.producer {
+        data["producer"] = Value::String(producer.clone());
+    }
+    if let Some(category) = &phase.category {
+        data["category"] = Value::String(category.clone());
+    }
+    Response {
+        id: request_id.to_string(),
+        success: false,
+        data,
+    }
+}
+
+fn failed_phase_from_response(response: &Response) -> Option<InspectPhaseEntry> {
+    let phase = match response.data.get("failed_phase")?.as_str()? {
+        "tier2_rescan" => InspectPhaseId::Tier2Rescan,
+        "callgraph_ready" => InspectPhaseId::CallgraphReady,
+        "stat_verification" => InspectPhaseId::StatVerification,
+        _ => return None,
+    };
+    let category = response.data.get("category")?.as_str()?.parse().ok()?;
+    Some(InspectPhaseEntry::category(phase, category))
+}
+
 fn quiescence_failure_reason(message: &str) -> &'static str {
-    if message.contains("lsp_quiescence_timeout") {
+    if message.contains("inspect_request_timeout") {
+        "inspect_request_timeout"
+    } else if message.contains("lsp_quiescence_timeout") {
         "lsp_quiescence_timeout"
     } else {
         "inspect_not_fresh"
@@ -868,7 +1169,9 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if message.contains("writer_lease_timeout") {
+    if message.contains("inspect_request_timeout") {
+        "inspect_request_timeout"
+    } else if message.contains("writer_lease_timeout") {
         "writer_lease_timeout"
     } else if message.contains("cold_build_limiter_timeout") {
         "cold_build_limiter_timeout"
@@ -889,7 +1192,15 @@ fn finish_start_phases(
     outcomes: &ApplicableServerStartOutcomes,
 ) {
     for (server, phase) in starts {
-        if let Some(failure) = outcomes
+        if outcomes.deadline_exceeded.as_ref() == Some(&server)
+            || (!outcomes.successful.contains(&server)
+                && !outcomes
+                    .failures
+                    .iter()
+                    .any(|failure| failure.server_key == server))
+        {
+            phase.fail("producer was not started before the inspect request deadline");
+        } else if let Some(failure) = outcomes
             .failures
             .iter()
             .find(|failure| failure.server_key == server)
@@ -903,8 +1214,11 @@ fn finish_start_phases(
     }
 }
 
-fn applicability_failure_reason(_error: &ApplicabilityResolutionError) -> &'static str {
-    "applicability_resolution_failed"
+fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'static str {
+    match error {
+        ApplicabilityResolutionError::RequestDeadline { .. } => "inspect_request_timeout",
+        ApplicabilityResolutionError::RootUnreadable { .. } => "applicability_resolution_failed",
+    }
 }
 
 fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
@@ -912,6 +1226,10 @@ fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
         ApplicabilityResolutionError::RootUnreadable { root, reason } => {
             format!("cannot resolve {}: {reason}", root.display())
         }
+        ApplicabilityResolutionError::RequestDeadline { root } => format!(
+            "inspect_request_timeout: producer discovery for {} exceeded the shared request deadline",
+            root.display()
+        ),
     }
 }
 
@@ -1166,10 +1484,18 @@ fn receive_tier2_completion_until(
     manager: &crate::inspect::InspectManager,
     category: InspectCategory,
     deadline: std::time::Instant,
+    request_deadline: Option<InspectRequestDeadline>,
 ) -> Option<JobOutcome> {
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
+            if request_deadline.is_some_and(|request| now >= request.work_at()) {
+                return Some(JobOutcome::Failed {
+                    message: request_deadline
+                        .expect("checked request deadline")
+                        .timeout_detail(InspectPhaseId::Tier2Rescan),
+                });
+            }
             return Some(JobOutcome::Failed {
                 message: format!(
                     "inspect_phase_timeout: tier2 {} aggregate did not complete within {}s; builder_state={}",
@@ -3318,6 +3644,7 @@ mod deferred_terminal_tests {
             &manager,
             InspectCategory::DeadCode,
             std::time::Instant::now() + Duration::from_millis(20),
+            None,
         )
         .expect("deadline produces an honest failure");
         assert!(matches!(
@@ -3330,6 +3657,79 @@ mod deferred_terminal_tests {
     }
 
     #[test]
+    fn shared_request_deadline_returns_a_named_tier2_terminal_before_slow_work() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = tx.send(JobOutcome::Fresh {
+                payload: serde_json::json!({}),
+            });
+        });
+        let manager = crate::inspect::InspectManager::new();
+        let deadline =
+            InspectRequestDeadline::new(Duration::from_millis(120), Duration::from_millis(40));
+        let started = Instant::now();
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            deadline.phase_deadline(BLOCKING_TIER2_PHASE_TIMEOUT),
+            Some(deadline),
+        )
+        .expect("deadline produces an honest failure");
+        assert!(
+            started.elapsed() < Duration::from_millis(160),
+            "slow Tier-2 work escaped the request deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            outcome,
+            JobOutcome::Failed { message } if message.contains("inspect_request_timeout")
+        ));
+
+        let log = InspectPhaseLog::for_request("inspect-slow-tier2");
+        let response = build_inspect_terminal(
+            "inspect-slow-tier2",
+            &log,
+            request_deadline_terminal(
+                Some(InspectPhaseEntry::category(
+                    InspectPhaseId::Tier2Rescan,
+                    InspectCategory::DeadCode,
+                )),
+                deadline,
+            ),
+        );
+        assert_eq!(response.data["inspect_terminal"], "phase_failed");
+        assert_eq!(response.data["failed_phase"], "tier2_rescan");
+        assert_eq!(response.data["category"], "dead_code");
+    }
+
+    #[test]
+    fn expired_request_does_not_start_tier2_rescan() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join("main.rs"), "fn main() {}\n").expect("fixture");
+        let ctx = deferred_test_context(root.path());
+        let request = inspect_request("inspect-no-tier2-start");
+        let phase_log = InspectPhaseLog::for_request(request.id.clone());
+        let manager = ctx.inspect_manager();
+        let starts_before = manager.reuse_start_count_for_test();
+        let response = handle_inspect_payload(
+            &request,
+            &ctx,
+            true,
+            true,
+            &[],
+            &[],
+            Some(&phase_log),
+            Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
+        );
+
+        assert!(!response.success);
+        assert_eq!(response.data["failed_phase"], "tier2_rescan");
+        assert_eq!(manager.reuse_start_count_for_test(), starts_before);
+    }
+
+    #[test]
     fn inspect_builder_state_refusal_includes_start_timestamp() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let manager = crate::inspect::InspectManager::new();
@@ -3339,6 +3739,7 @@ mod deferred_terminal_tests {
             &manager,
             InspectCategory::DeadCode,
             std::time::Instant::now() + Duration::from_millis(20),
+            None,
         )
         .expect("deadline produces an honest failure");
         assert!(matches!(

@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
 use crate::config::{
@@ -15,11 +15,10 @@ use crate::lsp::registry::servers_for_file;
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
-/// Configured deadline for the blocking root-level quiescence wait. The same
-/// config value also drives the plugin-side transport headroom for inspect
-/// calls, so a caller that waits the full deadline still returns before the
-/// transport gives up.
-pub(crate) fn diagnostics_phase_timeout(config: &Config) -> Duration {
+/// Whole-request server budget for blocking inspect. Every phase shares one
+/// absolute deadline derived from this value; client transport adds separate
+/// headroom so the server always answers before the client gives up.
+pub(crate) fn inspect_request_timeout(config: &Config) -> Duration {
     Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
         MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
         MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -283,27 +282,6 @@ fn scoped_coverage_candidates(
     candidates.into_iter().collect()
 }
 
-/// Boundary check for the blocking quiescence wait: observes cancellation and
-/// the configured deadline at every tick. The deadline error text carries the
-/// configured millisecond budget so the agent can see which value fired.
-pub(crate) fn check_diagnostics_phase_boundary(
-    deadline: Instant,
-    timeout: Duration,
-) -> Result<(), String> {
-    if crate::executor::current_job_cancellation()
-        .is_some_and(|token| token.cancel_requested_before_commit())
-    {
-        return Err("inspect request cancelled during LSP quiescence".to_string());
-    }
-    if Instant::now() >= deadline {
-        return Err(format!(
-            "lsp_quiescence_timeout: diagnostics did not complete within {}ms",
-            timeout.as_millis()
-        ));
-    }
-    Ok(())
-}
-
 impl DiagnosticsCollection {
     fn record_producer_failures(&mut self, failures: &[ApplicableServerFailure]) {
         for failure in failures {
@@ -530,8 +508,7 @@ mod payload_count_tests {
     use std::sync::{Arc, RwLock};
 
     use super::{
-        check_diagnostics_phase_boundary, diagnostics_phase_timeout, CollectedDiagnostic,
-        DiagnosticsCollection, ScopedCoverageGap,
+        inspect_request_timeout, CollectedDiagnostic, DiagnosticsCollection, ScopedCoverageGap,
     };
     use crate::config::Config;
     use crate::inspect::job::{InspectSnapshot, JobScope};
@@ -569,7 +546,7 @@ mod payload_count_tests {
     }
 
     #[test]
-    fn configured_diagnostics_deadline_drives_the_blocking_phase_boundary() {
+    fn configured_diagnostics_deadline_is_the_whole_request_budget() {
         let config = Config {
             inspect: crate::config::InspectConfig {
                 diagnostics_timeout_ms: 15_000,
@@ -577,12 +554,10 @@ mod payload_count_tests {
             },
             ..Config::default()
         };
-        let timeout = diagnostics_phase_timeout(&config);
 
-        assert_eq!(timeout, std::time::Duration::from_millis(15_000));
         assert_eq!(
-            check_diagnostics_phase_boundary(std::time::Instant::now(), timeout),
-            Err("lsp_quiescence_timeout: diagnostics did not complete within 15000ms".to_string())
+            inspect_request_timeout(&config),
+            std::time::Duration::from_millis(15_000)
         );
     }
 
