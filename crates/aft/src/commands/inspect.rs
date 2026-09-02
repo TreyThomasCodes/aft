@@ -3658,9 +3658,13 @@ mod deferred_terminal_tests {
 
     #[test]
     fn shared_request_deadline_returns_a_named_tier2_terminal_before_slow_work() {
+        // The slow producer never completes on its own: it only sends after the
+        // test releases it, so "returned before the slow work finished" is an
+        // ordering proof rather than a wall-clock race on a loaded runner.
         let (tx, rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
+            let _ = release_rx.recv();
             let _ = tx.send(JobOutcome::Fresh {
                 payload: serde_json::json!({}),
             });
@@ -3668,7 +3672,6 @@ mod deferred_terminal_tests {
         let manager = crate::inspect::InspectManager::new();
         let deadline =
             InspectRequestDeadline::new(Duration::from_millis(120), Duration::from_millis(40));
-        let started = Instant::now();
         let outcome = receive_tier2_completion_until(
             rx,
             &manager,
@@ -3678,14 +3681,14 @@ mod deferred_terminal_tests {
         )
         .expect("deadline produces an honest failure");
         assert!(
-            started.elapsed() < Duration::from_millis(160),
-            "slow Tier-2 work escaped the request deadline: {:?}",
-            started.elapsed()
+            !deadline.has_work_budget(),
+            "the receive loop must not return before the shared work deadline"
         );
         assert!(matches!(
             outcome,
             JobOutcome::Failed { message } if message.contains("inspect_request_timeout")
         ));
+        let _ = release_tx.send(());
 
         let log = InspectPhaseLog::for_request("inspect-slow-tier2");
         let response = build_inspect_terminal(

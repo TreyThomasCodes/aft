@@ -115,18 +115,55 @@ thread_local! {
     static WORKSPACE_MANIFEST_FINGERPRINT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn note_configure_artifact_load_attempt() {
+// Attempts are also recorded per project root: the process-wide total is
+// observed by every configure in a parallel libtest binary, so a test that
+// asserts "no load started yet" must read its own root's count or a neighbour's
+// background load races it.
+static CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT: Mutex<Option<HashMap<PathBuf, usize>>> =
+    Mutex::new(None);
+
+// Keys are canonical so a test that configured `/var/...` matches the load
+// recorded under `/private/var/...`.
+fn artifact_load_root_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+fn note_configure_artifact_load_attempt(root: &Path) {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+    let mut by_root = CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *by_root
+        .get_or_insert_with(HashMap::new)
+        .entry(artifact_load_root_key(root))
+        .or_default() += 1;
 }
 
 #[doc(hidden)]
 pub fn reset_configure_artifact_load_attempts_for_test() {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.store(0, Ordering::SeqCst);
+    if let Some(by_root) = CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        by_root.clear();
+    }
 }
 
 #[doc(hidden)]
 pub fn configure_artifact_load_attempts_for_test() -> usize {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.load(Ordering::SeqCst)
+}
+
+#[doc(hidden)]
+pub fn configure_artifact_load_attempts_for_root_for_test(root: &Path) -> usize {
+    CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|by_root| by_root.get(&artifact_load_root_key(root)).copied())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -3226,7 +3263,7 @@ fn schedule_artifact_loads(
                 return;
             }
             log_ctx::with_session(session_id_for_bg.clone(), || {
-                note_configure_artifact_load_attempt();
+                note_configure_artifact_load_attempt(&root_for_search);
                 // Borrow-only opens are bounded disk reads, not cold builds. They
                 // must stay independent of the limiter that protects paths able
                 // to fall through to `rebuild_or_refresh_with_strategy` below.
@@ -3489,7 +3526,7 @@ fn schedule_artifact_loads(
                 return;
             }
             log_ctx::with_session(session_id, || {
-                note_configure_artifact_load_attempt();
+                note_configure_artifact_load_attempt(&semantic_root);
                 let event = match crate::readonly_artifacts::open_semantic_index_read_only(
                     &semantic_root,
                     semantic_storage.as_deref(),
@@ -3605,7 +3642,7 @@ fn schedule_artifact_loads(
                 note_configure_artifact_load_cancellation_for_test();
                 return;
             };
-            note_configure_artifact_load_attempt();
+            note_configure_artifact_load_attempt(&root_clone);
             log_ctx::with_session(session_id_for_bg2, || {
                 // Cap file count to bound memory on huge project roots (e.g.,
                 // /home/user). The local fastembed model (~200MB) + embeddings +
@@ -4541,6 +4578,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
+        configure_artifact_load_attempts_for_root_for_test,
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
@@ -7408,6 +7446,27 @@ mod tests {
     }
 
     #[test]
+    fn artifact_load_attempts_are_scoped_per_root_for_parallel_tests() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let mine = tempfile::tempdir().unwrap();
+        let neighbour = tempfile::tempdir().unwrap();
+        reset_configure_artifact_load_attempts_for_test();
+        // A parallel test's background load on another root must not be
+        // visible through the per-root accessor, only through the total.
+        super::note_configure_artifact_load_attempt(neighbour.path());
+        assert_eq!(
+            configure_artifact_load_attempts_for_root_for_test(mine.path()),
+            0
+        );
+        assert_eq!(configure_artifact_load_attempts_for_test(), 1);
+        super::note_configure_artifact_load_attempt(mine.path());
+        assert_eq!(
+            configure_artifact_load_attempts_for_root_for_test(mine.path()),
+            1
+        );
+    }
+
+    #[test]
     fn configure_artifact_loads_start_only_from_post_ack_maintenance() {
         let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
@@ -7432,7 +7491,7 @@ mod tests {
         let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success);
         assert_eq!(
-            configure_artifact_load_attempts_for_test(),
+            configure_artifact_load_attempts_for_root_for_test(root.path()),
             0,
             "artifact deserialization started before configure returned its acknowledgement"
         );
@@ -7440,7 +7499,7 @@ mod tests {
 
         super::drain_deferred_configure_maintenance(&ctx);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while configure_artifact_load_attempts_for_test() == 0 {
+        while configure_artifact_load_attempts_for_root_for_test(root.path()) == 0 {
             assert!(
                 Instant::now() < deadline,
                 "post-ack maintenance did not release the artifact loader"
