@@ -11,7 +11,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::commands::outline::handle_outline;
 use aft::commands::read::handle_read;
+use aft::commands::zoom::handle_zoom;
 use aft::config::{Config, GhReadConfig};
 use aft::context::{default_language_provider_factory, AppContext};
 use aft::github_read::{
@@ -242,6 +244,26 @@ fn isolated_restriction_probe() {
     let rendered = serde_json::to_string(&response).expect("serialize restricted response");
     assert!(rendered.contains("Network-backed GitHub reads are unavailable on restricted binds"));
     assert_no_sensitive_material(&rendered);
+
+    for (command, params) in [
+        ("outline", json!({ "target": "issue://7" })),
+        ("zoom", json!({ "file": "issue://7", "symbols": ["1"] })),
+    ] {
+        let request = RawRequest {
+            id: format!("{case}-github-{command}"),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: Some(format!("{case}-session")),
+            params,
+        };
+        let response = ctx.with_force_restrict(&request.id, || match command {
+            "outline" => handle_outline(&request, &ctx),
+            "zoom" => handle_zoom(&request, &ctx),
+            _ => unreachable!(),
+        });
+        assert!(!response.success, "restricted {command} unexpectedly succeeded");
+        assert_eq!(response.data["code"], "external_fetch_restricted");
+    }
     fs::write(completion_marker, case).expect("mark isolated restriction probe complete");
 }
 

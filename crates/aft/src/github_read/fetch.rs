@@ -6,12 +6,12 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use super::model::GithubDocument;
-use super::normalize::normalize_structured_document;
+use super::normalize::{normalize_structured_document, normalize_timeline_events};
 use super::resource::{GithubResource, GithubResourceKind};
 
 const ISSUE_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,url";
-const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,url";
-const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { author { login } body createdAt updatedAt isMinimized } } } } } } }";
+const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,baseRefName,headRefName,reviewDecision,url";
+const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
 
 /// Request context passed to a structured GitHub fetcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +159,11 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
             let review_document = normalize_document(&request.resource, &review_json)?;
             document.review_comment_sections = review_document.review_comment_sections;
         }
+        let timeline_json = self.structured_json(
+            &request.working_directory,
+            &gh_timeline_args(&request.resource, &document.repository)?,
+        )?;
+        document.timeline = normalize_timeline_events(&timeline_json);
         Ok(document)
     }
 }
@@ -242,6 +247,30 @@ pub fn gh_view_args(resource: &GithubResource) -> Vec<String> {
 /// Build the structured GraphQL fetch for inline PR review comments. The first
 /// `pr view --json` call resolves the repository; this second JSON call fills
 /// comment sections that `gh pr view` does not expose as a display field.
+pub fn gh_timeline_args(
+    resource: &GithubResource,
+    resolved_repository: &str,
+) -> Result<Vec<String>, GithubReadError> {
+    let (owner, repository) = resolved_repository.split_once('/').ok_or_else(|| {
+        GithubReadError::InvalidStructuredResponse(
+            "GitHub structured response returned an invalid resolved repository".to_string(),
+        )
+    })?;
+    if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        return Err(GithubReadError::InvalidStructuredResponse(
+            "GitHub structured response returned an invalid resolved repository".to_string(),
+        ));
+    }
+    Ok(vec![
+        "api".to_string(),
+        format!("repos/{owner}/{repository}/issues/{}/timeline", resource.number),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+        "-f".to_string(),
+        "per_page=100".to_string(),
+    ])
+}
+
 pub fn gh_pr_review_comments_args(
     resource: &GithubResource,
     resolved_repository: &str,

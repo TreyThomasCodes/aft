@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::commands::outline::symbol_to_entry;
+use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
     build_container_outline, format_qualified_entry, might_have_container_members,
     qualified_symbol_name, render_container_member_menu, should_return_member_menu,
@@ -142,6 +143,9 @@ fn zoom_one_target_response(
     context_lines: usize,
     include_callgraph: bool,
 ) -> Response {
+    if is_github_read_target(file) {
+        return handle_github_zoom(req, ctx, file, symbol);
+    }
     let (path, source) = match resolve_zoom_file(req, ctx, file) {
         Ok(file) => file,
         Err(resp) => return resp,
@@ -294,6 +298,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+
+    if is_github_read_target(file) {
+        let selector = match github_zoom_selector(req) {
+            Ok(selector) => selector,
+            Err(response) => return response,
+        };
+        return handle_github_zoom(req, ctx, file, &selector);
+    }
 
     let start_line = req
         .params
@@ -473,6 +485,35 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         context_lines,
         include_callgraph,
     )
+}
+
+fn github_zoom_selector(req: &RawRequest) -> Result<String, Response> {
+    let value = req
+        .params
+        .get("symbols")
+        .or_else(|| req.params.get("symbol"));
+    match value {
+        Some(serde_json::Value::String(selector)) if !selector.trim().is_empty() => {
+            Ok(selector.trim().to_string())
+        }
+        Some(serde_json::Value::Array(values)) if !values.is_empty() => values
+            .iter()
+            .map(|value| value.as_str().filter(|value| !value.trim().is_empty()))
+            .collect::<Option<Vec<_>>>()
+            .map(|values| values.join(","))
+            .ok_or_else(|| {
+                Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "zoom: GitHub symbols must be non-empty ordinal strings",
+                )
+            }),
+        _ => Err(Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: GitHub targets require discussion ordinals in symbols",
+        )),
+    }
 }
 
 /// Raw `symbol` or `symbols` param before language-aware splitting.

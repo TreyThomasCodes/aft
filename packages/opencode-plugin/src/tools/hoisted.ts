@@ -57,6 +57,11 @@ function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
 const ISSUE_AND_PR_READ_DESCRIPTION =
   "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
 
+/** Reuse the user-tier gh_read description gate across every GitHub-capable tool. */
+export function whenGhReadEnabled(enabled: boolean, description: string): string {
+  return enabled ? description : "";
+}
+
 type OpenCodeModelCatalogEntry = {
   attachment?: unknown;
   modalities?: { input?: unknown };
@@ -375,8 +380,9 @@ Examples:
 `;
 
 function readDescription(ghReadEnabled: boolean): string {
-  if (!ghReadEnabled) return READ_DESCRIPTION;
-  return READ_DESCRIPTION.replace("\nExamples:", `\n${ISSUE_AND_PR_READ_DESCRIPTION}\n\nExamples:`);
+  const githubDescription = whenGhReadEnabled(ghReadEnabled, ISSUE_AND_PR_READ_DESCRIPTION);
+  if (!githubDescription) return READ_DESCRIPTION;
+  return READ_DESCRIPTION.replace("\nExamples:", `\n${githubDescription}\n\nExamples:`);
 }
 
 /**

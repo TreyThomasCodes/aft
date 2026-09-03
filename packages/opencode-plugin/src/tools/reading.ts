@@ -3,6 +3,7 @@ import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugi
 import { tool } from "@opencode-ai/plugin";
 import { toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
+import { whenGhReadEnabled } from "./hoisted.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -61,6 +62,15 @@ interface ZoomBatchResult {
  */
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
+  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const githubOutlineDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",
+  );
+  const githubZoomDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issue and pull-request discussion ordinals can be zoomed with `path: issue://…` or `path: pr://…` and `symbols`.",
+  );
   const tools = prepareToolMap({
     aft_outline: {
       description:
@@ -74,7 +84,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
         "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
-        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
+        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
+        (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""),
       args: {
         target: z
           .union([z.string(), z.array(z.string())])
@@ -128,8 +139,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             throw new Error("'target' must be a non-empty string or array of strings");
           }
 
-          const hasUrl =
-            !filesMode && (target.startsWith("http://") || target.startsWith("https://"));
+              const hasUrl =
+                !filesMode &&
+                (target.startsWith("http://") ||
+                  target.startsWith("https://") ||
+                  target.startsWith("issue://") ||
+                  target.startsWith("pr://"));
           if (!hasUrl) {
             const resolvedTarget = await resolvePathArg(ctx, context, target);
             const permissionDenied = await assertPathExternalPermissions(
@@ -151,8 +166,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
 
     aft_zoom: {
-      description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them.",
+            description:
+              "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+              (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
       args: {
         path: z.string().optional().describe("Path to file (absolute or relative to project root)"),
         url: z
@@ -312,7 +328,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // URL mode passes through to Rust; Rust fetches, validates, and caches.
         // File mode still resolves locally before dispatch so external-directory
         // permission checks approve the same path the server will read.
-        if (!hasUrl) {
+        const githubPath =
+          (hasFilePath &&
+            (String(args.path).startsWith("issue://") || String(args.path).startsWith("pr://"))) ||
+          (hasUrl &&
+            (String(args.url).startsWith("issue://") || String(args.url).startsWith("pr://")));
+        if (!hasUrl && !githubPath) {
           const file = await resolvePathArg(ctx, context, args.path as string);
           const permissionDenied = await assertPathExternalPermissions(ctx, context, file);
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);

@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
+use crate::commands::read::{handle_github_outline, is_github_read_target};
 use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
@@ -155,6 +156,10 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+
+    if is_github_read_target(file) {
+        return handle_github_outline(req, ctx, file);
+    }
 
     let path = match resolve_file_or_url(req, ctx, file) {
         Ok(path) => path,
