@@ -890,10 +890,12 @@ fn zoom_one_symbol(
 
     if should_return_member_menu(target, resolved_lang, container_outline.as_ref()) {
         let kind_str = symbol_kind_string(&target.kind);
+        let zoom_enabled = ctx.tool_enabled("aft_zoom");
         let menu = format!(
-            "{}. {} Pick one of the listed member names and zoom it for its body.",
-            render_container_member_menu(target, container_outline.as_ref().unwrap()),
+            "{}. {} Pick one of the listed member names and {} it for its body.",
+            render_container_member_menu(target, container_outline.as_ref().unwrap(), zoom_enabled,),
             RETRY_UNCHANGED_ZOOM_MESSAGE,
+            if zoom_enabled { "zoom" } else { "read" },
         );
         let resp = ZoomResponse {
             name: target.name.clone(),
@@ -2805,6 +2807,16 @@ function helper(value: number): number {
             "expected member menu, got: {content}"
         );
         assert!(content.contains("Pick one of the listed member names"));
+
+        let disabled_ctx = make_ctx();
+        disabled_ctx.update_config(|config| {
+            config.disabled_tools.insert("aft_zoom".to_string());
+        });
+        let disabled = serde_json::to_value(handle_zoom(&req, &disabled_ctx)).unwrap();
+        let disabled_content = disabled["content"].as_str().unwrap();
+        assert!(disabled_content.contains("member-signature menu; read a member for its body"));
+        assert!(disabled_content.contains("Pick one of the listed member names and read it"));
+        assert!(!disabled_content.contains("aft_zoom"));
     }
 
     fn assert_heading_miss_steering(fixture: &str) {

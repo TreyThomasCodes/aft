@@ -266,6 +266,10 @@ export interface BashConfig {
   powershell_tool?: boolean;
 }
 
+export function toolEnabled(config: AftConfig, toolName: string): boolean {
+  return !(config.disabled_tools ?? []).includes(toolName);
+}
+
 export interface AftConfig {
   /**
    * Optional JSON Schema URL for editor tooling. Runtime no-op — only present

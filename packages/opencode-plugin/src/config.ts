@@ -572,6 +572,10 @@ export const AftConfigSchema = z.preprocess(
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+
+export function toolEnabled(config: AftConfig, toolName: string): boolean {
+  return !(config.disabled_tools ?? []).includes(toolName);
+}
 type AftConfigFields = z.infer<typeof AftConfigFieldsSchema>;
 
 function applyActiveHarnessOverride(config: AftConfig): AftConfig {

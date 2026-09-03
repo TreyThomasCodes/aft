@@ -81,6 +81,19 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).not.toContain("taskId");
   });
 
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const out = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: true,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      absentTools: new Set(["aft_zoom"]),
+    });
+    expect(out).toContain("→ `read` for symbol(s)");
+    expect(out).not.toContain("aft_zoom");
+  });
+
   test("omits bg-bash section when background is disabled", () => {
     const out = buildWorkflowHints({
       toolSurface: "recommended",

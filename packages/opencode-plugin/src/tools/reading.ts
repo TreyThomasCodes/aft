@@ -3,6 +3,7 @@ import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugi
 import { tool } from "@opencode-ai/plugin";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
+import { toolEnabled } from "../config.js";
 import {
   callToolCall,
   coerceOptionalInt,
@@ -59,7 +60,7 @@ interface ZoomBatchResult {
  * Tool definitions for code reading commands: outline + zoom.
  */
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  return prepareToolMap({
+  const tools = prepareToolMap({
     aft_outline: {
       description:
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
@@ -327,6 +328,10 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       },
     },
   });
+  if (!toolEnabled(ctx.config, "aft_zoom") && tools.aft_outline) {
+    tools.aft_outline.description = tools.aft_outline.description.replaceAll("aft_zoom", "read");
+  }
+  return tools;
 }
 
 /**

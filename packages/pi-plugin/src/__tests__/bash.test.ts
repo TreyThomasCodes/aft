@@ -1768,6 +1768,14 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(promptGuidelines.join("\n")).toContain("DO NOT use bash for code search");
   });
 
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const { description } = registeredDescription(true, { disabled_tools: ["aft_zoom"] });
+    expect(description).toContain("aft_search");
+    expect(description).toContain("aft_outline");
+    expect(description).toContain("read");
+    expect(description).not.toContain("aft_zoom");
+  });
+
   test("steers to the grep tool when aft_search is not registered", () => {
     const { description } = registeredDescription(false);
     expect(description).toContain("DO NOT use bash for code search");

@@ -11,7 +11,7 @@ import {
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, toolEnabled } from "../config.js";
 import { sessionLog } from "../logger.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
@@ -92,10 +92,11 @@ export function bashToolDescription(
   compressionOn: boolean,
   backgroundOn: boolean,
   detachOnUserMessage = true,
+  zoomEnabled = true,
 ): string {
   const searchSteer = aftSearchRegistered
-    ? "use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead"
-    : "use the grep tool, read, aft_outline, or aft_zoom instead";
+    ? `use aft_search (concepts, identifiers, regex, literals), read, aft_outline${zoomEnabled ? ", or aft_zoom" : ""} instead`
+    : `use the grep tool, read, aft_outline${zoomEnabled ? ", or aft_zoom" : ""} instead`;
   const compression = compressionOn
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
@@ -289,7 +290,13 @@ export function createBashTool(
   let hostFallbackActive = false;
 
   return {
-    description: bashToolDescription(false, initialBashCfg.compress, initialBashCfg.background),
+    description: bashToolDescription(
+      false,
+      initialBashCfg.compress,
+      initialBashCfg.background,
+      true,
+      toolEnabled(ctx.config, "aft_zoom"),
+    ),
     args: args as ToolDefinition["args"],
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);

@@ -916,6 +916,7 @@ fn handle_external_semantic_or_hybrid_search(
             &external_root,
             top_k,
             &borrow_metadata,
+            ctx,
         );
     };
 
@@ -947,6 +948,7 @@ fn handle_external_semantic_or_hybrid_search(
                     &external_root,
                     top_k,
                     &borrow_metadata,
+                    ctx,
                 );
             }
         };
@@ -968,13 +970,14 @@ fn handle_external_semantic_or_hybrid_search(
     }
     rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
 
-    let mut results = fuse_hybrid_results(
+    let mut results = fuse_hybrid_results_with_zoom(
         semantic_results,
         lexical.files,
         &shape,
         top_k.saturating_add(1),
         params.include_tests,
         &external_root,
+        ctx.tool_enabled("aft_zoom"),
     );
     results.retain(|result| result.file.is_file());
     let fused_more_available = results.len() > top_k;
@@ -1020,7 +1023,7 @@ fn handle_external_semantic_or_hybrid_search(
     }
 
     let snippets_incomplete =
-        enrich_snippets_from_source_with_context(&mut results, &external_root, None);
+        enrich_snippets_from_source_with_context(&mut results, &external_root, Some(ctx));
     let display_root = absolute_display_root(&external_root);
 
     let text = format_semantic_text_with_display_root(
@@ -1028,7 +1031,7 @@ fn handle_external_semantic_or_hybrid_search(
         &display_root,
         more_available,
         snippets_incomplete,
-        None,
+        Some(ctx),
     );
 
     search_response(
@@ -1066,16 +1069,18 @@ fn external_lexical_only_response(
     external_root: &Path,
     top_k: usize,
     borrow_metadata: &ExternalBorrowMetadata,
+    ctx: &AppContext,
 ) -> Response {
     let lexical_count = lexical.files.len();
     let lexical_engine_capped = lexical.engine_capped;
-    let mut results = fuse_hybrid_results(
+    let mut results = fuse_hybrid_results_with_zoom(
         Vec::new(),
         lexical.files,
         shape,
         top_k,
         params.include_tests,
         external_root,
+        ctx.tool_enabled("aft_zoom"),
     );
     results.retain(|result| result.file.is_file());
     let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
@@ -1685,13 +1690,14 @@ fn handle_semantic_or_hybrid_search(
 
             let lexical_count = lexical.files.len();
             let lexical_engine_capped = lexical.engine_capped;
-            let results = fuse_hybrid_results(
+            let results = fuse_hybrid_results_with_zoom(
                 Vec::new(),
                 lexical.files,
                 &shape,
                 top_k,
                 params.include_tests,
                 project_root,
+                ctx.tool_enabled("aft_zoom"),
             );
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let note = building_lexical_note(borrowed_loading && !results.is_empty());
@@ -1908,13 +1914,14 @@ fn handle_semantic_or_hybrid_search(
     }
     rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
 
-    let mut results = fuse_hybrid_results(
+    let mut results = fuse_hybrid_results_with_zoom(
         semantic_results,
         lexical.files,
         &shape,
         top_k.saturating_add(1),
         params.include_tests,
         project_root,
+        ctx.tool_enabled("aft_zoom"),
     );
     if ctx.shared_artifacts_read_only() {
         results.retain(|result| result.file.is_file());
@@ -2047,13 +2054,14 @@ fn zero_result_escalation_response(
 ) -> Response {
     let lexical_count = lexical.files.len();
     let lexical_engine_capped = lexical.engine_capped;
-    let mut results = fuse_hybrid_results(
+    let mut results = fuse_hybrid_results_with_zoom(
         Vec::new(),
         lexical.files,
         shape,
         top_k,
         include_tests,
         project_root,
+        ctx.map_or(true, |ctx| ctx.tool_enabled("aft_zoom")),
     );
     if let Some(ctx) = ctx {
         if ctx.shared_artifacts_read_only() {
@@ -3153,6 +3161,26 @@ pub fn fuse_hybrid_results(
     include_tests: bool,
     project_root: &Path,
 ) -> Vec<HybridResult> {
+    fuse_hybrid_results_with_zoom(
+        semantic,
+        lexical_files,
+        shape,
+        top_k,
+        include_tests,
+        project_root,
+        true,
+    )
+}
+
+fn fuse_hybrid_results_with_zoom(
+    semantic: Vec<SemanticResult>,
+    lexical_files: Vec<(PathBuf, f32)>,
+    shape: &QueryShape,
+    top_k: usize,
+    include_tests: bool,
+    project_root: &Path,
+    zoom_enabled: bool,
+) -> Vec<HybridResult> {
     if top_k == 0 {
         return Vec::new();
     }
@@ -3182,7 +3210,7 @@ pub fn fuse_hybrid_results(
         return lexical_candidates
             .into_iter()
             .take(top_k)
-            .map(|candidate| lexical_only_result(candidate, shape))
+            .map(|candidate| lexical_only_result(candidate, shape, zoom_enabled))
             .collect();
     }
 
@@ -3212,7 +3240,7 @@ pub fn fuse_hybrid_results(
         results.iter().map(|result| result.file.clone()).collect();
     for candidate in lexical_candidates {
         if !semantic_files.contains(&candidate.file) {
-            results.push(lexical_only_result(candidate, shape));
+            results.push(lexical_only_result(candidate, shape, zoom_enabled));
         }
     }
 
@@ -3256,7 +3284,11 @@ fn hybrid_from_semantic(
     }
 }
 
-fn lexical_only_result(candidate: LexicalCandidate, shape: &QueryShape) -> HybridResult {
+fn lexical_only_result(
+    candidate: LexicalCandidate,
+    shape: &QueryShape,
+    zoom_enabled: bool,
+) -> HybridResult {
     let score = if candidate.generated_artifact {
         0.0
     } else {
@@ -3281,7 +3313,11 @@ fn lexical_only_result(candidate: LexicalCandidate, shape: &QueryShape) -> Hybri
         hybrid_boosted: false,
         cap_protected: false,
         lexical_generated_artifact: candidate.generated_artifact,
-        snippet: "[lexical match — use aft_zoom or read for context]".to_string(),
+        snippet: if zoom_enabled {
+            "[lexical match — use aft_zoom or read for context]".to_string()
+        } else {
+            "[lexical match — use read for context]".to_string()
+        },
     }
 }
 
@@ -3465,7 +3501,11 @@ fn format_semantic_text_with_display_root(
     // truncated within the top 3) — so the hint appears exactly when it's
     // actionable, not on every search.
     if snippets_incomplete {
-        text.push_str("\nZoom any result for full source: aft_zoom <file> <symbol>.");
+        if ctx.map_or(true, |ctx| ctx.tool_enabled("aft_zoom")) {
+            text.push_str("\nZoom any result for full source: aft_zoom <file> <symbol>.");
+        } else {
+            text.push_str("\nRead any result for full source: read <file> [startLine..endLine].");
+        }
     }
     text
 }
@@ -3807,6 +3847,7 @@ fn render_rank0_symbol_snippet(
         crate::parser::detect_language(&result.file),
         outline.as_ref(),
         RANK0_FULL_SNIPPET_MAX_LINES,
+        ctx.map_or(true, |ctx| ctx.tool_enabled("aft_zoom")),
     )
 }
 
@@ -6315,7 +6356,7 @@ mod tests {
             .find(|symbol| symbol.name == "BigContainer")
             .expect("BigContainer symbol");
         let mut results = vec![HybridResult {
-            file: path,
+            file: path.clone(),
             name: "BigContainer".to_string(),
             kind: SymbolKind::Class,
             start_line: target.range.start_line,
@@ -6352,6 +6393,21 @@ mod tests {
             !snippet.contains(RANK0_FULL_SYMBOL_NOTICE),
             "member menu must not claim the full symbol was shown: {snippet}"
         );
+
+        let disabled_ctx = test_context(dir.path());
+        disabled_ctx.update_config(|config| {
+            config.disabled_tools.insert("aft_zoom".to_string());
+        });
+        let mut disabled_results = vec![results[0].clone()];
+        enrich_snippets_from_source_with_context(
+            &mut disabled_results,
+            dir.path(),
+            Some(&disabled_ctx),
+        );
+        assert!(disabled_results[0]
+            .snippet
+            .contains("member-signature menu; read a member for its body"));
+        assert!(!disabled_results[0].snippet.contains("aft_zoom"));
     }
 
     #[test]
@@ -6510,6 +6566,43 @@ mod tests {
         assert!(!text.contains("Top match is weak"), "got: {text}");
         // And no unconditional "[index: ready]" tax on the happy path.
         assert!(!text.contains("[index: ready]"), "got: {text}");
+    }
+
+    #[test]
+    fn disabled_zoom_steering_uses_read_and_enabled_text_stays_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 30)];
+        let enabled_ctx = test_context(dir.path());
+        let incomplete =
+            enrich_snippets_from_source_with_context(&mut results, dir.path(), Some(&enabled_ctx));
+        let enabled =
+            format_semantic_text(&results, dir.path(), false, incomplete, Some(&enabled_ctx));
+        assert!(enabled.contains("Zoom any result for full source: aft_zoom <file> <symbol>."));
+        assert!(!enabled.contains("Read any result for full source"));
+
+        let disabled_ctx = test_context(dir.path());
+        disabled_ctx.update_config(|config| {
+            config.disabled_tools.insert("aft_zoom".to_string());
+        });
+        let disabled =
+            format_semantic_text(&results, dir.path(), false, incomplete, Some(&disabled_ctx));
+        assert!(
+            disabled.contains("Read any result for full source: read <file> [startLine..endLine].")
+        );
+        assert!(!disabled.contains("aft_zoom"));
+
+        let shape = query_shape::classify("foo");
+        let candidate = LexicalCandidate {
+            file: dir.path().join("a.rs"),
+            score: 1.0,
+            generated_artifact: false,
+            ordinal: 0,
+        };
+        let enabled_lexical = lexical_only_result(candidate.clone(), &shape, true);
+        let disabled_lexical = lexical_only_result(candidate, &shape, false);
+        assert!(enabled_lexical.snippet.contains("aft_zoom"));
+        assert!(disabled_lexical.snippet.contains("use read for context"));
+        assert!(!disabled_lexical.snippet.contains("aft_zoom"));
     }
 
     #[test]

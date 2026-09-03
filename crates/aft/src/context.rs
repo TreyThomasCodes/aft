@@ -3680,6 +3680,11 @@ impl AppContext {
         *self.last_request_at.lock() = at;
     }
 
+    /// Return whether a tool is available to the active agent session.
+    pub fn tool_enabled(&self, tool: &str) -> bool {
+        !self.config().disabled_tools.contains(tool)
+    }
+
     /// Access an owned configuration snapshot.
     pub fn config(&self) -> Arc<Config> {
         let guard = match self.config.read() {

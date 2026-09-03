@@ -11,6 +11,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { toolEnabled } from "../config.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -345,79 +346,81 @@ export function registerReadingTools(
   surface: ReadingSurface,
 ): void {
   if (surface.outline) {
-    pi.registerTool(
-      withPathAliasPreparation({
-        name: "aft_outline",
-        label: "outline",
-        description:
-          "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
-        parameters: OutlineParams,
-        async execute(
-          _toolCallId: string,
-          params: Static<typeof OutlineParams>,
-          _signal,
-          _onUpdate,
-          extCtx,
-        ) {
-          const bridge = bridgeFor(ctx, extCtx.cwd);
-          // Coerce at the boundary: a host may deliver the string|array `target` as
-          // a JSON-stringified array, which would otherwise be treated as one
-          // literal path (coerceTargetParam). And a stringified "true" must enable
-          // files mode (coerceBoolean).
-          const target = coerceTargetParam(params.target);
-          const filesMode = coerceBoolean(params.files);
-          const hasIncludeTests = !isEmptyParam(params.includeTests);
-          const includeTests = coerceBoolean(params.includeTests);
-          const rawArgs: Record<string, unknown> = {
-            target,
-            ...(filesMode ? { files: true } : {}),
-            ...(hasIncludeTests ? { includeTests } : {}),
-          };
+    const outlineTool = withPathAliasPreparation({
+      name: "aft_outline",
+      label: "outline",
+      description:
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
+      parameters: OutlineParams,
+      async execute(
+        _toolCallId: string,
+        params: Static<typeof OutlineParams>,
+        _signal,
+        _onUpdate,
+        extCtx,
+      ) {
+        const bridge = bridgeFor(ctx, extCtx.cwd);
+        // Coerce at the boundary: a host may deliver the string|array `target` as
+        // a JSON-stringified array, which would otherwise be treated as one
+        // literal path (coerceTargetParam). And a stringified "true" must enable
+        // files mode (coerceBoolean).
+        const target = coerceTargetParam(params.target);
+        const filesMode = coerceBoolean(params.files);
+        const hasIncludeTests = !isEmptyParam(params.includeTests);
+        const includeTests = coerceBoolean(params.includeTests);
+        const rawArgs: Record<string, unknown> = {
+          target,
+          ...(filesMode ? { files: true } : {}),
+          ...(hasIncludeTests ? { includeTests } : {}),
+        };
 
-          if (Array.isArray(target)) {
-            if (target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            const resolvedTargets = await Promise.all(
-              (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
-            );
-            await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
-          } else {
-            if (typeof target !== "string" || target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            if (!(!filesMode && isUrl(target))) {
-              const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
-              await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
-            }
+        if (Array.isArray(target)) {
+          if (target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
           }
+          const resolvedTargets = await Promise.all(
+            (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
+          );
+          await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
+        } else {
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+          if (!(!filesMode && isUrl(target))) {
+            const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
+            await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
+          }
+        }
 
-          const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
-          if (response.success === false) {
-            throw new Error(response.text || response.message || "outline failed");
-          }
-          let text = typeof response.text === "string" ? response.text : "";
-          const trimmed = text.trim();
-          if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            try {
-              const parsed = JSON.parse(text);
-              if (typeof parsed.text === "string") {
-                text = parsed.text;
-              }
-            } catch {
-              // keep original text
+        const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "outline failed");
+        }
+        let text = typeof response.text === "string" ? response.text : "";
+        const trimmed = text.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+          try {
+            const parsed = JSON.parse(text);
+            if (typeof parsed.text === "string") {
+              text = parsed.text;
             }
+          } catch {
+            // keep original text
           }
-          return textResult(text, response);
-        },
-        renderCall(args, theme, context) {
-          return renderOutlineCall(args, theme, context);
-        },
-        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
-          return renderOutlineResult(result, theme, context, options);
-        },
-      }),
-    );
+        }
+        return textResult(text, response);
+      },
+      renderCall(args, theme, context) {
+        return renderOutlineCall(args, theme, context);
+      },
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderOutlineResult(result, theme, context, options);
+      },
+    });
+    if (!toolEnabled(ctx.config, "aft_zoom")) {
+      outlineTool.description = outlineTool.description.replaceAll("aft_zoom", "read");
+    }
+    pi.registerTool(outlineTool);
   }
 
   if (surface.zoom) {

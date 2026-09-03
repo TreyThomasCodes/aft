@@ -1069,6 +1069,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_inspect",
     "grep",
     "aft_grep",
+    "read",
+    "aft_read",
     "bash",
     "aft_bash",
     "bash_status",

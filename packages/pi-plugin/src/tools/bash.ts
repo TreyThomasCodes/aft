@@ -30,7 +30,7 @@ import {
   unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, toolEnabled } from "../config.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -460,9 +460,10 @@ export function registerBashTool(
   // advertising `compressed: false` when compression is disabled would
   // describe a no-op. Background/PTY/watch wording appears only when
   // `bash.background` is enabled.
+  const zoomSteer = toolEnabled(ctx.config, "aft_zoom") ? ", or `aft_zoom`" : "";
   const searchSteer = aftSearchRegistered
-    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`
-    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`;
+    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`
+    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`;
   const bashCfg = resolveBashConfig(ctx.config);
   // Every command probes the module before fallback. Retain only enough state to
   // clear fallback mode after the first successful module response.

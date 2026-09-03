@@ -3,6 +3,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
+import { toolEnabled } from "../config.js";
 import {
   callToolCall,
   coerceOptionalInt,
@@ -27,7 +28,7 @@ const CALLGRAPH_SOFT_CODES = new Set(["symbol_not_found", "callgraph_building"])
  * Tool definitions for call-graph navigation: call_tree, callers, trace_to, trace_to_symbol, impact, and trace_data.
  */
 export function navigationTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  return prepareToolMap({
+  const tools = prepareToolMap({
     aft_callgraph: {
       description:
         "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\n" +
@@ -141,4 +142,11 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
       },
     },
   });
+  if (!toolEnabled(ctx.config, "aft_zoom") && tools.aft_callgraph) {
+    tools.aft_callgraph.description = tools.aft_callgraph.description.replaceAll(
+      "aft_zoom",
+      "read",
+    );
+  }
+  return tools;
 }
