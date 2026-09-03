@@ -462,12 +462,15 @@ describe("reading tool adapters", () => {
       ),
     ).rejects.toThrow(/targets\[0\]\.symbol/);
 
+    // An empty sentinel on a required path field means the field was not
+    // supplied in substance, so the error names the canonical `path` as
+    // missing (v0.49 surface rule) rather than the legacy `filePath` alias.
     await expect(
       tools.aft_zoom.execute(
         { targets: [{ filePath: "", symbol: "x" }] },
         createMockSdkContext(root),
       ),
-    ).rejects.toThrow(/targets\[0\]\.filePath/);
+    ).rejects.toThrow(/targets\[0\]\.path/);
 
     expect(sendCalls).toHaveLength(0);
     expect(toolCallCalls).toHaveLength(0);

@@ -142,9 +142,13 @@ export function runCallgraphToolcallSuite(
       const tools = navigationTools(createPluginContext(h));
       const context = createToolContext(h);
 
+      // An empty sentinel on a required path field means the field was not
+      // supplied in substance, so the error names the canonical `path` as
+      // missing (v0.49 surface rule) rather than the legacy `filePath` alias
+      // with the well-formed-Unicode wording.
       await expect(
         tools.aft_callgraph.execute({ op: "callers", filePath: "", symbol: "normalize" }, context),
-      ).rejects.toThrow("'filePath' must be a non-empty well-formed Unicode string");
+      ).rejects.toThrow("'path' is required");
 
       await expect(
         tools.aft_callgraph.execute(
