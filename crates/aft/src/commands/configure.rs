@@ -4530,8 +4530,8 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
         }
         match crate::fs_lock::sweep_stale_reclaim_tokens(&job.storage_root) {
-            Ok(0) => {}
-            Ok(n) => slog_info!(
+            Ok(None | Some(0)) => {}
+            Ok(Some(n)) => slog_info!(
                 "filesystem lock cleanup: removed {} stale reclaim tokens",
                 n
             ),
