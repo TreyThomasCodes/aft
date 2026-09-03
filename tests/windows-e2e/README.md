@@ -146,6 +146,24 @@ pwsh -File tests\windows-e2e\run.ps1
 
 ## What the suite covers
 
+### Warm-up launch
+
+Before Scenario 1, the harness runs a throwaway `opencode run` with a trivial
+prompt and its own generous 240s timeout. Its only success criterion is that
+the plugin log gains at least one new line (plugin loaded). This absorbs the
+cold-runner cost of the FIRST opencode launch (plugin install from the
+`file://` tarball + first plugin load), which can otherwise exceed Scenario
+1's 90s budget and hang with 0 bytes of stdout/stderr and nothing at the mock
+provider. The warm-up is NOT a scenario and does NOT use any scenario's
+budget. If the plugin never loads within 240s, the run fails with a distinct,
+named message (`warmup: plugin never loaded within 240s`) so the flake class
+is visible instead of being misread as a Scenario 1 failure.
+
+The end-of-run "Plugin log (last 40 lines)" tail is annotated with scenario
+boundaries (each scenario's first line is prefixed with a
+`--- <scenario> begins here ---` marker), so a reader cannot attribute
+Scenario 2's lines to Scenario 1.
+
 ### Scenario 1 — Full session
 
 Exercises plugin load, bridge spawn, basic tool surface (`aft_outline`,

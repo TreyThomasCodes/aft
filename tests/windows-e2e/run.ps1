@@ -696,6 +696,141 @@ $PluginLog = Join-Path $CacheBase "cortexkit\aft\logs\aft-plugin.log"
 if (Test-Path $PluginLog) { Remove-Item $PluginLog -Force }
 
 # ---------------------------------------------------------------------------
+# Plugin-log helpers
+#
+# The plugin log is the durable record of what the AFT plugin actually did
+# (binary resolution, bridge spawn, tool calls). Scenarios append to it, so
+# a reader of the end-of-run tail cannot tell which scenario produced a given
+# line without a boundary marker. These helpers record the line count at each
+# scenario start and annotate the tail with the scenario boundary, so a
+# reader cannot attribute Scenario 2's lines to Scenario 1.
+# ---------------------------------------------------------------------------
+
+# Scenario name -> plugin-log line count at that scenario's start. Populated
+# by Record-PluginLogBoundary and consumed by Show-PluginLogTail.
+$script:PluginLogBoundaries = @{}
+
+# Reset the plugin log so a scenario's assertions don't see stale lines from
+# an earlier scenario. Also clears the recorded boundaries: the file is now
+# fresh, so any earlier scenario's boundary index (e.g. warm-up at 0) no
+# longer describes this file's content and would mislabel the tail.
+function Reset-PluginLog {
+    Remove-Item $PluginLog -Force -ErrorAction SilentlyContinue
+    $script:PluginLogBoundaries = @{}
+    return 0
+}
+
+# Record the current plugin-log line count as the boundary for a scenario.
+# Returns the count so the caller can stash it. The end-of-run tail uses
+# these to print which scenario's lines it holds.
+function Record-PluginLogBoundary {
+    param([string]$Scenario)
+    $count = 0
+    if (Test-Path $PluginLog) {
+        $count = (Get-Content $PluginLog).Count
+    }
+    $script:PluginLogBoundaries[$Scenario] = $count
+    return $count
+}
+
+# Print the last N lines of a file with a label and byte size. Used for
+# diagnostics when a log is missing or empty.
+function Show-LogTail {
+    param([string]$Label, [string]$Path, [int]$Lines = 50)
+    if (Test-Path $Path) {
+        $size = (Get-Item $Path).Length
+        Write-Host "  ${Label} (${Path}, ${size} bytes):"
+        if ($size -eq 0) {
+            Write-Host "    (empty)"
+        } else {
+            Get-Content $Path -Tail $Lines | ForEach-Object { Write-Host "    $_" }
+        }
+    } else {
+        Write-Host "  ${Label} (no file at $Path)"
+    }
+}
+
+# Print the plugin-log tail annotated with scenario boundaries, so a reader
+# cannot attribute Scenario 2's lines to Scenario 1. Each scenario's first
+# line is prefixed with a "--- <scenario> begins here ---" marker.
+function Show-PluginLogTail {
+    param([int]$Lines = 40)
+    if (-not (Test-Path $PluginLog)) {
+        Write-Host "Plugin log: no file at $PluginLog"
+        return
+    }
+    $all = Get-Content $PluginLog
+    $total = $all.Count
+    Write-Host "Plugin log (last $Lines lines; $total total):"
+    $start = [Math]::Max(0, $total - $Lines)
+    for ($i = $start; $i -lt $total; $i++) {
+        foreach ($entry in $script:PluginLogBoundaries.GetEnumerator()) {
+            if ($entry.Value -eq $i) {
+                Write-Host "  --- ${entry.Key} begins here (line $($entry.Value + 1)) ---"
+                break
+            }
+        }
+        Write-Host "    $($all[$i])"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# WARM-UP: first opencode launch on a cold runner
+#
+# The FIRST opencode launch on a cold runner (plugin install from the
+# file:// tarball + first plugin load) can exceed Scenario 1's 90s budget,
+# hanging with 0 bytes of stdout/stderr and nothing at the mock provider.
+# Scenarios 2/3 then load fine, and their plugin log lines appear in the
+# end-of-run tail and get misread as Scenario 1's.
+#
+# We burn that cold-start cost here, in a throwaway launch that is NOT a
+# scenario and does NOT use any scenario's budget. Its only success
+# criterion is that the plugin log gains at least one new line (plugin
+# loaded). If the warm-up itself times out, we fail the run with a distinct,
+# named message so this flake class is visible instead of being misread as
+# a Scenario 1 failure.
+# ---------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "-- Warm-up: first opencode launch (plugin install + load) --"
+Write-Host ""
+
+# Record the plugin-log boundary before the warm-up so we can measure the
+# delta (plugin loaded => at least one new line).
+$WarmupStartCount = Record-PluginLogBoundary -Scenario "warm-up"
+
+# "Outline src" is the only mock-scripted prompt that fires a tool call
+# (aft_outline), which is what makes the plugin load and start logging. The
+# warm-up is throwaway, so running the full scripted turn sequence is fine.
+$WarmupResult = Join-Path $env:TEMP "result-warmup.txt"
+$WarmupStart = Get-Date
+$WarmupExit = Run-OpencodeSession `
+    -Prompt "Outline src" `
+    -ResultFile $WarmupResult `
+    -TimeoutSec 240
+$WarmupDuration = (Get-Date) - $WarmupStart
+Write-Host "  (warm-up wall-clock: $([Math]::Round($WarmupDuration.TotalSeconds, 1))s; exit=$WarmupExit)"
+
+# The warm-up's ONLY success criterion: the plugin log gained at least one
+# new line (plugin loaded). We do NOT count this as a scenario and do NOT
+# use any scenario's budget. If the plugin never loaded within 240s, fail
+# the run with a distinct, named message so the flake class is visible.
+$WarmupEndCount = 0
+if (Test-Path $PluginLog) { $WarmupEndCount = (Get-Content $PluginLog).Count }
+if ($WarmupEndCount -le $WarmupStartCount) {
+    Write-Host ""
+    Write-Host "  -- diagnostic: warm-up plugin never loaded, dumping captured output --" -ForegroundColor Yellow
+    Show-LogTail "opencode stdout" $WarmupResult
+    Show-LogTail "opencode stderr" ($WarmupResult + ".err")
+    Show-LogTail "aimock stdout" $AimockLog
+    Show-LogTail "aimock stderr" $AimockErrLog
+    Write-Host ""
+    Write-Host "warmup: plugin never loaded within 240s" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  (warm-up: plugin loaded; log grew from $WarmupStartCount to $WarmupEndCount lines)"
+
+# ---------------------------------------------------------------------------
 # Scenario 1: Full session -- exercises plugin load, bridge spawn, basic tools
 # ---------------------------------------------------------------------------
 
@@ -704,6 +839,10 @@ Write-Host "-- Scenario 1: Full session --"
 Write-Host ""
 
 $Result1 = Join-Path $env:TEMP "result-scenario1.txt"
+# Record the plugin-log boundary so the end-of-run tail can attribute this
+# scenario's lines (the warm-up already loaded the plugin, so S1's lines
+# start after the warm-up's).
+Record-PluginLogBoundary -Scenario "Scenario 1" | Out-Null
 $ExitCode = Run-OpencodeSession `
     -Prompt "Outline src, read main.py, grep for def, then make a small edit and undo it." `
     -ResultFile $Result1 `
@@ -739,21 +878,6 @@ if (-not $logExists) {
     # so the failure mode is unambiguous on first read.
     Write-Host ""
     Write-Host "  -- diagnostic: plugin log missing, dumping all captured output --" -ForegroundColor Yellow
-
-    function Show-LogTail {
-        param([string]$Label, [string]$Path, [int]$Lines = 50)
-        if (Test-Path $Path) {
-            $size = (Get-Item $Path).Length
-            Write-Host "  ${Label} (${Path}, ${size} bytes):"
-            if ($size -eq 0) {
-                Write-Host "    (empty)"
-            } else {
-                Get-Content $Path -Tail $Lines | ForEach-Object { Write-Host "    $_" }
-            }
-        } else {
-            Write-Host "  ${Label} (no file at $Path)"
-        }
-    }
 
     Show-LogTail "opencode stdout" $Result1
     Show-LogTail "opencode stderr" ($Result1 + ".err")
@@ -854,8 +978,10 @@ Write-Host "-- Scenario 2: Bash long-task auto-promotion (issue #26) --"
 Write-Host ""
 
 # Reset the plugin log so this scenario's assertions don't conflict with
-# Scenario 1's content.
-Remove-Item $PluginLog -Force -ErrorAction SilentlyContinue
+# Scenario 1's content, then record the boundary so the end-of-run tail can
+# attribute this scenario's lines.
+Reset-PluginLog
+Record-PluginLogBoundary -Scenario "Scenario 2" | Out-Null
 
 # Reset the bash timing marker. If the marker exists at the end of the
 # scenario, bash actually ran. If it doesn't, bash was skipped (the
@@ -999,7 +1125,8 @@ Write-Host ""
 Write-Host "-- Scenario 2b: Interactive-prompt deadlock (issue #26 root cause) --"
 Write-Host ""
 
-Remove-Item $PluginLog -Force -ErrorAction SilentlyContinue
+Reset-PluginLog
+Record-PluginLogBoundary -Scenario "Scenario 2b" | Out-Null
 $InteractiveMarker = Join-Path $env:TEMP "interactive-marker.txt"
 Remove-Item $InteractiveMarker -Force -ErrorAction SilentlyContinue
 
@@ -1219,7 +1346,9 @@ Write-Host ""
 
 # We don't reset the plugin log here -- ONNX install kicks off during plugin
 # load (Scenario 1) and finishes async. Just check that the install path used
-# tar.exe (Windows) and not an extraction failure.
+# tar.exe (Windows) and not an extraction failure. Record the boundary so the
+# end-of-run tail can attribute this scenario's lines.
+Record-PluginLogBoundary -Scenario "Scenario 3" | Out-Null
 
 WarnCheck "ONNX download attempted (or already installed)" {
     LogContains $PluginLog "ONNX Runtime found at|Downloading ONNX Runtime|ONNX Runtime ready"
@@ -1251,10 +1380,7 @@ if ($MockProc -and -not $MockProc.HasExited) {
 }
 
 Write-Host ""
-if (Test-Path $PluginLog) {
-    Write-Host "Plugin log (last 40 lines):"
-    Get-Content $PluginLog -Tail 40 | ForEach-Object { Write-Host "    $_" }
-}
+Show-PluginLogTail -Lines 40
 
 # Bash timing marker — empirical evidence dump for issue #26.
 if (Test-Path $BashMarker) {
