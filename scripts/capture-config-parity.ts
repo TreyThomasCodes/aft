@@ -506,6 +506,23 @@ const CASES: ParityCase[] = [
     project: { bash: { detach_on_user_message: false } },
   },
   {
+    name: "idle_user_tier",
+    user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 5 } },
+  },
+  {
+    name: "idle_project_tier",
+    user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 8 } },
+    project: { idle: { root_ttl_minutes: 15, lsp_ttl_minutes: 3 } },
+  },
+  {
+    name: "idle_out_of_range_clamped",
+    user: { idle: { root_ttl_minutes: 60, lsp_ttl_minutes: 0 } },
+  },
+  {
+    name: "idle_non_integer_dropped",
+    user: { idle: { root_ttl_minutes: 12.5 } },
+  },
+  {
     name: "jsonc_comments",
     user: `{
   // comment

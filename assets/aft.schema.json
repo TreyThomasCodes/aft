@@ -206,6 +206,23 @@
       "additionalProperties": false,
       "description": "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect."
     },
+    "idle": {
+      "type": "object",
+      "properties": {
+        "root_ttl_minutes": {
+          "type": "integer",
+          "default": 30,
+          "description": "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers."
+        },
+        "lsp_ttl_minutes": {
+          "type": "integer",
+          "default": 10,
+          "description": "Minutes without a request before language servers for a root are shut down, even while the root is still bound. Default 10; values outside 1..=10 are clamped. Servers respawn on the next diagnostics request. Independent of root_ttl_minutes. User and project tiers."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Idle reclamation windows for unbound-root artifacts and language servers."
+    },
     "worktree": {
       "type": "object",
       "properties": {
@@ -830,6 +847,23 @@
             },
             "additionalProperties": false,
             "description": "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect."
+          },
+          "idle": {
+            "type": "object",
+            "properties": {
+              "root_ttl_minutes": {
+                "type": "integer",
+                "default": 30,
+                "description": "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers."
+              },
+              "lsp_ttl_minutes": {
+                "type": "integer",
+                "default": 10,
+                "description": "Minutes without a request before language servers for a root are shut down, even while the root is still bound. Default 10; values outside 1..=10 are clamped. Servers respawn on the next diagnostics request. Independent of root_ttl_minutes. User and project tiers."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Idle reclamation windows for unbound-root artifacts and language servers."
           },
           "worktree": {
             "type": "object",

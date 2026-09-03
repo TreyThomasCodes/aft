@@ -14,10 +14,12 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
-    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig,
+    SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_IDLE_LSP_TTL_MINUTES,
+    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
@@ -116,6 +118,7 @@ pub struct RawAftConfig {
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
+    pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
     pub gh_shim: Option<RawGhShim>,
@@ -455,6 +458,19 @@ impl RawInspectDuplicates {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawIdle {
+    pub root_ttl_minutes: Option<Value>,
+    pub lsp_ttl_minutes: Option<Value>,
+}
+
+impl RawIdle {
+    fn is_empty(&self) -> bool {
+        self.root_ttl_minutes.is_none() && self.lsp_ttl_minutes.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawBridge {
@@ -586,6 +602,7 @@ pub fn resolve_config_for_harness(
     let mut config = Config::default();
     apply_resolved_config(&merged, &mut config);
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     ResolveResult {
         config,
         dropped,
@@ -826,6 +843,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
     }
+    if override_config.idle.is_some() {
+        base.idle = override_config.idle;
+    }
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
     }
@@ -914,6 +934,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
+    base.idle = merge_idle_config(base.idle.clone(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
     if project.git.is_some() {
         base.git = project.git;
@@ -1141,6 +1162,20 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
         },
         RawBash::Features(features) => features.clone(),
     }
+}
+
+fn merge_idle_config(base: Option<RawIdle>, override_idle: Option<RawIdle>) -> Option<RawIdle> {
+    let Some(override_idle) = override_idle else {
+        return base;
+    };
+    let mut idle = base.unwrap_or_default();
+    if override_idle.root_ttl_minutes.is_some() {
+        idle.root_ttl_minutes = override_idle.root_ttl_minutes;
+    }
+    if override_idle.lsp_ttl_minutes.is_some() {
+        idle.lsp_ttl_minutes = override_idle.lsp_ttl_minutes;
+    }
+    (!idle.is_empty()).then_some(idle)
 }
 
 fn merge_inspect_config(
@@ -1520,6 +1555,74 @@ fn resolve_semantic_config(
     }
 
     semantic
+}
+
+fn resolve_idle_config(raw: Option<&RawIdle>, warnings: &mut Vec<ConfigWarning>) -> IdleConfig {
+    let mut idle = IdleConfig::default();
+    let Some(raw) = raw else {
+        return idle;
+    };
+    idle.root_ttl_minutes = resolve_clamped_minutes(
+        raw.root_ttl_minutes.as_ref(),
+        "idle.root_ttl_minutes",
+        DEFAULT_IDLE_ROOT_TTL_MINUTES,
+        MIN_IDLE_ROOT_TTL_MINUTES,
+        MAX_IDLE_ROOT_TTL_MINUTES,
+        warnings,
+    );
+    idle.lsp_ttl_minutes = resolve_clamped_minutes(
+        raw.lsp_ttl_minutes.as_ref(),
+        "idle.lsp_ttl_minutes",
+        DEFAULT_IDLE_LSP_TTL_MINUTES,
+        MIN_IDLE_LSP_TTL_MINUTES,
+        MAX_IDLE_LSP_TTL_MINUTES,
+        warnings,
+    );
+    idle
+}
+
+fn resolve_clamped_minutes(
+    raw: Option<&Value>,
+    key: &'static str,
+    default: u32,
+    min: u32,
+    max: u32,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u32 {
+    let Some(value) = raw else {
+        return default;
+    };
+    let Some(parsed) = json_integer(value) else {
+        warnings.push(ConfigWarning {
+            code: "invalid_idle_ttl",
+            key,
+            tier: "config".to_string(),
+            value: value.to_string(),
+            message: format!("{key} must be an integer; using default {default}"),
+        });
+        return default;
+    };
+    let clamped = parsed.clamp(i64::from(min), i64::from(max)) as u32;
+    if i64::from(clamped) != parsed {
+        warnings.push(ConfigWarning {
+            code: "clamped_idle_ttl",
+            key,
+            tier: "config".to_string(),
+            value: parsed.to_string(),
+            message: format!("{key}={parsed} is outside {min}..={max}; clamped to {clamped}"),
+        });
+    }
+    clamped
+}
+
+fn json_integer(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) if number.is_i64() => number.as_i64(),
+        Value::Number(number) if number.is_u64() => {
+            number.as_u64().and_then(|value| i64::try_from(value).ok())
+        }
+        _ => None,
+    }
 }
 
 fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
@@ -2456,6 +2559,93 @@ mod tests {
         assert_eq!(
             above_max.config.inspect.diagnostics_timeout_ms,
             MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn idle_root_ttl_clamps_to_five_through_thirty() {
+        let below = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 1 } }"#)]);
+        assert_eq!(
+            below.config.idle.root_ttl_minutes,
+            MIN_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(below
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+
+        let above = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 60 } }"#)]);
+        assert_eq!(
+            above.config.idle.root_ttl_minutes,
+            MAX_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(above
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+
+        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 5 } }"#)]);
+        assert_eq!(at_min.config.idle.root_ttl_minutes, 5);
+        assert!(at_min.warnings.is_empty());
+
+        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 30 } }"#)]);
+        assert_eq!(at_max.config.idle.root_ttl_minutes, 30);
+        assert!(at_max.warnings.is_empty());
+    }
+
+    #[test]
+    fn idle_lsp_ttl_clamps_to_one_through_ten() {
+        let below = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 0 } }"#)]);
+        assert_eq!(below.config.idle.lsp_ttl_minutes, MIN_IDLE_LSP_TTL_MINUTES);
+        assert!(below
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.lsp_ttl_minutes"));
+
+        let above = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 20 } }"#)]);
+        assert_eq!(above.config.idle.lsp_ttl_minutes, MAX_IDLE_LSP_TTL_MINUTES);
+        assert!(above
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.lsp_ttl_minutes"));
+
+        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 1 } }"#)]);
+        assert_eq!(at_min.config.idle.lsp_ttl_minutes, 1);
+        assert!(at_min.warnings.is_empty());
+
+        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 10 } }"#)]);
+        assert_eq!(at_max.config.idle.lsp_ttl_minutes, 10);
+        assert!(at_max.warnings.is_empty());
+    }
+
+    #[test]
+    fn idle_non_integer_ttl_is_dropped_with_warning() {
+        let result = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 12.5 } }"#)]);
+        assert_eq!(
+            result.config.idle.root_ttl_minutes,
+            DEFAULT_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "invalid_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+    }
+
+    #[test]
+    fn idle_project_tier_overrides_user_ttl() {
+        let result = resolve_config(&[
+            tier("user", r#"{ "idle": { "lsp_ttl_minutes": 8 } }"#),
+            tier("project", r#"{ "idle": { "lsp_ttl_minutes": 3 } }"#),
+        ]);
+        assert_eq!(result.config.idle.lsp_ttl_minutes, 3);
+        assert_eq!(
+            result.config.idle.root_ttl_minutes,
+            DEFAULT_IDLE_ROOT_TTL_MINUTES
         );
     }
 

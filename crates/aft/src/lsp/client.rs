@@ -389,25 +389,14 @@ impl LspClient {
                             params,
                         });
                     }
-                    Ok(None) => {
+                    terminal @ (Ok(None) | Err(_)) => {
                         if let Ok(mut guard) = reader_pending.lock() {
                             guard.clear();
                         }
                         let _ = event_tx.send(LspEvent::ServerExited {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
-                            reason: ServerExitReason::Eof,
-                        });
-                        break;
-                    }
-                    Err(err) => {
-                        if let Ok(mut guard) = reader_pending.lock() {
-                            guard.clear();
-                        }
-                        let _ = event_tx.send(LspEvent::ServerExited {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            reason: ServerExitReason::ReadError(err.to_string()),
+                            reason: ServerExitReason::from_read_result(terminal),
                         });
                         break;
                     }
@@ -727,6 +716,17 @@ impl LspClient {
 
     /// Graceful shutdown: send shutdown request, then exit notification.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
+        self.shutdown_with_request_timeout(HANDSHAKE_REQUEST_TIMEOUT)
+    }
+
+    /// Idle reclaim must not sit on the initialize-length Shutdown handshake.
+    /// A short request timeout falls through to the kill-if-still-running error
+    /// path so the detached reap thread finishes within `SHUTDOWN_TIMEOUT`.
+    pub(crate) fn shutdown_for_idle_reap(&mut self) -> Result<(), LspError> {
+        self.shutdown_with_request_timeout(EXIT_POLL_INTERVAL)
+    }
+
+    fn shutdown_with_request_timeout(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
             self.child_registry.untrack(self.child_pid);
             return Ok(());
@@ -738,10 +738,9 @@ impl LspClient {
             return Ok(());
         }
 
-        if let Err(err) = self.send_request_with_timeout::<lsp_types::request::Shutdown>(
-            (),
-            HANDSHAKE_REQUEST_TIMEOUT,
-        ) {
+        if let Err(err) =
+            self.send_request_with_timeout::<lsp_types::request::Shutdown>((), request_timeout)
+        {
             self.state = ServerState::ShuttingDown;
             return self.abort_live_child_after_shutdown_error(err);
         }

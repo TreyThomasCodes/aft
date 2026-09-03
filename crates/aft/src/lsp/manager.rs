@@ -2187,16 +2187,45 @@ impl LspManager {
         }
     }
 
+    /// Drain every client and clear spawn/document/diagnostic state without
+    /// waiting on child processes. The caller owns graceful shutdown so the
+    /// manager lock is not held across a Shutdown handshake.
+    pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
+        let clients: Vec<_> = self.clients.drain().collect();
+        self.server_binaries.clear();
+        self.documents.clear();
+        self.diagnostics = DiagnosticsStore::new();
+        clients
+    }
+
     /// Shutdown all servers gracefully.
     pub fn shutdown_all(&mut self) {
-        for (key, mut client) in self.clients.drain() {
+        for (key, mut client) in self.take_all_clients() {
             if let Err(err) = client.shutdown() {
                 slog_error!("error shutting down {:?}: {}", key, err);
             }
         }
-        self.server_binaries.clear();
-        self.documents.clear();
-        self.diagnostics = DiagnosticsStore::new();
+    }
+
+    /// Shut down taken clients on a detached thread named `aft-lsp-idle-reap`.
+    /// Idle reapers use this so a hung Shutdown handshake cannot stall the
+    /// daemon loop or hold the manager mutex.
+    pub(crate) fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
+        if clients.is_empty() {
+            return;
+        }
+        let spawn_result = std::thread::Builder::new()
+            .name("aft-lsp-idle-reap".into())
+            .spawn(move || {
+                for (key, mut client) in clients {
+                    if let Err(err) = client.shutdown_for_idle_reap() {
+                        slog_error!("error shutting down {:?}: {}", key, err);
+                    }
+                }
+            });
+        if let Err(err) = spawn_result {
+            slog_error!("failed to spawn idle LSP reap thread: {err}");
+        }
     }
 
     /// Check if any server is active.

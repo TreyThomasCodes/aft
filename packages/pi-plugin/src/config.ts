@@ -163,6 +163,13 @@ export interface InspectConfig {
   };
 }
 
+export interface IdleConfig {
+  /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
+  root_ttl_minutes?: number;
+  /** Language-server idle window in minutes. Default 10; clamped to 1..=10. */
+  lsp_ttl_minutes?: number;
+}
+
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
 export const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 10_000;
 export const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 600_000;
@@ -292,6 +299,8 @@ export interface AftConfig {
   callgraph_chunk_size?: number;
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;
+  /** Idle reclamation windows for unbound-root artifacts and language servers. */
+  idle?: IdleConfig;
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup?: BackupConfig;
   /**
@@ -704,6 +713,27 @@ const InspectConfigSchema = z.object({
     .optional(),
 });
 
+function clampIdleRootTtlMinutes(value: number): number {
+  return Math.min(30, Math.max(5, value));
+}
+
+function clampIdleLspTtlMinutes(value: number): number {
+  return Math.min(10, Math.max(1, value));
+}
+
+const IdleConfigSchema = z.object({
+  root_ttl_minutes: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
+  lsp_ttl_minutes: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleLspTtlMinutes(value))),
+});
+
 const WorktreeConfigSchema = z.object({
   /**
    * When true, a linked worktree applies local file-watcher events to the
@@ -758,6 +788,7 @@ const AftConfigFieldsSchema = z.object({
   callgraph_store: z.boolean().optional(),
   callgraph_chunk_size: z.number().optional(),
   inspect: InspectConfigSchema.optional(),
+  idle: IdleConfigSchema.optional(),
   backup: BackupConfigSchema.optional(),
   worktree: WorktreeConfigSchema.optional(),
   sandbox: SandboxConfigSchema.optional(),
@@ -910,6 +941,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
@@ -1486,6 +1518,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_store",
   "callgraph_chunk_size",
   "inspect",
+  "idle",
   "worktree",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.

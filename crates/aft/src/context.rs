@@ -1685,6 +1685,9 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
+    /// Last tool/request activity for this root. Standalone idle LSP reclaim
+    /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.
+    last_request_at: parking_lot::Mutex<Instant>,
     /// Per-root-actor memo for containment checks. The key is the configured
     /// root's exact `PathBuf` spelling, so reconfiguration never reuses a
     /// canonical root selected for another configured value.
@@ -2178,6 +2181,7 @@ impl AppContext {
             backup: parking_lot::Mutex::new(BackupStore::new()),
             checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
+            last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
@@ -3631,6 +3635,19 @@ impl AppContext {
         &self,
     ) -> &crate::db::compression_events::CompressionAggregateCache {
         self.compression_aggregates.as_ref()
+    }
+
+    pub fn note_request(&self) {
+        *self.last_request_at.lock() = Instant::now();
+    }
+
+    pub fn last_request_at(&self) -> Instant {
+        *self.last_request_at.lock()
+    }
+
+    #[cfg(test)]
+    pub fn set_last_request_at_for_test(&self, at: Instant) {
+        *self.last_request_at.lock() = at;
     }
 
     /// Access an owned configuration snapshot.

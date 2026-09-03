@@ -82,9 +82,7 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 /// loop turn so busy select arms cannot starve it.
 const DRAIN_TICK_PERIOD: Duration = Duration::from_millis(250);
 
-/// Root-scoped stores and watcher runtimes are reopened lazily after this
-/// period without tool traffic. Keeping the value fixed avoids per-client
-/// eviction policies competing inside the module loop.
+/// Fallback unbound-root artifact TTL when a root has no actor config yet.
 const IDLE_ROOT_TTL: Duration = Duration::from_secs(30 * 60);
 
 const WRITER_QUEUE_CAPACITY: usize = 256;
@@ -1062,10 +1060,21 @@ fn idle_root_eviction_message(
     message
 }
 
-fn process_has_been_idle(now: Instant, live_roots: &HashMap<ProjectRootId, RootMeta>) -> bool {
+fn root_idle_ttl(executor: &Executor, root_id: &ProjectRootId) -> Duration {
+    executor
+        .actor_context(root_id)
+        .map(|ctx| ctx.config().idle.root_ttl())
+        .unwrap_or(IDLE_ROOT_TTL)
+}
+
+fn process_has_been_idle(
+    now: Instant,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    executor: &Executor,
+) -> bool {
     !live_roots.is_empty()
-        && live_roots.values().all(|meta| {
-            now.saturating_duration_since(meta.last_touched) >= IDLE_ROOT_TTL
+        && live_roots.iter().all(|(root_id, meta)| {
+            now.saturating_duration_since(meta.last_touched) >= root_idle_ttl(executor, root_id)
                 && meta.active_bash_waits == 0
                 && !meta.maintenance_pending
                 && meta.maintenance_queued_kinds.is_empty()
@@ -1077,7 +1086,7 @@ fn allocator_pressure_relief_after_idle_sweep(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     executor: &Executor,
 ) -> Option<crate::memory::AllocatorPressureRelief> {
-    if !process_has_been_idle(now, live_roots)
+    if !process_has_been_idle(now, live_roots, executor)
         || live_roots.keys().any(|root_id| {
             executor
                 .actor_context(root_id)
@@ -1290,7 +1299,8 @@ fn reap_idle_roots(
             if has_bound_route
                 || !meta.unbound_quiesced
                 || meta.idle_artifacts_evicted
-                || now.saturating_duration_since(meta.last_touched) < IDLE_ROOT_TTL
+                || now.saturating_duration_since(meta.last_touched)
+                    < root_idle_ttl(executor, root_id)
                 || meta.active_bash_waits > 0
                 || meta.maintenance_pending
                 || !meta.maintenance_queued_kinds.is_empty()
@@ -1393,6 +1403,26 @@ fn reap_idle_roots(
     IdleReapOutcome {
         evicted: reaped.len(),
         forgotten_deleted_roots,
+    }
+}
+
+/// Shut down language servers for roots that have had no request for the
+/// configured LSP idle window. This is independent of artifact eviction and
+/// runs even while the root is still bound.
+///
+/// `meta.last_touched` moves on every inbound tool call for a bound root
+/// (`reactivate_bound` in the route-request handler) and on response delivery,
+/// so an active harness does not look idle.
+fn reap_idle_lsp_servers(
+    now: Instant,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    executor: &Executor,
+) {
+    for (root_id, meta) in live_roots {
+        let Some(ctx) = executor.actor_context(root_id) else {
+            continue;
+        };
+        crate::runtime_drain::shutdown_idle_lsp_at(&ctx, now, meta.last_touched);
     }
 }
 
@@ -3477,8 +3507,10 @@ where
                         "subc attach: reaped {reaped_lsp_children} LSP child process group(s) with a deleted cwd or reclaimed root"
                     );
                 }
+                let now = Instant::now();
+                reap_idle_lsp_servers(now, &live_roots, &executor);
                 let reap = reap_idle_roots(
-                    Instant::now(),
+                    now,
                     &mut live_roots,
                     &pending_binds,
                     &root_channels,
@@ -7992,17 +8024,18 @@ mod tests {
         let mut idle = RootMeta::new(now);
         idle.last_touched = now - IDLE_ROOT_TTL - Duration::from_secs(1);
         live_roots.insert(idle_root, idle);
-        assert!(process_has_been_idle(now, &live_roots));
+        let executor = Executor::new();
+        assert!(process_has_been_idle(now, &live_roots, &executor));
 
         live_roots.insert(active_root.clone(), RootMeta::new(now));
-        assert!(!process_has_been_idle(now, &live_roots));
+        assert!(!process_has_been_idle(now, &live_roots, &executor));
 
         let active = live_roots
             .get_mut(&active_root)
             .expect("active root metadata");
         active.last_touched = now - IDLE_ROOT_TTL - Duration::from_secs(1);
         active.active_bash_waits = 1;
-        assert!(!process_has_been_idle(now, &live_roots));
+        assert!(!process_has_been_idle(now, &live_roots, &executor));
     }
 
     #[test]

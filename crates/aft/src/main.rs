@@ -303,6 +303,7 @@ fn main() {
                 // standalone; the selected single runtime is the root today.
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
+                runtime.note_request();
                 let dispatch_result = if req.command == "cancel_request" {
                     Ok(DispatchOutcome::Immediate(handle_cancel_request(
                         &req,
@@ -406,6 +407,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_inspect_events(runtime);
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
+        aft::runtime_drain::shutdown_idle_lsp(runtime);
     }
     aft::logging::perf_tick(None);
     aft::logging::maybe_sweep_logs();

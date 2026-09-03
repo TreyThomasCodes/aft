@@ -10,6 +10,15 @@ pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
 
+/// Unbound-root artifact eviction idle window, in minutes.
+pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
+pub const MIN_IDLE_ROOT_TTL_MINUTES: u32 = 5;
+pub const MAX_IDLE_ROOT_TTL_MINUTES: u32 = 30;
+/// Language-server idle window, in minutes. Independent of artifact eviction.
+pub const DEFAULT_IDLE_LSP_TTL_MINUTES: u32 = 10;
+pub const MIN_IDLE_LSP_TTL_MINUTES: u32 = 1;
+pub const MAX_IDLE_LSP_TTL_MINUTES: u32 = 10;
+
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
 }
@@ -23,6 +32,37 @@ const fn default_bash_detach_on_user_message() -> bool {
 }
 
 use crate::harness::Harness;
+
+/// Idle reclamation windows for unbound-root artifacts and language servers.
+///
+/// `root_ttl_minutes` controls when an unbound root's indexes are evicted.
+/// `lsp_ttl_minutes` shuts down that root's language servers after no request,
+/// even while the root is still bound. Both rebuild/respawn on the next request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdleConfig {
+    pub root_ttl_minutes: u32,
+    pub lsp_ttl_minutes: u32,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            root_ttl_minutes: DEFAULT_IDLE_ROOT_TTL_MINUTES,
+            lsp_ttl_minutes: DEFAULT_IDLE_LSP_TTL_MINUTES,
+        }
+    }
+}
+
+impl IdleConfig {
+    pub fn root_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.root_ttl_minutes) * 60)
+    }
+
+    pub fn lsp_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.lsp_ttl_minutes) * 60)
+    }
+}
 
 /// The durable index families that a standing root may maintain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -523,6 +563,8 @@ pub struct Config {
     /// cap is exceeded. Set to 0 to disable the cap entirely.
     /// Default: 5000 (covers very large monorepos with bounded memory).
     pub diagnostic_cache_size: usize,
+    /// Idle reclamation windows for unbound-root artifacts and language servers.
+    pub idle: IdleConfig,
 }
 
 impl Default for Config {
@@ -584,6 +626,7 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             harness: None,
             diagnostic_cache_size: 5000,
+            idle: IdleConfig::default(),
         }
     }
 }

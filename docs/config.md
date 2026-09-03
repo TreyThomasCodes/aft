@@ -288,6 +288,19 @@ The backup store treats its on-disk tree as authoritative across processes; dele
     }
   },
 
+  // Idle reclamation. User and project tiers. Values outside the documented
+  // ranges are clamped with a warning; non-integers are dropped with a warning.
+  // Reclaimed indexes rebuild and language servers respawn on the next request.
+  "idle": {
+    // Minutes without tool traffic before an unbound root's artifacts are
+    // evicted. Default 30; clamped to 5..=30.
+    "root_ttl_minutes": 30,
+    // Minutes without a request before language servers for a root shut down,
+    // even while the root is still bound. Default 10; clamped to 1..=10.
+    // Independent of root_ttl_minutes.
+    "lsp_ttl_minutes": 10
+  },
+
   // Native sandbox for first-party bash and PTY commands. Default: false.
   "sandbox": {
     "enabled": false,
