@@ -176,6 +176,10 @@ const CASES: ParityCase[] = [
     project: { search_index: true, format_on_edit: false },
   },
   {
+    name: "disabled_tools_project_safe",
+    project: { disabled_tools: ["aft_zoom"] },
+  },
+  {
     name: "index_roots_user_semantic_closure",
     user: { index: { roots: [{ path: "~/.aft-standing-root", indexes: ["semantic"] }] } },
   },

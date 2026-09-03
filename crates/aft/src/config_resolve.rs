@@ -1353,13 +1353,7 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
 /// of `RawAftConfig` and are preserved separately by `resolve_config_onto`.
 fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
-    config.disabled_tools = raw
-        .disabled_tools
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-        .collect();
+    config.disabled_tools = raw.disabled_tools.clone().unwrap_or_default();
     if let Some(value) = raw.hoist_builtin_tools {
         config.hoist_builtin_tools = value;
     }
@@ -2899,8 +2893,16 @@ mod tests {
             "user",
             r#"{ "disabled_tools": ["aft_zoom", "aft_search"] }"#,
         )]);
-        assert!(result.config.disabled_tools.contains("aft_zoom"));
-        assert!(result.config.disabled_tools.contains("aft_search"));
+        assert!(result
+            .config
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "aft_zoom"));
+        assert!(result
+            .config
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "aft_search"));
     }
 
     #[test]

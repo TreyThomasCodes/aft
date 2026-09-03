@@ -60,11 +60,16 @@ interface ZoomBatchResult {
  * Tool definitions for code reading commands: outline + zoom.
  */
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
+  const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
   const tools = prepareToolMap({
     aft_outline: {
       description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
-        "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n" +
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
+        (zoomEnabled ? "aft_zoom" : "read") +
+        ". Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
+        (zoomEnabled
+          ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n"
+          : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping.\n\n") +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
@@ -328,9 +333,6 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       },
     },
   });
-  if (!toolEnabled(ctx.config, "aft_zoom") && tools.aft_outline) {
-    tools.aft_outline.description = tools.aft_outline.description.replaceAll("aft_zoom", "read");
-  }
   return tools;
 }
 

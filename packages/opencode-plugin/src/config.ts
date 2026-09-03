@@ -693,12 +693,17 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
  * one OpenCode/Pi process.
  *
  * **DO NOT** put fields that affect plugin-side tool registration here.
- * `enabled`, `tool_surface`, `disabled_tools`, and `hoist_builtin_tools` lock
+ * `enabled`, `tool_surface`, and `hoist_builtin_tools` lock
  * at plugin init because OpenCode registers tools synchronously when the plugin
  * function returns. Per-bridge changes to those fields wouldn't take effect.
  */
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
   const overrides: Record<string, unknown> = {};
+
+  // The Rust server also needs disabled_tools to decide which tools to omit from
+  // rendered steering text. loadAftConfig has already merged the project and
+  // session values, so forward the merged value unchanged.
+  if (config.disabled_tools !== undefined) overrides.disabled_tools = config.disabled_tools;
 
   // Edit-pipeline behavior — overridable per-project.
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
@@ -1656,7 +1661,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),
     // Union — both levels contribute to the disabled set
-    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
+    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)].sort() } : {}),
   };
 }
 

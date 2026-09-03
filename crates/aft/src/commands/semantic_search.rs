@@ -6396,7 +6396,7 @@ mod tests {
 
         let disabled_ctx = test_context(dir.path());
         disabled_ctx.update_config(|config| {
-            config.disabled_tools.insert("aft_zoom".to_string());
+            config.disabled_tools.push("aft_zoom".to_string());
         });
         let mut disabled_results = vec![results[0].clone()];
         enrich_snippets_from_source_with_context(
@@ -6582,7 +6582,7 @@ mod tests {
 
         let disabled_ctx = test_context(dir.path());
         disabled_ctx.update_config(|config| {
-            config.disabled_tools.insert("aft_zoom".to_string());
+            config.disabled_tools.push("aft_zoom".to_string());
         });
         let disabled =
             format_semantic_text(&results, dir.path(), false, incomplete, Some(&disabled_ctx));

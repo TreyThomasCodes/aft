@@ -3682,7 +3682,7 @@ impl AppContext {
 
     /// Return whether a tool is available to the active agent session.
     pub fn tool_enabled(&self, tool: &str) -> bool {
-        !self.config().disabled_tools.contains(tool)
+        !self.config().disabled_tools.iter().any(|name| name == tool)
     }
 
     /// Access an owned configuration snapshot.

@@ -2810,7 +2810,7 @@ function helper(value: number): number {
 
         let disabled_ctx = make_ctx();
         disabled_ctx.update_config(|config| {
-            config.disabled_tools.insert("aft_zoom".to_string());
+            config.disabled_tools.push("aft_zoom".to_string());
         });
         let disabled = serde_json::to_value(handle_zoom(&req, &disabled_ctx)).unwrap();
         let disabled_content = disabled["content"].as_str().unwrap();

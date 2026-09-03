@@ -906,6 +906,10 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
   const overrides: Record<string, unknown> = {};
 
+  // Forward disabled_tools because the Rust server uses it to omit disabled
+  // tools from the steering text it renders for the session.
+  if (config.disabled_tools !== undefined) overrides.disabled_tools = config.disabled_tools;
+
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
   if (config.formatter_timeout_secs !== undefined)
@@ -1615,7 +1619,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     experimental,
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),
-    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
+    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)].sort() } : {}),
   };
 }
 
