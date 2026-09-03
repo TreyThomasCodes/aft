@@ -57,6 +57,7 @@ mod tests {
         RegistrationRequest {
             configured_enabled: true,
             edit_slot_survives: true,
+            read_slot_survives: true,
         }
     }
 
@@ -64,6 +65,7 @@ mod tests {
         RegistrationRequest {
             configured_enabled: false,
             edit_slot_survives: true,
+            read_slot_survives: true,
         }
     }
 
@@ -191,6 +193,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: false,
+                read_slot_survives: true,
             },
         );
         assert!(!outcome.effective);
@@ -208,6 +211,62 @@ mod tests {
             select_edit_schema_for_capture(Some(&guard)),
             EditSchemaArm::Legacy
         );
+    }
+
+    #[test]
+    fn a7_downgrade_names_the_tagged_read_slot_when_only_read_is_missing() {
+        // The #292 surface: `edit` is registered and looks healthy, but nothing
+        // in the session can mint a tag, so the patch arm must not be offered
+        // and the warning has to name the slot that is actually missing.
+        let registry = BindingRegistry::new();
+        let outcome = registry.register(
+            root(),
+            "s-no-read",
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+                read_slot_survives: false,
+            },
+        );
+        assert!(!outcome.effective);
+        let warning = outcome.downgrade.expect("downgrade");
+        assert_eq!(warning.code, "hashline_downgraded");
+        assert_eq!(warning.reason, "tagged_read_unavailable");
+
+        let guard = registry.capture(root(), "s-no-read").expect("bound");
+        assert!(!guard.effective());
+        assert_eq!(
+            select_edit_schema_for_capture(Some(&guard)),
+            EditSchemaArm::Legacy
+        );
+        assert_eq!(
+            edit_schema_for(select_edit_schema_for_capture(Some(&guard)))["required"],
+            json!(["filePath"])
+        );
+
+        // Both slots missing keeps naming the read slot: it is the one that
+        // makes the surface unusable even after the edit slot comes back.
+        let both = RegistrationRequest {
+            configured_enabled: true,
+            edit_slot_survives: false,
+            read_slot_survives: false,
+        };
+        assert_eq!(
+            both.downgrade_warning().expect("downgrade").reason,
+            "tagged_read_unavailable"
+        );
+    }
+
+    #[test]
+    fn hashline_description_names_the_tools_that_mint_tags() {
+        // Navigation output looks edit-ready but publishes no snapshot, so the
+        // description has to say which calls actually produce an addressable tag.
+        assert!(HASHLINE_EDIT_DESCRIPTION.contains(
+            "Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. \
+`aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. \
+After navigation, call `read` on every file and range the patch addresses."
+        ));
+        assert!(!LEGACY_EDIT_DESCRIPTION.contains("mint hashline tags"));
     }
 
     #[test]
@@ -230,6 +289,7 @@ mod tests {
                 RegistrationRequest {
                     configured_enabled: configured,
                     edit_slot_survives: survives,
+                    read_slot_survives: true,
                 },
             );
             assert_eq!(outcome.effective, expect_effective, "case {i}");

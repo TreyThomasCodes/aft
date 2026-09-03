@@ -231,12 +231,17 @@ pub(crate) fn ensure_hashline_registration(
         }
         None => return false,
     };
+    // The read slot is resolved from config on this side of the boundary rather
+    // than carried, so the plugin and the core answer "can this session mint a
+    // tag?" from the same rule instead of two drifting ones.
+    let config = app_ctx.config();
     let registration = app_ctx.hashline_bindings().register(
         &binding_root,
         session.to_string(),
         crate::hashline::integration::RegistrationRequest {
-            configured_enabled: app_ctx.config().hashline_enabled,
+            configured_enabled: config.hashline_enabled,
             edit_slot_survives,
+            read_slot_survives: config.read_slot_survives(),
         },
     );
     report_registration_downgrade

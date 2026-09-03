@@ -87,6 +87,7 @@ import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import {
   buildOpenCodeToolMap,
+  openCodeHashlineDowngrade,
   openCodeHashlineEditRegistered,
   openCodeHashlineEffective,
 } from "./tool-registration.js";
@@ -1080,9 +1081,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const hashlineEditRegistered = openCodeHashlineEditRegistered(aftConfig, registeredTools);
   ctx.hashlineEffective = hashlineEditRegistered;
   pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
+  const hashlineDowngrade = openCodeHashlineDowngrade(aftConfig, registeredTools);
   log(
     `hashline activation decision requested=${aftConfig.edit_mode === "hashline"} ` +
-      `edit_slot_survives=${hashlineEditRegistered} effective=${ctx.hashlineEffective}`,
+      `edit_slot_survives=${hashlineEditRegistered} effective=${ctx.hashlineEffective}` +
+      (hashlineDowngrade ? ` downgraded=${hashlineDowngrade.reason}` : ""),
   );
   const aftSearchRegistered = registeredTools.has("aft_search");
   // Tell Rust whether `aft_search` is registered for this surface so the
@@ -1117,7 +1120,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   for (const name of HINTS_TOOL_NAMES) {
     if (!registeredTools.has(name)) hintsAbsentTools.add(name);
   }
-  const hintsBlock = buildHintsFromConfig(aftConfig, hintsAbsentTools);
+  const hintsBlock = buildHintsFromConfig(aftConfig, hintsAbsentTools, hashlineEditRegistered);
   if (hintsBlock) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }

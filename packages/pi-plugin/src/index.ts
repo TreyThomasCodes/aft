@@ -93,7 +93,12 @@ import {
 } from "./bash-wait-detach.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
-import { registerPiToolSurface, resolvePiToolSurface } from "./tool-registration.js";
+import {
+  piHashlineDowngrade,
+  piHashlineEffective,
+  registerPiToolSurface,
+  resolvePiToolSurface,
+} from "./tool-registration.js";
 import { resolveSessionId } from "./tools/_shared.js";
 import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
 import type { PluginContext } from "./types.js";
@@ -664,7 +669,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
   pool.setConfigureOverride("harness", "pi");
   const surface = resolvePiToolSurface(config, pi);
-  const hashlineEditRegistered = config.edit_mode === "hashline" && surface.hoistEdit;
+  // Hashline needs the tagged read slot as well as the edit slot: without it
+  // nothing in the session can mint the tags a patch addresses, so the carrier
+  // must report the surface as unusable rather than half-enabled.
+  const hashlineEditRegistered = piHashlineEffective(config, surface);
+  const hashlineDowngrade = piHashlineDowngrade(config, surface);
+  if (hashlineDowngrade) {
+    warn(
+      `[hashline] edit_mode: hashline downgraded to the default edit surface (${hashlineDowngrade.reason})`,
+    );
+  }
   pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager

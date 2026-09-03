@@ -82,6 +82,47 @@ export function piPowerShellEnabledFromHost(pi: ExtensionAPI): boolean | undefin
   }
 }
 
+/**
+ * Select the hashline schema only when both the edit and tagged-read slots survive.
+ *
+ * Only a tagged AFT read mints the `[path#TAG]` snapshots a hashline patch
+ * addresses, so an edit slot on its own is not a usable hashline surface: the
+ * host keeps serving its own untagged read and the agent has nothing to patch
+ * against. Mirrors `openCodeHashlineEffective` and the core's
+ * `RegistrationRequest::effective`.
+ */
+export function piHashlineEffective(
+  config: AftConfig,
+  surface: Pick<PiToolSurface, "hoistEdit" | "hoistRead">,
+): boolean {
+  return config.edit_mode === "hashline" && surface.hoistEdit && surface.hoistRead;
+}
+
+/** One `hashline_downgraded` warning describing why the hashline arm was refused. */
+export interface PiHashlineDowngradeWarning {
+  code: "hashline_downgraded";
+  reason: "edit_not_registered" | "tagged_read_unavailable";
+}
+
+/**
+ * Classify a requested-but-refused hashline surface for the warning channel.
+ *
+ * The read slot is reported first for the same reason the core reports it
+ * first: a session can keep a working `edit` tool beside an untagged host read,
+ * and the "I never got a hashline" symptom then points at the wrong tool.
+ */
+export function piHashlineDowngrade(
+  config: AftConfig,
+  surface: Pick<PiToolSurface, "hoistEdit" | "hoistRead">,
+): PiHashlineDowngradeWarning | null {
+  if (config.edit_mode !== "hashline") return null;
+  if (piHashlineEffective(config, surface)) return null;
+  return {
+    code: "hashline_downgraded",
+    reason: surface.hoistRead ? "edit_not_registered" : "tagged_read_unavailable",
+  };
+}
+
 /** Resolve the feature predicates used by Pi's production registration path. */
 export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiToolSurface {
   const surface = config.tool_surface ?? "recommended";

@@ -1,7 +1,38 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
-import { buildHintsFromConfig, buildWorkflowHints } from "../workflow-hints.js";
+import {
+  buildHintsFromConfig,
+  buildWorkflowHints,
+  HASHLINE_TAG_SOURCE_HINT,
+} from "../workflow-hints.js";
+
+describe("Pi hashline tag-source guidance", () => {
+  const opts = {
+    toolSurface: "all" as const,
+    hoistBuiltins: true,
+    semanticEnabled: true,
+    bashBackgroundEnabled: true,
+    bashCompressionEnabled: true,
+    absentTools: new Set<string>(),
+  };
+
+  test("legacy edit users see byte-identical text", () => {
+    const legacy = buildWorkflowHints(opts);
+    expect(buildWorkflowHints({ ...opts, hashlineEffective: false })).toBe(legacy);
+    expect(legacy).not.toContain("mint hashline tags");
+  });
+
+  test("hashline sessions are told which tools mint tags", () => {
+    const legacy = buildWorkflowHints(opts);
+    expect(buildWorkflowHints({ ...opts, hashlineEffective: true })).toBe(
+      `${legacy}\n\n${HASHLINE_TAG_SOURCE_HINT}`,
+    );
+    expect(HASHLINE_TAG_SOURCE_HINT).toContain(
+      "Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
+    );
+  });
+});
 
 describe("Pi buildWorkflowHints", () => {
   test("renders all four sections at tool_surface=all with bg + semantic", () => {

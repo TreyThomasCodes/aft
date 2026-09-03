@@ -389,7 +389,7 @@ impl SnapshotLookupError {
                 "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
             }
             Self::UnknownTag | Self::EvictedTag => {
-                "re-read the file to mint a fresh tag, then retry the edit"
+                "run `read <path>` again to mint a fresh tag, then retry the edit"
             }
         }
     }

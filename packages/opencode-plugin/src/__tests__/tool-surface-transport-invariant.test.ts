@@ -12,7 +12,7 @@ import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
-import { buildWorkflowHints } from "../workflow-hints.js";
+import { buildWorkflowHints, HASHLINE_TAG_SOURCE_HINT } from "../workflow-hints.js";
 
 // The agent-visible tool surface (names, descriptions, parameter schemas) and
 // the injected system-prompt hints MUST be byte-identical between the
@@ -103,6 +103,52 @@ describe("tool surface transport invariance", () => {
     ]) {
       expect(description).toContain(fragment);
     }
+  });
+
+  test("the hashline edit description names the tools that mint tags", () => {
+    const ctx = {
+      pool: fakePool("hashline-tag-sources"),
+      client: {} as PluginContext["client"],
+      config: { edit_mode: "hashline" },
+      storageDir: "/tmp/aft-hashline-tag-source-test",
+      hashlineEffective: true,
+    } as PluginContext;
+    const description = hoistedTools(ctx).edit?.description ?? "";
+
+    expect(description).toContain(
+      "Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
+    );
+  });
+
+  test("legacy edit users see byte-identical text", () => {
+    // The routing rule is conditional on the hashline arm. A legacy session has
+    // no tags at all, so being told to go mint them would be noise.
+    const legacyCtx = {
+      pool: fakePool("legacy-edit"),
+      client: {} as PluginContext["client"],
+      config: {},
+      storageDir: "/tmp/aft-legacy-edit-test",
+    } as PluginContext;
+    const before =
+      "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.";
+    const description = hoistedTools(legacyCtx).edit?.description ?? "";
+    expect(description.startsWith(before)).toBe(true);
+    expect(description).not.toContain("mint hashline tags");
+
+    const opts = {
+      toolSurface: "all" as const,
+      hoistBuiltins: true,
+      semanticEnabled: true,
+      bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
+      disabledTools: new Set<string>(),
+    };
+    const legacyHints = buildWorkflowHints(opts);
+    expect(buildWorkflowHints({ ...opts, hashlineEffective: false })).toBe(legacyHints);
+    expect(legacyHints).not.toContain("mint hashline tags");
+    expect(buildWorkflowHints({ ...opts, hashlineEffective: true })).toBe(
+      `${legacyHints}\n\n${HASHLINE_TAG_SOURCE_HINT}`,
+    );
   });
 
   test("tool names, descriptions, and schemas are independent of the pool", () => {

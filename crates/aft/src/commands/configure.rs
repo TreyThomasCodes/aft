@@ -1941,12 +1941,32 @@ fn configure_maintenance_backpressure(req_id: &str) -> Response {
 pub(crate) const HASHLINE_DOWNGRADE_MESSAGE: &str =
     "Hashline mode was downgraded because the edit tool is not registered for this session";
 
-pub(crate) fn hashline_downgrade_warning() -> Value {
+pub(crate) const HASHLINE_READ_DOWNGRADE_MESSAGE: &str =
+    "Hashline mode was downgraded because the tagged read tool is not registered for this session, so nothing could mint the tags a patch addresses";
+
+/// Agent/user-visible text for one downgrade reason.
+pub(crate) fn hashline_downgrade_message(reason: &str) -> &'static str {
+    if reason == crate::hashline::integration::DowngradeWarning::TAGGED_READ_UNAVAILABLE.reason {
+        HASHLINE_READ_DOWNGRADE_MESSAGE
+    } else {
+        HASHLINE_DOWNGRADE_MESSAGE
+    }
+}
+
+pub(crate) fn hashline_downgrade_warning_for(
+    warning: &crate::hashline::integration::DowngradeWarning,
+) -> Value {
     json!({
-        "code": "hashline_downgraded",
-        "reason": "edit_not_registered",
-        "message": HASHLINE_DOWNGRADE_MESSAGE,
+        "code": warning.code,
+        "reason": warning.reason,
+        "message": hashline_downgrade_message(warning.reason),
     })
+}
+
+pub(crate) fn hashline_downgrade_warning() -> Value {
+    hashline_downgrade_warning_for(
+        &crate::hashline::integration::DowngradeWarning::EDIT_NOT_REGISTERED,
+    )
 }
 
 fn register_hashline_for_configure(
@@ -1954,6 +1974,7 @@ fn register_hashline_for_configure(
     root: &Path,
     session: &str,
     configured_enabled: bool,
+    read_slot_survives: bool,
     edit_slot_survives: Option<bool>,
     warnings: &mut Vec<Value>,
 ) {
@@ -1969,10 +1990,11 @@ fn register_hashline_for_configure(
         crate::hashline::integration::RegistrationRequest {
             configured_enabled,
             edit_slot_survives,
+            read_slot_survives,
         },
     );
-    if registration.downgrade.is_some() {
-        warnings.push(hashline_downgrade_warning());
+    if let Some(warning) = &registration.downgrade {
+        warnings.push(hashline_downgrade_warning_for(warning));
     }
 }
 
@@ -2325,6 +2347,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &canonical_cache_root,
             req.session(),
             next_config.hashline_enabled,
+            next_config.read_slot_survives(),
             edit_slot_survives,
             &mut configure_warnings,
         );
@@ -2561,6 +2584,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         &canonical_cache_root,
         req.session(),
         next_config.hashline_enabled,
+        next_config.read_slot_survives(),
         edit_slot_survives,
         &mut configure_warnings,
     );

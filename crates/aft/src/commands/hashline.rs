@@ -308,6 +308,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         assert!(registration.effective);
@@ -340,6 +341,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         assert!(registration.effective);
@@ -396,6 +398,7 @@ mod tests {
                 RegistrationRequest {
                     configured_enabled: true,
                     edit_slot_survives: true,
+                    read_slot_survives: true,
                 },
             );
             assert!(registration.effective);
@@ -674,6 +677,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
 

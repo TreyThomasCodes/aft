@@ -149,6 +149,7 @@ pub fn channel0_health_reply_avoids_hashline_stores() -> HealthIsolationReport {
         RegistrationRequest {
             configured_enabled: true,
             edit_slot_survives: true,
+            read_slot_survives: true,
         },
     );
     assert!(outcome.effective);

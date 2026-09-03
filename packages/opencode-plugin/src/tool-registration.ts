@@ -26,9 +26,30 @@ export function openCodeEditSlotSurvives(config: AftConfig): boolean {
   );
 }
 
-/** Select the hashline schema only when the host's final edit slot can survive. */
+/**
+ * Returns true when bare `read` remains available after surface, hoisting, and
+ * disable filters.
+ *
+ * Only a tagged AFT read mints the `[path#TAG]` snapshots a hashline patch
+ * addresses. With the AFT read registration removed, OpenCode keeps serving its
+ * own untagged `read`, so the agent can inspect a file and still have no tag to
+ * patch with.
+ */
+export function openCodeReadSlotSurvives(config: AftConfig): boolean {
+  return (
+    (config.tool_surface ?? "recommended") !== "minimal" &&
+    config.hoist_builtin_tools !== false &&
+    !(config.disabled_tools ?? []).includes("read")
+  );
+}
+
+/** Select the hashline schema only when both the edit and tagged-read slots survive. */
 export function openCodeHashlineEffective(config: AftConfig): boolean {
-  return config.edit_mode === "hashline" && openCodeEditSlotSurvives(config);
+  return (
+    config.edit_mode === "hashline" &&
+    openCodeEditSlotSurvives(config) &&
+    openCodeReadSlotSurvives(config)
+  );
 }
 
 /** Return the process-state flag Rust uses to select the same edit schema arm. */
@@ -36,7 +57,36 @@ export function openCodeHashlineEditRegistered(
   config: AftConfig,
   registeredTools: ReadonlySet<string>,
 ): boolean {
-  return openCodeHashlineEffective(config) && registeredTools.has("edit");
+  return (
+    openCodeHashlineEffective(config) && registeredTools.has("edit") && registeredTools.has("read")
+  );
+}
+
+/** One `hashline_downgraded` warning describing why the hashline arm was refused. */
+export interface HashlineDowngradeWarning {
+  code: "hashline_downgraded";
+  reason: "edit_not_registered" | "tagged_read_unavailable";
+}
+
+/**
+ * Classify a requested-but-refused hashline surface for the warning channel.
+ *
+ * The read slot is reported first because it is the harder failure to diagnose:
+ * a session can keep a working `edit` tool beside the host's own untagged read,
+ * and the resulting "I never got a hashline" symptom points at the edit tool,
+ * which is not the missing piece. Mirrors `RegistrationRequest::downgrade_warning`.
+ */
+export function openCodeHashlineDowngrade(
+  config: AftConfig,
+  registeredTools: ReadonlySet<string>,
+): HashlineDowngradeWarning | null {
+  if (config.edit_mode !== "hashline") return null;
+  if (openCodeHashlineEditRegistered(config, registeredTools)) return null;
+  const readSurvives = openCodeReadSlotSurvives(config) && registeredTools.has("read");
+  return {
+    code: "hashline_downgraded",
+    reason: readSurvives ? "edit_not_registered" : "tagged_read_unavailable",
+  };
 }
 
 /**

@@ -507,6 +507,14 @@ pub struct Config {
     /// Resolved host-tool registration preference. The Rust core retains this
     /// value for cross-harness config parity; the hosting plugin owns registration.
     pub hoist_builtin_tools: bool,
+    /// Resolved tool-surface tier ("minimal", "recommended", or "all"). The
+    /// hosting plugin owns registration; the core keeps the value so it can
+    /// reach the same conclusion about which built-in slots survive.
+    pub tool_surface: String,
+    /// Agent-visible tool names the user switched off. Kept for the same reason
+    /// as `tool_surface`: slot-survival questions must be answered identically
+    /// on both sides of the plugin boundary.
+    pub disabled_tools: Vec<String>,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
     pub harness: Option<Harness>,
@@ -572,9 +580,27 @@ impl Default for Config {
             storage_dir: None,
             url_fetch_allow_private: false,
             hoist_builtin_tools: true,
+            tool_surface: "recommended".to_string(),
+            disabled_tools: Vec::new(),
             harness: None,
             diagnostic_cache_size: 5000,
         }
+    }
+}
+
+impl Config {
+    /// Whether the host's tagged `read` slot survives surface, hoisting, and
+    /// disable filters.
+    ///
+    /// Only a tagged read mints the `[path#TAG]` snapshots a hashline patch can
+    /// address, so a session that lost the read slot must not be offered the
+    /// hashline edit arm. The predicate is deliberately spelled the same way as
+    /// the plugins' registration check so both sides of the boundary classify a
+    /// given config identically.
+    pub fn read_slot_survives(&self) -> bool {
+        self.tool_surface != "minimal"
+            && self.hoist_builtin_tools
+            && !self.disabled_tools.iter().any(|name| name == "read")
     }
 }
 
@@ -585,6 +611,37 @@ fn default_foreground_wait_window_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_slot_survival_matches_the_plugin_registration_rule() {
+        let base = Config::default();
+        assert!(base.read_slot_survives());
+
+        let disabled = Config {
+            disabled_tools: vec!["read".to_string()],
+            ..Config::default()
+        };
+        assert!(!disabled.read_slot_survives());
+
+        // An unrelated disabled tool leaves the read slot alone.
+        let unrelated = Config {
+            disabled_tools: vec!["aft_zoom".to_string()],
+            ..Config::default()
+        };
+        assert!(unrelated.read_slot_survives());
+
+        let minimal = Config {
+            tool_surface: "minimal".to_string(),
+            ..Config::default()
+        };
+        assert!(!minimal.read_slot_survives());
+
+        let unhoisted = Config {
+            hoist_builtin_tools: false,
+            ..Config::default()
+        };
+        assert!(!unhoisted.read_slot_survives());
+    }
 
     #[test]
     fn index_root_path_expands_tilde_before_absolute_validation() {

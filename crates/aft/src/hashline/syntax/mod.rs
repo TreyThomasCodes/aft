@@ -257,12 +257,12 @@ impl std::error::Error for HashlineRejection {}
 fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static str {
     match (code, stage) {
         (HashlineRejectionCode::MissingTag | HashlineRejectionCode::MalformedTag, _) => {
-            "read the current file with the tagged read surface, then include its four-hex tag"
+            "run `read <path>` on the file, then include the four-hex tag it returns"
         }
         (
             HashlineRejectionCode::UnknownTag | HashlineRejectionCode::EvictedTag,
             RejectionStage::Resolution,
-        ) => "re-read the file to mint a fresh tag, then retry the edit",
+        ) => "run `read <path>` again to mint a fresh tag, then retry the edit",
         (HashlineRejectionCode::AmbiguousTag, RejectionStage::Resolution) => {
             "use apply_patch or another available non-hashline edit surface; re-reading preserves this colliding four-hex tag"
         }
@@ -270,7 +270,7 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
             "re-address the current tagged content; the stale span has multiple verbatim landings"
         }
         (HashlineRejectionCode::StaleTag, RejectionStage::Verification) => {
-            "perform a ranged tagged re-read because required boundary context changed"
+            "run `read <path>` over the addressed range because required boundary context changed"
         }
         (HashlineRejectionCode::StaleTag, RejectionStage::Recovery) => {
             "re-address the current tagged content; the stale span no longer occurs verbatim"
@@ -290,7 +290,7 @@ fn steering_for(code: HashlineRejectionCode, stage: RejectionStage) -> &'static 
         (HashlineRejectionCode::ParseError, _) => {
             "submit only a hashline patch with tagged section headers and valid operations"
         }
-        _ => "re-read the file to mint a fresh tag, then retry the edit",
+        _ => "run `read <path>` again to mint a fresh tag, then retry the edit",
     }
 }
 

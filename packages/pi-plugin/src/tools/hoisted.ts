@@ -344,6 +344,7 @@ const HASHLINE_EDIT_DESCRIPTION = [
   "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), `<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). A plain `N` PUT replaces; use `<N` or `>N` to insert.",
   "- PUT text: `PUT <address>:` followed by one or more `+` body rows (`+` alone is blank). A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.",
   "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. `*** Begin Patch`/`*** End Patch` is an optional envelope.",
+  "- Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
 ].join("\n");
 
 const HashlineEditParams = Type.Object(

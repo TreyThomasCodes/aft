@@ -250,6 +250,16 @@ pub enum RawToolSurface {
     All,
 }
 
+impl RawToolSurface {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Recommended => "recommended",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 // Nested objects mirror TS sub-schemas, which are non-strict z.object (unknown
 // keys are silently stripped, the object survives). Only the TOP-LEVEL
@@ -1310,6 +1320,12 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     if let Some(value) = raw.hoist_builtin_tools {
         config.hoist_builtin_tools = value;
+    }
+    if let Some(value) = raw.tool_surface {
+        config.tool_surface = value.as_str().to_string();
+    }
+    if let Some(value) = &raw.disabled_tools {
+        config.disabled_tools = value.clone();
     }
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;

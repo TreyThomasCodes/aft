@@ -30,8 +30,8 @@ impl SessionKey {
     }
 }
 
-/// Configure-channel warning emitted when hashline is configured on but `edit`
-/// did not survive final surface selection.
+/// Configure-channel warning emitted when hashline is configured on but a slot
+/// the hashline surface depends on did not survive final surface selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DowngradeWarning {
     pub code: &'static str,
@@ -42,6 +42,13 @@ impl DowngradeWarning {
     pub const EDIT_NOT_REGISTERED: Self = Self {
         code: "hashline_downgraded",
         reason: "edit_not_registered",
+    };
+
+    /// The `edit` slot survived but the tagged `read` slot did not, so nothing
+    /// in the session could mint the `[path#TAG]` snapshots a patch addresses.
+    pub const TAGGED_READ_UNAVAILABLE: Self = Self {
+        code: "hashline_downgraded",
+        reason: "tagged_read_unavailable",
     };
 
     /// JSON object for the configure-warnings channel.
@@ -62,15 +69,36 @@ pub struct RegistrationRequest {
     /// hoisting, and `disabled_tools`. Sessions without a host pruning layer
     /// (MCP, daemon-direct) default this to `true`.
     pub edit_slot_survives: bool,
+    /// Whether the tagged `read` slot survived the same filtering. Only a tagged
+    /// read mints the snapshots a hashline patch addresses, so an edit slot on
+    /// its own is not a usable hashline surface.
+    pub read_slot_survives: bool,
 }
 
 impl RegistrationRequest {
     pub const fn effective(self) -> bool {
-        self.configured_enabled && self.edit_slot_survives
+        self.configured_enabled && self.edit_slot_survives && self.read_slot_survives
     }
 
     pub const fn should_downgrade(self) -> bool {
-        self.configured_enabled && !self.edit_slot_survives
+        self.configured_enabled && !(self.edit_slot_survives && self.read_slot_survives)
+    }
+
+    /// Which missing slot to report.
+    ///
+    /// The read slot is reported first because it is the harder failure to
+    /// diagnose: a host can leave a perfectly good `edit` tool registered next
+    /// to its own untagged read, and the resulting "I never got a hashline"
+    /// symptom points at the edit tool, which is not the missing piece.
+    pub const fn downgrade_warning(self) -> Option<DowngradeWarning> {
+        if !self.should_downgrade() {
+            return None;
+        }
+        if self.read_slot_survives {
+            Some(DowngradeWarning::EDIT_NOT_REGISTERED)
+        } else {
+            Some(DowngradeWarning::TAGGED_READ_UNAVAILABLE)
+        }
     }
 }
 
@@ -79,6 +107,7 @@ impl RegistrationRequest {
 pub struct RegistrationOutcome {
     pub configured_enabled: bool,
     pub edit_slot_survives: bool,
+    pub read_slot_survives: bool,
     pub effective: bool,
     /// Present when configured on but edit was not registered.
     pub downgrade: Option<DowngradeWarning>,
@@ -94,6 +123,7 @@ pub struct HashlineBinding {
     key: SessionKey,
     configured_enabled: bool,
     edit_slot_survives: bool,
+    read_slot_survives: bool,
     effective: bool,
     snapshots: SnapshotStore,
     registers: RegisterStore,
@@ -107,6 +137,7 @@ impl HashlineBinding {
             key,
             configured_enabled: request.configured_enabled,
             edit_slot_survives: request.edit_slot_survives,
+            read_slot_survives: request.read_slot_survives,
             effective: request.effective(),
             snapshots: SnapshotStore::new(),
             registers: RegisterStore::new(),
@@ -124,6 +155,10 @@ impl HashlineBinding {
 
     pub fn edit_slot_survives(&self) -> bool {
         self.edit_slot_survives
+    }
+
+    pub fn read_slot_survives(&self) -> bool {
+        self.read_slot_survives
     }
 
     pub fn effective(&self) -> bool {
@@ -318,9 +353,7 @@ impl BindingRegistry {
         after_existing_read: impl FnOnce(),
     ) -> RegistrationOutcome {
         let effective = request.effective();
-        let downgrade = request
-            .should_downgrade()
-            .then_some(DowngradeWarning::EDIT_NOT_REGISTERED);
+        let downgrade = request.downgrade_warning();
 
         // Serialize the existing-value read, comparison, and binding update. A
         // guard may finish while this lock is held because guard release only
@@ -337,6 +370,7 @@ impl BindingRegistry {
                     let mut binding = existing.lock();
                     binding.configured_enabled = request.configured_enabled;
                     binding.edit_slot_survives = request.edit_slot_survives;
+                    binding.read_slot_survives = request.read_slot_survives;
                     binding.effective = effective;
                     binding.clear_stores();
                 }
@@ -347,6 +381,7 @@ impl BindingRegistry {
                     let mut binding = existing.lock();
                     binding.configured_enabled = request.configured_enabled;
                     binding.edit_slot_survives = request.edit_slot_survives;
+                    binding.read_slot_survives = request.read_slot_survives;
                     // effective unchanged; stores preserved.
                 }
                 state.bindings.insert(key, existing);
@@ -361,6 +396,7 @@ impl BindingRegistry {
         RegistrationOutcome {
             configured_enabled: request.configured_enabled,
             edit_slot_survives: request.edit_slot_survives,
+            read_slot_survives: request.read_slot_survives,
             effective,
             downgrade,
             stores_cleared,
@@ -457,6 +493,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         registry.register(
@@ -465,6 +502,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         let first = registry.peek(root, "first").expect("first binding");
@@ -498,6 +536,7 @@ mod tests {
                 RegistrationRequest {
                     configured_enabled: true,
                     edit_slot_survives: true,
+                    read_slot_survives: true,
                 },
             );
         }
@@ -561,6 +600,7 @@ mod tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         registry
@@ -582,6 +622,7 @@ mod tests {
                 RegistrationRequest {
                     configured_enabled: false,
                     edit_slot_survives: true,
+                    read_slot_survives: true,
                 },
                 || {
                     first_read_tx.send(()).expect("signal first read");
@@ -605,6 +646,7 @@ mod tests {
                 RegistrationRequest {
                     configured_enabled: true,
                     edit_slot_survives: false,
+                    read_slot_survives: true,
                 },
                 || second_read_tx.send(()).expect("signal second read"),
             );

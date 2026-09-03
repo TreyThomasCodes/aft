@@ -65,7 +65,10 @@ pub const HASHLINE_EDIT_DESCRIPTION: &str = concat!(
     "A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.\n",
     "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. ",
     "MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. ",
-    "`*** Begin Patch`/`*** End Patch` is an optional envelope."
+    "`*** Begin Patch`/`*** End Patch` is an optional envelope.\n",
+    "- Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. ",
+    "`aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. ",
+    "After navigation, call `read` on every file and range the patch addresses."
 );
 
 /// JSON Schema for the legacy edit arm (gate-off).

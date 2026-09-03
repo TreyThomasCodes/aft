@@ -23,9 +23,22 @@ export interface WorkflowHintsOpts {
   bashCompressionEnabled: boolean;
   /** Set of disabled tool names (after surface filtering). */
   disabledTools: Set<string>;
+  /** Whether the hashline `edit` arm is the one actually registered. */
+  hashlineEffective?: boolean;
 }
 
 const HEADING = "## IMPORTANT NOTICE about your tools";
+
+/**
+ * Routing rule for hashline sessions.
+ *
+ * Navigation tools return source that looks edit-ready but never publishes a
+ * snapshot, so an agent that inspects a symbol and then patches it is refused
+ * for a tag it believes it already has. Naming the tag-minting tools is the
+ * only way to distinguish "I have seen this code" from "I can address it".
+ */
+export const HASHLINE_TAG_SOURCE_HINT =
+  "**Hashline edit tags**: Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.";
 
 /**
  * Build the workflow hints block. Returns `null` when no hints are
@@ -147,6 +160,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     );
   }
 
+  // Conditional on the hashline arm being the registered one: a legacy-edit
+  // session has no tags and must not be told to go mint them.
+  if (opts.hashlineEffective === true) {
+    sections.push(HASHLINE_TAG_SOURCE_HINT);
+  }
+
   if (sections.length === 0) {
     return null;
   }
@@ -169,7 +188,11 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
  * Background-bash gating reads the resolved bash config so the graduated
  * `bash.background` setting controls whether the hint appears.
  */
-export function buildHintsFromConfig(config: AftConfig, disabledTools: Set<string>): string | null {
+export function buildHintsFromConfig(
+  config: AftConfig,
+  disabledTools: Set<string>,
+  hashlineEffective = false,
+): string | null {
   return buildWorkflowHints({
     toolSurface: config.tool_surface ?? "recommended",
     hoistBuiltins: config.hoist_builtin_tools !== false,
@@ -177,6 +200,7 @@ export function buildHintsFromConfig(config: AftConfig, disabledTools: Set<strin
     bashBackgroundEnabled: resolveBashConfig(config).background,
     bashCompressionEnabled: resolveBashConfig(config).compress,
     disabledTools,
+    hashlineEffective,
   });
 }
 

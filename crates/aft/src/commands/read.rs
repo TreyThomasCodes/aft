@@ -2095,6 +2095,7 @@ mod hashline_wiring_tests {
             RegistrationRequest {
                 configured_enabled: true,
                 edit_slot_survives: true,
+                read_slot_survives: true,
             },
         );
         assert!(registration.effective);

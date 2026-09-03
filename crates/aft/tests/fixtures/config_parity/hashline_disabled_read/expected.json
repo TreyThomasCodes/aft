@@ -1,8 +1,11 @@
 {
+  "disabled_tools": [
+    "read"
+  ],
   "experimental_bash_background": true,
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
+  "hashline_enabled": true,
   "hoist_builtin_tools": true,
-  "restrict_to_project_root": false,
-  "tool_surface": "minimal"
+  "restrict_to_project_root": false
 }

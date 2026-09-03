@@ -3,6 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import type { AftConfig } from "../config.js";
 import {
+  piHashlineDowngrade,
+  piHashlineEffective,
   piPowerShellEnabledFromHost,
   registerPiToolSurface,
   resolvePiToolSurface,
@@ -89,6 +91,39 @@ describe("Pi dual-mode tool registration", () => {
       edits: [{ oldString: "before", newString: "after" }],
     });
     expect(calls.at(-1)?.params.name).toBe("edit");
+  });
+
+  test("hashline needs the tagged read slot, not just the edit slot", () => {
+    // With AFT's `read` registration removed, Pi keeps serving its own untagged
+    // read while `edit` survives — nothing left to mint the tags a patch needs.
+    const disabledRead: AftConfig = {
+      tool_surface: "recommended",
+      edit_mode: "hashline",
+      disabled_tools: ["read"],
+    };
+    const surface = resolvePiToolSurface(disabledRead);
+    expect(surface.hoistEdit).toBe(true);
+    expect(surface.hoistRead).toBe(false);
+    expect(piHashlineEffective(disabledRead, surface)).toBe(false);
+    expect(piHashlineDowngrade(disabledRead, surface)).toEqual({
+      code: "hashline_downgraded",
+      reason: "tagged_read_unavailable",
+    });
+
+    const enabled: AftConfig = { tool_surface: "recommended", edit_mode: "hashline" };
+    const enabledSurface = resolvePiToolSurface(enabled);
+    expect(piHashlineEffective(enabled, enabledSurface)).toBe(true);
+    expect(piHashlineDowngrade(enabled, enabledSurface)).toBeNull();
+
+    const disabledEdit: AftConfig = {
+      tool_surface: "recommended",
+      edit_mode: "hashline",
+      disabled_tools: ["edit"],
+    };
+    expect(piHashlineDowngrade(disabledEdit, resolvePiToolSurface(disabledEdit))).toEqual({
+      code: "hashline_downgraded",
+      reason: "edit_not_registered",
+    });
   });
 
   test("uses the active registration spelling for disabled native replacements", () => {

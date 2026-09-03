@@ -16,7 +16,10 @@ import { buildSubcToolSchemas, SUBC_BARE_TOOL_NAMES } from "../subc-tool-schemas
 import {
   buildOpenCodeToolMap,
   openCodeEditSlotSurvives,
+  openCodeHashlineDowngrade,
+  openCodeHashlineEditRegistered,
   openCodeHashlineEffective,
+  openCodeReadSlotSurvives,
 } from "../tool-registration.js";
 import type { PluginContext as OpenCodeContext } from "../types.js";
 
@@ -526,6 +529,73 @@ describe("hashline edit schema selection", () => {
     const governedSchema = canonicalizeSchema("edit", governed.arms.hashline.schema);
     expect(canonicalizeSchema("edit", openCodeSchema)).toEqual(governedSchema);
     expect(canonicalizeSchema("edit", piSchema)).toEqual(governedSchema);
+  });
+
+  test("a hashline session without the tagged read slot registers the legacy arm", () => {
+    // The reported surface: AFT's `read` registration is gone, so OpenCode keeps
+    // serving its own untagged read while `edit` survives. Nothing in that
+    // session can mint a tag, so the patch arm must not be offered.
+    const config = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: true,
+      edit_mode: "hashline",
+      disabled_tools: ["read"],
+    } as const;
+
+    expect(openCodeReadSlotSurvives(config)).toBe(false);
+    expect(openCodeHashlineEffective(config)).toBe(false);
+
+    const ctx = stubContext(config) as OpenCodeContext;
+    ctx.hashlineEffective = openCodeHashlineEffective(config);
+    const tools = buildOpenCodeToolMap(ctx, config as OpenCodeConfig) as Record<
+      string,
+      { args: Record<string, unknown> }
+    >;
+    expect(Object.keys(tools)).not.toContain("read");
+    const schema = schemaForOpenCode(tools.edit);
+    expect(Object.keys(schema.properties as JsonObject)).toContain("filePath");
+    expect(Object.keys(schema.properties as JsonObject)).not.toContain("patch");
+
+    const registered = new Set(Object.keys(tools));
+    expect(openCodeHashlineEditRegistered(config, registered)).toBe(false);
+    expect(openCodeHashlineDowngrade(config, registered)).toEqual({
+      code: "hashline_downgraded",
+      reason: "tagged_read_unavailable",
+    });
+  });
+
+  test("the default hashline surface keeps both slots and stays on the patch arm", () => {
+    const config = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: true,
+      edit_mode: "hashline",
+    } as const;
+
+    const ctx = stubContext(config) as OpenCodeContext;
+    ctx.hashlineEffective = openCodeHashlineEffective(config);
+    const tools = buildOpenCodeToolMap(ctx, config as OpenCodeConfig) as Record<
+      string,
+      { args: Record<string, unknown> }
+    >;
+    const registered = new Set(Object.keys(tools));
+    expect(registered.has("read")).toBe(true);
+    expect(Object.keys(schemaForOpenCode(tools.edit).properties as JsonObject)).toEqual(["patch"]);
+    expect(openCodeHashlineEditRegistered(config, registered)).toBe(true);
+    expect(openCodeHashlineDowngrade(config, registered)).toBeNull();
+  });
+
+  test("a hashline session missing only the edit slot keeps the original reason", () => {
+    const config = {
+      tool_surface: "recommended",
+      hoist_builtin_tools: true,
+      edit_mode: "hashline",
+      disabled_tools: ["edit"],
+    } as const;
+    const registered = new Set(["read"]);
+    expect(openCodeHashlineDowngrade(config, registered)).toEqual({
+      code: "hashline_downgraded",
+      reason: "edit_not_registered",
+    });
   });
 
   test("default schema stays legacy and final surface controls edit-slot eligibility", () => {

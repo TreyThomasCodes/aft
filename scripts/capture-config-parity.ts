@@ -75,6 +75,15 @@ function goldenParamsFromMerged(
   // Hoisting is used only during plugin registration, but the generated parity
   // fixture retains its resolved value so Rust verifies harness selection.
   params.hoist_builtin_tools = merged.hoist_builtin_tools ?? true;
+  // Same reasoning for the surface tier and the disabled-tool list: the plugin
+  // owns registration, but the core answers "did the tagged read slot survive?"
+  // from these two fields, so the resolver has to agree on them.
+  if (merged.tool_surface !== undefined) {
+    params.tool_surface = merged.tool_surface;
+  }
+  if (merged.disabled_tools !== undefined) {
+    params.disabled_tools = merged.disabled_tools;
+  }
   if (merged.url_fetch_allow_private !== undefined) {
     params.url_fetch_allow_private = merged.url_fetch_allow_private;
   }
@@ -275,6 +284,13 @@ const CASES: ParityCase[] = [
     name: "bash_powershell_tool_project_safe",
     user: { bash: { powershell_tool: false } },
     project: { bash: { powershell_tool: true } },
+  },
+  {
+    // The reported #292 surface: hashline requested, but the tagged read slot is
+    // switched off. The core answers "can this session mint a tag?" from the
+    // resolved config, so the resolver must agree with the plugins on it.
+    name: "hashline_disabled_read",
+    user: { edit_mode: "hashline", disabled_tools: ["read"] },
   },
   {
     name: "drop_restrict",

@@ -530,6 +530,46 @@ fn effective_hashline_edit_routes_before_legacy_translation() {
 }
 
 #[test]
+fn hashline_edit_without_the_carrier_falls_to_the_legacy_arm() {
+    // A downgraded plugin never sends the hashline carrier, so `effective_hashline`
+    // is false and translation must take the legacy path — both for a legacy edit
+    // shape (which has to work) and for a patch (which must not be silently
+    // accepted by a session that has no tags to address).
+    let legacy = subc_translate_with_context(
+        "edit",
+        &json!({ "path": "src/main.ts", "oldString": "1", "newString": "2" }),
+        Path::new("/project"),
+        TranslateContext {
+            diagnostics_on_edit: false,
+            preview: false,
+            effective_hashline: false,
+        },
+    )
+    .expect("legacy edit shape translates without the carrier");
+    // Normalization folds the top-level find/replace into `edits`, so the legacy
+    // arm lands on the batch command rather than the hashline one.
+    assert_eq!(legacy.command, "batch");
+
+    let patch = subc_translate_with_context(
+        "edit",
+        &json!({ "patch": "[src/main.ts#ABCD]\nPUT 1\nconst value = 2;\n" }),
+        Path::new("/project"),
+        TranslateContext {
+            diagnostics_on_edit: false,
+            preview: false,
+            effective_hashline: false,
+        },
+    )
+    .expect_err("a patch must not reach the hashline arm without the carrier");
+    assert_eq!(patch.code, "invalid_request");
+    assert!(
+        !patch.message.contains("hashline"),
+        "legacy arm should not steer toward hashline: {}",
+        patch.message
+    );
+}
+
+#[test]
 fn effective_hashline_edit_rejects_every_legacy_key_with_hashline_steering() {
     let error = subc_translate_with_context(
         "edit",

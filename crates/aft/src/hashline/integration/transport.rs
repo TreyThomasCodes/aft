@@ -688,22 +688,22 @@ pub fn rejection_transport_registry() -> Vec<RejectionTransportContract> {
         row(
             MissingTag,
             Header,
-            "read the current file with the tagged read surface, then include its four-hex tag",
+            "run `read <path>` on the file, then include the four-hex tag it returns",
         ),
         row(
             MalformedTag,
             Header,
-            "read the current file with the tagged read surface, then include its four-hex tag",
+            "run `read <path>` on the file, then include the four-hex tag it returns",
         ),
         row(
             UnknownTag,
             Resolution,
-            "re-read the file to mint a fresh tag, then retry the edit",
+            "run `read <path>` again to mint a fresh tag, then retry the edit",
         ),
         row(
             EvictedTag,
             Resolution,
-            "re-read the file to mint a fresh tag, then retry the edit",
+            "run `read <path>` again to mint a fresh tag, then retry the edit",
         ),
         row(
             AmbiguousTag,
@@ -718,7 +718,7 @@ pub fn rejection_transport_registry() -> Vec<RejectionTransportContract> {
         row(
             StaleTag,
             Verification,
-            "perform a ranged tagged re-read because required boundary context changed",
+            "run `read <path>` over the addressed range because required boundary context changed",
         ),
         row(
             StaleTag,
