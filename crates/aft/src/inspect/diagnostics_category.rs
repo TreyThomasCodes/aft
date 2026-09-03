@@ -112,7 +112,7 @@ pub(crate) fn run_diagnostics_category(
             payload: collection.into_payload(snapshot),
         }
     } else {
-        JobOutcome::Pending { in_flight: true }
+        JobOutcome::pending(true)
     }
 }
 

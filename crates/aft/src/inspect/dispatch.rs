@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread;
@@ -96,10 +97,30 @@ fn dispatch_loop(
         let tx = result_tx.clone();
         let worker = Arc::clone(&worker);
         pool.spawn_fifo(move || {
-            let result = worker(job);
+            let started = Instant::now();
+            let panic_job = job.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(job)))
+                .unwrap_or_else(|panic| {
+                    InspectResult::failed(
+                        &panic_job,
+                        format!(
+                            "inspect worker panicked before completion: {}",
+                            panic_message(panic.as_ref())
+                        ),
+                        started.elapsed(),
+                    )
+                });
             let _ = tx.send(result);
         });
     }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
 }
 
 fn dispatch_category(job: InspectJob) -> InspectResult {

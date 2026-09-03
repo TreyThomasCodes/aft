@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{after, bounded, select, Receiver, Sender};
+use crossbeam_channel::{after, bounded, select_biased, Receiver, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -14,7 +14,7 @@ use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
     is_test_file, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob, InspectResult,
-    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope, PendingWaitCause,
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
@@ -301,10 +301,10 @@ fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: Pat
     }
 }
 
-/// Drops the builder-registry entry (and any leftover waiters) if a reuse
-/// worker returns, panics, or is cancelled without going through the
-/// completion router. Admission and exit must be paired; a leftover
-/// registration reads as `building` with no running job.
+/// Completes the builder registration and sends `Failed` to leftover waiters
+/// if a reuse worker returns, panics, or is cancelled without going through the
+/// completion router. Admission and exit must be paired; a leftover registration
+/// reads as `building` with no running job.
 struct Tier2FlightExitGuard<'a> {
     manager: &'a InspectManager,
     key: JobKey,
@@ -527,16 +527,27 @@ impl InspectManager {
     /// Record the attempt outcome and wake leftover waiters. Idempotent: a
     /// second call after the completion router already ran is a no-op.
     fn finish_tier2_flight(&self, key: &JobKey, outcome: JobOutcome) {
-        let Some(waiters) = self
-            .in_flight
-            .lock()
-            .ok()
-            .and_then(|mut in_flight| in_flight.remove(key))
-        else {
+        let Some(waiters) = self.take_waiters(key) else {
             return;
         };
         self.record_builder_attempt_outcome(key, &outcome);
         self.reuse_completions.fetch_add(1, Ordering::SeqCst);
+        Self::deliver_waiters(waiters, outcome);
+    }
+
+    fn take_waiters(&self, key: &JobKey) -> Option<Vec<Waiter>> {
+        let waiters = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+        if waiters.is_some() {
+            self.in_flight_changed.notify_all();
+        }
+        waiters
+    }
+
+    fn deliver_waiters(waiters: Vec<Waiter>, outcome: JobOutcome) {
         for waiter in waiters {
             let _ = waiter.tx.send(outcome.clone());
         }
@@ -733,6 +744,8 @@ impl InspectManager {
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
         deadline: Instant,
     ) -> JobOutcome {
+        let wait_started = Instant::now();
+        let wait_budget = deadline.saturating_duration_since(wait_started);
         if !category.is_active() {
             return JobOutcome::Failed {
                 message: format!("inspect category '{category}' is disabled in v0.33"),
@@ -760,9 +773,16 @@ impl InspectManager {
             waiter_tx,
             callgraph_snapshot,
         ) {
-            Ok(()) => {
-                self.wait_for_outcome(key, caller_scope, cache, waiter_rx, wait_snapshot, deadline)
-            }
+            Ok(()) => self.wait_for_outcome(
+                key,
+                caller_scope,
+                cache,
+                waiter_rx,
+                wait_snapshot,
+                deadline,
+                wait_started,
+                wait_budget,
+            ),
             Err(message) => JobOutcome::Failed { message },
         }
     }
@@ -1172,7 +1192,14 @@ impl InspectManager {
 
     pub fn discard_completions(&self) -> usize {
         let mut discarded = 0usize;
-        while self.result_rx.try_recv().is_ok() {
+        while let Ok(result) = self.result_rx.try_recv() {
+            let outcome = JobOutcome::Failed {
+                message: "inspect job cancelled because its project root was unbound".to_string(),
+            };
+            self.record_builder_attempt_outcome(&result.key, &outcome);
+            if let Some(waiters) = self.take_waiters(&result.key) {
+                Self::deliver_waiters(waiters, outcome);
+            }
             discarded += 1;
         }
         discarded
@@ -1369,7 +1396,9 @@ impl InspectManager {
                 cache.as_ref(),
                 &caller_scope,
             ),
-            Err(_) => JobOutcome::Pending { in_flight: true },
+            Err(_) => JobOutcome::Failed {
+                message: "inspect Tier-2 waiter dropped without a terminal outcome".to_string(),
+            },
         }
     }
 
@@ -1608,7 +1637,7 @@ impl InspectManager {
             snapshot.project_root.clone(),
         ) {
             Ok(Some(cache)) => cache,
-            Ok(None) => return JobOutcome::Pending { in_flight },
+            Ok(None) => return JobOutcome::pending(in_flight),
             Err(error) => {
                 return JobOutcome::Failed {
                     message: error.to_string(),
@@ -1665,7 +1694,7 @@ impl InspectManager {
                     cache,
                     caller_scope,
                 ),
-                Ok(None) => JobOutcome::Pending { in_flight },
+                Ok(None) => JobOutcome::pending(in_flight),
                 Err(error) => JobOutcome::Failed {
                     message: error.to_string(),
                 },
@@ -2335,11 +2364,14 @@ impl InspectManager {
             key.clone(),
             callgraph_snapshot,
         ) {
-            if let Ok(mut in_flight) = self.in_flight.lock() {
-                in_flight.remove(&key);
+            let outcome = JobOutcome::Failed {
+                message: message.clone(),
+            };
+            if let Some(waiters) = self.take_waiters(&key) {
+                Self::deliver_waiters(waiters, outcome);
             }
             self.clear_builder_state(&key);
-            return Err(message);
+            return Ok(());
         }
         Ok(())
     }
@@ -2411,6 +2443,7 @@ impl InspectManager {
             .map_err(|_| "inspect dispatch loop is unavailable".to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wait_for_outcome(
         &self,
         key: JobKey,
@@ -2419,11 +2452,16 @@ impl InspectManager {
         waiter_rx: Receiver<JobOutcome>,
         snapshot: InspectSnapshot,
         deadline: Instant,
+        wait_started: Instant,
+        wait_budget: Duration,
     ) -> JobOutcome {
         let timeout = after(deadline.saturating_duration_since(Instant::now()));
         let result_rx = self.result_rx.clone();
         loop {
-            select! {
+            // Route a worker result before an equally ready deadline notification.
+            // Returning Pending while a terminal result is already available makes
+            // the response depend on thread scheduling rather than job completion.
+            select_biased! {
                 recv(waiter_rx) -> outcome => {
                     return match outcome {
                         Ok(outcome) => filter_outcome_for_scope_with_contributions(
@@ -2433,17 +2471,41 @@ impl InspectManager {
                             cache.as_ref(),
                             &caller_scope,
                         ),
-                        Err(_) => self.timeout_outcome(&key, &caller_scope, &cache, &snapshot),
+                        Err(_) => self.timeout_outcome(
+                            &key,
+                            &caller_scope,
+                            &cache,
+                            &snapshot,
+                            PendingWaitCause::WaiterDropped,
+                            wait_started,
+                            wait_budget,
+                        ),
                     };
                 }
                 recv(result_rx) -> result => {
                     match result {
                         Ok(result) => self.route_completion(result),
-                        Err(_) => return self.timeout_outcome(&key, &caller_scope, &cache, &snapshot),
+                        Err(_) => return self.timeout_outcome(
+                            &key,
+                            &caller_scope,
+                            &cache,
+                            &snapshot,
+                            PendingWaitCause::ResultChannelDisconnected,
+                            wait_started,
+                            wait_budget,
+                        ),
                     }
                 }
                 recv(timeout) -> _ => {
-                    return self.timeout_outcome(&key, &caller_scope, &cache, &snapshot);
+                    return self.timeout_outcome(
+                        &key,
+                        &caller_scope,
+                        &cache,
+                        &snapshot,
+                        PendingWaitCause::DeadlineElapsed,
+                        wait_started,
+                        wait_budget,
+                    );
                 }
             }
         }
@@ -2455,6 +2517,9 @@ impl InspectManager {
         caller_scope: &JobScope,
         cache: &(impl InspectCacheRead + ?Sized),
         snapshot: &InspectSnapshot,
+        cause: PendingWaitCause,
+        wait_started: Instant,
+        wait_budget: Duration,
     ) -> JobOutcome {
         match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
             Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
@@ -2467,7 +2532,7 @@ impl InspectManager {
                 cache,
                 caller_scope,
             ),
-            Ok(None) => JobOutcome::Pending { in_flight: true },
+            Ok(None) => JobOutcome::pending_wait(true, cause, wait_started.elapsed(), wait_budget),
             Err(error) => JobOutcome::Failed {
                 message: error.to_string(),
             },
@@ -2477,14 +2542,8 @@ impl InspectManager {
     fn route_completion(&self, result: InspectResult) {
         let outcome = self.completion_outcome(result.clone());
         self.record_builder_attempt_outcome(&result.key, &outcome);
-        let waiters = self
-            .in_flight
-            .lock()
-            .ok()
-            .and_then(|mut in_flight| in_flight.remove(&result.key))
-            .unwrap_or_default();
-        for waiter in waiters {
-            let _ = waiter.tx.send(outcome.clone());
+        if let Some(waiters) = self.take_waiters(&result.key) {
+            Self::deliver_waiters(waiters, outcome);
         }
     }
 
@@ -4419,7 +4478,7 @@ fn filter_outcome_for_scope_with_contributions(
                 in_flight,
             },
         },
-        JobOutcome::Pending { in_flight } => JobOutcome::Pending { in_flight },
+        JobOutcome::Pending { in_flight, wait } => JobOutcome::Pending { in_flight, wait },
         JobOutcome::Failed { message } => JobOutcome::Failed { message },
     }
 }
@@ -4433,7 +4492,7 @@ fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome
             cached: cached.map(|payload| filter_payload_for_scope(payload, scope)),
             in_flight,
         },
-        JobOutcome::Pending { in_flight } => JobOutcome::Pending { in_flight },
+        JobOutcome::Pending { in_flight, wait } => JobOutcome::Pending { in_flight, wait },
         JobOutcome::Failed { message } => JobOutcome::Failed { message },
     }
 }
@@ -4706,6 +4765,119 @@ mod guard_tests {
         let project_key = crate::search_index::artifact_cache_key(&canonical_root);
         crate::root_cache::configure_artifact_access(&canonical_root, &project_key, false);
         dir
+    }
+
+    fn tier1_snapshot(root: &Path) -> InspectSnapshot {
+        use crate::config::Config;
+        use crate::parser::SymbolCache;
+        use std::sync::RwLock;
+
+        InspectSnapshot::new(
+            root.to_path_buf(),
+            root.join(".aft-cache/inspect"),
+            Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        )
+    }
+
+    #[test]
+    fn tier1_worker_panic_delivers_failed_to_waiter() {
+        let dir = write_ts_project(2);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let snapshot = tier1_snapshot(&root);
+        let manager = InspectManager::with_worker(
+            Arc::new(|_| panic!("forced Tier-1 worker panic")),
+            Duration::from_millis(250),
+        );
+
+        let outcome = manager.submit_category(
+            snapshot,
+            InspectCategory::Metrics,
+            JobScope::for_project(root),
+        );
+
+        match outcome {
+            JobOutcome::Failed { message } => assert!(
+                message.contains(
+                    "inspect worker panicked before completion: forced Tier-1 worker panic"
+                ),
+                "unexpected panic terminal: {message}"
+            ),
+            other => panic!("worker panic must deliver Failed, got {other:?}"),
+        }
+        assert!(
+            manager
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "panic completion must clear its waiter registration"
+        );
+    }
+
+    #[test]
+    fn ready_worker_result_wins_over_simultaneously_ready_deadline() {
+        let dir = write_ts_project(2);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let snapshot = tier1_snapshot(&root);
+        let manager = InspectManager::with_worker(
+            Arc::new(|job| {
+                InspectResult::success(
+                    &job,
+                    InspectScanSuccess {
+                        scanned_files: job.scope_files.clone(),
+                        contributions: Vec::new(),
+                        aggregate: json!({"count": 2}),
+                    },
+                    Duration::ZERO,
+                )
+            }),
+            Duration::from_secs(1),
+        );
+        let scope = JobScope::for_project(root);
+        let key = JobKey::for_category_scope(InspectCategory::Metrics, &scope);
+        let cache = manager
+            .cache_for_snapshot(&snapshot)
+            .expect("open inspect cache");
+        let (waiter_tx, waiter_rx) = bounded(1);
+        manager
+            .enqueue_with_waiter(
+                snapshot.clone(),
+                InspectCategory::Metrics,
+                scope.clone(),
+                key.clone(),
+                waiter_tx,
+                None,
+            )
+            .expect("enqueue metrics scan");
+
+        let result_deadline = Instant::now() + Duration::from_secs(5);
+        while manager.result_rx.is_empty() {
+            assert!(
+                Instant::now() < result_deadline,
+                "worker result did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let wait_started = Instant::now();
+        let outcome = manager.wait_for_outcome(
+            key,
+            scope,
+            cache,
+            waiter_rx,
+            snapshot,
+            wait_started,
+            wait_started,
+            Duration::ZERO,
+        );
+
+        assert!(
+            matches!(outcome, JobOutcome::Fresh { .. }),
+            "an already-ready terminal result must beat the deadline: {outcome:?}"
+        );
     }
 
     struct ProjectionObserverReset;

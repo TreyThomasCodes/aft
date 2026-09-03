@@ -582,6 +582,61 @@ impl InspectResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingWaitCause {
+    WaiterDropped,
+    ResultChannelDisconnected,
+    DeadlineElapsed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingWait {
+    pub cause: PendingWaitCause,
+    pub elapsed_ms: u64,
+    pub budget_ms: u64,
+}
+
+impl PendingWait {
+    pub fn new(cause: PendingWaitCause, elapsed: Duration, budget: Duration) -> Self {
+        Self {
+            cause,
+            elapsed_ms: duration_millis(elapsed),
+            budget_ms: duration_millis(budget),
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        let elapsed = display_duration_millis(self.elapsed_ms);
+        let budget = display_duration_millis(self.budget_ms);
+        match self.cause {
+            PendingWaitCause::WaiterDropped => {
+                format!("waiter dropped without outcome after {elapsed}; budget {budget}")
+            }
+            PendingWaitCause::ResultChannelDisconnected => {
+                format!("result channel disconnected after {elapsed}; budget {budget}")
+            }
+            PendingWaitCause::DeadlineElapsed => {
+                format!("deadline elapsed after {elapsed}; budget {budget}")
+            }
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn display_duration_millis(millis: u64) -> String {
+    if millis >= 1_000 && millis % 1_000 == 0 {
+        format!("{}s", millis / 1_000)
+    } else if millis >= 1_000 {
+        format!("{:.1}s", millis as f64 / 1_000.0)
+    } else {
+        format!("{millis}ms")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobOutcome {
@@ -594,6 +649,8 @@ pub enum JobOutcome {
     },
     Pending {
         in_flight: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wait: Option<PendingWait>,
     },
     Failed {
         message: String,
@@ -601,6 +658,34 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
+    pub fn pending(in_flight: bool) -> Self {
+        Self::Pending {
+            in_flight,
+            wait: None,
+        }
+    }
+
+    pub fn pending_wait(
+        in_flight: bool,
+        cause: PendingWaitCause,
+        elapsed: Duration,
+        budget: Duration,
+    ) -> Self {
+        Self::Pending {
+            in_flight,
+            wait: Some(PendingWait::new(cause, elapsed, budget)),
+        }
+    }
+
+    pub fn pending_detail(&self) -> Option<String> {
+        match self {
+            Self::Pending {
+                wait: Some(wait), ..
+            } => Some(wait.detail()),
+            _ => None,
+        }
+    }
+
     pub fn payload(&self) -> Option<&serde_json::Value> {
         match self {
             JobOutcome::Fresh { payload } => Some(payload),

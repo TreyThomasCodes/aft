@@ -1550,8 +1550,14 @@ fn fresh_payloads(
             Some(JobOutcome::Stale { .. }) => {
                 return Err(format!("{} could not be stat-verified", category.as_str()));
             }
-            Some(JobOutcome::Pending { .. }) => {
-                return Err(format!("{} did not complete", category.as_str()));
+            Some(outcome @ JobOutcome::Pending { .. }) => {
+                let mut message = format!("{} did not complete", category.as_str());
+                if let Some(detail) = outcome.pending_detail() {
+                    message.push_str(" (");
+                    message.push_str(&detail);
+                    message.push(')');
+                }
+                return Err(message);
             }
             Some(JobOutcome::Failed { message }) => {
                 return Err(format!("{} failed: {message}", category.as_str()));
@@ -2754,18 +2760,9 @@ mod status_bar_refresh_tests {
         refresh_status_bar_counts(
             &ctx,
             &outcomes(vec![
-                (
-                    InspectCategory::DeadCode,
-                    JobOutcome::Pending { in_flight: true },
-                ),
-                (
-                    InspectCategory::UnusedExports,
-                    JobOutcome::Pending { in_flight: true },
-                ),
-                (
-                    InspectCategory::Duplicates,
-                    JobOutcome::Pending { in_flight: true },
-                ),
+                (InspectCategory::DeadCode, JobOutcome::pending(true)),
+                (InspectCategory::UnusedExports, JobOutcome::pending(true)),
+                (InspectCategory::Duplicates, JobOutcome::pending(true)),
             ]),
         );
 
@@ -3444,7 +3441,7 @@ mod fresh_payload_tests {
             .copied()
             .map(|category| {
                 let outcome = if category == InspectCategory::Diagnostics {
-                    JobOutcome::Pending { in_flight: true }
+                    JobOutcome::pending(true)
                 } else {
                     JobOutcome::Fresh {
                         payload: serde_json::json!({}),
@@ -3455,6 +3452,53 @@ mod fresh_payload_tests {
             .collect();
 
         assert!(fresh_payloads(&outcomes).is_err());
+    }
+
+    #[test]
+    fn pending_wait_detail_keeps_the_category_prefix_stable() {
+        use crate::inspect::job::PendingWaitCause;
+
+        let cases = [
+            (
+                PendingWaitCause::WaiterDropped,
+                "metrics did not complete (waiter dropped without outcome after 1.8s; budget 120s)",
+            ),
+            (
+                PendingWaitCause::ResultChannelDisconnected,
+                "metrics did not complete (result channel disconnected after 1.8s; budget 120s)",
+            ),
+            (
+                PendingWaitCause::DeadlineElapsed,
+                "metrics did not complete (deadline elapsed after 1.8s; budget 120s)",
+            ),
+        ];
+
+        for (cause, expected) in cases {
+            let outcomes = InspectCategory::active()
+                .iter()
+                .copied()
+                .map(|category| {
+                    let outcome = if category == InspectCategory::Metrics {
+                        JobOutcome::pending_wait(
+                            true,
+                            cause,
+                            Duration::from_millis(1_800),
+                            Duration::from_secs(120),
+                        )
+                    } else {
+                        JobOutcome::Fresh {
+                            payload: serde_json::json!({}),
+                        }
+                    };
+                    (category, outcome)
+                })
+                .collect();
+
+            assert_eq!(
+                fresh_payloads(&outcomes).expect_err("pending metrics must fail freshness"),
+                expected
+            );
+        }
     }
 }
 

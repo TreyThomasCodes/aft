@@ -271,7 +271,10 @@ fn inspect_engine_blocking_deadline_outlives_soft_deadline_for_cold_scan() {
         manager.submit_category(snapshot.clone(), InspectCategory::Metrics, scope.clone());
     assert!(matches!(
         soft_outcome,
-        JobOutcome::Pending { in_flight: true }
+        JobOutcome::Pending {
+            in_flight: true,
+            ..
+        }
     ));
 
     let blocking_outcome = manager.submit_category_until(
