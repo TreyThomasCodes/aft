@@ -23,7 +23,6 @@ import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
 import { importTools } from "../packages/opencode-plugin/src/tools/imports.ts";
 import { navigationTools } from "../packages/opencode-plugin/src/tools/navigation.ts";
 import { readingTools } from "../packages/opencode-plugin/src/tools/reading.ts";
-import { refactoringTools } from "../packages/opencode-plugin/src/tools/refactoring.ts";
 import { safetyTools } from "../packages/opencode-plugin/src/tools/safety.ts";
 import { searchTools } from "../packages/opencode-plugin/src/tools/search.ts";
 import { semanticTools } from "../packages/opencode-plugin/src/tools/semantic.ts";
@@ -56,7 +55,6 @@ type BareToolName =
   | "delete"
   | "move"
   | "import"
-  | "refactor"
   | "safety";
 
 interface BridgeCall {
@@ -156,27 +154,6 @@ function translateAftImportToolCall(rawArgs: Record<string, unknown>): BridgeCal
   if (rawArgs.validate !== undefined) params.validate = rawArgs.validate;
   return { command, params };
 }
-
-function translateAftRefactorToolCall(rawArgs: Record<string, unknown>): BridgeCall {
-  const op = rawArgs.op;
-  const command = op === "move" ? "move_symbol" : op === "extract" ? "extract_function" : "inline_symbol";
-  const params: Record<string, unknown> = { file: rawArgs.filePath };
-  if (op === "move") {
-    if (rawArgs.symbol !== undefined) params.symbol = rawArgs.symbol;
-    if (rawArgs.destination !== undefined) params.destination = rawArgs.destination;
-    if (rawArgs.scope !== undefined) params.scope = rawArgs.scope;
-  } else if (op === "extract") {
-    if (rawArgs.name !== undefined) params.name = rawArgs.name;
-    if (rawArgs.startLine !== undefined) params.start_line = rawArgs.startLine;
-    if (typeof rawArgs.endLine === "number") params.end_line = rawArgs.endLine + 1;
-  } else if (op === "inline") {
-    if (rawArgs.symbol !== undefined) params.symbol = rawArgs.symbol;
-    if (rawArgs.callSiteLine !== undefined) params.call_site_line = rawArgs.callSiteLine;
-  }
-  if (rawArgs.lsp_hints !== undefined) params.lsp_hints = rawArgs.lsp_hints;
-  return { command, params };
-}
-
 function translateAftSafetyToolCall(rawArgs: Record<string, unknown>): BridgeCall {
   const op = rawArgs.op;
   const command =
@@ -271,11 +248,6 @@ function makeCtx(
               calls.push(translated);
               return responseForCall(translated.command, translated.params);
             }
-            if (name === "refactor") {
-              const translated = translateAftRefactorToolCall(rawArgs);
-              calls.push(translated);
-              return responseForCall(translated.command, translated.params);
-            }
             if (name === "safety") {
               const translated = translateAftSafetyToolCall(rawArgs);
               calls.push(translated);
@@ -337,7 +309,6 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
     delete: hoisted.aft_delete,
     move: hoisted.aft_move,
     import: importTools(ctx).aft_import,
-    refactor: refactoringTools(ctx).aft_refactor,
     safety: safetyTools(ctx).aft_safety,
   };
 }
@@ -565,19 +536,6 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "import_organize_translate", tool_name: "import", agent_args: { op: "organize", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "import_add_missing_module", tool_name: "import", expected_error: "'module' is required for 'add' op", agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "import_missing_file_path", tool_name: "import", expected_error: "aft_import: missing required param 'filePath'", agent_args: { op: "organize" } },
-  { name: "refactor_move_translate_full", tool_name: "refactor", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, scope: "exports" } },
-  { name: "refactor_extract_translate", tool_name: "refactor", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, name: "computeValue", startLine: 2, endLine: 4 } },
-  { name: "refactor_inline_translate", tool_name: "refactor", agent_args: { op: "inline", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "helper", callSiteLine: 6 } },
-  { name: "refactor_missing_symbol_for_move", tool_name: "refactor", expected_error: "'symbol' is required for 'move' op", agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, destination: `${PROJECT_ROOT}/src/moved.ts` } },
-  { name: "refactor_missing_name_for_extract", tool_name: "refactor", expected_error: "'name' is required for 'extract' op", agent_args: { op: "extract", filePath: `${PROJECT_ROOT}/src/main.ts`, startLine: 2, endLine: 4 } },
-  { name: "refactor_missing_filePath", tool_name: "refactor", expected_error: "aft_refactor: missing required param 'filePath'", agent_args: { op: "move", symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` } },
-  {
-    name: "refactor_lsp_hints_passthrough",
-    tool_name: "refactor",
-    agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts` },
-    input_agent_args: { op: "move", filePath: `${PROJECT_ROOT}/src/main.ts`, symbol: "run", destination: `${PROJECT_ROOT}/src/moved.ts`, lsp_hints: { symbols: [{ name: "run", file: `${PROJECT_ROOT}/src/main.ts`, line: 4, kind: "function" }] } },
-    lsp_symbols: [{ name: "run", kind: 12, location: { uri: `file://${PROJECT_ROOT}/src/main.ts`, range: { start: { line: 4 } } } }],
-  },
   { name: "safety_undo_file", tool_name: "safety", agent_args: { op: "undo", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "safety_history_file", tool_name: "safety", agent_args: { op: "history", filePath: `${PROJECT_ROOT}/src/main.ts` } },
   { name: "safety_checkpoint_files", tool_name: "safety", agent_args: { op: "checkpoint", name: "before-edit", files: [`${PROJECT_ROOT}/src/main.ts`, "docs/guide.md"] } },

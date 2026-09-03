@@ -10,7 +10,6 @@ import { conflictTools } from "../tools/conflicts.js";
 import { aftPrefixedTools, createReadTool, hoistedTools } from "../tools/hoisted.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
-import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
@@ -72,7 +71,6 @@ function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
     ...aftPrefixedTools(ctx),
     ...navigationTools(ctx),
     ...readingTools(ctx),
-    ...refactoringTools(ctx),
     ...safetyTools(ctx),
     ...searchTools(ctx),
     ...semanticTools(ctx),

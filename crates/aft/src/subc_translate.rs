@@ -139,9 +139,6 @@ fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, Trans
             normalize_path_alias_pair(&mut map, "path", "filePath", false)?;
         }
         "edit" => normalize_edit_arguments(&mut map)?,
-        "refactor" => {
-            normalize_path_alias_pair(&mut map, "path", "filePath", false)?;
-        }
         "zoom" => normalize_zoom_aliases(&mut map)?,
         "callgraph" => {
             normalize_path_alias_pair(&mut map, "path", "filePath", false)?;
@@ -972,7 +969,6 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
             | "delete"
             | "move"
             | "import"
-            | "refactor"
             | "safety"
     )
 }
@@ -1081,7 +1077,6 @@ pub fn subc_translate_owned_with_context(
         "delete" => translate_delete(agent_args, project_root),
         "move" => translate_move(agent_args, project_root),
         "import" => translate_import(agent_args),
-        "refactor" => translate_refactor(agent_args),
         "safety" => translate_safety(agent_args, project_root),
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
@@ -1833,92 +1828,6 @@ fn translate_import(args: Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_refactor(args: Value) -> Result<Translated, TranslateError> {
-    let map_in = agent_args_map(args);
-    let op = map_in
-        .get("op")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_request("aft_refactor: missing required param 'op'"))?;
-    let command = match op {
-        "move" => "move_symbol",
-        "extract" => "extract_function",
-        "inline" => "inline_symbol",
-        other => {
-            return Err(invalid_request(format!(
-                "aft_refactor: invalid op {other:?}; expected 'move', 'extract', or 'inline'"
-            )));
-        }
-    };
-
-    let file_path = map_in
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid_request("aft_refactor: missing required param 'filePath'"))?;
-
-    if matches!(op, "move" | "inline") && map_in.get("symbol").is_none_or(is_empty_param) {
-        return Err(invalid_request(format!(
-            "'symbol' is required for '{op}' op"
-        )));
-    }
-    if op == "move" && map_in.get("destination").is_none_or(is_empty_param) {
-        return Err(invalid_request("'destination' is required for 'move' op"));
-    }
-
-    let mut out = Map::new();
-    out.insert("file".to_string(), Value::String(file_path.to_string()));
-
-    match op {
-        "move" => {
-            insert_present_renamed(&mut out, &map_in, "symbol", "symbol");
-            insert_present_renamed(&mut out, &map_in, "destination", "destination");
-            insert_present_renamed(&mut out, &map_in, "scope", "scope");
-        }
-        "extract" => {
-            if map_in.get("name").is_none_or(is_empty_param) {
-                return Err(invalid_request("'name' is required for 'extract' op"));
-            }
-            let start_line = coerce_optional_int_result(
-                map_in.get("startLine"),
-                "startLine",
-                1,
-                MAX_SAFE_INTEGER,
-            )?
-            .ok_or_else(|| invalid_request("'startLine' is required for 'extract' op"))?;
-            let end_line =
-                coerce_optional_int_result(map_in.get("endLine"), "endLine", 1, MAX_SAFE_INTEGER)?
-                    .ok_or_else(|| invalid_request("'endLine' is required for 'extract' op"))?;
-
-            insert_present_renamed(&mut out, &map_in, "name", "name");
-            out.insert("start_line".to_string(), Value::Number(start_line.into()));
-            out.insert("end_line".to_string(), Value::Number((end_line + 1).into()));
-        }
-        "inline" => {
-            let call_site_line = coerce_optional_int_result(
-                map_in.get("callSiteLine"),
-                "callSiteLine",
-                1,
-                MAX_SAFE_INTEGER,
-            )?
-            .ok_or_else(|| invalid_request("'callSiteLine' is required for 'inline' op"))?;
-
-            insert_present_renamed(&mut out, &map_in, "symbol", "symbol");
-            out.insert(
-                "call_site_line".to_string(),
-                Value::Number(call_site_line.into()),
-            );
-        }
-        _ => unreachable!("validated refactor op"),
-    }
-
-    insert_present_renamed(&mut out, &map_in, "lsp_hints", "lsp_hints");
-
-    Ok(Translated {
-        command: command.into(),
-        args: out,
-    })
-}
-
 fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
@@ -2645,7 +2554,7 @@ mod tests {
         // `edit` is excluded: its full translation runs the edit contract
         // (mode selection) before path validation, so an empty path reports
         // the no-mode error, matching the TypeScript prepareCanonicalEditArguments.
-        for tool in ["read", "write", "move", "import", "refactor"] {
+        for tool in ["read", "write", "move", "import"] {
             let error = subc_translate_owned(tool, serde_json::json!({ "path": "" }), project)
                 .expect_err("empty required path");
             assert_eq!(error.code, "invalid_request");
@@ -3497,7 +3406,6 @@ mod tests {
             "delete",
             "move",
             "import",
-            "refactor",
             "safety",
         ] {
             // Every name the allowlist claims support for must actually

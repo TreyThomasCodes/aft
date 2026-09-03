@@ -27,7 +27,6 @@ import { registerImportTools } from "../tools/imports.js";
 import { registerInspectTool } from "../tools/inspect.js";
 import { registerNavigateTool } from "../tools/navigate.js";
 import { registerReadingTools } from "../tools/reading.js";
-import { registerRefactorTool } from "../tools/refactor.js";
 import { registerSafetyTool } from "../tools/safety.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -62,17 +61,6 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
         label: "aft_import",
         toolName: "aft_import",
         params: { op: "organize", filePath: "/outside/imports.ts" },
-      },
-      {
-        label: "aft_refactor",
-        toolName: "aft_refactor",
-        params: {
-          op: "extract",
-          filePath: "/outside/refactor.ts",
-          name: "pulledOut",
-          startLine: 1,
-          endLine: 2,
-        },
       },
       {
         label: "aft_safety undo",
@@ -140,7 +128,6 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
       });
 
       if (entry.label === "aft_import") registerImportTools(api, restrictedContext(bridge));
-      if (entry.label === "aft_refactor") registerRefactorTool(api, restrictedContext(bridge));
       if (entry.label === "aft_safety undo") registerSafetyTool(api, restrictedContext(bridge));
       if (entry.label === "ast_grep_search") {
         registerAstTools(api, restrictedContext(bridge), { astSearch: true, astReplace: false });

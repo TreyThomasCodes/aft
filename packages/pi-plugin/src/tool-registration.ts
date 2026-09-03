@@ -11,7 +11,6 @@ import { registerImportTools } from "./tools/imports.js";
 import { registerInspectTool } from "./tools/inspect.js";
 import { registerNavigateTool } from "./tools/navigate.js";
 import { registerReadingTools } from "./tools/reading.js";
-import { registerRefactorTool } from "./tools/refactor.js";
 import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
@@ -38,10 +37,9 @@ export interface PiToolSurface {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
-  refactor: boolean;
 }
 
-const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"]);
+const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move"]);
 
 /**
  * Pi's tool registry is unavailable while extension factories load. Older Pi
@@ -158,7 +156,6 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
       move: false,
       astSearch: false,
       astReplace: false,
-      refactor: false,
     };
   }
 
@@ -183,7 +180,6 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
     move: false,
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    refactor: false,
   };
 
   if (surface === "all") {
@@ -192,7 +188,6 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
       navigate: allOnly("aft_callgraph"),
       delete: allOnly("aft_delete"),
       move: allOnly("aft_move"),
-      refactor: allOnly("aft_refactor"),
     };
   }
 
@@ -245,5 +240,4 @@ export function registerPiToolSurface(
   if (surface.safety && ctx.config.backup?.enabled !== false) registerSafetyTool(pi, ctx);
   if (surface.astSearch || surface.astReplace) registerAstTools(pi, ctx, surface);
   if (surface.delete || surface.move) registerFsTools(pi, ctx, surface);
-  if (surface.refactor) registerRefactorTool(pi, ctx);
 }

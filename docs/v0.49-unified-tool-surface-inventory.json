@@ -36,7 +36,6 @@
     "packages/opencode-plugin/src/tools/hoisted.ts",
     "packages/opencode-plugin/src/tools/reading.ts",
     "packages/opencode-plugin/src/tools/navigation.ts",
-    "packages/opencode-plugin/src/tools/refactoring.ts",
     "packages/opencode-plugin/src/tools/safety.ts",
     "packages/pi-plugin/src/index.ts",
     "packages/pi-plugin/src/tools/hoisted.ts",
@@ -159,18 +158,6 @@
         "baseline_property": "filePath"
       },
       {
-        "id": "PATH-V049-010",
-        "harnesses": ["opencode", "pi"],
-        "subc_artifact": "refactor",
-        "tool": "aft_refactor",
-        "json_pointer": "/path",
-        "semantic_role": "source file containing the moved, extracted, or inlined symbol",
-        "canonical": "path",
-        "legacy": "filePath",
-        "requiredness": "required",
-        "baseline_property": "filePath"
-      },
-      {
         "id": "PATH-V049-011",
         "harnesses": ["opencode", "pi"],
         "subc_artifact": "safety",
@@ -204,7 +191,7 @@
       {"id": "SUBC-CAP-V049-002", "bind": "untrusted/MCP", "stage": "before manifest-schema validation", "required": true, "status": "contractual; implementation owned by later slice"}
     ],
     "artifact_capabilities": [
-      {"id": "SUBC-CAP-V049-003", "capability": "22 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
+      {"id": "SUBC-CAP-V049-003", "capability": "21 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
       {"id": "SUBC-CAP-V049-004", "capability": "schemas are loaded by Rust manifest translation", "evidence": "crates/aft/src/subc/manifest.rs include_str!", "status": "checked"},
       {"id": "SUBC-CAP-V049-005", "capability": "schema bytes can be regenerated from host definitions", "evidence": "packages/opencode-plugin/scripts/build-tool-schemas.ts", "status": "checked; regeneration prohibited in S0"},
       {"id": "SUBC-CAP-V049-006", "capability": "trusted and untrusted binds share canonical compatibility rules", "evidence": "v0.49 specification contract", "status": "target; boundary tests owned by later slices"}
@@ -229,7 +216,6 @@
       {"id": "SUBC-TOOL-V049-016", "name": "delete", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-017", "name": "move", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-018", "name": "import", "preview": "unknown; verify host/command capability"},
-      {"id": "SUBC-TOOL-V049-019", "name": "refactor", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-020", "name": "safety", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-021", "name": "status", "preview": "not a mutation; subc-only probe"}
     ]
@@ -254,7 +240,6 @@
       "delete": "aft_delete",
       "move": "aft_move",
       "import": "aft_import",
-      "refactor": "aft_refactor",
       "safety": "aft_safety"
     },
     "profiles": [
@@ -278,7 +263,7 @@
         "id": "REG-V049-OC-ALL",
         "harness": "opencode",
         "surface": "all",
-        "contract_tools": ["bash", "read", "write", "edit", "apply_patch", "aft_outline", "aft_zoom", "aft_inspect", "aft_import", "aft_conflicts", "ast_grep_search", "ast_grep_replace", "aft_callgraph", "aft_delete", "aft_move", "aft_refactor", "aft_safety"],
+        "contract_tools": ["bash", "read", "write", "edit", "apply_patch", "aft_outline", "aft_zoom", "aft_inspect", "aft_import", "aft_conflicts", "ast_grep_search", "ast_grep_replace", "aft_callgraph", "aft_delete", "aft_move", "aft_safety"],
         "conditional": ["recommended-profile conditionals remain in force"],
         "parity_role": "full shared parity profile"
       },
@@ -302,7 +287,7 @@
         "id": "REG-V049-PI-ALL",
         "harness": "pi",
         "surface": "all",
-        "contract_tools": ["bash", "read", "write", "edit", "aft_outline", "aft_zoom", "aft_inspect", "aft_import", "aft_conflicts", "ast_grep_search", "ast_grep_replace", "aft_callgraph", "aft_delete", "aft_move", "aft_refactor", "aft_safety"],
+        "contract_tools": ["bash", "read", "write", "edit", "aft_outline", "aft_zoom", "aft_inspect", "aft_import", "aft_conflicts", "ast_grep_search", "ast_grep_replace", "aft_callgraph", "aft_delete", "aft_move", "aft_safety"],
         "conditional": ["recommended-profile conditionals remain in force"],
         "parity_role": "full shared parity profile"
       }
@@ -310,10 +295,10 @@
     "checked_expected_sets": {
       "REG-V049-OC-MIN": ["aft_outline", "aft_safety", "aft_zoom"],
       "REG-V049-OC-REC": ["aft_conflicts", "aft_import", "aft_inspect", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
-      "REG-V049-OC-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_refactor", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
+      "REG-V049-OC-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
       "REG-V049-PI-MIN": ["aft_outline", "aft_safety", "aft_zoom"],
       "REG-V049-PI-REC": ["aft_conflicts", "aft_import", "aft_inspect", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "grep", "read", "write"],
-      "REG-V049-PI-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_refactor", "aft_safety", "aft_search", "aft_zoom", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "grep", "read", "write"]
+      "REG-V049-PI-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "grep", "read", "write"]
     },
     "host_only_allowlist": [
       {"id": "HOSTONLY-V049-001", "harness": "subc", "tool": "status", "reason": "manifest health probe is not an agent-registered tool", "owning_test": "scripts/capture-subc-parity.ts"},
@@ -344,7 +329,6 @@
       {"id": "SHARED-V049-016", "bare": "delete", "opencode": "aft_delete", "pi": "aft_delete", "subc": "delete"},
       {"id": "SHARED-V049-017", "bare": "move", "opencode": "aft_move", "pi": "aft_move", "subc": "move"},
       {"id": "SHARED-V049-018", "bare": "import", "opencode": "aft_import", "pi": "aft_import", "subc": "import"},
-      {"id": "SHARED-V049-019", "bare": "refactor", "opencode": "aft_refactor", "pi": "aft_refactor", "subc": "refactor"},
       {"id": "SHARED-V049-020", "bare": "safety", "opencode": "aft_safety", "pi": "aft_safety", "subc": "safety"}
     ],
     "host_control_tools": [

@@ -268,7 +268,7 @@ function canonicalizeSchema(toolName: string, value: unknown): JsonValue {
     const bare = toolName.startsWith("aft_") ? toolName.slice(4) : toolName;
     const required = new Set(Array.isArray(result.required) ? (result.required as string[]) : []);
     if (
-      ["read", "write", "edit", "callgraph", "move", "import", "refactor"].includes(bare) &&
+      ["read", "write", "edit", "callgraph", "move", "import"].includes(bare) &&
       "path" in properties
     ) {
       required.add("path");

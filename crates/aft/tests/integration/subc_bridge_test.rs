@@ -8470,19 +8470,7 @@ async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
         }),
     )
     .await;
-    expect_manifest_tool_reaches_dispatch(
-        &mut stream,
-        305,
-        "refactor",
-        json!({
-            "op": "move",
-            "filePath": "src/missing.ts",
-            "symbol": "missingSymbol",
-            "destination": "src/missing-dest.ts",
-        }),
-    )
-    .await;
-    expect_manifest_tool_success(&mut stream, 306, "safety", json!({ "op": "list" })).await;
+    expect_manifest_tool_success(&mut stream, 305, "safety", json!({ "op": "list" })).await;
 
     send_connection_goodbye(&mut stream).await;
 }

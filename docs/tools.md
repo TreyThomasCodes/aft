@@ -68,7 +68,6 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_delete` | Delete one or more files (or directories) with backup | `files`, `recursive` |
 | `aft_move` | Move or rename a file with backup | `path`, `destination` |
 | `aft_callgraph` | Call graph and data-flow navigation | `op`, `path`, `symbol`, `depth` |
-| `aft_refactor` | Workspace-wide move, extract, inline | `op`, `path`, `symbol`, `destination` |
 
 ---
 
@@ -994,30 +993,6 @@ in it) instead of pretending the removal succeeded. For languages whose grammar 
 safely regenerated (wildcard/group/rename forms), `organize` sorts verbatim and refuses
 rather than corrupting syntax; a generated line that fails to parse rolls back and reports
 `generated_invalid_syntax` instead of a false success.
-
----
-
-### aft_refactor
-
-Workspace-wide refactoring that updates imports and references across all files.
-
-| Op | Description |
-|----|-------------|
-| `move` | Move a symbol to another file, updating all imports workspace-wide |
-| `extract` | Extract a line range (1-based) into a new function (auto-detects parameters) |
-| `inline` | Replace a call site (1-based `callSiteLine`) with the function's body |
-
-```json
-// Move a utility function to a shared module
-{
-  "op": "move",
-  "path": "src/pages/home.ts",
-  "symbol": "formatCurrency",
-  "destination": "src/utils/format.ts"
-}
-```
-
-`move` saves a checkpoint before mutating anything. Use `aft_safety undo` to revert if needed.
 
 ---
 

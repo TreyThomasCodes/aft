@@ -461,13 +461,13 @@ const AftConfigFieldsSchema = z.object({
    * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
    * - "recommended": minimal + hoisted read/write/edit/apply_patch
    *                  + ast_grep_search/replace + aft_import (default)
-   * - "all":         recommended + aft_callgraph, aft_delete, aft_move, aft_refactor
+   * - "all":         recommended + aft_callgraph, aft_delete, aft_move
    */
   tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
   /**
    * List of tool names to disable. Disabled tools are not registered with
    * OpenCode and will be invisible to agents. Use exact tool names, e.g.
-   * ["aft_callgraph", "aft_refactor"]. Hoisted names ("read", "edit") and
+   * ["aft_callgraph", "aft_move"]. Hoisted names ("read", "edit") and
    * aft-prefixed names both work. Applied after tool_surface filtering.
    */
   disabled_tools: z.array(z.string()).optional(),

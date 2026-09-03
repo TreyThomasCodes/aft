@@ -8,7 +8,6 @@ import { importTools } from "../tools/imports.js";
 import { inspectTools } from "../tools/inspect.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
-import { refactoringTools } from "../tools/refactoring.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
@@ -63,7 +62,6 @@ function buildSurface(pool: PluginContext["pool"]): Record<string, unknown> {
     ...semanticTools(ctx),
     ...inspectTools(ctx),
     ...searchTools(ctx),
-    ...refactoringTools(ctx),
     ...conflictTools(ctx),
   };
 

@@ -504,21 +504,6 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         "import { b } from './b';\nimport { a } from './a';\nexport const value = a + b;\n",
         "utf8",
       );
-      await writeFile(
-        join(env.workdir, "extract.ts"),
-        "export function calc(a: number, b: number): number {\n  const sum = a + b;\n  return sum * 2;\n}\n",
-        "utf8",
-      );
-      await writeFile(
-        join(env.workdir, "move-symbol.ts"),
-        "export function movedValue(): string {\n  return 'moved';\n}\nexport function caller(): string {\n  return movedValue();\n}\n",
-        "utf8",
-      );
-      await writeFile(
-        join(env.workdir, "inline.ts"),
-        "function addOne(value: number): number {\n  return value + 1;\n}\nexport function run(): number {\n  return addOne(2);\n}\n",
-        "utf8",
-      );
       await writeFile(join(env.workdir, "delete-me.txt"), "delete\n", "utf8");
       await writeFile(join(env.workdir, "move-me.txt"), "move\n", "utf8");
 
@@ -566,29 +551,6 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         {
           name: "aft_import",
           arguments: { op: "organize", filePath: "import-organize.ts", validate: "syntax" },
-        },
-        {
-          name: "aft_refactor",
-          arguments: {
-            op: "extract",
-            filePath: "extract.ts",
-            name: "doubleSum",
-            startLine: 2,
-            endLine: 3,
-          },
-        },
-        {
-          name: "aft_refactor",
-          arguments: {
-            op: "move",
-            filePath: "move-symbol.ts",
-            symbol: "movedValue",
-            destination: "moved-symbol-target.ts",
-          },
-        },
-        {
-          name: "aft_refactor",
-          arguments: { op: "inline", filePath: "inline.ts", symbol: "addOne", callSiteLine: 5 },
         },
         { name: "aft_delete", arguments: { files: ["delete-me.txt"] } },
         {
@@ -638,16 +600,6 @@ describe("AFT Pi tools (real Pi RPC)", () => {
       expect(await readFile(join(env.workdir, "import-organize.ts"), "utf8")).toContain(
         "import { a } from './a';",
       );
-
-      const refactorTexts = eventsForTool(events, "aft_refactor").map(resultText);
-      expect(refactorTexts.some((text) => text.includes("extracted doubleSum"))).toBe(true);
-      expect(refactorTexts.some((text) => text.includes("moved symbol movedValue"))).toBe(true);
-      expect(refactorTexts.some((text) => text.includes("inlined addOne"))).toBe(true);
-      expect(await readFile(join(env.workdir, "extract.ts"), "utf8")).toContain(
-        "function doubleSum",
-      );
-      expect(existsSync(join(env.workdir, "moved-symbol-target.ts"))).toBe(true);
-      expect(await readFile(join(env.workdir, "inline.ts"), "utf8")).not.toContain("addOne(2)");
 
       const deleteText = resultText(eventsForTool(events, "aft_delete")[0]);
       expect(deleteText).toContain("Deleted");

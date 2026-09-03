@@ -1157,7 +1157,7 @@ function moveDescription(ctx: PluginContext): string {
       : "Creates an undo backup before moving. ";
   return (
     `Move or rename a file. ${backupText}Creates parent directories for destination automatically\n` +
-    "Note: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead."
+    "Note: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports."
   );
 }
 

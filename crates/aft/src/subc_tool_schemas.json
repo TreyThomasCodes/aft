@@ -726,7 +726,7 @@
       "path",
       "destination"
     ],
-    "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead."
+    "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports."
   },
   "import": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -801,64 +801,6 @@
       "path"
     ],
     "description": "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.\n\nOps:\n- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'path'. Use aft_safety checkpoint/undo for recovery before broad cleanup."
-  },
-  "refactor": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "op": {
-        "description": "Refactoring operation",
-        "type": "string",
-        "enum": [
-          "move",
-          "extract",
-          "inline"
-        ]
-      },
-      "path": {
-        "description": "Path to the source file (absolute or relative to project root)",
-        "type": "string"
-      },
-      "symbol": {
-        "description": "Symbol name — required for 'move' and 'inline' ops",
-        "type": "string"
-      },
-      "destination": {
-        "description": "Target file path — required for 'move' op",
-        "type": "string"
-      },
-      "scope": {
-        "description": "Disambiguation scope for 'move' op — when multiple top-level symbols share the same name, specify the containing scope to disambiguate (e.g. 'MyClass'). Does NOT enable access to nested symbols or class methods.",
-        "type": "string"
-      },
-      "name": {
-        "description": "New function name — required for 'extract' op",
-        "type": "string"
-      },
-      "startLine": {
-        "description": "1-based start line — required for 'extract' op",
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 9007199254740991
-      },
-      "endLine": {
-        "description": "1-based end line (inclusive) — required for 'extract' op",
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 9007199254740991
-      },
-      "callSiteLine": {
-        "description": "1-based call site line — required for 'inline' op",
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 9007199254740991
-      }
-    },
-    "required": [
-      "op",
-      "path"
-    ],
-    "description": "Workspace-wide refactoring that updates imports and references across files.\n\nOps:\n- 'move': move a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide. A checkpoint is created first. To move/rename a whole file, use aft_move.\n- 'extract': extract a line range into a new function with auto-detected parameters (TS/JS/TSX, Python).\n- 'inline': replace a function call with the function's body."
   },
   "safety": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

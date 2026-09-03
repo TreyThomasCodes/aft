@@ -36,7 +36,6 @@ import { registerHoistedTools } from "../../tools/hoisted.js";
 import { registerImportTools } from "../../tools/imports.js";
 import { registerNavigateTool } from "../../tools/navigate.js";
 import { registerReadingTools } from "../../tools/reading.js";
-import { registerRefactorTool } from "../../tools/refactor.js";
 import { registerSafetyTool } from "../../tools/safety.js";
 import { registerSemanticTool } from "../../tools/semantic.js";
 import type { PluginContext } from "../../types.js";
@@ -316,7 +315,6 @@ export async function createHarness(
     move: true,
     astSearch: true,
     astReplace: true,
-    refactor: true,
     // E2E surface defaults to restricted mode so the existing tests that
     // expect ui.confirm prompts for external paths keep working. The new
     // regression test in hoisted.test.ts toggles this flag explicitly.
@@ -332,7 +330,6 @@ export async function createHarness(
   registerSafetyTool(api, ctx);
   registerAstTools(api, ctx, surface);
   registerFsTools(api, ctx, surface);
-  registerRefactorTool(api, ctx);
 
   const extCtx: MockExtensionContext = {
     cwd: tempDir,

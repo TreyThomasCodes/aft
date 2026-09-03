@@ -9,13 +9,12 @@ import { importTools } from "./tools/imports.js";
 import { inspectToolSurfaceEnabled, inspectTools } from "./tools/inspect.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
-import { refactoringTools } from "./tools/refactoring.js";
 import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
-const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move", "aft_refactor"] as const;
+const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move"] as const;
 
 /** Returns true when bare `edit` remains available after surface, hoisting, and disable filters. */
 export function openCodeEditSlotSurvives(config: AftConfig): boolean {
@@ -114,7 +113,6 @@ export function buildOpenCodeToolMap(
       ...(surface !== "minimal" && config.semantic_search === true && semanticTools(ctx)),
       ...(inspectToolSurfaceEnabled(config) && inspectTools(ctx)),
       ...(surface !== "minimal" && config.search_index === true && searchTools(ctx)),
-      ...refactoringTools(ctx),
       ...(surface !== "minimal" && conflictTools(ctx)),
     },
     { hashlineEffective: ctx.hashlineEffective },

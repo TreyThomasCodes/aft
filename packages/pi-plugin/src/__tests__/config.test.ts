@@ -260,7 +260,7 @@ describe("loadAftConfig", () => {
     writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ disabled_tools: ["aft_safety", "aft_refactor"] }),
+      JSON.stringify({ disabled_tools: ["aft_safety", "aft_move"] }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -270,7 +270,7 @@ describe("loadAftConfig", () => {
 
     const config = JSON.parse(result.stdout);
     expect(config.disabled_tools).toContain("aft_safety");
-    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toContain("aft_move");
     expect(config.disabled_tools).toHaveLength(2);
   });
 

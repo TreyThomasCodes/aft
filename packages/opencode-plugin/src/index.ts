@@ -234,7 +234,6 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
  * - Safety: aft_safety
  * - Imports: aft_import
  * - Navigation: aft_callgraph
- * - Refactoring: aft_refactor
  */
 // OpenCode currently calls this function more than once per process when a
 // single plugin is configured — see https://github.com/anomalyco/opencode/issues/26812.

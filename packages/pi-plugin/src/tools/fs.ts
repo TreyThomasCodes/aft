@@ -228,7 +228,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           (backupsDisabled
             ? "Backup capture is disabled by user config. "
             : "Creates an undo backup before moving. ") +
-          "Creates parent directories for the destination automatically. This operates on files at the OS level — to relocate a code symbol between files, use `aft_refactor` with op='move' instead.",
+          "Creates parent directories for the destination automatically. This operates on whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
         parameters: MoveParams,
         async execute(
           _toolCallId: string,

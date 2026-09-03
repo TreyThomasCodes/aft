@@ -33,7 +33,6 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
             | "delete"
             | "move"
             | "import"
-            | "refactor"
             | "safety"
     )
 }
@@ -168,7 +167,6 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "remove_import"
         | "organize_imports"
         | "configure"
-        | "refactor"
         | "move_symbol"
         | "extract_function"
         | "inline_symbol"
@@ -254,7 +252,6 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 tool("delete", ExecutionMode::Mutating),
                 tool("move", ExecutionMode::Mutating),
                 tool("import", ExecutionMode::Mutating),
-                tool("refactor", ExecutionMode::Mutating),
                 tool("safety", ExecutionMode::Mutating),
             ],
             identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
@@ -318,7 +315,6 @@ mod tests {
         "delete",
         "move",
         "import",
-        "refactor",
         "safety",
     ];
 
@@ -489,7 +485,6 @@ mod tests {
             "delete",
             "move",
             "import",
-            "refactor",
             "safety",
         ] {
             assert_eq!(

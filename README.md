@@ -116,7 +116,6 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 - **`edit`**: find/replace with fuzzy matching, or replace a named symbol directly. Batch edits, multi-file transactions, and glob replace across matching files.
 - **`write`**: write a file with auto-created directories, backup, formatting, and optional inline diagnostics.
 - **`apply_patch`**: multi-file `*** Begin Patch` format with atomic rollback.
-- **`aft_refactor`**: workspace-wide symbol move (updates every import), function extraction, and inlining.
 - **`aft_import`**: language-aware import add, remove, and organize.
 - **`ast_grep_search` / `ast_grep_replace`**: structural search and replace using AST patterns with meta-variables.
 

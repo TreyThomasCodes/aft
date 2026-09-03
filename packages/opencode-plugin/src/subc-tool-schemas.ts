@@ -15,7 +15,6 @@ import { importTools } from "./tools/imports.js";
 import { inspectTools } from "./tools/inspect.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
-import { refactoringTools } from "./tools/refactoring.js";
 import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
@@ -52,7 +51,6 @@ const BARE_TOOL_ORDER = [
   "delete",
   "move",
   "import",
-  "refactor",
   "safety",
 ] as const;
 
@@ -116,7 +114,6 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   const astSearch = ast.ast_grep_search ?? ast.aft_ast_search;
   const astReplace = ast.ast_grep_replace ?? ast.aft_ast_replace;
   const importTool = importTools(ctx).aft_import;
-  const refactor = refactoringTools(ctx).aft_refactor;
   const safety = safetyTools(ctx).aft_safety;
   if (
     !search ||
@@ -128,7 +125,6 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     !astSearch ||
     !astReplace ||
     !importTool ||
-    !refactor ||
     !safety
   ) {
     throw new Error("all subc manifest tools must expose an agent tool schema");
@@ -177,7 +173,6 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     delete: argsToJsonSchema(deleteTool),
     move: argsToJsonSchema(moveTool),
     import: argsToJsonSchema(importTool),
-    refactor: argsToJsonSchema(refactor),
     safety: argsToJsonSchema(safety),
   };
 }

@@ -96,7 +96,7 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
   it("unions disabled_tools from user and project configs", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_callgraph"] }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_refactor"] }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_move"] }));
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
@@ -105,7 +105,7 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
 
     const config = JSON.parse(result.stdout);
     expect(config.disabled_tools).toContain("aft_callgraph");
-    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toContain("aft_move");
     expect(config.disabled_tools).toHaveLength(2);
   });
 
@@ -113,9 +113,9 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ disabled_tools: ["aft_callgraph", "aft_refactor"] }),
+      JSON.stringify({ disabled_tools: ["aft_callgraph", "aft_move"] }),
     );
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_refactor"] }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: ["aft_move"] }));
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
@@ -124,7 +124,7 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
 
     const config = JSON.parse(result.stdout);
     expect(config.disabled_tools).toContain("aft_callgraph");
-    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toContain("aft_move");
     expect(config.disabled_tools).toHaveLength(2);
   });
 
@@ -163,7 +163,7 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
     writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: ["aft_safety"] }));
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ disabled_tools: ["aft_safety", "aft_refactor"] }),
+      JSON.stringify({ disabled_tools: ["aft_safety", "aft_move"] }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -173,7 +173,7 @@ describe("loadAftConfig — disabled_tools merge behavior", () => {
 
     const config = JSON.parse(result.stdout);
     expect(config.disabled_tools).toContain("aft_safety");
-    expect(config.disabled_tools).toContain("aft_refactor");
+    expect(config.disabled_tools).toContain("aft_move");
     expect(config.disabled_tools).toHaveLength(2);
   });
 
