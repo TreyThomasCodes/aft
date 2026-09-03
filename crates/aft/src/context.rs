@@ -1770,7 +1770,9 @@ pub struct AppContext {
     /// without delivering an index, so a persistently failing worker cannot be
     /// relaunched in a loop on the drain thread. Resets when the configure
     /// generation advances.
-    search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32)>,
+    // Generation, automatic replacement count, and the earliest time a query may
+    // probe again after repeated load disconnects.
+    search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
     search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
@@ -2236,7 +2238,7 @@ impl AppContext {
             search_index_rx_generation: AtomicU64::new(0),
             search_index_rx_epoch: AtomicU64::new(0),
             search_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
-            search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0)),
+            search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
@@ -5051,23 +5053,51 @@ impl AppContext {
     }
 
     /// Allow one automatic search-index replacement load per configure
-    /// generation. The drain disconnect path calls this before rescheduling a
-    /// load whose worker exited without delivering an index; capping it at one
-    /// prevents a persistently failing worker from being relaunched in a loop on
-    /// the drain thread. After the cap is hit, the query-triggered reload
-    /// (`trigger_search_index_reload_if_evicted`) remains the recovery path.
+    /// generation. A second disconnect opens a retry cooldown so queued fallback
+    /// queries cannot each launch the same load again after the worker exits.
     pub(crate) fn allow_search_index_disconnect_reschedule(&self) -> bool {
         const MAX_REPLACEMENTS_PER_GENERATION: u32 = 1;
+        const QUERY_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
         let generation = self.configure_generation();
         let mut state = self.search_index_disconnect_reschedule.lock();
         if state.0 != generation {
-            *state = (generation, 0);
+            *state = (generation, 0, None);
         }
         if state.1 >= MAX_REPLACEMENTS_PER_GENERATION {
+            state.2 = Some(Instant::now() + QUERY_RETRY_COOLDOWN);
             return false;
         }
         state.1 += 1;
         true
+    }
+
+    pub(crate) fn search_index_query_reload_allowed(&self) -> bool {
+        let generation = self.configure_generation();
+        let now = Instant::now();
+        let mut state = self.search_index_disconnect_reschedule.lock();
+        if state.0 != generation {
+            *state = (generation, 0, None);
+            return true;
+        }
+        let Some(retry_at) = state.2 else {
+            return true;
+        };
+        if now < retry_at {
+            return false;
+        }
+        // Record the next retry while holding this mutex so another query cannot
+        // consume the same retry opportunity. Receiver installation is separately
+        // serialized by `artifact_reload_lock`.
+        state.2 = Some(now + Duration::from_secs(60));
+        true
+    }
+
+    pub(crate) fn note_search_index_load_succeeded(&self) {
+        let generation = self.configure_generation();
+        let mut state = self.search_index_disconnect_reschedule.lock();
+        if state.0 == generation {
+            state.2 = None;
+        }
     }
 
     pub(crate) fn next_search_persist_epoch(&self) -> u64 {
@@ -6375,6 +6405,9 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // Intentional idle eviction starts a new reload lifecycle; a cooldown
+        // from an earlier failed load must not suppress the first reopen.
+        self.note_search_index_load_succeeded();
         self.semantic_index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

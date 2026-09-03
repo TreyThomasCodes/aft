@@ -479,6 +479,7 @@ pub fn drain_search_index_events(ctx: &AppContext) {
         if !installed_index {
             return;
         }
+        ctx.note_search_index_load_succeeded();
     } else if disconnected {
         let cleared = ctx
             .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
@@ -3713,7 +3714,15 @@ mod tests {
             !ctx.allow_search_index_disconnect_reschedule(),
             "a second automatic replacement in the same generation must be denied"
         );
+        assert!(
+            !ctx.search_index_query_reload_allowed(),
+            "queued queries must use fallback during the retry cooldown"
+        );
         ctx.advance_configure_generation();
+        assert!(
+            ctx.search_index_query_reload_allowed(),
+            "a new configure generation must clear the retry cooldown"
+        );
         assert!(
             ctx.allow_search_index_disconnect_reschedule(),
             "advancing the configure generation must reset the replacement cap"

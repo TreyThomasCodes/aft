@@ -3122,7 +3122,7 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// may temporarily hide in-flight local edits from search; that is the
 /// intended initial behavior.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
-    if ctx.canonical_cache_root_opt().is_none() {
+    if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
         return false;
     }
     let generation = ctx.configure_generation();
@@ -3157,7 +3157,7 @@ pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bo
         // so a raced-ahead replacement does not waste the slot.
         if !ctx.allow_search_index_disconnect_reschedule() {
             crate::slog_info!(
-                "search index load disconnected without an index; automatic replacement already used for this configure generation, leaving query-triggered reload as recovery"
+                "search index load disconnected without an index; automatic replacement already used for this configure generation, cooling down query-triggered reloads for 60s"
             );
             return false;
         }
@@ -7409,7 +7409,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_absent_search_loader_wakes_completion_drain() {
+    fn read_only_absent_search_loader_cools_down_query_retries_after_replacement() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let ctx = test_context();
@@ -7446,10 +7446,10 @@ mod tests {
         }
 
         assert!(
-            super::trigger_search_index_reload_if_evicted(&ctx),
-            "a later query must be able to retry the read-only snapshot"
+            !super::trigger_search_index_reload_if_evicted(&ctx),
+            "queued queries must not each retry an absent read-only snapshot"
         );
-        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
     }
