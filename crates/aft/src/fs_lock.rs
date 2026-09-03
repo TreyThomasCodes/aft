@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,51 @@ pub const POLL_INTERVAL_MS: u64 = 100;
 /// retry rides them out while a genuinely persistent permission/IO failure still
 /// surfaces promptly.
 const MAX_TRANSIENT_CREATE_RETRIES: u32 = 50;
+const RECLAIM_TOKEN_MALFORMED_STALE_AGE: Duration = Duration::from_secs(60);
+const RECLAIM_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const DEAD_RECLAIM_INITIAL_BACKOFF_MS: u64 = 250;
+const DEAD_RECLAIM_MAX_BACKOFF_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimTokenState {
+    Alive,
+    DeadForeignHost,
+    Malformed,
+    Dead,
+}
+
+impl ReclaimTokenState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::DeadForeignHost => "dead-foreign-host",
+            Self::Malformed => "malformed",
+            Self::Dead => "dead",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReclaimTokenHeld {
+    pid: Option<u32>,
+    state: ReclaimTokenState,
+}
+
+#[derive(Debug)]
+enum ReclaimResult {
+    Removed,
+    Blocked(ReclaimTokenHeld),
+    Unchanged,
+}
+
+#[derive(Clone, Debug)]
+struct ReclaimBlockLogRecord {
+    last_emitted: Instant,
+    suppressed: u64,
+}
+
+static RECLAIM_BLOCK_LOGS: OnceLock<Mutex<HashMap<PathBuf, ReclaimBlockLogRecord>>> =
+    OnceLock::new();
 
 /// True for OS errors that mean "another actor is touching this exact lock path
 /// right now", as opposed to a real, persistent failure. On Windows a contended
@@ -239,6 +285,7 @@ fn acquire_with_config(
     let mut warned_stale_live_owner = false;
     let mut transient_create_failures: u32 = 0;
     let mut attempted_once = false;
+    let mut dead_reclaim_blocked_attempts = 0_u32;
     // A zero-timeout acquire still gets one immediate retry after it removes a
     // stale lock; otherwise it would reap the dead owner and report Timeout.
     let mut immediate_retry_budget = 0_u8;
@@ -311,19 +358,27 @@ fn acquire_with_config(
         let since_heartbeat = now.saturating_sub(metadata.heartbeat_at_ms);
 
         if metadata.hostname != hostname {
+            dead_reclaim_blocked_attempts = 0;
             let cross_host_stale_ms = config.cross_host_stale_heartbeat_ms();
             if since_heartbeat > cross_host_stale_ms {
-                slog_warn!(
-                    "reclaiming cross-host filesystem lock at {} from host {} after stale heartbeat ({}ms > {}ms)",
-                    path.display(),
-                    metadata.hostname,
-                    since_heartbeat,
-                    cross_host_stale_ms
-                );
-                // Compare-and-delete: only remove if it's still the SAME stale
-                // owner (a fresh owner may have acquired it in the gap).
-                if reclaim_lock_file(path, &metadata)? {
-                    immediate_retry_budget = 1;
+                match reclaim_lock_file(path, &metadata)? {
+                    ReclaimResult::Removed => {
+                        slog_warn!(
+                            "reclaimed cross-host filesystem lock at {} from host {} after stale heartbeat ({}ms > {}ms)",
+                            path.display(),
+                            metadata.hostname,
+                            since_heartbeat,
+                            cross_host_stale_ms
+                        );
+                        immediate_retry_budget = 1;
+                    }
+                    ReclaimResult::Blocked(holder) => {
+                        log_reclaim_blocked(path, &holder);
+                        sleep_until_retry(deadline, config.poll_interval_ms)?;
+                    }
+                    ReclaimResult::Unchanged => {
+                        sleep_until_retry(deadline, config.poll_interval_ms)?;
+                    }
                 }
                 continue;
             }
@@ -332,19 +387,33 @@ fn acquire_with_config(
         }
 
         if !lock_owner_is_alive(&metadata) {
-            slog_warn!(
-                "removing filesystem lock at {} from dead or recycled PID {}",
-                path.display(),
-                metadata.pid
-            );
-            // Compare-and-delete: only remove if it's still this dead owner's
-            // lock. A fresh owner could have written a new lock (with a recycled
-            // or different PID) between our liveness check and the unlink.
-            if reclaim_lock_file(path, &metadata)? {
-                immediate_retry_budget = 1;
+            match reclaim_lock_file(path, &metadata)? {
+                ReclaimResult::Removed => {
+                    slog_warn!(
+                        "removing filesystem lock at {} from dead or recycled PID {}",
+                        path.display(),
+                        metadata.pid
+                    );
+                    immediate_retry_budget = 1;
+                    dead_reclaim_blocked_attempts = 0;
+                }
+                ReclaimResult::Blocked(holder) => {
+                    log_reclaim_blocked(path, &holder);
+                    let backoff_ms = dead_reclaim_backoff_ms(
+                        dead_reclaim_blocked_attempts,
+                        config.poll_interval_ms,
+                    );
+                    dead_reclaim_blocked_attempts = dead_reclaim_blocked_attempts.saturating_add(1);
+                    sleep_until_retry(deadline, backoff_ms)?;
+                }
+                ReclaimResult::Unchanged => {
+                    dead_reclaim_blocked_attempts = 0;
+                    sleep_until_retry(deadline, config.poll_interval_ms)?;
+                }
             }
             continue;
         }
+        dead_reclaim_blocked_attempts = 0;
 
         if since_heartbeat > config.stale_heartbeat_ms && !warned_stale_live_owner {
             // Same-host PID plus start-time identity is authoritative. A
@@ -759,27 +828,30 @@ fn remove_lock_file(path: &Path) -> io::Result<()> {
 /// `remove_file` would then delete the fresh owner's lock, allowing split-brain
 /// writers. Re-read immediately before the unlink and bail if the full owner
 /// identity changed or the file vanished. POSIX has no atomic compare-and-unlink,
-/// so a microscopic residual race remains, but this
-/// shrinks the window from the whole judgment/poll duration to a couple of
-/// syscalls — the standard mitigation. Returns true if we removed it.
-fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<bool> {
-    let Some(_token) = acquire_reclaim_token(path)? else {
-        return Ok(false);
+/// so a microscopic residual race remains, but this shrinks the window from the
+/// whole judgment/poll duration to a couple of syscalls — the standard mitigation.
+fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<ReclaimResult> {
+    let token = match acquire_reclaim_token(path)? {
+        ReclaimTokenAcquire::Acquired(token) => token,
+        ReclaimTokenAcquire::Held(holder) => return Ok(ReclaimResult::Blocked(holder)),
     };
+    let _token = token;
     match read_lock_metadata(path) {
         Ok(current) => {
             if lock_identity_matches(&current, judged) {
                 remove_lock_file(path)?;
-                Ok(true)
+                Ok(ReclaimResult::Removed)
             } else {
                 // A different owner acquired it in the gap — do NOT delete.
-                Ok(false)
+                Ok(ReclaimResult::Unchanged)
             }
         }
         // Already gone (released/reclaimed by someone else) — nothing to do.
-        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(ReclaimResult::Unchanged)
+        }
         // Malformed now (mid-write by a new owner) — don't delete; retry next poll.
-        Err(ReadLockError::Malformed(_)) => Ok(false),
+        Err(ReadLockError::Malformed(_)) => Ok(ReclaimResult::Unchanged),
         Err(ReadLockError::Io(error)) => Err(error),
     }
 }
@@ -795,32 +867,152 @@ impl Drop for ReclaimTokenGuard {
     }
 }
 
-fn acquire_reclaim_token(lock_path: &Path) -> io::Result<Option<ReclaimTokenGuard>> {
+fn acquire_reclaim_token(lock_path: &Path) -> io::Result<ReclaimTokenAcquire> {
     let token_path = reclaim_token_path(lock_path);
+    let metadata = current_reclaim_token_metadata();
+
+    match create_reclaim_token(&token_path, &metadata) {
+        Ok(guard) => return Ok(ReclaimTokenAcquire::Acquired(guard)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let stale = match inspect_reclaim_token(&token_path)? {
+        ExistingReclaimToken::Held(holder) => return Ok(ReclaimTokenAcquire::Held(holder)),
+        ExistingReclaimToken::StaleValid(owner) => remove_lock_if_owned(&token_path, &owner)?,
+        ExistingReclaimToken::StaleMalformed => remove_malformed_reclaim_token(&token_path)?,
+        ExistingReclaimToken::Missing => true,
+    };
+    if !stale {
+        return inspect_reclaim_token_as_held(&token_path);
+    }
+
+    // A stale-token takeover gets exactly one O_EXCL retry. Another contender may
+    // win after the unlink; never loop and accidentally turn reclamation into a
+    // second lock-acquisition spin.
+    match create_reclaim_token(&token_path, &metadata) {
+        Ok(guard) => Ok(ReclaimTokenAcquire::Acquired(guard)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            inspect_reclaim_token_as_held(&token_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+enum ReclaimTokenAcquire {
+    Acquired(ReclaimTokenGuard),
+    Held(ReclaimTokenHeld),
+}
+
+enum ExistingReclaimToken {
+    Held(ReclaimTokenHeld),
+    StaleValid(LockMetadata),
+    StaleMalformed,
+    Missing,
+}
+
+fn current_reclaim_token_metadata() -> LockMetadata {
     let pid = std::process::id();
     let process_identity = process_identity(pid);
-    let metadata = LockMetadata {
+    let now = now_ms();
+    LockMetadata {
         pid,
         hostname: current_hostname(),
         process_start_time: process_identity
             .as_ref()
             .map(|identity| identity.start_time),
         boot_id: process_identity.and_then(|identity| identity.boot_id),
-        created_at_ms: now_ms(),
-        heartbeat_at_ms: now_ms(),
+        created_at_ms: now,
+        heartbeat_at_ms: now,
         writer_epoch: format!("reclaim-{pid}-{}", now_nanos()),
-    };
-    let mut file = match open_new_lock_file(&token_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if let Err(error) = write_lock_metadata_to_file(&mut file, &metadata) {
-        let _ = fs::remove_file(&token_path);
+    }
+}
+
+fn create_reclaim_token(
+    token_path: &Path,
+    metadata: &LockMetadata,
+) -> io::Result<ReclaimTokenGuard> {
+    let mut file = open_new_lock_file(token_path)?;
+    if let Err(error) = write_lock_metadata_to_file(&mut file, metadata) {
+        let _ = fs::remove_file(token_path);
         return Err(error);
     }
-    sync_parent(&token_path);
-    Ok(Some(ReclaimTokenGuard { path: token_path }))
+    sync_parent(token_path);
+    Ok(ReclaimTokenGuard {
+        path: token_path.to_path_buf(),
+    })
+}
+
+fn inspect_reclaim_token(token_path: &Path) -> io::Result<ExistingReclaimToken> {
+    match read_lock_metadata(token_path) {
+        Ok(metadata) if metadata.hostname != current_hostname() => {
+            Ok(ExistingReclaimToken::Held(ReclaimTokenHeld {
+                pid: Some(metadata.pid),
+                state: ReclaimTokenState::DeadForeignHost,
+            }))
+        }
+        Ok(metadata) if lock_owner_is_alive(&metadata) => {
+            Ok(ExistingReclaimToken::Held(ReclaimTokenHeld {
+                pid: Some(metadata.pid),
+                state: ReclaimTokenState::Alive,
+            }))
+        }
+        Ok(metadata) => Ok(ExistingReclaimToken::StaleValid(metadata)),
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(ExistingReclaimToken::Missing)
+        }
+        Err(ReadLockError::Io(error)) => Err(error),
+        Err(ReadLockError::Malformed(_)) => {
+            let old_enough = fs::metadata(token_path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age > RECLAIM_TOKEN_MALFORMED_STALE_AGE);
+            if old_enough {
+                Ok(ExistingReclaimToken::StaleMalformed)
+            } else {
+                Ok(ExistingReclaimToken::Held(ReclaimTokenHeld {
+                    pid: malformed_token_pid(token_path),
+                    state: ReclaimTokenState::Malformed,
+                }))
+            }
+        }
+    }
+}
+
+fn inspect_reclaim_token_as_held(token_path: &Path) -> io::Result<ReclaimTokenAcquire> {
+    let holder = match inspect_reclaim_token(token_path)? {
+        ExistingReclaimToken::Held(holder) => holder,
+        ExistingReclaimToken::StaleValid(metadata) => ReclaimTokenHeld {
+            pid: Some(metadata.pid),
+            state: ReclaimTokenState::Dead,
+        },
+        ExistingReclaimToken::StaleMalformed | ExistingReclaimToken::Missing => ReclaimTokenHeld {
+            pid: malformed_token_pid(token_path),
+            state: ReclaimTokenState::Malformed,
+        },
+    };
+    Ok(ReclaimTokenAcquire::Held(holder))
+}
+
+fn malformed_token_pid(token_path: &Path) -> Option<u32> {
+    let bytes = fs::read(token_path).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+fn remove_malformed_reclaim_token(token_path: &Path) -> io::Result<bool> {
+    match fs::remove_file(token_path) {
+        Ok(()) => {
+            sync_parent(token_path);
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn reclaim_token_path(lock_path: &Path) -> PathBuf {
@@ -831,8 +1023,77 @@ fn reclaim_token_path(lock_path: &Path) -> PathBuf {
     lock_path.with_file_name(format!(".{file_name}.reclaim"))
 }
 
+fn dead_reclaim_backoff_ms(blocked_attempt: u32, poll_interval_ms: u64) -> u64 {
+    let base = poll_interval_ms.max(DEAD_RECLAIM_INITIAL_BACKOFF_MS);
+    base.saturating_mul(
+        1_u64
+            .checked_shl(blocked_attempt.min(20))
+            .unwrap_or(u64::MAX),
+    )
+    .min(DEAD_RECLAIM_MAX_BACKOFF_MS)
+}
+
+fn log_reclaim_blocked(path: &Path, holder: &ReclaimTokenHeld) {
+    let now = Instant::now();
+    let logs = RECLAIM_BLOCK_LOGS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut logs) = logs.lock() else {
+        return;
+    };
+    let message = match logs.get_mut(path) {
+        Some(record)
+            if now.saturating_duration_since(record.last_emitted) < RECLAIM_BLOCK_LOG_INTERVAL =>
+        {
+            record.suppressed = record.suppressed.saturating_add(1);
+            return;
+        }
+        Some(record) => {
+            let suppressed = record.suppressed;
+            record.last_emitted = now;
+            record.suppressed = 0;
+            format_reclaim_blocked(path, holder, suppressed)
+        }
+        None => {
+            logs.insert(
+                path.to_path_buf(),
+                ReclaimBlockLogRecord {
+                    last_emitted: now,
+                    suppressed: 0,
+                },
+            );
+            format_reclaim_blocked(path, holder, 0)
+        }
+    };
+    drop(logs);
+    emit_reclaim_warning(message);
+}
+
+fn format_reclaim_blocked(path: &Path, holder: &ReclaimTokenHeld, suppressed: u64) -> String {
+    let pid = holder
+        .pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut message = format!(
+        "reclaim of {} blocked: reclaim token held by pid {} ({})",
+        path.display(),
+        pid,
+        holder.state.as_str()
+    );
+    if suppressed > 0 {
+        message.push_str(&format!(" (repeated {suppressed}x in 60s)"));
+    }
+    message
+}
+
+fn emit_reclaim_warning(message: String) {
+    #[cfg(test)]
+    RECLAIM_TEST_LOGS.with(|logs| logs.borrow_mut().push(message.clone()));
+    slog_warn!("{}", message);
+}
+
 #[cfg(test)]
 thread_local! {
+    static RECLAIM_TEST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+
     // The observer is thread-local so concurrent lock tests cannot record one
     // another's retry decisions.
     static RETRY_SLEEP_OBSERVER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> =
@@ -1190,6 +1451,16 @@ mod tests {
         start_time.checked_add(1).unwrap_or(start_time - 1)
     }
 
+    fn write_reclaim_token(lock_path: &Path, metadata: &LockMetadata) -> PathBuf {
+        let token_path = reclaim_token_path(lock_path);
+        write_synthetic_lock(&token_path, metadata);
+        token_path
+    }
+
+    fn take_reclaim_test_logs() -> Vec<String> {
+        RECLAIM_TEST_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+    }
+
     #[test]
     fn lock_operation_trace_lines_are_debug_not_info() {
         let source = include_str!("fs_lock.rs");
@@ -1262,8 +1533,11 @@ mod tests {
         // We judged a DIFFERENT (older) owner A as stale. Reclaiming must NOT
         // delete B's lock (the TOCTOU split-brain guard).
         let judged_a = synthetic_metadata(1111, "host-a".to_string(), now_ms() - 1_000_000);
-        let removed = reclaim_lock_file(&path, &judged_a).expect("reclaim");
-        assert!(!removed, "must not remove a different owner's lock");
+        let outcome = reclaim_lock_file(&path, &judged_a).expect("reclaim");
+        assert!(
+            matches!(outcome, ReclaimResult::Unchanged),
+            "must not remove a different owner's lock"
+        );
         assert!(path.exists(), "owner B's lock must survive");
         let still = read_lock_metadata(&path).expect("still readable");
         assert_eq!(still.pid, 4242, "owner B's lock intact");
@@ -1276,12 +1550,18 @@ mod tests {
         create_lock_file_atomically(&path, &owner).expect("write lock");
 
         // Same identity we judged → safe to remove.
-        let removed = reclaim_lock_file(&path, &owner).expect("reclaim");
-        assert!(removed, "matching-identity stale lock should be removed");
+        let outcome = reclaim_lock_file(&path, &owner).expect("reclaim");
+        assert!(
+            matches!(outcome, ReclaimResult::Removed),
+            "matching-identity stale lock should be removed"
+        );
         assert!(!path.exists());
 
         // Reclaiming a now-absent lock is a no-op, not an error.
-        assert!(!reclaim_lock_file(&path, &owner).expect("reclaim missing"));
+        assert!(matches!(
+            reclaim_lock_file(&path, &owner).expect("reclaim missing"),
+            ReclaimResult::Unchanged
+        ));
     }
 
     #[test]
@@ -1473,6 +1753,112 @@ mod tests {
         let metadata = read_lock_metadata(&path).expect("read reclaimed lock");
         assert_eq!(metadata.pid, std::process::id());
         drop(guard);
+    }
+
+    #[test]
+    fn dead_same_host_reclaim_token_is_reaped_with_stale_lock() {
+        let (_dir, path) = test_lock_path();
+        let stale = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &stale);
+        let token_path = write_reclaim_token(&path, &stale);
+
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
+            .expect("dead token must not wedge stale-lock reclamation");
+        assert!(!token_path.exists(), "stale reclaim token must be removed");
+        drop(guard);
+        assert!(!path.exists(), "acquired lock must be released normally");
+    }
+
+    #[test]
+    fn live_reclaim_token_blocks_and_is_untouched() {
+        let (_dir, path) = test_lock_path();
+        let stale = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &stale);
+        let live = current_process_metadata();
+        let token_path = write_reclaim_token(&path, &live);
+
+        let result = acquire_with_config(&path, Some(Duration::ZERO), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(read_lock_metadata(&token_path).expect("live token"), live);
+    }
+
+    #[test]
+    fn foreign_host_reclaim_token_is_authoritative() {
+        let (_dir, path) = test_lock_path();
+        let stale = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &stale);
+        let mut foreign = stale.clone();
+        foreign.hostname = format!("{}-foreign", current_hostname());
+        let token_path = write_reclaim_token(&path, &foreign);
+
+        let result = acquire_with_config(&path, Some(Duration::ZERO), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        assert_eq!(
+            read_lock_metadata(&token_path).expect("foreign token"),
+            foreign
+        );
+    }
+
+    #[test]
+    fn malformed_reclaim_token_is_held_until_older_than_sixty_seconds() {
+        use filetime::{set_file_mtime, FileTime};
+
+        let (_dir, path) = test_lock_path();
+        let stale = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &stale);
+        let token_path = reclaim_token_path(&path);
+        fs::write(&token_path, b"{ malformed").expect("write malformed token");
+
+        let young_result = acquire_with_config(&path, Some(Duration::ZERO), test_config());
+        assert!(matches!(young_result, Err(AcquireError::Timeout)));
+        assert_eq!(fs::read(&token_path).expect("young token"), b"{ malformed");
+
+        let old = SystemTime::now()
+            .checked_sub(RECLAIM_TOKEN_MALFORMED_STALE_AGE + Duration::from_secs(1))
+            .expect("old timestamp");
+        set_file_mtime(&token_path, FileTime::from_system_time(old)).expect("age token");
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
+            .expect("old malformed token should be reclaimed");
+        assert!(!token_path.exists());
+        drop(guard);
+    }
+
+    #[test]
+    fn held_reclaim_token_logs_blocked_without_claiming_lock_removal() {
+        let (_dir, path) = test_lock_path();
+        let stale = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &stale);
+        let live = current_process_metadata();
+        write_reclaim_token(&path, &live);
+        take_reclaim_test_logs();
+
+        let result = acquire_with_config(&path, Some(Duration::ZERO), test_config());
+        assert!(matches!(result, Err(AcquireError::Timeout)));
+        let logs = take_reclaim_test_logs();
+        assert!(logs.iter().any(|line| {
+            line.contains(&format!("reclaim of {} blocked", path.display()))
+                && line.contains(&format!("pid {} (alive)", live.pid))
+        }));
+        assert!(!logs
+            .iter()
+            .any(|line| line.contains("removing filesystem lock")));
+    }
+
+    #[test]
+    fn dead_unreclaimable_lock_retry_backoff_stays_bounded() {
+        let mut elapsed_ms = 0_u64;
+        let mut attempts = 0_u32;
+        while elapsed_ms < 60_000 {
+            elapsed_ms = elapsed_ms.saturating_add(dead_reclaim_backoff_ms(attempts, 100));
+            attempts += 1;
+        }
+
+        assert!(
+            attempts <= 17,
+            "{attempts} retries exceed the one-minute bound"
+        );
+        assert_eq!(dead_reclaim_backoff_ms(0, 100), 250);
+        assert_eq!(dead_reclaim_backoff_ms(20, 100), 5_000);
     }
 
     #[test]
