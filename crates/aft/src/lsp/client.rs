@@ -34,13 +34,6 @@ const STDERR_LINE_BYTES: usize = 4 * 1024;
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
 type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
 
-#[cfg(windows)]
-fn is_windows_batch_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
-}
-
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -178,17 +171,22 @@ impl LspClient {
         reclaim_root: Option<&Path>,
     ) -> io::Result<Self> {
         #[cfg(windows)]
-        let mut command = if is_windows_batch_file(binary) {
-            let mut command = Command::new("cmd.exe");
-            command.arg("/C").arg(binary.as_os_str());
-            command
+        let is_batch_file = crate::windows_command::is_batch_file(binary);
+        #[cfg(windows)]
+        let mut command = if is_batch_file {
+            crate::windows_command::batch_command(binary, args.iter())?
         } else {
             Command::new(binary)
         };
         #[cfg(not(windows))]
         let mut command = crate::effective_path::new_command(binary);
+        #[cfg(windows)]
+        if !is_batch_file {
+            command.args(args);
+        }
+        #[cfg(not(windows))]
+        command.args(args);
         command
-            .args(args)
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -196,6 +194,13 @@ impl LspClient {
             // actionable diagnostics without risking pipe-buffer deadlock.
             .stderr(Stdio::piped());
         for (key, value) in env {
+            #[cfg(windows)]
+            if is_batch_file && crate::windows_command::is_batch_internal_env(key, args.len()) {
+                crate::slog_warn!(
+                    "ignoring reserved batch-shim environment variable {key} for LSP server"
+                );
+                continue;
+            }
             command.env(key, value);
         }
 
