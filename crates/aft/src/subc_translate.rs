@@ -2584,8 +2584,9 @@ mod tests {
         // not supplied, so the translated args carry no `path` key at all.
         // Each tool still needs its own required fields, so supply them and
         // assert the empty path sentinel is gone from the output.
-        let conflicts = subc_translate_owned("conflicts", serde_json::json!({ "path": "" }), project)
-            .expect("conflicts with empty path");
+        let conflicts =
+            subc_translate_owned("conflicts", serde_json::json!({ "path": "" }), project)
+                .expect("conflicts with empty path");
         assert!(!conflicts.args.contains_key("path"));
 
         let grep = subc_translate_owned(
