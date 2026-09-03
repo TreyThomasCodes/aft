@@ -22,6 +22,7 @@ use base64::Engine;
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::manifest::ProviderRole;
 
@@ -428,6 +429,7 @@ struct StatePaths {
     last_valid_manifest: PathBuf,
     version_high_water: PathBuf,
     numeric_ids: PathBuf,
+    manifests_dir: PathBuf,
 }
 
 impl StatePaths {
@@ -457,6 +459,7 @@ impl StatePaths {
             last_valid_manifest: root.join("last-valid-manifest.json"),
             version_high_water: root.join("manifest-version-high-water.json"),
             numeric_ids: root.join("numeric-ids.json"),
+            manifests_dir: root.join("manifests"),
             root,
         }
     }
@@ -1704,6 +1707,11 @@ fn load_manifest_with_trust_set(
         write_version_high_water(paths, manifest.manifest_version);
     }
     write_last_valid_manifest(paths, &manifest);
+    // Retain the exact verified bytes for later reproducibility checks. The
+    // signature already verified above; the admission filter re-checks that the
+    // version inside the verified payload matches the filing name. This never
+    // affects activation.
+    retain_manifest(paths, &envelope, manifest.manifest_version);
     Ok(VerifiedManifest {
         manifest,
         verified_by_key_id,
@@ -2020,6 +2028,110 @@ fn write_version_high_water(paths: &StatePaths, newest_accepted_version: u64) {
     let temporary = paths.version_high_water.with_extension("tmp");
     if fs::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.version_high_water);
+    }
+}
+
+/// One retained signed manifest: the exact verified payload bytes, the
+/// signature, and the key id. This is byte-for-byte what was verified, never a
+/// re-serialization, so a later reproducibility check (e.g. the signer needing
+/// the v7 bytes) can read it back and re-verify it without trusting this
+/// machine's memory of the manifest.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RetainedManifest {
+    manifest_bytes: String,
+    signature: String,
+    key_id: String,
+}
+
+/// Retain one accepted signed manifest on the consumer side.
+///
+/// On every successful activation the shim files the exact verified bytes so a
+/// later reproducibility check can read them back. The file is named from the
+/// version read INSIDE the verified payload bytes, never from a caller-supplied
+/// label: a signature authenticates bytes, not a label, so a validly signed
+/// superseded v9 must never be filed as v12.
+///
+/// ADMISSION FILTER (both must hold):
+///   1. the envelope signature already verified against the compiled trust root
+///      (the caller reuses that result — this function does not re-verify), and
+///   2. the `manifest_version` parsed from inside the verified payload bytes
+///      equals the version used in the filing name.
+///
+/// On mismatch the file is refused (logged once) and activation is unaffected.
+/// Existing files are never overwritten: identical bytes are a no-op; different
+/// bytes at the same name is a collision that must not silently replace
+/// evidence, so it is refused with a loud log line.
+fn retain_manifest(paths: &StatePaths, envelope: &SignedManifest, filing_version: u64) {
+    // The version that names the file must come from inside the verified bytes,
+    // not from any caller-supplied label. The envelope is already verified, so
+    // this parse is over authenticated bytes.
+    let inside_version = match serde_json::from_str::<Manifest>(&envelope.manifest_bytes) {
+        Ok(manifest) => manifest.manifest_version,
+        Err(_) => {
+            eprintln!(
+                "gh-shim: refusing to retain manifest: verified payload bytes failed to parse"
+            );
+            return;
+        }
+    };
+    if inside_version != filing_version {
+        eprintln!(
+            "gh-shim: refusing to retain manifest: payload version {inside_version} does not match filing version {filing_version}"
+        );
+        return;
+    }
+
+    let digest = Sha256::digest(envelope.manifest_bytes.as_bytes());
+    let digest_hex = format!("{digest:x}");
+    let file_name = format!("v{inside_version}-{}.json", &digest_hex[..16]);
+    let destination = paths.manifests_dir.join(&file_name);
+
+    if destination.exists() {
+        // Identical bytes are a no-op; different bytes at the same name is a
+        // collision that must never silently replace evidence. The existing
+        // file holds a RetainedManifest record, so compare its payload bytes.
+        let existing_bytes = fs::read(&destination)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RetainedManifest>(&bytes).ok())
+            .map(|record| record.manifest_bytes);
+        if existing_bytes.as_deref() == Some(envelope.manifest_bytes.as_str()) {
+            return;
+        }
+        eprintln!(
+            "gh-shim: refusing to retain manifest: collision at {} (different bytes at the same name)",
+            destination.display()
+        );
+        return;
+    }
+
+    if fs::create_dir_all(&paths.manifests_dir).is_err() {
+        eprintln!("gh-shim: refusing to retain manifest: could not create manifests dir");
+        return;
+    }
+
+    let record = RetainedManifest {
+        manifest_bytes: envelope.manifest_bytes.clone(),
+        signature: envelope.signature.clone(),
+        key_id: envelope.key_id.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        eprintln!("gh-shim: refusing to retain manifest: serialization failed");
+        return;
+    };
+
+    let temporary = paths.manifests_dir.join(format!(".{file_name}.tmp"));
+    if fs::write(&temporary, &bytes).is_err() {
+        eprintln!("gh-shim: refusing to retain manifest: could not write temporary file");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
+    }
+    if fs::rename(&temporary, &destination).is_err() {
+        eprintln!("gh-shim: refusing to retain manifest: could not move into place");
+        let _ = fs::remove_file(&temporary);
     }
 }
 
@@ -3184,6 +3296,8 @@ struct SelfReport {
     executing_image_error: Option<String>,
     real_gh_resolution: Option<RealGhResolution>,
     real_gh_resolution_error: Option<String>,
+    manifests_retained: usize,
+    manifests_dir: String,
 }
 
 #[derive(Serialize)]
@@ -3289,7 +3403,23 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         executing_image_error: image.err(),
         real_gh_resolution,
         real_gh_resolution_error,
+        manifests_retained: retained_manifest_count(paths),
+        manifests_dir: paths.manifests_dir.to_string_lossy().into_owned(),
     }
+}
+
+/// Number of retained signed manifests on disk. A directory read failure or a
+/// non-regular entry is not a security boundary, so this degrades to zero
+/// rather than failing the whole self-report.
+fn retained_manifest_count(paths: &StatePaths) -> usize {
+    fs::read_dir(&paths.manifests_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Self-report for the disabled-by-config state: the shim is a hard passthrough
@@ -3861,6 +3991,8 @@ mod tests {
                 "executing_image_error",
                 "real_gh_resolution",
                 "real_gh_resolution_error",
+                "manifests_retained",
+                "manifests_dir",
             ]
         );
     }
@@ -6447,6 +6579,140 @@ mod tests {
                 "fixture {name} drifted from its generator; rerun with AFT_GH_SHIM_REGEN=1"
             );
         }
+    }
+
+    fn retained_files(paths: &StatePaths) -> Vec<PathBuf> {
+        fs::read_dir(&paths.manifests_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn activation_retains_every_accepted_manifest_with_exact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        // Activate v11 then v12 in the same temp state dir.
+        write_signed_manifest(&paths, v11_fixture_manifest(), TEST_NOW);
+        assert_eq!(
+            load_manifest(&paths, TEST_NOW).unwrap().manifest_version,
+            11
+        );
+        write_signed_manifest(&paths, v12_fixture_manifest(), TEST_NOW);
+        assert_eq!(
+            load_manifest(&paths, TEST_NOW).unwrap().manifest_version,
+            12
+        );
+
+        // Two files, one per accepted version.
+        let files = retained_files(&paths);
+        assert_eq!(files.len(), 2);
+
+        // Reading each back and re-verifying its signature passes, and the
+        // payload bytes are the exact signed bytes (never a re-serialization).
+        let mut versions = BTreeSet::new();
+        for file in &files {
+            let record: RetainedManifest =
+                serde_json::from_slice(&fs::read(file).unwrap()).expect("retained record");
+            let envelope = SignedManifest {
+                artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
+                envelope_version: ENVELOPE_VERSION,
+                key_id: record.key_id.clone(),
+                fetched_at_unix_secs: TEST_NOW,
+                signature: record.signature.clone(),
+                manifest_bytes: record.manifest_bytes.clone(),
+            };
+            let verified =
+                verify_manifest_signature(&envelope).expect("retained signature re-verifies");
+            versions.insert(verified.manifest_version);
+        }
+        assert_eq!(versions, BTreeSet::from([11, 12]));
+
+        // The self-report reflects the retained count and directory.
+        let document = render_self_report(&paths).expect("self report");
+        let value: Value = serde_json::from_str(&document).expect("self report JSON");
+        assert_eq!(value["manifests_retained"], json!(2));
+        assert_eq!(
+            value["manifests_dir"],
+            json!(paths.manifests_dir.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn tampered_payload_is_not_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        // A tampered envelope fails signature verification, so activation is
+        // refused and nothing is filed.
+        write_envelope_fixture(
+            &paths,
+            include_str!("../tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"),
+        );
+        assert!(load_manifest(&paths, TEST_NOW).is_err());
+        assert!(retained_files(&paths).is_empty());
+    }
+
+    #[test]
+    fn version_mismatch_between_payload_and_filing_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        // A validly signed v11 payload presented under a v12 filing must be
+        // refused: a signature authenticates bytes, not a label.
+        let envelope = signed(&v11_fixture_manifest(), TEST_NOW);
+        retain_manifest(&paths, &envelope, 12);
+
+        assert!(retained_files(&paths).is_empty());
+    }
+
+    #[test]
+    fn same_name_different_bytes_is_refused_and_existing_file_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        // Pre-place a file at the exact name the v11 payload would use, but with
+        // different bytes. Retention must refuse rather than silently replace
+        // evidence.
+        let envelope = signed(&v11_fixture_manifest(), TEST_NOW);
+        let digest = Sha256::digest(envelope.manifest_bytes.as_bytes());
+        let digest_hex = format!("{digest:x}");
+        let destination = paths
+            .manifests_dir
+            .join(format!("v11-{}.json", &digest_hex[..16]));
+        fs::create_dir_all(&paths.manifests_dir).unwrap();
+        let original = b"{\"different\":\"bytes\"}".to_vec();
+        fs::write(&destination, &original).unwrap();
+
+        retain_manifest(&paths, &envelope, 11);
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            original,
+            "existing file must be untouched on collision"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_manifest_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+
+        write_signed_manifest(&paths, v11_fixture_manifest(), TEST_NOW);
+        load_manifest(&paths, TEST_NOW).unwrap();
+
+        let files = retained_files(&paths);
+        assert_eq!(files.len(), 1);
+        let mode = fs::metadata(&files[0]).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
 
