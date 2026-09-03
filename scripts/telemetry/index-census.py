@@ -459,6 +459,13 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
         "semantic_collect_ms_n_p50_max", "semantic_embed_retries", "search_build_ms_n_p50_max",
         "slow_calls_p50_p95_by_tool", "slow_calls_over_10s_by_tool", "limiter_queued", "limiter_wait_ms_n_p95_max",
         "tier2_deferred", "breaker_or_suspension_hits",
+        "index_search_start_to_ready_ms_n_p50_max", "index_search_ready_to_first_query_ms_n_p50_max",
+        "index_callgraph_start_to_ready_ms_n_p50_max", "index_callgraph_ready_to_first_query_ms_n_p50_max",
+        "index_semantic_start_to_ready_ms_n_p50_max", "index_semantic_ready_to_first_query_ms_n_p50_max",
+        "index_search_superseded", "index_search_failed", "index_search_suspended",
+        "index_callgraph_superseded", "index_callgraph_failed", "index_callgraph_suspended",
+        "index_semantic_superseded", "index_semantic_failed", "index_semantic_suspended",
+        "index_waiting_on",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=headers, lineterminator="\n")
@@ -498,6 +505,22 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
                 "limiter_wait_ms_n_p95_max": fmt_compact_ms(root_stats.limiter_wait_ms) if not root_stats.limiter_wait_ms else f"{len(root_stats.limiter_wait_ms)}/{percentile(root_stats.limiter_wait_ms, 0.95)}/{max(root_stats.limiter_wait_ms)}",
                 "tier2_deferred": root_stats.deferred,
                 "breaker_or_suspension_hits": root_stats.breaker_hits,
+                "index_search_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["search"]),
+                "index_search_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["search"]),
+                "index_callgraph_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["callgraph"]),
+                "index_callgraph_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["callgraph"]),
+                "index_semantic_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["semantic"]),
+                "index_semantic_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["semantic"]),
+                "index_search_superseded": root_stats.index_superseded["search"],
+                "index_search_failed": root_stats.index_failed["search"],
+                "index_search_suspended": root_stats.index_suspended["search"],
+                "index_callgraph_superseded": root_stats.index_superseded["callgraph"],
+                "index_callgraph_failed": root_stats.index_failed["callgraph"],
+                "index_callgraph_suspended": root_stats.index_suspended["callgraph"],
+                "index_semantic_superseded": root_stats.index_superseded["semantic"],
+                "index_semantic_failed": root_stats.index_failed["semantic"],
+                "index_semantic_suspended": root_stats.index_suspended["semantic"],
+                "index_waiting_on": format_reasons(root_stats.waiting_on),
             })
 
 
