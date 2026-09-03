@@ -2674,8 +2674,12 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                     params.unwrap_or(serde_json::Value::Null)
                 );
             }
-            LspEvent::ServerExited { server_kind, root } => {
-                aft::slog_info!("exited {:?} {}", server_kind, root.display());
+            LspEvent::ServerExited {
+                server_kind,
+                root,
+                reason,
+            } => {
+                aft::slog_info!("exited {:?} {} ({reason})", server_kind, root.display());
                 status_changed = true;
             }
         }

@@ -17,10 +17,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
+use crate::lsp::registry::ServerKind;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LspChildHealth {
     pub spawned: usize,
     pub cwd_gone: usize,
+}
+
+/// Identity recorded for a spawned language-server child.
+///
+/// `root` is the reclaim-marker path (often the session project). `server_root`
+/// and `kind` identify the `(ServerKind, workspace root)` pair so a later spawn
+/// can reap children that no live client still references.
+#[derive(Clone, Debug, Default)]
+struct TrackedChild {
+    root: Option<PathBuf>,
+    server_root: Option<PathBuf>,
+    kind: Option<ServerKind>,
 }
 
 #[derive(Clone, Default)]
@@ -28,7 +42,7 @@ pub struct LspChildRegistry {
     // A child is registered with the project root that owns it. Maintenance
     // checks only these known roots for reclaim markers, avoiding directory
     // scans while still covering servers rooted below a task worktree.
-    inner: Arc<Mutex<HashMap<u32, Option<PathBuf>>>>,
+    inner: Arc<Mutex<HashMap<u32, TrackedChild>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +65,29 @@ impl LspChildRegistry {
     /// The root is retained solely for reclaim-marker checks; it is not used
     /// for process cwd inspection or normal shutdown.
     pub fn track_in_root(&self, pid: u32, root: Option<&Path>) {
+        self.track_child(pid, root, None, None);
+    }
+
+    /// Track a child with the workspace root and server kind used to spawn it.
+    ///
+    /// `root` remains the reclaim-marker path. `server_root` and `kind` are the
+    /// `(ServerKind, workspace root)` pair a later spawn uses to find orphans.
+    pub fn track_child(
+        &self,
+        pid: u32,
+        root: Option<&Path>,
+        server_root: Option<&Path>,
+        kind: Option<&ServerKind>,
+    ) {
         if let Ok(mut children) = self.inner.lock() {
-            children.insert(pid, root.map(Path::to_path_buf));
+            children.insert(
+                pid,
+                TrackedChild {
+                    root: root.map(Path::to_path_buf),
+                    server_root: server_root.map(Path::to_path_buf),
+                    kind: kind.cloned(),
+                },
+            );
         }
     }
 
@@ -71,12 +106,30 @@ impl LspChildRegistry {
         command: &mut Command,
         root: Option<&Path>,
     ) -> io::Result<Child> {
+        self.spawn_tracked_child(command, root, None, None)
+    }
+
+    /// Spawn and register a child with reclaim-marker root plus server identity.
+    pub fn spawn_tracked_child(
+        &self,
+        command: &mut Command,
+        root: Option<&Path>,
+        server_root: Option<&Path>,
+        kind: Option<&ServerKind>,
+    ) -> io::Result<Child> {
         let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
         let child = command.spawn()?;
-        children.insert(child.id(), root.map(Path::to_path_buf));
+        children.insert(
+            child.id(),
+            TrackedChild {
+                root: root.map(Path::to_path_buf),
+                server_root: server_root.map(Path::to_path_buf),
+                kind: kind.cloned(),
+            },
+        );
         Ok(child)
     }
 
@@ -95,16 +148,41 @@ impl LspChildRegistry {
             .collect()
     }
 
-    fn tracked_children(&self) -> Vec<(u32, Option<PathBuf>)> {
+    fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
         self.inner
             .lock()
             .map(|children| {
                 children
                     .iter()
-                    .map(|(pid, root)| (*pid, root.clone()))
+                    .map(|(pid, tracked)| (*pid, tracked.clone()))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// PIDs registered for this workspace root and server kind.
+    pub fn pids_for_server(&self, server_root: &Path, kind: &ServerKind) -> Vec<u32> {
+        self.tracked_children()
+            .into_iter()
+            .filter(|(_, tracked)| {
+                tracked.server_root.as_deref() == Some(server_root)
+                    && tracked.kind.as_ref() == Some(kind)
+            })
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    /// Kill and untrack the given PIDs. Used to reap children that are still
+    /// registered after their `LspClient` was dropped without a kill.
+    pub fn reap_pids(&self, pids: &[u32]) -> usize {
+        let mut reaped = 0;
+        for pid in pids {
+            if kill_child_process_group(*pid) {
+                self.untrack(*pid);
+                reaped += 1;
+            }
+        }
+        reaped
     }
 
     /// Snapshot the current child count and the children whose working directory
@@ -152,10 +230,10 @@ impl LspChildRegistry {
         Terminate: FnMut(u32, ReapSignal) -> bool,
     {
         let mut reaped = 0;
-        for (pid, root) in self.tracked_children() {
+        for (pid, tracked) in self.tracked_children() {
             let has_gone_cwd = matches!(child_cwd_state(pid), ChildCwdState::Gone);
-            let has_reclaimed_root =
-                include_reclaimed_roots && root.as_deref().is_some_and(root_has_reclaim_marker);
+            let has_reclaimed_root = include_reclaimed_roots
+                && tracked.root.as_deref().is_some_and(root_has_reclaim_marker);
             if !has_gone_cwd && !has_reclaimed_root {
                 continue;
             }
@@ -418,6 +496,27 @@ mod tests {
         assert_eq!(b.pids(), vec![42]);
         b.untrack(42);
         assert!(a.pids().is_empty());
+    }
+
+    #[test]
+    fn pids_for_server_filters_by_root_and_kind() {
+        let reg = LspChildRegistry::new();
+        let root_a = PathBuf::from("/tmp/a");
+        let root_b = PathBuf::from("/tmp/b");
+        reg.track_child(1, Some(&root_a), Some(&root_a), Some(&ServerKind::Rust));
+        reg.track_child(
+            2,
+            Some(&root_a),
+            Some(&root_a),
+            Some(&ServerKind::TypeScript),
+        );
+        reg.track_child(3, Some(&root_b), Some(&root_b), Some(&ServerKind::Rust));
+        let mut rust_a = reg.pids_for_server(&root_a, &ServerKind::Rust);
+        rust_a.sort();
+        assert_eq!(rust_a, vec![1]);
+        reg.untrack(1);
+        reg.untrack(2);
+        reg.untrack(3);
     }
 
     #[test]
