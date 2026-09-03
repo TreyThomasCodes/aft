@@ -4529,6 +4529,14 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
             Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
         }
+        match crate::fs_lock::sweep_stale_reclaim_tokens(&job.storage_root) {
+            Ok(0) => {}
+            Ok(n) => slog_info!(
+                "filesystem lock cleanup: removed {} stale reclaim tokens",
+                n
+            ),
+            Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
+        }
         crate::search_index::sweep_orphaned_index_dirs(&job.storage_root);
         crate::search_index::sweep_transient_search_cache_dirs();
 

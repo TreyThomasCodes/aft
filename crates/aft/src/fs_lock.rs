@@ -1015,6 +1015,50 @@ fn remove_malformed_reclaim_token(token_path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Remove abandoned reclaim tokens below an AFT storage root. Live same-host
+/// owners and every foreign-host owner remain authoritative.
+pub(crate) fn sweep_stale_reclaim_tokens(root: &Path) -> io::Result<usize> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut removed = 0_usize;
+
+    while let Some(directory) = directories.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_reclaim_token_path(&path) {
+                continue;
+            }
+
+            let did_remove = match inspect_reclaim_token(&path)? {
+                ExistingReclaimToken::StaleValid(owner) => remove_lock_if_owned(&path, &owner)?,
+                ExistingReclaimToken::StaleMalformed => remove_malformed_reclaim_token(&path)?,
+                ExistingReclaimToken::Held(_) | ExistingReclaimToken::Missing => false,
+            };
+            if did_remove {
+                sync_parent(&path);
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn is_reclaim_token_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".reclaim"))
+}
+
 fn reclaim_token_path(lock_path: &Path) -> PathBuf {
     let file_name = lock_path
         .file_name()
@@ -1859,6 +1903,25 @@ mod tests {
         );
         assert_eq!(dead_reclaim_backoff_ms(0, 100), 250);
         assert_eq!(dead_reclaim_backoff_ms(20, 100), 5_000);
+    }
+
+    #[test]
+    fn maintenance_sweep_removes_dead_reclaim_tokens() {
+        let root = tempfile::tempdir().expect("temporary storage root");
+        let cache_dir = root.path().join("index").join("project");
+        fs::create_dir_all(&cache_dir).expect("create nested cache");
+        let lock_path = cache_dir.join("cache.lock");
+        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        let dead_token = write_reclaim_token(&lock_path, &dead);
+        let live_lock = cache_dir.join("live.lock");
+        let live = current_process_metadata();
+        let live_token = write_reclaim_token(&live_lock, &live);
+
+        let removed = sweep_stale_reclaim_tokens(root.path()).expect("sweep tokens");
+
+        assert_eq!(removed, 1);
+        assert!(!dead_token.exists());
+        assert_eq!(read_lock_metadata(&live_token).expect("live token"), live);
     }
 
     #[test]
