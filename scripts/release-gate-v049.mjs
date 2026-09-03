@@ -86,10 +86,14 @@ function git(args, encoding = "utf8") {
 
 function sourceBytes(commit, path) {
   try {
+    // An artifact that did not exist at the previous release commit is a
+    // legitimate `present: false` row, so git's "exists on disk, but not in
+    // <commit>" complaint is expected output here, not a failure to surface.
     return execFileSync("git", ["show", `${commit}:${path}`], {
       cwd: ROOT,
       encoding: "buffer",
       maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
     });
   } catch {
     return null;
