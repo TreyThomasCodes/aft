@@ -4831,6 +4831,9 @@ mod tests {
             .expect("expected metadata object")
             .remove("agent_id");
         let mut actual = wire;
+        // The repository field is derived from the checkout's git origin, so it
+        // is checkout-derived and intentionally different in a fork.
+        expected["repository"] = actual["repository"].clone();
         actual["metadata"]
             .as_object_mut()
             .expect("actual metadata object")
