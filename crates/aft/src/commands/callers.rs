@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, callers_result, store_error_response, unavailable_for,
+    building_response, callers_result, note_callgraph_building, note_callgraph_served,
+    store_error_response, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -70,7 +71,10 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => return building_response(&req.id, "callers"),
+        CallgraphStoreAccess::Building => {
+            note_callgraph_building(ctx, "callers");
+            return building_response(&req.id, "callers");
+        }
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "callers", &suspension)
         }
@@ -93,6 +97,12 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 file_path.display(),
                 result.total_callers,
                 elapsed_ms
+            );
+            note_callgraph_served(
+                ctx,
+                "callers",
+                elapsed_ms.min(u64::MAX as u128) as u64,
+                "ok",
             );
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)

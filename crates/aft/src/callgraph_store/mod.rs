@@ -725,6 +725,18 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
     notify_cold_build_slice_observer(stage, completed, total);
     let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
     if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
+        if let Some(scope) = crate::logging::current_index_build() {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildProgress,
+                    &scope,
+                )
+                .field("stage", stage)
+                .field("completed", completed)
+                .field("total", total)
+                .field("elapsed_ms", scope.elapsed_ms()),
+            );
+        }
         return Ok(());
     }
     crate::slog_info!(
@@ -733,6 +745,17 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
         total,
         stage
     );
+    if let Some(scope) = crate::logging::current_index_build() {
+        crate::logging::log_index_event(
+            crate::logging::IndexEvent::from_scope(
+                crate::logging::IndexEventKind::BuildSuperseded,
+                &scope,
+            )
+            .field("stage", stage)
+            .field("completed", completed)
+            .field("total", total),
+        );
+    }
     Err(CallGraphStoreError::Superseded)
 }
 
@@ -3128,6 +3151,22 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
 
+        let scope = crate::logging::IndexBuildScope::new(
+            crate::logging::IndexPlane::Callgraph,
+            project_root,
+            project_key,
+        );
+        let _index_build = crate::logging::install_index_build(scope.clone());
+        let mut failure_guard = crate::logging::IndexBuildFailureGuard::new();
+        let mut started = crate::logging::IndexEvent::from_scope(
+            crate::logging::IndexEventKind::BuildStarted,
+            &scope,
+        );
+        if adopting_staging {
+            started = started.field("resumed_from_staging", "true");
+        }
+        crate::logging::log_index_event(started);
+
         let (stats, breaker_key) = {
             if adopting_staging {
                 crate::slog_info!(
@@ -3165,8 +3204,21 @@ impl CallGraphStore {
                 .admit(&breaker_key, 0)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                crate::build_breaker::BreakerAdmission::Admitted(_) => {}
+                crate::build_breaker::BreakerAdmission::Admitted(_) => {
+                    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BreakerAdmitted,
+                        &scope,
+                    ));
+                }
                 crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
+                    crate::logging::log_index_event(
+                        crate::logging::IndexEvent::from_scope(
+                            crate::logging::IndexEventKind::BuildSuspended,
+                            &scope,
+                        )
+                        .field("reason", &suspension.reason),
+                    );
+                    failure_guard.disarm();
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
             }
@@ -3213,13 +3265,37 @@ impl CallGraphStore {
         // A superseded generation remains a valid resumable staging artifact.
         // Its successor compares the durable corpus fingerprint before either
         // adopting this work or resetting it for a changed corpus.
+        if let Err(CallGraphStoreError::Superseded) = &publication {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildSuperseded,
+                    &scope,
+                )
+                .field("stage", "publish"),
+            );
+            failure_guard.disarm();
+        }
         publication?;
         // Pointer publication is the only automatic breaker reset. The staging
         // batches above never reset history because a process can die after them.
         breaker
             .record_ready_publication(&breaker_key)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+            crate::logging::IndexEventKind::BreakerReset,
+            &scope,
+        ));
         record_successful_rebuild(callgraph_dir, project_key, project_root, Instant::now());
+        crate::logging::log_index_event(
+            crate::logging::IndexEvent::from_scope(
+                crate::logging::IndexEventKind::BuildReady,
+                &scope,
+            )
+            .field("elapsed_ms", scope.elapsed_ms())
+            .field("files", stats.files)
+            .field("edges", stats.edges),
+        );
+        failure_guard.disarm();
         Ok((stats, generation))
     }
 

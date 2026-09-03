@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, ensure_symbol_resolves, store_error_response, trace_to_symbol_candidates,
-    trace_to_symbol_result, unavailable_for,
+    building_response, ensure_symbol_resolves, note_callgraph_building, note_callgraph_served,
+    store_error_response, trace_to_symbol_candidates, trace_to_symbol_result, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::inspect::job::is_test_file;
@@ -80,7 +80,10 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => return building_response(&req.id, "trace_to_symbol"),
+        CallgraphStoreAccess::Building => {
+            note_callgraph_building(ctx, "trace_to_symbol");
+            return building_response(&req.id, "trace_to_symbol");
+        }
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "trace_to_symbol", &suspension)
         }
@@ -161,6 +164,7 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         include_tests,
     ) {
         Ok(result) => {
+            note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }

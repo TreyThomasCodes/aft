@@ -3297,6 +3297,23 @@ impl AppContext {
             .store(enabled, Ordering::SeqCst);
     }
 
+    /// Consume a newly-ready index plane on the query path (`first_query` or a Building wait).
+    pub(crate) fn note_index_query(
+        &self,
+        plane: crate::logging::IndexPlane,
+        tool: &str,
+        service_ms: u64,
+        status: &str,
+    ) {
+        let root = self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone());
+        let Some(root) = root else {
+            return;
+        };
+        crate::logging::note_index_query(plane, &root, tool, service_ms, status);
+    }
+
     pub fn memoized_artifact_cache_key(&self, canonical_root: &Path) -> String {
         let mut keys = self.artifact_cache_keys.lock();
         if let Some(key) = keys.get(canonical_root).cloned() {

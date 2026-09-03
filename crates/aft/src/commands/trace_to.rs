@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, store_error_response, trace_to_result, unavailable_for,
+    building_response, note_callgraph_building, note_callgraph_served, store_error_response,
+    trace_to_result, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -68,7 +69,10 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => return building_response(&req.id, "trace_to"),
+        CallgraphStoreAccess::Building => {
+            note_callgraph_building(ctx, "trace_to");
+            return building_response(&req.id, "trace_to");
+        }
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "trace_to", &suspension)
         }
@@ -80,6 +84,7 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match trace_to_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
+            note_callgraph_served(ctx, "trace_to", 0, "ok");
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }

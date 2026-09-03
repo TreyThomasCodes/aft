@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2121,7 +2122,7 @@ impl InspectManager {
                     cache
                         .touch_tier2_last_full_run(job.category)
                         .map_err(|error| error.to_string())?;
-                    phases.log(job.category);
+                    phases.log(job.category, &job.project_root);
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
                         contributions: Vec::new(),
@@ -2155,7 +2156,7 @@ impl InspectManager {
                         .touch_tier2_last_full_run(job.category)
                         .map_err(|error| error.to_string())?;
                     let contributions = load_contributions(cache, job)?;
-                    phases.log(job.category);
+                    phases.log(job.category, &job.project_root);
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
                         contributions,
@@ -2246,7 +2247,7 @@ impl InspectManager {
                                 .touch_tier2_last_full_run(job.category)
                                 .map_err(|error| error.to_string())?;
                             let contributions = load_contributions(cache, job)?;
-                            phases.log(job.category);
+                            phases.log(job.category, &job.project_root);
                             return Ok(InspectScanSuccess {
                                 scanned_files: scan_files,
                                 contributions,
@@ -2296,7 +2297,7 @@ impl InspectManager {
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
         phases.rollup = rollup_started.elapsed();
-        phases.log(job.category);
+        phases.log(job.category, &job.project_root);
 
         Ok(InspectScanSuccess {
             scanned_files: scan_files,
@@ -2602,7 +2603,7 @@ impl Tier2PhaseTimings {
         self.db_txn += timings.transaction;
     }
 
-    fn log(&self, category: InspectCategory) {
+    fn log(&self, category: InspectCategory, project_root: &Path) {
         let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
         if !worked.is_zero() {
             crate::logging::note_tier2_scan(
@@ -2613,8 +2614,9 @@ impl Tier2PhaseTimings {
         if worked < Duration::from_millis(50) {
             return;
         }
+        let key = crate::search_index::artifact_cache_key(project_root);
         crate::slog_info!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms root={} key={}",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
@@ -2623,7 +2625,9 @@ impl Tier2PhaseTimings {
             self.db.as_millis(),
             self.db_lock.as_millis(),
             self.db_txn.as_millis(),
-            self.rollup.as_millis()
+            self.rollup.as_millis(),
+            crate::logging::normalize_index_root(project_root),
+            key
         );
     }
 }
@@ -2787,7 +2791,37 @@ fn tier2_benchmark_logging_enabled() -> bool {
     std::env::var_os("AFT_SETTLE_BENCH_LOG").is_some()
 }
 
+thread_local! {
+    static TIER2_INDEX_SCOPE: RefCell<Option<crate::logging::IndexBuildScope>> =
+        const { RefCell::new(None) };
+}
+
 fn log_tier2_benchmark_category_start(job: &InspectJob) {
+    let key = crate::search_index::artifact_cache_key(&job.project_root);
+    let scope = crate::logging::IndexBuildScope::new(
+        crate::logging::IndexPlane::Tier2,
+        &job.project_root,
+        key,
+    );
+    crate::logging::log_index_event(
+        crate::logging::IndexEvent::from_scope(
+            crate::logging::IndexEventKind::BuildStarted,
+            &scope,
+        )
+        .field("category", job.category.as_str())
+        .field("files", job.scope_files.len()),
+    );
+    crate::logging::log_index_event(
+        crate::logging::IndexEvent::from_scope(
+            crate::logging::IndexEventKind::BuildProgress,
+            &scope,
+        )
+        .field("stage", job.category.as_str())
+        .field("completed", 0)
+        .field("total", 1)
+        .field("elapsed_ms", 0),
+    );
+    TIER2_INDEX_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope));
     if !tier2_benchmark_logging_enabled() {
         return;
     }
@@ -2800,6 +2834,34 @@ fn log_tier2_benchmark_category_start(job: &InspectJob) {
 }
 
 fn log_tier2_benchmark_category_end(result: &InspectResult) {
+    let scope = TIER2_INDEX_SCOPE.with(|slot| slot.borrow_mut().take());
+    if let Some(scope) = scope {
+        match &result.outcome {
+            Ok(success) => {
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildReady,
+                        &scope,
+                    )
+                    .field("category", result.category.as_str())
+                    .field("elapsed_ms", result.duration.as_millis())
+                    .field("files", success.scanned_files.len())
+                    .field("contributions", success.contributions.len()),
+                );
+            }
+            Err(message) => {
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildFailed,
+                        &scope,
+                    )
+                    .field("category", result.category.as_str())
+                    .field("elapsed_ms", result.duration.as_millis())
+                    .field("reason", message),
+                );
+            }
+        }
+    }
     if !tier2_benchmark_logging_enabled() {
         return;
     }

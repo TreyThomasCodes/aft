@@ -341,7 +341,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
             deadline.work_at(),
         )
     };
-    match applicability {
+    let response = match applicability {
         Ok(applicability) => {
             run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
         }
@@ -354,7 +354,10 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
                 failure_detail: Some(applicability_failure_detail(error)),
             },
         ),
-    }
+    };
+    let status = if response.success { "ok" } else { "error" };
+    ctx.note_index_query(crate::logging::IndexPlane::Tier2, "inspect", 0, status);
+    response
 }
 
 /// Diagnostics collection is always the warm working set, with or without a

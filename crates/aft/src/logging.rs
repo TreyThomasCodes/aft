@@ -5,8 +5,9 @@
 
 use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
-use crate::run_tool_call::ToolCallPhaseDurations;
-use std::collections::{BTreeMap, VecDeque};
+use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,485 @@ const DEFAULT_PERF_TICK_INTERVAL: Duration = Duration::from_secs(60);
 const PERF_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
 const TOOL_CALL_SAMPLE_CAPACITY: usize = 256;
+/// Census lines stay greppable and short; extra fields are dropped past this.
+const INDEX_EVENT_MAX_BYTES: usize = 300;
+
+/// Standing-index plane recorded on every `index_event` line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum IndexPlane {
+    Callgraph,
+    Search,
+    Semantic,
+    Tier2,
+}
+
+impl IndexPlane {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Callgraph => "callgraph",
+            Self::Search => "search",
+            Self::Semantic => "semantic",
+            Self::Tier2 => "tier2",
+        }
+    }
+}
+
+/// Lifecycle kind recorded on every `index_event` line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexEventKind {
+    BuildStarted,
+    BuildProgress,
+    BuildReady,
+    BuildSuperseded,
+    #[allow(dead_code)]
+    BuildCancelled,
+    BuildFailed,
+    BuildSuspended,
+    BreakerAdmitted,
+    BreakerReset,
+    ArtifactLoaded,
+    FirstQuery,
+}
+
+impl IndexEventKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildStarted => "build_started",
+            Self::BuildProgress => "build_progress",
+            Self::BuildReady => "build_ready",
+            Self::BuildSuperseded => "build_superseded",
+            Self::BuildCancelled => "build_cancelled",
+            Self::BuildFailed => "build_failed",
+            Self::BuildSuspended => "build_suspended",
+            Self::BreakerAdmitted => "breaker_admitted",
+            Self::BreakerReset => "breaker_reset",
+            Self::ArtifactLoaded => "artifact_loaded",
+            Self::FirstQuery => "first_query",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::BuildReady
+                | Self::BuildSuperseded
+                | Self::BuildCancelled
+                | Self::BuildFailed
+                | Self::BuildSuspended
+        )
+    }
+}
+
+/// One structured standing-index lifecycle record.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexEvent {
+    pub kind: IndexEventKind,
+    pub plane: IndexPlane,
+    pub build_id: String,
+    pub root: PathBuf,
+    pub key: String,
+    extra: Vec<(&'static str, String)>,
+}
+
+impl IndexEvent {
+    pub(crate) fn new(
+        kind: IndexEventKind,
+        plane: IndexPlane,
+        build_id: impl Into<String>,
+        root: impl AsRef<Path>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            plane,
+            build_id: build_id.into(),
+            root: root.as_ref().to_path_buf(),
+            key: key.into(),
+            extra: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_scope(kind: IndexEventKind, scope: &IndexBuildScope) -> Self {
+        Self::new(
+            kind,
+            scope.plane,
+            scope.build_id.clone(),
+            &scope.root,
+            scope.key.clone(),
+        )
+    }
+
+    pub(crate) fn field(mut self, key: &'static str, value: impl ToString) -> Self {
+        self.extra.push((key, value.to_string()));
+        self
+    }
+}
+
+/// Identity of one in-flight build attempt, carried on a thread-local so nested
+/// helpers such as `ensure_cold_build_current` can emit without extra params.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexBuildScope {
+    pub plane: IndexPlane,
+    pub build_id: String,
+    pub root: PathBuf,
+    pub key: String,
+    pub started_at: Instant,
+}
+
+impl IndexBuildScope {
+    pub(crate) fn new(plane: IndexPlane, root: impl AsRef<Path>, key: impl Into<String>) -> Self {
+        Self {
+            plane,
+            build_id: mint_index_build_id(),
+            root: root.as_ref().to_path_buf(),
+            key: key.into(),
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+}
+
+struct InFlightBuild {
+    build_id: String,
+}
+
+struct UnclaimedReady {
+    build_id: String,
+    key: String,
+    ready_at: Instant,
+}
+
+#[derive(Default)]
+struct IndexLifecycle {
+    in_flight: Mutex<HashMap<(String, IndexPlane), InFlightBuild>>,
+    unclaimed: Mutex<HashMap<(String, IndexPlane), UnclaimedReady>>,
+}
+
+struct ToolCallWaitState {
+    waiting_on: WaitingOn,
+    waiting_on_build_id: Option<String>,
+    wait_ms: u64,
+    queue_ms: u64,
+}
+
+impl Default for ToolCallWaitState {
+    fn default() -> Self {
+        Self {
+            waiting_on: WaitingOn::None,
+            waiting_on_build_id: None,
+            wait_ms: 0,
+            queue_ms: 0,
+        }
+    }
+}
+
+static INDEX_BUILD_COUNTER: AtomicU64 = AtomicU64::new(1);
+static INDEX_LIFECYCLE: LazyLock<IndexLifecycle> = LazyLock::new(IndexLifecycle::default);
+
+thread_local! {
+    static CURRENT_INDEX_BUILD: RefCell<Option<IndexBuildScope>> = const { RefCell::new(None) };
+    static TOOL_CALL_WAIT: RefCell<ToolCallWaitState> = const {
+        RefCell::new(ToolCallWaitState {
+            waiting_on: WaitingOn::None,
+            waiting_on_build_id: None,
+            wait_ms: 0,
+            queue_ms: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+static INDEX_EVENT_CAPTURE: LazyLock<Mutex<Option<Vec<String>>>> =
+    LazyLock::new(|| Mutex::new(None));
+#[cfg(test)]
+static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Mint a stable per-attempt id (`b-<pid>-<n>`) at `build_started`.
+pub(crate) fn mint_index_build_id() -> String {
+    let n = INDEX_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("b-{}-{n}", std::process::id())
+}
+
+/// RAII install of the current index-build attempt on this thread.
+pub(crate) struct IndexBuildGuard {
+    previous: Option<IndexBuildScope>,
+}
+
+impl Drop for IndexBuildGuard {
+    fn drop(&mut self) {
+        CURRENT_INDEX_BUILD.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install `scope` as the current index-build attempt until the guard drops.
+pub(crate) fn install_index_build(scope: IndexBuildScope) -> IndexBuildGuard {
+    let previous = CURRENT_INDEX_BUILD.with(|slot| slot.replace(Some(scope)));
+    IndexBuildGuard { previous }
+}
+
+/// Run `f` with `scope` as the current index-build attempt on this thread.
+#[allow(dead_code)]
+pub(crate) fn with_index_build<R>(scope: IndexBuildScope, f: impl FnOnce() -> R) -> R {
+    let _guard = install_index_build(scope);
+    f()
+}
+
+/// Emits `build_failed` if the attempt returns without a terminal event.
+pub(crate) struct IndexBuildFailureGuard {
+    armed: bool,
+}
+
+impl IndexBuildFailureGuard {
+    pub(crate) fn new() -> Self {
+        Self { armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IndexBuildFailureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(scope) = current_index_build() else {
+            return;
+        };
+        // A prior terminal event already cleared the in-flight slot.
+        if in_flight_build_id(scope.plane, &scope.root).as_deref() != Some(scope.build_id.as_str())
+        {
+            return;
+        }
+        log_current_index_event(
+            IndexEventKind::BuildFailed,
+            &[("reason", "error".to_string())],
+        );
+    }
+}
+
+pub(crate) fn current_index_build() -> Option<IndexBuildScope> {
+    CURRENT_INDEX_BUILD.with(|slot| slot.borrow().clone())
+}
+
+/// Normalize a project root for `index_event` (`\` → `/`).
+pub(crate) fn normalize_index_root(root: &Path) -> String {
+    root.to_string_lossy().replace('\\', "/")
+}
+
+fn sanitize_index_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().max(1));
+    for ch in value.chars() {
+        match ch {
+            ' ' | '\t' | '\n' | '\r' | '=' => out.push('_'),
+            '\\' => out.push('/'),
+            c if c.is_ascii_graphic() || c == '/' => out.push(c),
+            _ => out.push('_'),
+        }
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
+}
+
+fn push_index_field(line: &mut String, key: &str, value: &str) {
+    let sanitized = sanitize_index_value(value);
+    let addition = format!(" {key}={sanitized}");
+    if line.len() + addition.len() > INDEX_EVENT_MAX_BYTES {
+        return;
+    }
+    line.push_str(&addition);
+}
+
+fn format_index_event_line(event: &IndexEvent) -> String {
+    let mut line = String::from("index_event");
+    push_index_field(&mut line, "kind", event.kind.as_str());
+    push_index_field(&mut line, "plane", event.plane.as_str());
+    push_index_field(&mut line, "build_id", &event.build_id);
+    push_index_field(&mut line, "root", &normalize_index_root(&event.root));
+    push_index_field(&mut line, "key", &event.key);
+    for (key, value) in &event.extra {
+        push_index_field(&mut line, key, value);
+    }
+    line
+}
+
+fn root_plane_key(root: &Path, plane: IndexPlane) -> (String, IndexPlane) {
+    (normalize_index_root(root), plane)
+}
+
+fn remember_in_flight(event: &IndexEvent) {
+    let key = root_plane_key(&event.root, event.plane);
+    if event.kind == IndexEventKind::BuildStarted {
+        if let Ok(mut in_flight) = INDEX_LIFECYCLE.in_flight.lock() {
+            in_flight.insert(
+                key,
+                InFlightBuild {
+                    build_id: event.build_id.clone(),
+                },
+            );
+        }
+        return;
+    }
+    if event.kind.is_terminal() {
+        if let Ok(mut in_flight) = INDEX_LIFECYCLE.in_flight.lock() {
+            in_flight.remove(&key);
+        }
+    }
+    if event.kind == IndexEventKind::BuildReady {
+        if let Ok(mut unclaimed) = INDEX_LIFECYCLE.unclaimed.lock() {
+            unclaimed.insert(
+                key,
+                UnclaimedReady {
+                    build_id: event.build_id.clone(),
+                    key: event.key.clone(),
+                    ready_at: Instant::now(),
+                },
+            );
+        }
+    }
+}
+
+/// Write one greppable `index_event` info line through the house slog path.
+pub(crate) fn log_index_event(event: IndexEvent) {
+    remember_in_flight(&event);
+    let line = format_index_event_line(&event);
+    #[cfg(test)]
+    if let Ok(mut slot) = INDEX_EVENT_CAPTURE.lock() {
+        if let Some(events) = slot.as_mut() {
+            events.push(line.clone());
+        }
+    }
+    crate::slog_info!("{}", line);
+}
+
+/// Emit an event for the current thread's index-build scope, if any.
+pub(crate) fn log_current_index_event(kind: IndexEventKind, extra: &[(&'static str, String)]) {
+    let Some(scope) = current_index_build() else {
+        return;
+    };
+    let mut event = IndexEvent::from_scope(kind, &scope);
+    for (key, value) in extra {
+        event.extra.push((key, value.clone()));
+    }
+    log_index_event(event);
+}
+
+/// In-flight `build_id` for a root/plane, if a cold build has started and not yet terminated.
+pub(crate) fn in_flight_build_id(plane: IndexPlane, root: &Path) -> Option<String> {
+    INDEX_LIFECYCLE
+        .in_flight
+        .lock()
+        .ok()?
+        .get(&root_plane_key(root, plane))
+        .map(|build| build.build_id.clone())
+}
+
+/// Consume the per-root unclaimed ready slot for `plane` and emit `first_query` once.
+pub(crate) fn claim_first_query(
+    plane: IndexPlane,
+    root: &Path,
+    tool: &str,
+    queue_ms: u64,
+    service_ms: u64,
+    status: &str,
+) -> bool {
+    let slot = {
+        let Ok(mut unclaimed) = INDEX_LIFECYCLE.unclaimed.lock() else {
+            return false;
+        };
+        unclaimed.remove(&root_plane_key(root, plane))
+    };
+    let Some(slot) = slot else {
+        return false;
+    };
+    let ready_to_first_query_ms = slot.ready_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    log_index_event(
+        IndexEvent::new(
+            IndexEventKind::FirstQuery,
+            plane,
+            slot.build_id,
+            root,
+            slot.key,
+        )
+        .field("tool", tool)
+        .field("queue_ms", queue_ms)
+        .field("service_ms", service_ms)
+        .field("status", status)
+        .field("ready_to_first_query_ms", ready_to_first_query_ms),
+    );
+    true
+}
+
+/// Query-path helper: claim `first_query` on a ready plane, or attribute a Building wait.
+pub(crate) fn note_index_query(
+    plane: IndexPlane,
+    root: &Path,
+    tool: &str,
+    service_ms: u64,
+    status: &str,
+) {
+    match status {
+        "building" | "rebuilding" => {
+            let build_id = in_flight_build_id(plane, root);
+            note_tool_call_wait(WaitingOn::Build, build_id.as_deref(), 0);
+        }
+        _ => {
+            let queue_ms = TOOL_CALL_WAIT.with(|slot| slot.borrow().queue_ms);
+            claim_first_query(plane, root, tool, queue_ms, service_ms, status);
+        }
+    }
+}
+
+/// Reset causal-wait state at the start of a tool call.
+pub(crate) fn reset_tool_call_wait() {
+    TOOL_CALL_WAIT.with(|slot| *slot.borrow_mut() = ToolCallWaitState::default());
+}
+
+/// Record what the current tool-call thread waited on.
+pub(crate) fn note_tool_call_wait(waiting_on: WaitingOn, build_id: Option<&str>, wait_ms: u64) {
+    TOOL_CALL_WAIT.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.waiting_on = waiting_on;
+        state.waiting_on_build_id = build_id.map(str::to_string);
+        state.wait_ms = state.wait_ms.saturating_add(wait_ms);
+    });
+}
+
+pub(crate) fn note_tool_call_queue_ms(queue_ms: u64) {
+    TOOL_CALL_WAIT.with(|slot| slot.borrow_mut().queue_ms = queue_ms);
+}
+
+pub(crate) fn take_tool_call_wait() -> (WaitingOn, Option<String>, u64) {
+    TOOL_CALL_WAIT.with(|slot| {
+        let state = std::mem::take(&mut *slot.borrow_mut());
+        (state.waiting_on, state.waiting_on_build_id, state.wait_ms)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn capture_index_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let _serial = INDEX_EVENT_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut slot) = INDEX_EVENT_CAPTURE.lock() {
+        *slot = Some(Vec::new());
+    }
+    let result = f();
+    let events = INDEX_EVENT_CAPTURE
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_default();
+    (result, events)
+}
 
 /// Initialize the `RUST_LOG`-filtered stderr logger and its additive file sink.
 pub fn init() {
@@ -679,8 +1159,9 @@ pub fn note_tool_call_trace(
         PERF.tool_call_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    let waiting_on_build_id = phases.waiting_on_build_id.as_deref().unwrap_or("-");
     crate::slog_debug!(
-        "tool_call phase name={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} root={}",
+        "tool_call phase name={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
         name,
         channel,
         corr,
@@ -700,12 +1181,15 @@ pub fn note_tool_call_trace(
         phases.writer_active_at_enqueue,
         phases.writer_queue_was_full,
         phases.writer_reserve_timeouts,
+        phases.waiting_on.as_str(),
+        waiting_on_build_id,
+        phases.wait_ms,
         root.display(),
     );
 
     if phases.total > SLOW_TOOL_CALL_THRESHOLD {
         crate::slog_warn!(
-            "slow tool_call name={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} root={}",
+            "slow tool_call name={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
             name,
             channel,
             corr,
@@ -725,6 +1209,9 @@ pub fn note_tool_call_trace(
             phases.writer_active_at_enqueue,
             phases.writer_queue_was_full,
             phases.writer_reserve_timeouts,
+            phases.waiting_on.as_str(),
+            waiting_on_build_id,
+            phases.wait_ms,
             root.display(),
         );
     }
@@ -1086,5 +1573,303 @@ mod tests {
             format_tool_call_summary(0, summary),
             "toolcall={new:0,window:1,p50_total_ms:3000,max_total_ms:3000,p50_queue_ms:2900,max_queue_ms:2900}"
         );
+    }
+
+    fn index_event_matches_grammar(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("index_event ") else {
+            return false;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        rest.split(' ').all(|token| {
+            let Some((key, value)) = token.split_once('=') else {
+                return false;
+            };
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                && !value.is_empty()
+                && !value.contains(' ')
+                && !value.contains('=')
+        })
+    }
+
+    fn index_event_fields(line: &str) -> BTreeMap<String, String> {
+        let mut fields = BTreeMap::new();
+        for token in line.split_whitespace().skip(1) {
+            let Some((key, value)) = token.split_once('=') else {
+                continue;
+            };
+            fields.insert(key.to_string(), value.to_string());
+        }
+        fields
+    }
+
+    fn assert_index_event_grammar(lines: &[String]) {
+        for line in lines {
+            assert!(
+                index_event_matches_grammar(line),
+                "index_event line failed grammar: {line}"
+            );
+        }
+    }
+
+    fn event_matches(line: &str, plane: &str, root: &str, key: &str) -> bool {
+        let fields = index_event_fields(line);
+        fields.get("plane").map(String::as_str) == Some(plane)
+            && fields.get("root").map(String::as_str) == Some(root)
+            && fields.get("key").map(String::as_str) == Some(key)
+    }
+
+    fn assert_lifecycle_sequence(lines: &[String], plane: &str, root: &str, key: &str) {
+        let events: Vec<_> = lines
+            .iter()
+            .filter(|line| event_matches(line, plane, root, key))
+            .cloned()
+            .collect();
+        assert_index_event_grammar(&events);
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|line| index_event_fields(line).get("kind").cloned())
+            .filter(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "build_started" | "build_progress" | "build_ready"
+                )
+            })
+            .collect();
+        assert!(
+            kinds.first().is_some_and(|kind| kind == "build_started"),
+            "expected build_started first, got {kinds:?} from {events:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| kind == "build_progress"),
+            "expected build_progress in {kinds:?} from {events:?}"
+        );
+        assert!(
+            kinds.last().is_some_and(|kind| kind == "build_ready"),
+            "expected build_ready last, got {kinds:?} from {events:?}"
+        );
+        let build_ids: Vec<_> = events
+            .iter()
+            .filter_map(|line| index_event_fields(line).get("build_id").cloned())
+            .collect();
+        assert!(!build_ids.is_empty());
+        assert!(
+            build_ids.iter().all(|id| id == &build_ids[0]),
+            "build_id drifted across events: {build_ids:?}"
+        );
+        for line in &events {
+            let fields = index_event_fields(line);
+            assert_eq!(fields.get("root").map(String::as_str), Some(root), "{line}");
+            assert_eq!(fields.get("key").map(String::as_str), Some(key), "{line}");
+        }
+    }
+
+    fn tiny_project(name: &str, file_name: &str, contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join(name);
+        std::fs::create_dir_all(&root).expect("create project");
+        std::fs::write(root.join(file_name), contents).expect("write fixture");
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        (temp, root)
+    }
+
+    #[test]
+    fn index_event_grammar_rejects_spaces_and_equals_in_values() {
+        let (result, lines) = capture_index_events(|| {
+            log_index_event(
+                IndexEvent::new(
+                    IndexEventKind::BuildStarted,
+                    IndexPlane::Search,
+                    "b-1-1",
+                    "/tmp/root",
+                    "abc123",
+                )
+                .field("stage", "streaming"),
+            );
+        });
+        let _ = result;
+        assert_index_event_grammar(&lines);
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn first_query_fires_once_per_build_id() {
+        let root = PathBuf::from("/tmp/first-query-root");
+        let key = "firstquerykey";
+        let build_id = "b-1-99";
+        let (_, lines) = capture_index_events(|| {
+            log_index_event(IndexEvent::new(
+                IndexEventKind::BuildReady,
+                IndexPlane::Search,
+                build_id,
+                &root,
+                key,
+            ));
+            assert!(claim_first_query(
+                IndexPlane::Search,
+                &root,
+                "grep",
+                1,
+                2,
+                "ok"
+            ));
+            assert!(!claim_first_query(
+                IndexPlane::Search,
+                &root,
+                "grep",
+                1,
+                2,
+                "ok"
+            ));
+        });
+        let first_query: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("kind=first_query"))
+            .collect();
+        assert_eq!(first_query.len(), 1, "{lines:?}");
+        let fields = index_event_fields(first_query[0]);
+        assert_eq!(fields.get("build_id").map(String::as_str), Some(build_id));
+        assert_eq!(fields.get("tool").map(String::as_str), Some("grep"));
+    }
+
+    #[test]
+    fn callgraph_cold_build_emits_started_progress_ready() {
+        let (_temp, root) = tiny_project("cg", "lib.rs", "pub fn marker() {}\n");
+        let key = crate::search_index::artifact_cache_key(&root);
+        let callgraph_dir = _temp.path().join("callgraph").join(&key);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        let source = root.join("lib.rs");
+        let (built, lines) = capture_index_events(|| {
+            crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+                callgraph_dir,
+                root.clone(),
+                std::slice::from_ref(&source),
+            )
+        });
+        built.expect("callgraph cold build");
+        assert_lifecycle_sequence(&lines, "callgraph", &normalize_index_root(&root), &key);
+    }
+
+    #[test]
+    fn search_cold_build_emits_started_progress_ready() {
+        let (_temp, root) = tiny_project("search", "file.txt", "alpha token\n");
+        let key = crate::search_index::artifact_cache_key(&root);
+        let (index, lines) = capture_index_events(|| {
+            crate::search_index::SearchIndex::build_with_limit(&root, 1_000_000)
+        });
+        assert!(index.ready);
+        assert_lifecycle_sequence(&lines, "search", &normalize_index_root(&root), &key);
+    }
+
+    #[test]
+    fn semantic_cold_build_emits_started_progress_ready() {
+        let (_temp, root) = tiny_project("sem", "lib.rs", "pub fn hello() {}\n");
+        let key = crate::search_index::artifact_cache_key(&root);
+        let files = vec![root.join("lib.rs")];
+        let mut embed = |texts: Vec<String>| {
+            Ok(texts
+                .into_iter()
+                .map(|_| vec![0.01_f32; 384])
+                .collect::<Vec<_>>())
+        };
+        let (built, lines) = capture_index_events(|| {
+            crate::semantic_index::SemanticIndex::build(&root, &files, &mut embed, 8)
+        });
+        built.expect("semantic build");
+        assert_lifecycle_sequence(&lines, "semantic", &normalize_index_root(&root), &key);
+    }
+
+    #[test]
+    fn tier2_category_emits_started_progress_ready() {
+        let (_temp, root) = tiny_project("t2", "mod0.ts", "export function f0() { return 0; }\n");
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        let inspect_dir = _temp.path().join("inspect");
+        let manager = std::sync::Arc::new(crate::inspect::InspectManager::new());
+        let snapshot = crate::inspect::InspectSnapshot::new(
+            root.clone(),
+            inspect_dir,
+            std::sync::Arc::new(crate::config::Config {
+                project_root: Some(root.clone()),
+                ..crate::config::Config::default()
+            }),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        );
+        let (outcome, lines) = capture_index_events(|| {
+            manager.tier2_run_with_reuse_blocking_fresh(
+                snapshot,
+                crate::inspect::InspectCategory::Complexity,
+                crate::inspect::JobScope::for_project(root.clone()),
+            )
+        });
+        assert!(outcome.payload().is_some(), "{outcome:?}");
+        assert_lifecycle_sequence(&lines, "tier2", &normalize_index_root(&root), &key);
+    }
+
+    #[test]
+    fn superseded_cold_build_keeps_build_id_and_skips_ready() {
+        let (_temp, root) = tiny_project("sup", "lib.rs", "pub fn marker() {}\n");
+        let key = crate::search_index::artifact_cache_key(&root);
+        let callgraph_dir = _temp.path().join("callgraph").join(&key);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        let source = root.join("lib.rs");
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let stale_epoch = epoch.current();
+        epoch.next();
+        let (failed, lines) = capture_index_events(|| {
+            crate::callgraph_store::with_publish_epoch(epoch, stale_epoch, || {
+                crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+                    callgraph_dir,
+                    root.clone(),
+                    std::slice::from_ref(&source),
+                )
+            })
+        });
+        assert!(matches!(
+            failed,
+            Err(crate::callgraph_store::CallGraphStoreError::Superseded)
+        ));
+        let root_s = normalize_index_root(&root);
+        let events: Vec<_> = lines
+            .iter()
+            .filter(|line| event_matches(line, "callgraph", &root_s, &key))
+            .cloned()
+            .collect();
+        assert_index_event_grammar(&events);
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|line| index_event_fields(line).get("kind").cloned())
+            .collect();
+        assert!(
+            kinds.contains(&"build_started".to_string()),
+            "{kinds:?} {events:?}"
+        );
+        assert!(
+            kinds.contains(&"build_superseded".to_string()),
+            "{kinds:?} {events:?}"
+        );
+        assert!(
+            !kinds.contains(&"build_ready".to_string()),
+            "superseded build must not emit build_ready: {kinds:?}"
+        );
+        let started_id = events
+            .iter()
+            .find(|line| line.contains("kind=build_started"))
+            .and_then(|line| index_event_fields(line).get("build_id").cloned());
+        let superseded_id = events
+            .iter()
+            .find(|line| line.contains("kind=build_superseded"))
+            .and_then(|line| index_event_fields(line).get("build_id").cloned());
+        assert_eq!(started_id, superseded_id);
+        for line in &events {
+            let fields = index_event_fields(line);
+            assert_eq!(
+                fields.get("root").map(String::as_str),
+                Some(root_s.as_str())
+            );
+            assert_eq!(fields.get("key").map(String::as_str), Some(key.as_str()));
+        }
     }
 }

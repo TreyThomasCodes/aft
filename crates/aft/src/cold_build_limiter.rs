@@ -222,18 +222,24 @@ fn acquire_blocking_while_inner(
             return None;
         }
         if let Some(permit) = permit {
+            let wait_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             if logged {
+                crate::logging::note_tool_call_wait(
+                    crate::run_tool_call::WaitingOn::Limiter,
+                    None,
+                    wait_ms,
+                );
                 match request {
                     Some(request) => crate::slog_info!(
                         "{} cold-build slot acquired after {}ms wait: request={} kind={}",
                         request.class.label(),
-                        started.elapsed().as_millis(),
+                        wait_ms,
                         request.request_id,
                         kind
                     ),
                     None => crate::slog_info!(
                         "maintenance build slot acquired after {}ms wait: {}",
-                        started.elapsed().as_millis(),
+                        wait_ms,
                         kind
                     ),
                 }

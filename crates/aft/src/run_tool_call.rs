@@ -35,7 +35,30 @@ pub struct ToolCallEgressTiming {
     pub reserve_timeouts: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Causal wait recorded on a tool call so slow-call logs can name the blocker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WaitingOn {
+    #[default]
+    None,
+    Build,
+    Limiter,
+    ArtifactLoad,
+    Resolver,
+}
+
+impl WaitingOn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Build => "build",
+            Self::Limiter => "limiter",
+            Self::ArtifactLoad => "artifact_load",
+            Self::Resolver => "resolver",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolCallPhaseDurations {
     pub queue: Duration,
     pub translate: Duration,
@@ -53,10 +76,14 @@ pub struct ToolCallPhaseDurations {
     pub writer_queue_was_full: bool,
     pub writer_reserve_timeouts: u32,
     pub total: Duration,
+    pub waiting_on: WaitingOn,
+    pub waiting_on_build_id: Option<String>,
+    pub wait_ms: u64,
 }
 
 impl PhaseTrace {
     pub fn new(frame_decoded: Instant) -> Self {
+        crate::logging::reset_tool_call_wait();
         Self {
             frame_decoded,
             executor_submitted: None,
@@ -73,7 +100,15 @@ impl PhaseTrace {
     }
 
     pub fn mark_job_admitted(&mut self) {
-        self.job_admitted = Some(Instant::now());
+        let now = Instant::now();
+        self.job_admitted = Some(now);
+        if let Some(submitted) = self.executor_submitted {
+            crate::logging::note_tool_call_queue_ms(
+                now.duration_since(submitted)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            );
+        }
     }
 
     fn mark_translate_done(&mut self) {
@@ -99,6 +134,7 @@ impl PhaseTrace {
         let execute_done = self.execute_done?;
         let format_done = self.format_done?;
         let finalize_done = self.finalize_done?;
+        let (waiting_on, waiting_on_build_id, wait_ms) = crate::logging::take_tool_call_wait();
         Some(ToolCallPhaseDurations {
             queue: job_admitted.duration_since(executor_submitted),
             translate: translate_done.duration_since(job_admitted),
@@ -116,6 +152,9 @@ impl PhaseTrace {
             writer_queue_was_full: egress.writer_queue_was_full,
             writer_reserve_timeouts: egress.reserve_timeouts,
             total: egress.write_finished.duration_since(self.frame_decoded),
+            waiting_on,
+            waiting_on_build_id,
+            wait_ms,
         })
     }
 }

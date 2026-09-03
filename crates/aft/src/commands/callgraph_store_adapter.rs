@@ -1752,6 +1752,24 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
 }
 
+pub fn note_callgraph_building(ctx: &crate::context::AppContext, tool: &str) {
+    ctx.note_index_query(crate::logging::IndexPlane::Callgraph, tool, 0, "building");
+}
+
+pub fn note_callgraph_served(
+    ctx: &crate::context::AppContext,
+    tool: &str,
+    service_ms: u64,
+    status: &str,
+) {
+    ctx.note_index_query(
+        crate::logging::IndexPlane::Callgraph,
+        tool,
+        service_ms,
+        status,
+    );
+}
+
 /// The persisted callgraph store is cold-building in the background. The op did
 /// not block the request thread; the agent should retry shortly. Mirrors how
 /// semantic search reports a build in progress.

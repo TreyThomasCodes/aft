@@ -862,6 +862,15 @@ impl SearchIndex {
         cache_dir: &Path,
     ) -> Self {
         let started = std::time::Instant::now();
+        let key = artifact_cache_key(root);
+        let scope =
+            crate::logging::IndexBuildScope::new(crate::logging::IndexPlane::Search, root, key);
+        let _index_build = crate::logging::install_index_build(scope.clone());
+        let mut failure_guard = crate::logging::IndexBuildFailureGuard::new();
+        crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+            crate::logging::IndexEventKind::BuildStarted,
+            &scope,
+        ));
         if !artifact_write_allowed(root, cache_dir, &cache_dir.join("cache.bin")) {
             // Write-denied roots cannot persist or materialize a real index.
             // Return an empty index flagged as build-denied (ready stays false
@@ -869,16 +878,34 @@ impl SearchIndex {
             // the flag to avoid reporting a permanent "building" state for a
             // build that was never going to run here.
             crate::slog_info!(
-                "search index cold build denied: {} may not write the cache artifact at {}; reporting build-denied instead of building",
-                root.display(),
-                cache_dir.display()
+                    "search index cold build denied: {} may not write the cache artifact at {}; reporting build-denied instead of building",
+                    root.display(),
+                    cache_dir.display()
+                );
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildFailed,
+                    &scope,
+                )
+                .field("reason", "denied"),
             );
+            failure_guard.disarm();
             let mut index = Self::new();
             index.project_root = root.to_path_buf();
             index.max_file_size = max_file_size;
             index.build_denied = true;
             return index;
         }
+        crate::logging::log_index_event(
+            crate::logging::IndexEvent::from_scope(
+                crate::logging::IndexEventKind::BuildProgress,
+                &scope,
+            )
+            .field("stage", "streaming")
+            .field("completed", 0)
+            .field("total", 1)
+            .field("elapsed_ms", scope.elapsed_ms()),
+        );
         match build_streaming_index(root, max_file_size, cache_dir) {
             Ok((mut index, indexed)) => {
                 index.ready = true;
@@ -889,14 +916,55 @@ impl SearchIndex {
                     started.elapsed().as_millis(),
                     search_index_build_pool_size()
                 );
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildProgress,
+                        &scope,
+                    )
+                    .field("stage", "streaming")
+                    .field("completed", 1)
+                    .field("total", 1)
+                    .field("elapsed_ms", scope.elapsed_ms()),
+                );
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildReady,
+                        &scope,
+                    )
+                    .field("elapsed_ms", scope.elapsed_ms())
+                    .field("files", indexed)
+                    .field("trigrams", index.trigram_count()),
+                );
+                failure_guard.disarm();
                 index
             }
             Err(error) => {
                 log::warn!(
-                    "search index: streaming build failed ({}); falling back to bounded in-memory delta",
-                    error
+                        "search index: streaming build failed ({}); falling back to bounded in-memory delta",
+                        error
+                    );
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildProgress,
+                        &scope,
+                    )
+                    .field("stage", "fallback")
+                    .field("completed", 0)
+                    .field("total", 1)
+                    .field("elapsed_ms", scope.elapsed_ms()),
                 );
-                Self::build_in_memory(root, max_file_size, started)
+                let index = Self::build_in_memory(root, max_file_size, started);
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildReady,
+                        &scope,
+                    )
+                    .field("elapsed_ms", scope.elapsed_ms())
+                    .field("files", index.files.len())
+                    .field("trigrams", index.trigram_count()),
+                );
+                failure_guard.disarm();
+                index
             }
         }
     }
@@ -1245,8 +1313,9 @@ impl SearchIndex {
         max_records: usize,
         duration: Duration,
     ) -> BorrowedIndexLoad {
+        let load_started = Instant::now();
         let budget = BorrowedIndexLoadBudget::new(max_records, duration);
-        match Self::read_from_disk_with_policy(
+        let outcome = match Self::read_from_disk_with_policy(
             cache_dir,
             current_canonical_root,
             false,
@@ -1261,7 +1330,41 @@ impl SearchIndex {
                 .get()
                 .map(BorrowedIndexLoad::Stopped)
                 .unwrap_or(BorrowedIndexLoad::Invalid),
-        }
+        };
+        let outcome_label = match &outcome {
+            BorrowedIndexLoad::Loaded(_, ignore_rules_differ) if *ignore_rules_differ => "partial",
+            BorrowedIndexLoad::Loaded(_, _) => "ready",
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => "budget_stopped",
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled)
+            | BorrowedIndexLoad::Invalid => "denied",
+        };
+        let key = artifact_cache_key(current_canonical_root);
+        let build_id = crate::logging::in_flight_build_id(
+            crate::logging::IndexPlane::Search,
+            current_canonical_root,
+        )
+        .unwrap_or_else(crate::logging::mint_index_build_id);
+        crate::logging::log_index_event(
+            crate::logging::IndexEvent::new(
+                crate::logging::IndexEventKind::ArtifactLoaded,
+                crate::logging::IndexPlane::Search,
+                build_id,
+                current_canonical_root,
+                key,
+            )
+            .field("outcome", outcome_label)
+            .field("borrowed", "true")
+            .field(
+                "elapsed_ms",
+                load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ),
+        );
+        crate::logging::note_tool_call_wait(
+            crate::run_tool_call::WaitingOn::ArtifactLoad,
+            None,
+            load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        );
+        outcome
     }
 
     fn read_from_disk_with_options(

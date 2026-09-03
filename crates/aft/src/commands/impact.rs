@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, impact_result, store_error_response, unavailable_for,
+    building_response, impact_result, note_callgraph_building, note_callgraph_served,
+    store_error_response, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -68,7 +69,10 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => return building_response(&req.id, "impact"),
+        CallgraphStoreAccess::Building => {
+            note_callgraph_building(ctx, "impact");
+            return building_response(&req.id, "impact");
+        }
         CallgraphStoreAccess::Suspended(suspension) => {
             return suspended_response(&req.id, "impact", &suspension)
         }
@@ -80,6 +84,7 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
 
     match impact_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
+            note_callgraph_served(ctx, "impact", 0, "ok");
             let result_json = serde_json::to_value(&result).unwrap_or_default();
             Response::success(&req.id, result_json)
         }

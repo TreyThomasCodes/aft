@@ -149,6 +149,33 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         ));
     }
 
+    let service_ms = total_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    match result.index_status {
+        crate::search_index::IndexStatus::Ready => {
+            let status = if result.truncated || result.walk_truncated {
+                "partial"
+            } else {
+                "ok"
+            };
+            ctx.note_index_query(
+                crate::logging::IndexPlane::Search,
+                "grep",
+                service_ms,
+                status,
+            );
+        }
+        crate::search_index::IndexStatus::Building => {
+            ctx.note_index_query(
+                crate::logging::IndexPlane::Search,
+                "grep",
+                service_ms,
+                "building",
+            );
+        }
+        crate::search_index::IndexStatus::Fallback | crate::search_index::IndexStatus::Disabled => {
+        }
+    }
+
     Response::success(&req.id, body)
 }
 

@@ -34,6 +34,77 @@ const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
+fn begin_semantic_index_build(
+    project_root: &Path,
+) -> (
+    Option<crate::logging::IndexBuildGuard>,
+    crate::logging::IndexBuildScope,
+    crate::logging::IndexBuildFailureGuard,
+) {
+    if let Some(scope) = crate::logging::current_index_build() {
+        if scope.plane == crate::logging::IndexPlane::Semantic {
+            return (None, scope, crate::logging::IndexBuildFailureGuard::new());
+        }
+    }
+    let key = crate::search_index::artifact_cache_key(project_root);
+    let scope = crate::logging::IndexBuildScope::new(
+        crate::logging::IndexPlane::Semantic,
+        project_root,
+        key,
+    );
+    let guard = crate::logging::install_index_build(scope.clone());
+    crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
+        crate::logging::IndexEventKind::BuildStarted,
+        &scope,
+    ));
+    (
+        Some(guard),
+        scope,
+        crate::logging::IndexBuildFailureGuard::new(),
+    )
+}
+
+fn finish_semantic_index_build(
+    scope: &crate::logging::IndexBuildScope,
+    failure_guard: &mut crate::logging::IndexBuildFailureGuard,
+    result: &Result<SemanticIndex, String>,
+) {
+    match result {
+        Ok(index) => {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildReady,
+                    scope,
+                )
+                .field("elapsed_ms", scope.elapsed_ms())
+                .field("files", index.file_mtimes.len())
+                .field("chunks", index.entries.len()),
+            );
+            failure_guard.disarm();
+        }
+        Err(error) if error.contains("superseded") => {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildSuperseded,
+                    scope,
+                )
+                .field("stage", "embed"),
+            );
+            failure_guard.disarm();
+        }
+        Err(error) => {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildFailed,
+                    scope,
+                )
+                .field("reason", error),
+            );
+            failure_guard.disarm();
+        }
+    }
+}
+
 const ONNX_RUNTIME_INSTALL_HINT: &str =
     "ONNX Runtime not found. Install via: brew install onnxruntime (macOS), \
      apt install libonnxruntime (Linux), or place onnxruntime.dll in your PATH (Windows). \
@@ -2482,6 +2553,22 @@ impl SemanticIndex {
             file_metadata.len(),
             collect_ms
         );
+        if let Some(scope) = crate::logging::current_index_build() {
+            if scope.plane == crate::logging::IndexPlane::Semantic {
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildProgress,
+                        &scope,
+                    )
+                    .field("stage", "collect")
+                    .field("completed", 1)
+                    .field("total", 1)
+                    .field("elapsed_ms", scope.elapsed_ms())
+                    .field("chunks", chunks.len())
+                    .field("files", file_metadata.len()),
+                );
+            }
+        }
         if collect_ms > 50 {
             slog_info!(
                 "semantic collect phases: sched={}ms read_hash={}ms parse={}ms extract={}ms build={}ms",
@@ -2702,6 +2789,23 @@ impl SemanticIndex {
             if let Some(callback) = progress.as_mut() {
                 callback(entries.len(), total_chunks);
             }
+            if let Some(scope) = crate::logging::current_index_build() {
+                if scope.plane == crate::logging::IndexPlane::Semantic {
+                    crate::logging::log_index_event(
+                        crate::logging::IndexEvent::from_scope(
+                            crate::logging::IndexEventKind::BuildProgress,
+                            &scope,
+                        )
+                        .field("stage", "embed")
+                        .field("batch", batch_index + 1)
+                        .field("total_batches", batch_count)
+                        .field("chunks_done", entries.len())
+                        .field("completed", entries.len())
+                        .field("total", total_chunks)
+                        .field("elapsed_ms", scope.elapsed_ms()),
+                    );
+                }
+            }
             if (batch_index + 1) % 25 == 0 {
                 slog_info!(
                     "semantic embed progress: batch {}/{} ({} / {} chunks)",
@@ -2766,9 +2870,10 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
         let mut should_continue = || true;
-        Self::build_from_chunks(
+        let result = Self::build_from_chunks(
             project_root,
             chunks,
             file_mtimes,
@@ -2776,7 +2881,9 @@ impl SemanticIndex {
             max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
-        )
+        );
+        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        result
     }
 
     /// Build the semantic index and report embedding progress using entry counts.
@@ -2791,11 +2898,12 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let mut should_continue = || true;
-        Self::build_from_chunks(
+        let result = Self::build_from_chunks(
             project_root,
             chunks,
             file_mtimes,
@@ -2803,7 +2911,9 @@ impl SemanticIndex {
             max_batch_size,
             Some(progress),
             &mut should_continue,
-        )
+        );
+        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        result
     }
 
     /// Build the semantic index while checking cancellation before every embed
@@ -2822,10 +2932,11 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         C: FnMut() -> bool,
     {
+        let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
-        Self::build_from_chunks(
+        let result = Self::build_from_chunks(
             project_root,
             chunks,
             file_mtimes,
@@ -2833,7 +2944,9 @@ impl SemanticIndex {
             max_batch_size,
             Some(progress),
             should_continue,
-        )
+        );
+        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        result
     }
 
     /// Incrementally refresh entries for changed/new files only, preserving cached
@@ -3735,6 +3848,46 @@ impl SemanticIndex {
     }
 
     pub(crate) fn read_from_disk_borrow_tolerant(
+        storage_dir: &Path,
+        project_key: &str,
+        current_canonical_root: &Path,
+    ) -> Option<Self> {
+        let load_started = Instant::now();
+        let loaded = Self::read_from_disk_borrow_tolerant_inner(
+            storage_dir,
+            project_key,
+            current_canonical_root,
+        );
+        let outcome = if loaded.is_some() { "ready" } else { "denied" };
+        let build_id = crate::logging::in_flight_build_id(
+            crate::logging::IndexPlane::Semantic,
+            current_canonical_root,
+        )
+        .unwrap_or_else(crate::logging::mint_index_build_id);
+        crate::logging::log_index_event(
+            crate::logging::IndexEvent::new(
+                crate::logging::IndexEventKind::ArtifactLoaded,
+                crate::logging::IndexPlane::Semantic,
+                build_id,
+                current_canonical_root,
+                project_key,
+            )
+            .field("outcome", outcome)
+            .field("borrowed", "true")
+            .field(
+                "elapsed_ms",
+                load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ),
+        );
+        crate::logging::note_tool_call_wait(
+            crate::run_tool_call::WaitingOn::ArtifactLoad,
+            None,
+            load_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        );
+        loaded
+    }
+
+    fn read_from_disk_borrow_tolerant_inner(
         storage_dir: &Path,
         project_key: &str,
         current_canonical_root: &Path,

@@ -1645,6 +1645,12 @@ fn handle_semantic_or_hybrid_search(
             entries_done,
             entries_total,
         } => {
+            ctx.note_index_query(
+                crate::logging::IndexPlane::Semantic,
+                "semantic_search",
+                0,
+                "building",
+            );
             let borrowed_loading = stage == "loading_artifacts" && ctx.shared_artifacts_read_only();
             let mut detail = format!("Semantic index is still building (stage: {}).", stage);
             if let Some(files) = files {
@@ -1751,6 +1757,16 @@ fn handle_semantic_or_hybrid_search(
                     refreshing.len()
                 ));
             }
+            ctx.note_index_query(
+                crate::logging::IndexPlane::Semantic,
+                "semantic_search",
+                0,
+                if refreshing.is_empty() {
+                    "ok"
+                } else {
+                    "partial"
+                },
+            );
         }
     }
 

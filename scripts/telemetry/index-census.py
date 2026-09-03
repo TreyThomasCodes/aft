@@ -57,6 +57,8 @@ SEMANTIC_EMBED_RE = re.compile(r"semantic index build: embedding backend unavail
 SEARCH_BUILD_RE = re.compile(r"search index cold streaming build: (?P<files>\d+) files, (?P<trigrams>\d+) trigrams, (?P<ms>\d+) ms \(pool=(?P<pool>\d+)\)")
 # Exact sample: 2026-09-02T04:36:31Z [aft] [ses_13ae8f525ffeCnx9aTNmVDRBdR] slow tool_call name=bash_drain_completions channel=31 corr=14 total=5670ms queue=0 translate=0 exec=5670 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=285 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 root=/Users/ufukaltinok/Work/OSS/pi-mono
 SLOW_TOOL_RE = re.compile(r"slow tool_call name=(?P<tool>\S+) channel=\d+ corr=\d+ total=(?P<total>\d+)ms queue=(?P<queue>\d+) .*?\broot=(?P<root>\S+)")
+SLOW_WAITING_ON_RE = re.compile(r"\bwaiting_on=(?P<waiting_on>\S+)")
+INDEX_EVENT_RE = re.compile(r"\bindex_event(?P<body>(?: [a-z_]+=[^ =]+)+)")
 # Exact sample: 2026-09-02T05:06:29Z [aft] inspect-triggered cold-build request queued behind concurrency cap (2): request=inspect:/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_1d190f2f615098f5:1 kind=explicit inspect Tier-2 run
 LIMITER_QUEUED_RE = re.compile(r"inspect-triggered cold-build request queued behind concurrency cap \(2\): request=inspect:(?P<root>.+):(?P<request>\d+) kind=explicit inspect Tier-2 run")
 # Exact sample: 2026-09-02T05:06:30Z [aft] inspect-triggered cold-build slot acquired after 832ms wait: request=inspect:/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_1d190f2f615098f5:5 kind=explicit inspect Tier-2 run
@@ -91,6 +93,7 @@ PATTERN_NAMES = (
     "limiter_slot_acquired",
     "tier2_refresh_deferred",
     "breaker_or_suspension",
+    "index_event",
 )
 
 LANGUAGE_NAMES = {
@@ -154,6 +157,27 @@ class RootStats:
     limiter_wait_ms: list[int] = field(default_factory=list)
     deferred: int = 0
     breaker_hits: int = 0
+    index_start_to_ready_ms: DefaultDict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
+    index_ready_to_first_query_ms: DefaultDict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
+    index_superseded: Counter[str] = field(default_factory=Counter)
+    index_failed: Counter[str] = field(default_factory=Counter)
+    index_suspended: Counter[str] = field(default_factory=Counter)
+    waiting_on: Counter[str] = field(default_factory=Counter)
+
+
+def apply_index_event(stats: RootStats, fields: dict[str, str]) -> None:
+    plane = fields["plane"]
+    kind = fields["kind"]
+    if kind == "build_ready" and "elapsed_ms" in fields:
+        stats.index_start_to_ready_ms[plane].append(int(fields["elapsed_ms"]))
+    elif kind == "first_query" and "ready_to_first_query_ms" in fields:
+        stats.index_ready_to_first_query_ms[plane].append(int(fields["ready_to_first_query_ms"]))
+    elif kind == "build_superseded":
+        stats.index_superseded[plane] += 1
+    elif kind == "build_failed":
+        stats.index_failed[plane] += 1
+    elif kind == "build_suspended":
+        stats.index_suspended[plane] += 1
 
 
 @dataclass(frozen=True)
@@ -171,6 +195,18 @@ class RootInfo:
 
 def normalized_session(raw: str) -> str:
     return raw if raw.startswith("ses_") else f"ses_{raw}"
+
+
+def parse_index_event_fields(line: str) -> dict[str, str] | None:
+    match = INDEX_EVENT_RE.search(line)
+    if not match:
+        return None
+    fields: dict[str, str] = {}
+    for token in match.group("body").split():
+        key, _, value = token.partition("=")
+        if key and value:
+            fields[key] = value
+    return fields if fields.get("kind") and fields.get("plane") else None
 
 
 def parse_timestamp(line: str) -> datetime | None:
@@ -702,6 +738,20 @@ def main() -> int:
                     target = assign(event_root, "breaker_or_suspension")
                     if target:
                         target.breaker_hits += 1
+                index_fields = parse_index_event_fields(line)
+                if index_fields:
+                    pattern_counts["index_event"] += 1
+                    target = assign(clean_root(index_fields.get("root", "")) or event_root, "index_event")
+                    if target:
+                        apply_index_event(target, index_fields)
+                if match := SLOW_WAITING_ON_RE.search(line):
+                    waiting_root = event_root
+                    slow = SLOW_TOOL_RE.search(line)
+                    if slow:
+                        waiting_root = clean_root(slow.group("root"))
+                    target = assign(waiting_root, "slow_tool_call")
+                    if target:
+                        target.waiting_on[match.group("waiting_on")] += 1
 
     for root_stats in stats.values():
         pair_cold_events(root_stats)
@@ -721,5 +771,42 @@ def main() -> int:
     return 0
 
 
+def self_test() -> None:
+    lines = [
+        "2026-09-03T00:00:00Z [aft] index_event kind=build_started plane=search build_id=b-1-1 root=/tmp/proj key=abc",
+        "2026-09-03T00:00:01Z [aft] index_event kind=build_progress plane=search build_id=b-1-1 root=/tmp/proj key=abc stage=streaming completed=1 total=1 elapsed_ms=12",
+        "2026-09-03T00:00:02Z [aft] index_event kind=build_ready plane=search build_id=b-1-1 root=/tmp/proj key=abc elapsed_ms=25 files=3 trigrams=9",
+        "2026-09-03T00:00:03Z [aft] index_event kind=first_query plane=search build_id=b-1-1 root=/tmp/proj key=abc tool=grep queue_ms=1 service_ms=4 status=ok ready_to_first_query_ms=40",
+        "2026-09-03T00:00:04Z [aft] index_event kind=build_started plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc",
+        "2026-09-03T00:00:05Z [aft] index_event kind=build_superseded plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc stage=inventory",
+        "2026-09-03T00:00:06Z [aft] index_event kind=build_failed plane=semantic build_id=b-1-3 root=/tmp/proj key=abc reason=denied",
+        "2026-09-03T00:00:07Z [aft] index_event kind=build_suspended plane=callgraph build_id=b-1-4 root=/tmp/other key=def reason=breaker",
+        "2026-09-03T00:00:08Z [aft] slow tool_call name=grep channel=1 corr=1 total=12000ms queue=0 translate=0 exec=12000 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=1 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 waiting_on=build waiting_on_build_id=b-1-1 wait_ms=8000 root=/tmp/proj",
+    ]
+    by_root: dict[str, RootStats] = {}
+    for line in lines:
+        fields = parse_index_event_fields(line)
+        if fields:
+            stats = by_root.setdefault(fields["root"], RootStats())
+            apply_index_event(stats, fields)
+        waiting = SLOW_WAITING_ON_RE.search(line)
+        slow = SLOW_TOOL_RE.search(line)
+        if waiting and slow:
+            stats = by_root.setdefault(clean_root(slow.group("root")), RootStats())
+            stats.waiting_on[waiting.group("waiting_on")] += 1
+    proj = by_root["/tmp/proj"]
+    assert proj.index_start_to_ready_ms["search"] == [25], proj.index_start_to_ready_ms
+    assert proj.index_ready_to_first_query_ms["search"] == [40], proj.index_ready_to_first_query_ms
+    assert proj.index_superseded["callgraph"] == 1, proj.index_superseded
+    assert proj.index_failed["semantic"] == 1, proj.index_failed
+    assert proj.waiting_on["build"] == 1, proj.waiting_on
+    other = by_root["/tmp/other"]
+    assert other.index_suspended["callgraph"] == 1, other.index_suspended
+    print("index-census self-test passed")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        self_test()
+        raise SystemExit(0)
     raise SystemExit(main())
