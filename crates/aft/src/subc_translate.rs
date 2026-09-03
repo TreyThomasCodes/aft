@@ -50,6 +50,18 @@ fn normalize_path_alias_pair(
     legacy: &str,
     required: bool,
 ) -> Result<(), TranslateError> {
+    // An empty-string or null value on a path-shaped field means the field was
+    // not supplied in substance. Strip it before presence counting so hosts
+    // that serialize unused optional fields (e.g. `path: ""`) do not trip
+    // validation, and a required field that is only an empty sentinel reports
+    // the missing-required error rather than the well-formed-Unicode one.
+    if is_null_or_empty_string(map.get(canonical)) {
+        map.remove(canonical);
+    }
+    if is_null_or_empty_string(map.get(legacy)) {
+        map.remove(legacy);
+    }
+
     let has_canonical = map.contains_key(canonical);
     let has_legacy = map.contains_key(legacy);
     if !has_canonical && !has_legacy {
@@ -137,7 +149,12 @@ fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, Trans
         }
         "safety" => normalize_path_alias_pair(&mut map, "path", "filePath", false)?,
         "grep" | "search" | "conflicts" => {
-            if map.contains_key("path") {
+            // An empty-string or null `path` on these optional-path tools means
+            // the field was not supplied; strip it so it cannot trip the
+            // well-formed check.
+            if is_null_or_empty_string(map.get("path")) {
+                map.remove("path");
+            } else if map.contains_key("path") {
                 path_string(map.get("path"), "path")?;
             }
         }
@@ -261,6 +278,16 @@ fn normalize_edit_arguments(map: &mut Map<String, Value>) -> Result<(), Translat
 }
 
 fn normalize_edit_path_alias(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
+    // An empty-string or null path means the field was not supplied in
+    // substance. Strip it before alias resolution so a legacy-only empty
+    // sentinel reports the missing-required error rather than the
+    // well-formed-Unicode one.
+    if is_null_or_empty_string(map.get("path")) {
+        map.remove("path");
+    }
+    if is_null_or_empty_string(map.get("filePath")) {
+        map.remove("filePath");
+    }
     let has_path = map.contains_key("path");
     let has_file_path = map.contains_key("filePath");
     match (has_path, has_file_path) {
@@ -2548,6 +2575,115 @@ mod tests {
         let error = subc_translate_owned("read", canonically_different, project)
             .expect_err("different Unicode normalization");
         assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn empty_or_null_optional_path_is_stripped_as_absent() {
+        let project = Path::new("/project");
+        // Optional-path tools: an empty-string or null `path` is treated as
+        // not supplied, so the translated args carry no `path` key at all.
+        // Each tool still needs its own required fields, so supply them and
+        // assert the empty path sentinel is gone from the output.
+        let conflicts = subc_translate_owned("conflicts", serde_json::json!({ "path": "" }), project)
+            .expect("conflicts with empty path");
+        assert!(!conflicts.args.contains_key("path"));
+
+        let grep = subc_translate_owned(
+            "grep",
+            serde_json::json!({ "pattern": "x", "path": "" }),
+            project,
+        )
+        .expect("grep with empty path");
+        assert!(!grep.args.contains_key("path"));
+
+        let search = subc_translate_owned(
+            "search",
+            serde_json::json!({ "query": "x", "path": null }),
+            project,
+        )
+        .expect("search with null path");
+        assert!(!search.args.contains_key("path"));
+
+        let safety = subc_translate_owned(
+            "safety",
+            serde_json::json!({ "op": "list", "path": "" }),
+            project,
+        )
+        .expect("safety with empty path");
+        assert!(!safety.args.contains_key("path"));
+
+        // zoom with only empty path sentinels has no target at all, which is
+        // the "absent" outcome: it reports the missing-target error rather than
+        // the well-formed-Unicode one.
+        let zoom = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "path": "", "filePath": "" }),
+            project,
+        )
+        .expect_err("zoom with only empty path sentinels");
+        assert!(zoom.message.contains("Provide exactly one"));
+
+        // callgraph's optional `toPath` alias is stripped the same way.
+        let callgraph = subc_translate_owned(
+            "callgraph",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "toPath": "",
+                "op": "callers",
+                "symbol": "main"
+            }),
+            project,
+        )
+        .expect("callgraph with empty toPath");
+        assert!(!callgraph.args.contains_key("to_path"));
+    }
+
+    #[test]
+    fn required_tools_report_empty_path_as_missing_not_malformed() {
+        let project = Path::new("/project");
+        // `edit` is excluded: its full translation runs the edit contract
+        // (mode selection) before path validation, so an empty path reports
+        // the no-mode error, matching the TypeScript prepareCanonicalEditArguments.
+        for tool in ["read", "write", "move", "import", "refactor"] {
+            let error = subc_translate_owned(tool, serde_json::json!({ "path": "" }), project)
+                .expect_err("empty required path");
+            assert_eq!(error.code, "invalid_request");
+            assert!(
+                error.message.contains("'path' is required")
+                    || error.message.contains("missing required param"),
+                "{tool} empty path message: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("well-formed Unicode"),
+                "{tool} must not report the well-formed error for an empty path"
+            );
+        }
+        // edit with only an empty path sentinel reports the no-mode error, not
+        // the well-formed-Unicode one.
+        let edit = subc_translate_owned("edit", serde_json::json!({ "path": "" }), project)
+            .expect_err("edit empty path");
+        assert!(edit.message.contains("exactly one of"));
+        assert!(!edit.message.contains("well-formed Unicode"));
+    }
+
+    #[test]
+    fn empty_optional_path_sentinel_does_not_mask_a_non_string_error() {
+        let project = Path::new("/project");
+        // The strip is bounded to empty/null, not "anything falsy": a
+        // non-string value on an optional field still throws the well-formed
+        // error. (Rust strings cannot hold a lone UTF-16 surrogate, so a number
+        // is the closest non-string control.)
+        for tool in ["grep", "search", "conflicts", "zoom", "safety"] {
+            let error = subc_translate_owned(tool, serde_json::json!({ "path": 42 }), project)
+                .expect_err("non-string optional path");
+            assert_eq!(error.code, "invalid_request");
+            assert!(
+                error.message.contains("well-formed Unicode"),
+                "{tool} non-string path message: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

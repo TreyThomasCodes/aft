@@ -785,6 +785,11 @@ fn parity_cases() -> Vec<ParityCase> {
             arguments: json!({"query": "needle", "hint": "literal", "topK": 5}),
         },
         ParityCase {
+            label: "search_empty_path_sentinel",
+            tool: "search",
+            arguments: json!({"query": "needle", "path": ""}),
+        },
+        ParityCase {
             label: "inspect_todos",
             tool: "inspect",
             arguments: json!({"sections": "todos", "scope": "src", "topK": 5}),

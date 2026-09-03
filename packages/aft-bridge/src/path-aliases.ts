@@ -70,6 +70,14 @@ function normalizeAliasPair(
   legacy: string,
   required: boolean,
 ): void {
+  // An empty-string or null value on a path-shaped field means the field was
+  // not supplied in substance. Strip it before presence counting so hosts that
+  // serialize unused optional fields (e.g. `path: ""`) do not trip validation,
+  // and a required field that is only an empty sentinel reports the
+  // missing-required error rather than the well-formed-Unicode one.
+  if (isNullOrEmptyString(record[canonical])) delete record[canonical];
+  if (isNullOrEmptyString(record[legacy])) delete record[legacy];
+
   const hasCanonical = hasOwn(record, canonical);
   const hasLegacy = hasOwn(record, legacy);
 
@@ -110,7 +118,14 @@ function normalizeAliasPair(
 }
 
 function validateOptionalCanonicalPath(record: Record<string, unknown>, property: string): void {
-  if (hasOwn(record, property)) pathValue(record, property);
+  if (!hasOwn(record, property)) return;
+  // An empty-string or null sentinel on an optional path field means the field
+  // was not supplied; strip it so it cannot trip the well-formed check.
+  if (isNullOrEmptyString(record[property])) {
+    delete record[property];
+    return;
+  }
+  pathValue(record, property);
 }
 
 function normalizeZoomTargets(record: Record<string, unknown>): void {
@@ -350,6 +365,13 @@ export function prepareCanonicalEditArguments(
 }
 
 function normalizeEditPathAlias(record: Record<string, unknown>): void {
+  // An empty-string or null path means the field was not supplied in
+  // substance. Strip it before alias resolution so a legacy-only empty
+  // sentinel reports the missing-required error rather than the
+  // well-formed-Unicode one.
+  if (isNullOrEmptyString(record.path)) delete record.path;
+  if (isNullOrEmptyString(record.filePath)) delete record.filePath;
+
   const hasCanonical = hasOwn(record, "path");
   const hasLegacy = hasOwn(record, "filePath");
   if (!hasCanonical && !hasLegacy) return;
@@ -381,7 +403,7 @@ function normalizeEditPathAlias(record: Record<string, unknown>): void {
 }
 
 function validateEditPath(record: Record<string, unknown>): void {
-  if (!hasOwn(record, "path")) {
+  if (!hasOwn(record, "path") || isNullOrEmptyString(record.path)) {
     throw new InvalidRequestError("'path' is required");
   }
   pathValue(record, "path");

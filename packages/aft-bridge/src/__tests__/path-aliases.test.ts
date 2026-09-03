@@ -104,6 +104,53 @@ describe("canonical path alias preparation", () => {
       ...input,
     });
   });
+
+  test("strips empty or null optional path sentinels as absent", () => {
+    // Optional-path tools: an empty-string or null `path` is treated as not
+    // supplied, so the prepared record carries no `path` key at all.
+    for (const tool of ["grep", "search", "conflicts", "zoom", "safety"]) {
+      expect(prepareCanonicalPathArguments(tool, { path: "" })).toEqual({});
+      expect(prepareCanonicalPathArguments(tool, { path: null })).toEqual({});
+    }
+    // callgraph's optional `toPath` alias is stripped the same way.
+    expect(
+      prepareCanonicalPathArguments("callgraph", {
+        path: "src/main.ts",
+        toPath: "",
+        op: "callers",
+        symbol: "main",
+      }),
+    ).toEqual({ path: "src/main.ts", op: "callers", symbol: "main" });
+    // zoom's legacy optional `filePath` alias is stripped the same way.
+    expect(prepareCanonicalPathArguments("zoom", { filePath: "" })).toEqual({});
+  });
+
+  test("required tools report empty path as missing, not malformed", () => {
+    for (const tool of ["read", "write", "edit", "move", "import", "refactor"]) {
+      try {
+        prepareCanonicalPathArguments(tool, { path: "" });
+        throw new Error("expected invalid_request");
+      } catch (error) {
+        expect(error).toBeInstanceOf(InvalidRequestError);
+        expect((error as InvalidRequestError).code).toBe("invalid_request");
+        expect((error as Error).message).toBe("'path' is required");
+      }
+    }
+  });
+
+  test("empty optional path sentinel does not mask a lone-surrogate error", () => {
+    // The strip is bounded to empty/null, not "anything falsy": a lone
+    // surrogate on an optional field still throws the well-formed error.
+    for (const tool of ["grep", "search", "conflicts", "zoom", "safety"]) {
+      try {
+        prepareCanonicalPathArguments(tool, { path: "\ud800" });
+        throw new Error("expected invalid_request");
+      } catch (error) {
+        expect(error).toBeInstanceOf(InvalidRequestError);
+        expect((error as Error).message).toContain("well-formed Unicode");
+      }
+    }
+  });
 });
 
 describe("edit boundary preparation", () => {
