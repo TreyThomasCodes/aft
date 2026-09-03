@@ -35,8 +35,8 @@ const RECLAIM_TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 
 // Lock files in these storage domains have the fixed layout
 // `<storage>/<domain>/<key>/<lock>`. Add a domain here when a new persistent
-// artifact lock is introduced; keeping this list explicit prevents maintenance
-// from walking large unrelated trees such as harness backup histories.
+// artifact lock is introduced. BackupStore's deeper `.locks` shape is handled
+// separately so maintenance never walks backup entry histories.
 const RECLAIM_TOKEN_SWEEP_DOMAINS: &[&str] = &[
     "index",       // Search-index cache locks.
     "callgraph",   // Callgraph root-cache writer leases.
@@ -49,6 +49,10 @@ const RECLAIM_TOKEN_SWEEP_DOMAINS: &[&str] = &[
 const RECLAIM_TOKEN_SWEEP_MAX_DOMAIN_DEPTH: usize = 2;
 // compress::trust owns this one lock directly under the storage root.
 const ROOT_RECLAIM_TOKEN_PATHS: &[&str] = &[".trusted-filter-projects.json.lock.reclaim"];
+// BackupStore scopes locks below each harness and session. Prefixes cover the
+// client-specific MCP and fingerprint-specific federated harness directories.
+const FIXED_BACKUP_HARNESS_DIRS: &[&str] = &["opencode", "pi", "runner"];
+const BACKUP_HARNESS_DIR_PREFIXES: &[&str] = &["mcp--", "fed--"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReclaimTokenState {
@@ -1067,7 +1071,57 @@ fn sweep_stale_reclaim_tokens_at(
     for domain in RECLAIM_TOKEN_SWEEP_DOMAINS {
         removed = removed.saturating_add(sweep_reclaim_token_domain(&root.join(domain))?);
     }
+    removed = removed.saturating_add(sweep_backup_reclaim_tokens(root)?);
     Ok(Some(removed))
+}
+
+fn sweep_backup_reclaim_tokens(root: &Path) -> io::Result<usize> {
+    let harnesses = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0_usize;
+    for harness in harnesses {
+        let harness = harness?;
+        if !harness.file_type()?.is_dir() || !is_backup_harness_dir(&harness.file_name()) {
+            continue;
+        }
+        let sessions = match fs::read_dir(harness.path().join("backups")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for session in sessions {
+            let session = session?;
+            if !session.file_type()?.is_dir() {
+                continue;
+            }
+            let lock_entries = match fs::read_dir(session.path().join(".locks")) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for lock_entry in lock_entries {
+                let lock_entry = lock_entry?;
+                if lock_entry.file_type()?.is_file() && is_reclaim_token_path(&lock_entry.path()) {
+                    removed = removed
+                        .saturating_add(remove_stale_reclaim_token(&lock_entry.path())? as usize);
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn is_backup_harness_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    FIXED_BACKUP_HARNESS_DIRS.contains(&name)
+        || BACKUP_HARNESS_DIR_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 fn sweep_reclaim_token_domain(domain_root: &Path) -> io::Result<usize> {
@@ -1966,20 +2020,28 @@ mod tests {
         let dead_token = write_reclaim_token(&cache_dir.join("cache.lock"), &dead);
         let live = current_process_metadata();
         let live_token = write_reclaim_token(&cache_dir.join("live.lock"), &live);
-        let backup_dir = root.path().join("opencode/backups/x");
-        fs::create_dir_all(&backup_dir).expect("create unrelated backup tree");
-        let unrelated_token = write_reclaim_token(&backup_dir.join("foo.lock"), &dead);
+        let backup_session = root.path().join("opencode/backups/session");
+        let backup_entry = backup_session.join("path_hash");
+        let backup_locks = backup_session.join(".locks");
+        fs::create_dir_all(&backup_entry).expect("create backup entry tree");
+        fs::create_dir_all(&backup_locks).expect("create backup lock directory");
+        let unrelated_token = write_reclaim_token(&backup_entry.join("foo.lock"), &dead);
+        let backup_token = write_reclaim_token(&backup_locks.join("x.lock"), &dead);
         let cadence = Mutex::new(None);
 
         let removed = sweep_stale_reclaim_tokens_at(root.path(), Instant::now(), &cadence)
             .expect("sweep tokens");
 
-        assert_eq!(removed, Some(1));
+        assert_eq!(removed, Some(2));
         assert!(!dead_token.exists());
+        assert!(
+            !backup_token.exists(),
+            "BackupStore lock tokens must be swept"
+        );
         assert_eq!(read_lock_metadata(&live_token).expect("live token"), live);
         assert!(
             unrelated_token.exists(),
-            "maintenance must not descend into non-domain backup trees"
+            "maintenance must not descend into backup entry trees"
         );
     }
 
