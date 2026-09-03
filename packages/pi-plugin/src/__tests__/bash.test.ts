@@ -893,6 +893,9 @@ describe("bash tool adapter", () => {
     expect(confirmations).toHaveLength(0);
   });
 
+  // Spawns a real host process through the fallback executor; the first shell
+  // exec on a cold CI runner takes seconds, so this budget is explicit rather
+  // than Bun's 5s default.
   test("transport-dead fallback recovers on the next successful module call", async () => {
     const tools = new Map<string, MockToolDef>();
     const command =
@@ -945,7 +948,7 @@ describe("bash tool adapter", () => {
         message: `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${projectRoot}`,
       },
     ]);
-  });
+  }, 20_000);
 
   test("execute throws Rust-side bash error responses", async () => {
     const tools = new Map<string, MockToolDef>();

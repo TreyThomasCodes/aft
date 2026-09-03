@@ -390,6 +390,9 @@ describe("OpenCode bash adapter", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
+  // Spawns a real host process through the fallback executor; the first shell
+  // exec on a cold CI runner takes seconds, so this budget is explicit rather
+  // than Bun's 5s default.
   test("transport-dead fallback recovers on the next successful module call", async () => {
     const ask = mockAsk();
     const command =
@@ -428,7 +431,7 @@ describe("OpenCode bash adapter", () => {
       always: [],
       metadata: { command, cwd: PROJECT_CWD, host_fallback: true },
     });
-  });
+  }, 20_000);
 
   test("host fallback refuses background mode instead of spawning locally", async () => {
     const ask = mockAsk();
