@@ -11,6 +11,9 @@ pub type FinalizeFn<'a> = dyn Fn(&mut Response) + 'a;
 
 /// Monotonic timestamps for one subc tool call. The recorder stays on the
 /// request path and only takes an `Instant::now()` at each phase boundary.
+///
+/// Causal wait state is harvested on the executor worker at `mark_execute_done`
+/// because `PhaseTrace::new` and `finish` run on different threads than execute.
 #[derive(Debug)]
 pub struct PhaseTrace {
     frame_decoded: Instant,
@@ -20,6 +23,9 @@ pub struct PhaseTrace {
     execute_done: Option<Instant>,
     format_done: Option<Instant>,
     finalize_done: Option<Instant>,
+    waiting_on: WaitingOn,
+    waiting_on_build_id: Option<String>,
+    wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,7 +89,6 @@ pub struct ToolCallPhaseDurations {
 
 impl PhaseTrace {
     pub fn new(frame_decoded: Instant) -> Self {
-        crate::logging::reset_tool_call_wait();
         Self {
             frame_decoded,
             executor_submitted: None,
@@ -92,6 +97,9 @@ impl PhaseTrace {
             execute_done: None,
             format_done: None,
             finalize_done: None,
+            waiting_on: WaitingOn::None,
+            waiting_on_build_id: None,
+            wait_ms: 0,
         }
     }
 
@@ -100,6 +108,7 @@ impl PhaseTrace {
     }
 
     pub fn mark_job_admitted(&mut self) {
+        crate::logging::reset_tool_call_wait();
         let now = Instant::now();
         self.job_admitted = Some(now);
         if let Some(submitted) = self.executor_submitted {
@@ -117,6 +126,10 @@ impl PhaseTrace {
 
     pub(crate) fn mark_execute_done(&mut self) {
         self.execute_done = Some(Instant::now());
+        let (waiting_on, waiting_on_build_id, wait_ms) = crate::logging::take_tool_call_wait();
+        self.waiting_on = waiting_on;
+        self.waiting_on_build_id = waiting_on_build_id;
+        self.wait_ms = wait_ms;
     }
 
     fn mark_format_done(&mut self) {
@@ -134,7 +147,6 @@ impl PhaseTrace {
         let execute_done = self.execute_done?;
         let format_done = self.format_done?;
         let finalize_done = self.finalize_done?;
-        let (waiting_on, waiting_on_build_id, wait_ms) = crate::logging::take_tool_call_wait();
         Some(ToolCallPhaseDurations {
             queue: job_admitted.duration_since(executor_submitted),
             translate: translate_done.duration_since(job_admitted),
@@ -152,9 +164,9 @@ impl PhaseTrace {
             writer_queue_was_full: egress.writer_queue_was_full,
             writer_reserve_timeouts: egress.reserve_timeouts,
             total: egress.write_finished.duration_since(self.frame_decoded),
-            waiting_on,
-            waiting_on_build_id,
-            wait_ms,
+            waiting_on: self.waiting_on,
+            waiting_on_build_id: self.waiting_on_build_id,
+            wait_ms: self.wait_ms,
         })
     }
 }
@@ -492,6 +504,9 @@ mod tests {
             execute_done: Some(t0 + Duration::from_millis(10)),
             format_done: Some(t0 + Duration::from_millis(15)),
             finalize_done: Some(t0 + Duration::from_millis(21)),
+            waiting_on: WaitingOn::None,
+            waiting_on_build_id: None,
+            wait_ms: 0,
         };
 
         let phases = trace
@@ -524,6 +539,42 @@ mod tests {
         assert!(phases.writer_queue_was_full);
         assert_eq!(phases.writer_reserve_timeouts, 2);
         assert_eq!(phases.total, Duration::from_millis(48));
+    }
+
+    #[test]
+    fn phase_trace_carries_wait_harvested_on_worker_to_finish_on_other_thread() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        let worker = std::thread::spawn(move || {
+            trace.mark_job_admitted();
+            crate::logging::note_tool_call_wait(WaitingOn::Limiter, Some("b-1-1"), 42);
+            trace.mark_translate_done();
+            trace.mark_execute_done();
+            trace.mark_format_done();
+            trace.mark_finalize_done();
+            trace
+        });
+        let trace = worker.join().expect("worker");
+        let phases = std::thread::spawn(move || {
+            let now = Instant::now();
+            trace.finish(ToolCallEgressTiming {
+                enqueued: now,
+                dequeued: now,
+                write_started: now,
+                write_finished: now,
+                frame_bytes: 0,
+                queue_depth: 0,
+                writer_active_at_enqueue: false,
+                writer_queue_was_full: false,
+                reserve_timeouts: 0,
+            })
+        })
+        .join()
+        .expect("writer")
+        .expect("complete phase trace");
+        assert_eq!(phases.waiting_on, WaitingOn::Limiter);
+        assert_eq!(phases.waiting_on_build_id.as_deref(), Some("b-1-1"));
+        assert_eq!(phases.wait_ms, 42);
     }
 
     mod raw_request_construction {

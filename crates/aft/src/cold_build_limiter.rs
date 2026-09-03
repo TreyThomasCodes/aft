@@ -223,12 +223,14 @@ fn acquire_blocking_while_inner(
         }
         if let Some(permit) = permit {
             let wait_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            if logged {
+            if wait_ms > 0 {
                 crate::logging::note_tool_call_wait(
                     crate::run_tool_call::WaitingOn::Limiter,
                     None,
                     wait_ms,
                 );
+            }
+            if logged {
                 match request {
                     Some(request) => crate::slog_info!(
                         "{} cold-build slot acquired after {}ms wait: request={} kind={}",

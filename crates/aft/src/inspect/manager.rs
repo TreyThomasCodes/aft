@@ -2597,21 +2597,27 @@ struct Tier2PhaseTimings {
     scanned_files: usize,
 }
 
+const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+
 impl Tier2PhaseTimings {
     fn add_db_timings(&mut self, timings: InspectDbTimings) {
         self.db_lock += timings.lock_wait;
         self.db_txn += timings.transaction;
     }
 
+    fn worked(&self) -> Duration {
+        self.freshness + self.scan + self.snapshot + self.rollup + self.db
+    }
+
     fn log(&self, category: InspectCategory, project_root: &Path) {
-        let worked = self.freshness + self.scan + self.snapshot + self.rollup + self.db;
+        let worked = self.worked();
         if !worked.is_zero() {
             crate::logging::note_tier2_scan(
                 category.to_string(),
                 worked.as_millis().min(u128::from(u64::MAX)) as u64,
             );
         }
-        if worked < Duration::from_millis(50) {
+        if worked < TIER2_WORK_LOG_THRESHOLD {
             return;
         }
         let key = crate::search_index::artifact_cache_key(project_root);
@@ -2803,24 +2809,6 @@ fn log_tier2_benchmark_category_start(job: &InspectJob) {
         &job.project_root,
         key,
     );
-    crate::logging::log_index_event(
-        crate::logging::IndexEvent::from_scope(
-            crate::logging::IndexEventKind::BuildStarted,
-            &scope,
-        )
-        .field("category", job.category.as_str())
-        .field("files", job.scope_files.len()),
-    );
-    crate::logging::log_index_event(
-        crate::logging::IndexEvent::from_scope(
-            crate::logging::IndexEventKind::BuildProgress,
-            &scope,
-        )
-        .field("stage", job.category.as_str())
-        .field("completed", 0)
-        .field("total", 1)
-        .field("elapsed_ms", 0),
-    );
     TIER2_INDEX_SCOPE.with(|slot| *slot.borrow_mut() = Some(scope));
     if !tier2_benchmark_logging_enabled() {
         return;
@@ -2833,11 +2821,28 @@ fn log_tier2_benchmark_category_start(job: &InspectJob) {
     );
 }
 
+fn tier2_pass_did_real_work(result: &InspectResult) -> bool {
+    match &result.outcome {
+        Ok(success) => {
+            !success.scanned_files.is_empty() || result.duration >= TIER2_WORK_LOG_THRESHOLD
+        }
+        Err(_) => false,
+    }
+}
+
 fn log_tier2_benchmark_category_end(result: &InspectResult) {
     let scope = TIER2_INDEX_SCOPE.with(|slot| slot.borrow_mut().take());
     if let Some(scope) = scope {
         match &result.outcome {
-            Ok(success) => {
+            Ok(success) if tier2_pass_did_real_work(result) => {
+                crate::logging::log_index_event(
+                    crate::logging::IndexEvent::from_scope(
+                        crate::logging::IndexEventKind::BuildStarted,
+                        &scope,
+                    )
+                    .field("category", result.category.as_str())
+                    .field("files", success.scanned_files.len()),
+                );
                 crate::logging::log_index_event(
                     crate::logging::IndexEvent::from_scope(
                         crate::logging::IndexEventKind::BuildReady,
@@ -2849,6 +2854,7 @@ fn log_tier2_benchmark_category_end(result: &InspectResult) {
                     .field("contributions", success.contributions.len()),
                 );
             }
+            Ok(_) => {}
             Err(message) => {
                 crate::logging::log_index_event(
                     crate::logging::IndexEvent::from_scope(

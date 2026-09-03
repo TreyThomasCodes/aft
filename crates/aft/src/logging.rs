@@ -331,13 +331,36 @@ fn push_index_field(line: &mut String, key: &str, value: &str) {
     line.push_str(&addition);
 }
 
+/// Keep the distinctive suffix of a long root so the five required fields still fit.
+fn left_truncate_root(root: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "...";
+    if root.len() <= max_bytes {
+        return root.to_string();
+    }
+    let max_bytes = max_bytes.max(MARKER.len());
+    let keep = max_bytes.saturating_sub(MARKER.len());
+    let mut start = root.len().saturating_sub(keep);
+    while start < root.len() && !root.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &root[start..])
+}
+
 fn format_index_event_line(event: &IndexEvent) -> String {
-    let mut line = String::from("index_event");
-    push_index_field(&mut line, "kind", event.kind.as_str());
-    push_index_field(&mut line, "plane", event.plane.as_str());
-    push_index_field(&mut line, "build_id", &event.build_id);
-    push_index_field(&mut line, "root", &normalize_index_root(&event.root));
-    push_index_field(&mut line, "key", &event.key);
+    let kind = sanitize_index_value(event.kind.as_str());
+    let plane = sanitize_index_value(event.plane.as_str());
+    let build_id = sanitize_index_value(&event.build_id);
+    let key = sanitize_index_value(&event.key);
+    let mut root = sanitize_index_value(&normalize_index_root(&event.root));
+    let prefix = format!("index_event kind={kind} plane={plane} build_id={build_id} root=");
+    let key_field = format!(" key={key}");
+    let root_budget = INDEX_EVENT_MAX_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(key_field.len());
+    if root.len() > root_budget {
+        root = left_truncate_root(&root, root_budget);
+    }
+    let mut line = format!("{prefix}{root}{key_field}");
     for (key, value) in &event.extra {
         push_index_field(&mut line, key, value);
     }
@@ -471,7 +494,7 @@ pub(crate) fn note_index_query(
     }
 }
 
-/// Reset causal-wait state at the start of a tool call.
+/// Reset causal-wait state on the executor worker at job admission.
 pub(crate) fn reset_tool_call_wait() {
     TOOL_CALL_WAIT.with(|slot| *slot.borrow_mut() = ToolCallWaitState::default());
 }
@@ -1621,7 +1644,13 @@ mod tests {
             && fields.get("key").map(String::as_str) == Some(key)
     }
 
-    fn assert_lifecycle_sequence(lines: &[String], plane: &str, root: &str, key: &str) {
+    fn assert_lifecycle_sequence(
+        lines: &[String],
+        plane: &str,
+        root: &str,
+        key: &str,
+        require_progress: bool,
+    ) {
         let events: Vec<_> = lines
             .iter()
             .filter(|line| event_matches(line, plane, root, key))
@@ -1642,10 +1671,12 @@ mod tests {
             kinds.first().is_some_and(|kind| kind == "build_started"),
             "expected build_started first, got {kinds:?} from {events:?}"
         );
-        assert!(
-            kinds.iter().any(|kind| kind == "build_progress"),
-            "expected build_progress in {kinds:?} from {events:?}"
-        );
+        if require_progress {
+            assert!(
+                kinds.iter().any(|kind| kind == "build_progress"),
+                "expected build_progress in {kinds:?} from {events:?}"
+            );
+        }
         assert!(
             kinds.last().is_some_and(|kind| kind == "build_ready"),
             "expected build_ready last, got {kinds:?} from {events:?}"
@@ -1692,6 +1723,26 @@ mod tests {
         let _ = result;
         assert_index_event_grammar(&lines);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn index_event_keeps_required_fields_for_long_root() {
+        let root = format!("/{}", "a".repeat(399));
+        let (_, lines) = capture_index_events(|| {
+            log_index_event(IndexEvent::new(
+                IndexEventKind::BuildStarted,
+                IndexPlane::Search,
+                "b-9-9",
+                &root,
+                "keepkey",
+            ));
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let fields = index_event_fields(&lines[0]);
+        assert_eq!(fields.get("build_id").map(String::as_str), Some("b-9-9"));
+        assert_eq!(fields.get("key").map(String::as_str), Some("keepkey"));
+        assert!(fields.get("root").is_some(), "{lines:?}");
+        assert_index_event_grammar(&lines);
     }
 
     #[test]
@@ -1749,7 +1800,13 @@ mod tests {
             )
         });
         built.expect("callgraph cold build");
-        assert_lifecycle_sequence(&lines, "callgraph", &normalize_index_root(&root), &key);
+        assert_lifecycle_sequence(
+            &lines,
+            "callgraph",
+            &normalize_index_root(&root),
+            &key,
+            true,
+        );
     }
 
     #[test]
@@ -1760,7 +1817,7 @@ mod tests {
             crate::search_index::SearchIndex::build_with_limit(&root, 1_000_000)
         });
         assert!(index.ready);
-        assert_lifecycle_sequence(&lines, "search", &normalize_index_root(&root), &key);
+        assert_lifecycle_sequence(&lines, "search", &normalize_index_root(&root), &key, true);
     }
 
     #[test]
@@ -1778,11 +1835,11 @@ mod tests {
             crate::semantic_index::SemanticIndex::build(&root, &files, &mut embed, 8)
         });
         built.expect("semantic build");
-        assert_lifecycle_sequence(&lines, "semantic", &normalize_index_root(&root), &key);
+        assert_lifecycle_sequence(&lines, "semantic", &normalize_index_root(&root), &key, true);
     }
 
     #[test]
-    fn tier2_category_emits_started_progress_ready() {
+    fn tier2_category_emits_started_ready() {
         let (_temp, root) = tiny_project("t2", "mod0.ts", "export function f0() { return 0; }\n");
         let key = crate::search_index::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &key, false);
@@ -1805,7 +1862,14 @@ mod tests {
             )
         });
         assert!(outcome.payload().is_some(), "{outcome:?}");
-        assert_lifecycle_sequence(&lines, "tier2", &normalize_index_root(&root), &key);
+        assert_lifecycle_sequence(&lines, "tier2", &normalize_index_root(&root), &key, false);
+        assert!(
+            !lines.iter().any(|line| {
+                event_matches(line, "tier2", &normalize_index_root(&root), &key)
+                    && line.contains("kind=build_progress")
+            }),
+            "tier2 must not emit synthetic build_progress: {lines:?}"
+        );
     }
 
     #[test]
