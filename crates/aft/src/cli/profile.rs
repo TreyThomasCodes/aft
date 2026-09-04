@@ -23,6 +23,9 @@ use std::time::Duration;
 const DEFAULT_SECONDS: u64 = 4;
 const TOP_THREADS: usize = 5;
 const TOP_SYMBOLS: usize = 10;
+// The macOS `sample` text parsers compile on every platform so the fixture tests
+// (a real stripped ck-aft sample) run everywhere; only macOS calls them at runtime.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SAMPLE_ROOT_COLUMN: usize = 6;
 #[cfg(test)]
 #[inline(never)]
@@ -612,6 +615,7 @@ fn append_proc_stack(thread: &mut SampleThread, state: &str, stack: &str) {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_macos_sample(raw: &str) -> Vec<SampleThread> {
     let mut threads = Vec::new();
     let mut current: Option<SampleThread> = None;
@@ -671,6 +675,7 @@ fn parse_macos_sample(raw: &str) -> Vec<SampleThread> {
     threads
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_thread_header(line: &str) -> Option<(u64, String, String)> {
     let mut fields = line.split_whitespace();
     let samples = fields.next()?.parse::<u64>().ok()?;
@@ -683,6 +688,7 @@ fn parse_thread_header(line: &str) -> Option<(u64, String, String)> {
     ))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_sample_frame(line: &str) -> Option<(usize, u64, String, Option<String>)> {
     let (sample_column, samples) = first_sample_column(line)?;
     // `sample` draws each tree level two columns apart. Some trees replace
@@ -697,6 +703,7 @@ fn parse_sample_frame(line: &str) -> Option<(usize, u64, String, Option<String>)
     (!frame.is_empty()).then(|| (depth, samples, frame.clone(), parse_sample_offset(&frame)))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn first_sample_column(line: &str) -> Option<(usize, u64)> {
     line.char_indices().find_map(|(start, character)| {
         (character.is_ascii_digit()
@@ -708,6 +715,7 @@ fn first_sample_column(line: &str) -> Option<(usize, u64)> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_sample_offset(frame: &str) -> Option<String> {
     if let Some(tail) = frame.rsplit_once("load address ").map(|(_, tail)| tail) {
         let offset = tail.rsplit_once(" + ")?.1.split_whitespace().next()?;
