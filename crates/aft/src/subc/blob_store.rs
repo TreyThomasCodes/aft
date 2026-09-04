@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::blob_store::{BlobStore, BlobStoreError, FullKey, PutReport};
+use crate::blob_store::{BlobStore, BlobStoreError, FullKey, PutOutcome, PutReport};
 
 use super::BindTrust;
 
@@ -19,6 +19,12 @@ pub const BLOB_AGE_FLOOR: Duration = Duration::from_secs(15 * 60);
 pub struct BlobQuota {
     pub payload_bytes: u64,
     pub rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FamilyUsage {
+    rows: u64,
+    payload_bytes: u64,
 }
 
 impl Default for BlobQuota {
@@ -58,6 +64,8 @@ pub struct BoundBlobStore {
     family: String,
     view: String,
     quota: BlobQuota,
+    cached_usage: Option<FamilyUsage>,
+    usage_reads: u64,
     failed_paths: BTreeMap<Vec<u8>, FailedPath>,
     sweep_requests: Vec<SweepRequest>,
 }
@@ -82,6 +90,8 @@ impl BoundBlobStore {
             family,
             view: view.into(),
             quota,
+            cached_usage: None,
+            usage_reads: 0,
             failed_paths: BTreeMap::new(),
             sweep_requests: Vec::new(),
         }
@@ -97,15 +107,26 @@ impl BoundBlobStore {
         if !self.is_first_party() || family != self.family {
             return Ok(BoundPutOutcome::Denied);
         }
-        // Existing immutable rows are reused and consume no additional quota.
-        // Only a new payload can cross the family limits.
-        let is_new = self.store.get(full_key)?.is_none();
-        let usage = self.store.usage()?;
-        if is_new
-            && (usage.rows.saturating_add(1) > self.quota.rows
-                || usage.payload_bytes.saturating_add(payload.len() as u64)
-                    > self.quota.payload_bytes)
+        let payload_bytes = payload.len() as u64;
+        let usage = self.cached_usage()?;
+        if self.needs_exact_usage(usage, payload_bytes) {
+            self.refresh_usage()?;
+        }
+        let usage = self.cached_usage.expect("usage was initialized");
+        if usage.rows.saturating_add(1) > self.quota.rows
+            || usage.payload_bytes.saturating_add(payload_bytes) > self.quota.payload_bytes
         {
+            // A cached figure can only conservatively predict a new row. Near
+            // quota, preserve idempotence by allowing an existing key to reuse.
+            if self.store.get(full_key)?.is_some() {
+                return match self.store.put(full_key, payload) {
+                    Ok(report) => Ok(BoundPutOutcome::Stored(report)),
+                    Err(error) => {
+                        self.cached_usage = None;
+                        Err(error)
+                    }
+                };
+            }
             self.failed_paths.insert(
                 path.to_vec(),
                 FailedPath {
@@ -119,9 +140,25 @@ impl BoundBlobStore {
             });
             return Ok(BoundPutOutcome::QuotaExceeded);
         }
-        self.store
-            .put(full_key, payload)
-            .map(BoundPutOutcome::Stored)
+        let report = match self.store.put(full_key, payload) {
+            Ok(report) => report,
+            Err(error) => {
+                self.cached_usage = None;
+                return Err(error);
+            }
+        };
+        match report.outcome {
+            PutOutcome::Inserted => {
+                let usage = self.cached_usage.expect("usage was initialized");
+                self.cached_usage = Some(FamilyUsage {
+                    rows: usage.rows.saturating_add(1),
+                    payload_bytes: usage.payload_bytes.saturating_add(payload_bytes),
+                });
+            }
+            PutOutcome::Failed => self.cached_usage = None,
+            PutOutcome::Reused | PutOutcome::Quarantined | PutOutcome::QuotaExceeded => {}
+        }
+        Ok(BoundPutOutcome::Stored(report))
     }
 
     pub fn get(&self, family: &str, full_key: &FullKey) -> Result<Option<Vec<u8>>, BlobStoreError> {
@@ -144,6 +181,35 @@ impl BoundBlobStore {
 
     pub fn sweep_requests(&self) -> &[SweepRequest] {
         &self.sweep_requests
+    }
+
+    /// Exposes usage-cache refreshes so integration tests can verify that
+    /// quota checks remain bounded during large assemblies.
+    pub fn usage_read_count(&self) -> u64 {
+        self.usage_reads
+    }
+
+    fn cached_usage(&mut self) -> Result<FamilyUsage, BlobStoreError> {
+        if self.cached_usage.is_none() {
+            self.refresh_usage()?;
+        }
+        Ok(self.cached_usage.expect("usage was initialized"))
+    }
+
+    fn refresh_usage(&mut self) -> Result<(), BlobStoreError> {
+        let usage = self.store.usage()?;
+        self.cached_usage = Some(FamilyUsage {
+            rows: usage.rows,
+            payload_bytes: usage.payload_bytes,
+        });
+        self.usage_reads = self.usage_reads.saturating_add(1);
+        Ok(())
+    }
+
+    fn needs_exact_usage(&self, usage: FamilyUsage, payload_bytes: u64) -> bool {
+        usage.rows.saturating_add(1) * 10 >= self.quota.rows.saturating_mul(9)
+            || usage.payload_bytes.saturating_add(payload_bytes) * 10
+                >= self.quota.payload_bytes.saturating_mul(9)
     }
 
     fn is_first_party(&self) -> bool {
