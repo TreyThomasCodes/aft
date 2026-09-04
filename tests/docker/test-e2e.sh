@@ -231,6 +231,17 @@ run_opencode_session() {
         else
             echo "    (empty)" >&2
         fi
+        # With stdout/stderr empty, OpenCode's own log file is the only record
+        # of what a stalled launch was doing (plugin install, provider fetches).
+        local oc_log_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log"
+        local oc_log
+        oc_log=$(ls -t "$oc_log_dir"/*.log 2>/dev/null | head -n 1 || true)
+        if [ -n "$oc_log" ]; then
+            echo "  OpenCode log (last 60 lines of ${oc_log}):" >&2
+            tail -n 60 "$oc_log" | sed 's/^/    /' >&2
+        else
+            echo "  OpenCode log: none under ${oc_log_dir}" >&2
+        fi
     fi
     return "$exit_code"
 }

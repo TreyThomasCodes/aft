@@ -824,6 +824,21 @@ if ($WarmupEndCount -le $WarmupStartCount) {
     Show-LogTail "opencode stderr" ($WarmupResult + ".err")
     Show-LogTail "aimock stdout" $AimockLog
     Show-LogTail "aimock stderr" $AimockErrLog
+    # A launch that stalls before the plugin loads leaves stdout/stderr empty;
+    # OpenCode's own log is the only record of what it was doing (plugin
+    # install, provider fetches). Dump the newest log file wherever this host
+    # keeps it.
+    $OpencodeLogDirs = @(
+        (Join-Path $env:USERPROFILE ".local\share\opencode\log"),
+        (Join-Path $env:LOCALAPPDATA "opencode\log"),
+        (Join-Path $env:APPDATA "opencode\log")
+    )
+    foreach ($dir in $OpencodeLogDirs) {
+        if (Test-Path $dir) {
+            $newest = Get-ChildItem -Path $dir -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($newest) { Show-LogTail "opencode log ($dir)" $newest.FullName }
+        }
+    }
     Write-Host ""
     Write-Host "warmup: plugin never loaded within 240s" -ForegroundColor Red
     exit 1
