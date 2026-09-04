@@ -1805,7 +1805,16 @@ mod tests {
         });
         let _ = result;
         assert_index_event_grammar(&lines);
-        assert_eq!(lines.len(), 1);
+        // The capture slot is process-wide: a parallel lib test that builds an
+        // index can emit into the same window. Only this test's own event
+        // (unique build_id) is the subject here.
+        let own: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                index_event_fields(line).get("build_id").map(String::as_str) == Some("b-1-1")
+            })
+            .collect();
+        assert_eq!(own.len(), 1, "{lines:?}");
     }
 
     #[test]
