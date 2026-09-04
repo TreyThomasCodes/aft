@@ -17,10 +17,12 @@ use rayon::prelude::*;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
 };
+use std::cell::RefCell;
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -75,6 +77,7 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
+const DISK_FILE_INDEX_MEMO_CAPACITY: usize = 4_096;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
@@ -2398,9 +2401,16 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 }
 
-/// A cold-build resolver view that loads one file's index at a time. Keeping the
-/// complete staged corpus in SQLite makes the heap proportional to the active
-/// reference window rather than to the number of project files.
+/// A cold-build resolver view that loads file indexes on demand. The bounded
+/// memo keeps repeated lookups cheap without making the heap proportional to an
+/// unbounded project corpus.
+///
+/// Instances are created only after extraction commits every `files`, `nodes`,
+/// `file_dependencies`, and structural `refs` input and the indexing fence moves
+/// staging to `resolving`. Resolution replaces `refs` rows only to add status,
+/// target, and provenance outputs, and inserts `edges`; `DbFileIndex` reads none
+/// of those output columns. Its inputs therefore stay immutable for an instance,
+/// so the memo needs no generation key or slice-fence invalidation.
 struct DiskProjectIndex<'a> {
     project_root: &'a Path,
     conn: &'a Connection,
@@ -2408,10 +2418,37 @@ struct DiskProjectIndex<'a> {
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
     module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
+    file_index_memo: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    module_parent_memo: RefCell<HashMap<String, Option<(String, String)>>>,
+    memoize_resolver_indexes: bool,
 }
 
 impl DiskProjectIndex<'_> {
-    fn file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
+    fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
+        if self.memoize_resolver_indexes {
+            if let Some(cached) = self.file_index_memo.borrow().get(rel_path).cloned() {
+                return cached;
+            }
+        }
+
+        let loaded = self.load_file_index(rel_path).map(Rc::new);
+        if self.memoize_resolver_indexes {
+            let mut memo = self.file_index_memo.borrow_mut();
+            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
+                // Keep the active caller's index hot even when an unusually broad
+                // resolution walk exhausts the bounded target-file memo.
+                let caller_index = memo.remove(self.caller_file);
+                memo.clear();
+                if let Some(caller_index) = caller_index {
+                    memo.insert(self.caller_file.to_string(), caller_index);
+                }
+            }
+            memo.insert(rel_path.to_string(), loaded.clone());
+        }
+        loaded
+    }
+
+    fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
         let lang: String = self
             .conn
             .query_row(
@@ -2576,23 +2613,8 @@ impl DiskProjectIndex<'_> {
         let rel_path = relative_path(self.project_root, &candidate);
         self.contains_file(&rel_path).then_some(rel_path)
     }
-}
 
-impl ResolverIndex for DiskProjectIndex<'_> {
-    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
-        (file == self.caller_file).then_some(self.caller_data)
-    }
-
-    fn lang_for(&self, file: &str) -> Option<LangId> {
-        self.file_index(file).and_then(|index| index.lang)
-    }
-
-    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
-        self.file_index(caller_file)
-            .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
-    }
-
-    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+    fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2613,10 +2635,43 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         }
         None
     }
+}
+
+impl ResolverIndex for DiskProjectIndex<'_> {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
+        (file == self.caller_file).then_some(self.caller_data)
+    }
+
+    fn lang_for(&self, file: &str) -> Option<LangId> {
+        self.file_index(file).and_then(|index| index.lang)
+    }
+
+    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
+        self.file_index(caller_file)
+            .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
+    }
+
+    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        if self.memoize_resolver_indexes {
+            if let Some(cached) = self.module_parent_memo.borrow().get(target_file).cloned() {
+                return cached;
+            }
+        }
+
+        let parent = self.load_module_parent(target_file);
+        if self.memoize_resolver_indexes {
+            let mut memo = self.module_parent_memo.borrow_mut();
+            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
+                memo.clear();
+            }
+            memo.insert(target_file.to_string(), parent.clone());
+        }
+        parent
+    }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
         self.file_index(file)
-            .map(|index| index.reexports)
+            .map(|index| index.reexports.clone())
             .unwrap_or_default()
     }
 
@@ -2647,7 +2702,8 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn default_export(&self, file: &str) -> Option<String> {
-        self.file_index(file).and_then(|index| index.default_export)
+        self.file_index(file)
+            .and_then(|index| index.default_export.clone())
     }
 
     fn contains_file(&self, file: &str) -> bool {
@@ -3664,6 +3720,7 @@ impl CallGraphStore {
             corpus_fingerprint,
             COLD_BUILD_RESOLVE_WINDOW,
             &module_resolution_memo,
+            true,
         )
     }
 
@@ -3675,12 +3732,31 @@ impl CallGraphStore {
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
     ) -> Result<ColdBuildStats> {
+        self.cold_build_chunked_with_disk_index_memo_for_test(
+            files,
+            chunk_size,
+            resolve_window,
+            module_resolution_memo,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn cold_build_chunked_with_disk_index_memo_for_test(
+        &self,
+        files: &[PathBuf],
+        chunk_size: usize,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+        memoize_resolver_indexes: bool,
+    ) -> Result<ColdBuildStats> {
         let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
         self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
             chunk_size,
             &corpus_fingerprint,
             resolve_window.max(1),
             module_resolution_memo,
+            memoize_resolver_indexes,
         )
     }
 
@@ -3690,6 +3766,7 @@ impl CallGraphStore {
         corpus_fingerprint: &str,
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
+        memoize_resolver_indexes: bool,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
@@ -3871,6 +3948,9 @@ impl CallGraphStore {
                             caller_data: &caller_extract.data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
                             module_resolution_memo,
+                            file_index_memo: RefCell::new(HashMap::new()),
+                            module_parent_memo: RefCell::new(HashMap::new()),
+                            memoize_resolver_indexes,
                         };
                         for staged_ref in &staged[offset..end] {
                             let resolved = resolve_ref(staged_ref.raw.clone(), &index)?;
@@ -16425,12 +16505,15 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open uncached store");
+        // Bypass the outer disk-index memo so this comparison still isolates
+        // the filesystem-facing module-resolution memo.
         let uncached_stats = uncached
-            .cold_build_chunked_with_resolution_memo_for_test(
+            .cold_build_chunked_with_disk_index_memo_for_test(
                 &files,
                 7,
                 resolve_window,
                 &uncached_memo,
+                false,
             )
             .expect("uncached comparison build");
         assert!(
@@ -16532,6 +16615,56 @@ export function leaf() {}
     }
 
     #[test]
+    fn cold_build_disk_file_index_memo_preserves_resolved_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let files = write_rust_declared_module_memo_fixture(&project_root, 6);
+
+        let bypassed = CallGraphStore::open(
+            dir.path().join("store-disk-memo-bypassed"),
+            project_root.to_path_buf(),
+        )
+        .expect("open bypassed store");
+        let bypassed_module_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let bypassed_stats = bypassed
+            .cold_build_chunked_with_disk_index_memo_for_test(
+                &files,
+                3,
+                7,
+                &bypassed_module_memo,
+                false,
+            )
+            .expect("build with disk index memo bypassed");
+
+        let memoized = CallGraphStore::open(
+            dir.path().join("store-disk-memoized"),
+            project_root.to_path_buf(),
+        )
+        .expect("open memoized store");
+        let memoized_module_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let memoized_stats = memoized
+            .cold_build_chunked_with_disk_index_memo_for_test(
+                &files,
+                3,
+                7,
+                &memoized_module_memo,
+                true,
+            )
+            .expect("build with disk index memo enabled");
+
+        assert_cold_build_stats_match_except_elapsed(&bypassed_stats, &memoized_stats);
+        for table in ["refs", "edges"] {
+            assert_eq!(
+                graph_table_rows(&bypassed, table),
+                graph_table_rows(&memoized, table),
+                "memoized and bypassed disk indexes must produce byte-identical {table} rows"
+            );
+        }
+    }
+
+    #[test]
     fn rust_declared_module_memo_parses_each_declaring_file_once_and_preserves_edges() {
         let dir = tempdir().expect("temp dir");
         let project_root = dir.path().join("project");
@@ -16565,8 +16698,10 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open uncached Rust store");
+        // Bypass the outer disk-index memo so parse counts continue to measure
+        // the Rust declaration memo rather than the higher-level cache.
         let uncached_stats = uncached
-            .cold_build_chunked_with_resolution_memo_for_test(&files, 3, 11, &uncached_memo)
+            .cold_build_chunked_with_disk_index_memo_for_test(&files, 3, 11, &uncached_memo, false)
             .expect("uncached Rust build");
 
         let cached_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
