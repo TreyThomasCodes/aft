@@ -1500,12 +1500,30 @@ mod tests {
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
 
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &crate::context::App::default_shared(),
-        );
+        // Health reads try-locks by design and reports "could not be snapshotted
+        // without contention" when a parallel test holds one; that is the busy
+        // signal, not the verdict under test, so retry until a real snapshot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let report = loop {
+            let report = test_health_report(
+                &executor,
+                &HashMap::new(),
+                &DispatchPathMetrics::new(),
+                &crate::context::App::default_shared(),
+            );
+            let busy = report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("without contention"));
+            if !busy {
+                break report;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health snapshot stayed contended: {report:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(
             report.detail.as_deref(),
             Some("1 root(s) warming background indexes (serving normally)")
