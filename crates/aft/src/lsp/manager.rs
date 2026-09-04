@@ -1467,12 +1467,14 @@ impl LspManager {
             .expect("LSP event receiver should remain connected");
     }
 
-    #[cfg(test)]
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
     pub(crate) fn event_sender_for_test(&self) -> Sender<LspEvent> {
         self.event_tx.clone()
     }
 
-    #[cfg(test)]
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
     pub(crate) fn insert_client_for_test(&mut self, client: LspClient) {
         let key = ServerKey {
             kind: client.kind(),

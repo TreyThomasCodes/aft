@@ -835,12 +835,14 @@ impl LspClient {
         }
     }
 
-    #[cfg(test)]
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
     pub(crate) fn suppress_kill_on_drop_for_test(&mut self) {
         self.suppress_kill_on_drop = true;
     }
 
-    #[cfg(test)]
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
     pub(crate) fn poison_writer_for_test(&self) {
         let writer = Arc::clone(&self.writer);
         let _ = thread::spawn(move || {
