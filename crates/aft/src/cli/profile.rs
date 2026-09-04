@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
+// The atos stdin write happens only on macOS.
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
@@ -558,9 +561,13 @@ fn capture_proc_stacks(pid: u32, seconds: u64) -> Result<CapturedSample, Profile
                 .to_string();
             let state = fs::read_to_string(path.join("status"))
                 .ok()
-                .and_then(|status| status.lines().find(|line| line.starts_with("State:")))
-                .unwrap_or("State: unknown")
-                .to_string();
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with("State:"))
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "State: unknown".to_string());
             let stack = fs::read_to_string(path.join("stack")).unwrap_or_default();
             let thread = threads.entry(tid).or_insert_with(|| SampleThread {
                 id: tid.to_string(),
