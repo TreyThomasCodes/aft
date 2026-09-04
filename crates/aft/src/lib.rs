@@ -102,6 +102,7 @@ pub mod migrate_storage;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;
+pub mod path_status;
 pub mod pattern_compile;
 pub mod pins;
 mod platform_tls;
@@ -109,6 +110,7 @@ pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
 pub mod readonly_artifacts;
+pub mod refresh;
 pub mod response_finalize;
 pub mod root_cache;
 pub mod run_tool_call;
@@ -132,6 +134,7 @@ pub mod tool_path;
 pub mod url_fetch;
 pub mod views;
 pub(crate) mod walk_boundary;
+pub mod watcher;
 pub mod watcher_filter;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
