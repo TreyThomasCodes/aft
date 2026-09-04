@@ -8185,7 +8185,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     // Seed one live actor so both the digest's live-root path and the census's
     // lifecycle join are exercised before opening the process-wide read plane.
     bind_route1(&mut stream, &root1).await;
-    let actor_count = executor.try_actor_count().expect("actor count available");
+    let actor_count = executor.actor_count();
     let configure_count = state.configure_count();
     let watcher_count = app.watcher_count();
 
@@ -8201,8 +8201,8 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     .await;
     expect_route_bind_ack(&mut stream, 20).await;
     assert_eq!(
-        executor.try_actor_count(),
-        Some(actor_count),
+        executor.actor_count(),
+        actor_count,
         "management bind must not register an actor"
     );
     assert_eq!(
@@ -8273,7 +8273,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
 
     send_management_route_bind(&mut stream, 3, 40, &root2, Some(Principal::Unverified)).await;
     expect_route_bind_error(&mut stream, 40, "route_refused").await;
-    assert_eq!(executor.try_actor_count(), Some(actor_count));
+    assert_eq!(executor.actor_count(), actor_count);
     assert_eq!(state.configure_count(), configure_count);
     assert_eq!(app.watcher_count(), watcher_count);
 

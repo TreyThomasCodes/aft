@@ -793,6 +793,13 @@ impl Executor {
         )
     }
 
+    /// Registered actor count under the scheduler lock. Tests that assert a
+    /// bind had no actor side effect use this rather than the try-lock form,
+    /// which reports contention (`None`) instead of a count.
+    pub fn actor_count(&self) -> usize {
+        self.inner.state.lock().actors.len()
+    }
+
     /// Constant-time scheduler contention signal for the health reply path.
     pub fn try_actor_count(&self) -> Option<usize> {
         self.inner.state.try_lock().map(|state| state.actors.len())
