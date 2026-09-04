@@ -4,8 +4,8 @@
 //! standalone NDJSON-over-stdin loop. Instead it connects to a running subc
 //! daemon over loopback TCP, authenticates with the pre-envelope HMAC handshake
 //! (`subc-transport`), then speaks the subc frame protocol (`subc-protocol`):
-//! ModuleHello → HelloAck (register as a tool provider), then a channel-0
-//! control loop (Ping/Pong, RouteBind) plus route-channel tool calls.
+//! ModuleHello → HelloAck (register provider capabilities), then a channel-0
+//! control loop (Ping/Pong, RouteBind) plus tool and management route calls.
 //!
 //! Concurrency: subc routes tool calls through the executor. The tokio
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
@@ -40,16 +40,17 @@ use crate::runtime_drain;
 use crate::sandbox_spawn::{AuthenticatedPrincipal, PrincipalTrust};
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ModuleManifest,
-    ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+    StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{
     HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
 };
 use subc_protocol::{
-    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, MAX_FRAME_BODY_LEN,
-    PROTOCOL_VERSION,
+    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, RouteTarget,
+    MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -2133,6 +2134,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    management_routes: &mut HashSet<RouteChannel>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -2150,6 +2152,7 @@ async fn teardown_installed_route(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     remove_installed_route(installed_route_epochs, channel);
+    management_routes.remove(&channel);
     let bg_end_cause = match cancellation_reason {
         "Goodbye" => "goodbye",
         "higher-epoch RouteBind" => "higher-epoch",
@@ -2829,7 +2832,8 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // ModuleHello: register as a tool provider and advertise the supported control-plane operations.
+    // ModuleHello registers the tool and management providers and advertises
+    // the separate channel-0 control operations.
     // Echo the one-time launch nonce the daemon injected via SUBC_LAUNCH_NONCE so a
     // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
     let hello = ModuleHelloBody {
@@ -2918,6 +2922,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
+    let mut management_routes: HashSet<RouteChannel> = HashSet::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
@@ -2945,7 +2950,7 @@ where
     );
 
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
-        shared_app.set_open_route_count(routes.len());
+        shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
         let ready_inspects = pending_responses.poll_ready(executor.as_ref());
@@ -3177,6 +3182,7 @@ where
                             None,
                             &mut installed_route_epochs,
                             &mut routes,
+                            &mut management_routes,
                             &mut root_channels,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
@@ -3228,6 +3234,7 @@ where
                             &mut pending_binds,
                             &mut installed_route_epochs,
                             &mut routes,
+                            &mut management_routes,
                             &mut root_channels,
                             &mut bg_subs,
                             &mut bg_sub_by_session,
@@ -3254,35 +3261,50 @@ where
                         }
                     }
                     FrameType::Request => {
-                        if let Err(error) = handle_tool_call(
-                            &writer_tx,
-                            &frame,
-                            phase_trace,
-                            &routes,
-                            &pending_binds,
-                            &mut live_roots,
-                            &executor,
-                            &active_tool_calls,
-                            &pending_deferred_setups,
-                            &shutdown,
-                            &connection_cancel,
-                            &bash_deferred_tx,
-                            &bash_poll_touch_tx,
-                            &dispatch_path_metrics,
-                            &mut route_bash_cancels,
-                            &mut pending_bash_asks,
-                            &mut next_bash_ask_corr,
-                            &mut bg_subs,
-                            &mut bg_sub_by_session,
-                            &mut bg_wake_pending,
-                            &mut bg_wake_epoch,
-                            dispatch,
-                            &deferred_response_tx,
-                            allow_native_passthrough,
-                            tool_response_body_limit,
-                        )
-                        .await
-                        {
+                        let route = route_key(frame.header.channel, frame.header.epoch);
+                        let result = if management_routes.contains(&route) {
+                            handle_management_request(
+                                &writer_tx,
+                                &frame,
+                                &shared_app,
+                                &executor,
+                                &live_roots,
+                                &root_channels,
+                                &health_rollup_cache,
+                                &dispatch_path_metrics,
+                            )
+                            .await
+                        } else {
+                            handle_tool_call(
+                                &writer_tx,
+                                &frame,
+                                phase_trace,
+                                &routes,
+                                &pending_binds,
+                                &mut live_roots,
+                                &executor,
+                                &active_tool_calls,
+                                &pending_deferred_setups,
+                                &shutdown,
+                                &connection_cancel,
+                                &bash_deferred_tx,
+                                &bash_poll_touch_tx,
+                                &dispatch_path_metrics,
+                                &mut route_bash_cancels,
+                                &mut pending_bash_asks,
+                                &mut next_bash_ask_corr,
+                                &mut bg_subs,
+                                &mut bg_sub_by_session,
+                                &mut bg_wake_pending,
+                                &mut bg_wake_epoch,
+                                dispatch,
+                                &deferred_response_tx,
+                                allow_native_passthrough,
+                                tool_response_body_limit,
+                            )
+                            .await
+                        };
+                        if let Err(error) = result {
                             break Err(error);
                         }
                     }
@@ -4193,10 +4215,9 @@ async fn expire_overdue_route_binds(
     Ok(())
 }
 
-/// channel-0 control requests: RouteBind plus the cached health probe. RouteBind
-/// still reconciles the route's RootConfig through the executor's Mutating lane
-/// and resolves completion on a loop-owned control-completion channel so slow
-/// configure jobs do not block the transport loop.
+/// Channel-0 control requests: RouteBind plus the cached health probe.
+/// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
+/// management binds install immediately without creating project state.
 #[allow(clippy::too_many_arguments)]
 async fn handle_control_request(
     tx: &WriterSender,
@@ -4207,6 +4228,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    management_routes: &mut HashSet<RouteChannel>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -4227,94 +4249,13 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
-    // `memory.census` is newer than the pinned subc protocol enum, so older
-    // enum-based protocol crates would reject it. Decode this operation locally
-    // before normal protocol handling to preserve compatibility.
-    if serde_json::from_slice::<Value>(&frame.body)
-        .ok()
-        .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_owned))
-        .as_deref()
-        == Some("memory.census")
-    {
-        let mut census = health_rollup_cache.memory_census();
-        if let Some(rows) = census.get_mut("roots").and_then(Value::as_object_mut) {
-            let lifecycle = shared_app.lifecycle_census_snapshot();
-            for (root_id, meta) in live_roots.iter() {
-                let root = root_id.as_path().display().to_string();
-                let bound_routes = root_channels.get(root_id).map_or(0, HashSet::len);
-                let age_ms = Instant::now()
-                    .saturating_duration_since(meta.last_touched)
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                let ttl_ms = root_idle_ttl(executor, root_id)
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                let lsp = lifecycle
-                    .lsp
-                    .children_by_root
-                    .iter()
-                    .find(|child| child.root == root);
-                if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
-                    let evictable_bytes = row.get("evictable_bytes").cloned().unwrap_or(json!(0));
-                    row.insert("root_id".to_string(), json!(root));
-                    row.insert("bound_routes".to_string(), json!(bound_routes));
-                    row.insert("last_request_age_ms".to_string(), json!(age_ms));
-                    row.insert("idle_ttl_ms".to_string(), json!(ttl_ms));
-                    row.insert(
-                        "lsp_idle_ttl_ms".to_string(),
-                        json!(executor
-                            .actor_context(root_id)
-                            .map(|ctx| ctx
-                                .config()
-                                .idle
-                                .lsp_ttl()
-                                .as_millis()
-                                .min(u128::from(u64::MAX))
-                                as u64)
-                            .unwrap_or(0)),
-                    );
-                    row.insert(
-                        "evictable_in_ms".to_string(),
-                        crate::commands::memory_census::evictable_in_ms(
-                            bound_routes,
-                            ttl_ms,
-                            age_ms,
-                        )
-                        .map_or(Value::Null, |value| json!(value)),
-                    );
-                    row.insert(
-                        "evictable_bytes".to_string(),
-                        if bound_routes == 0 {
-                            evictable_bytes
-                        } else {
-                            json!(0)
-                        },
-                    );
-                    row.insert("lsp_children".to_string(), json!({ "count": lsp.map_or(0, |child| child.count), "rss_bytes": lsp.map_or(0, |child| child.rss_bytes) }));
-                }
-            }
-        }
-        let body = json!({ "op": "memory.census", "status": "ok", "data": census });
-        let response = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            frame.header.flags,
-            0,
-            0,
-            frame.header.corr,
-            serde_json::to_vec(&body).map_err(SubcError::Json)?,
-        )
-        .map_err(SubcError::FrameBuild)?;
-        return send_frame(tx, metrics, response).await;
-    }
-
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
             epoch,
-            target: _,
+            target,
             identity,
             principal,
             consumer_capabilities,
@@ -4331,6 +4272,101 @@ async fn handle_control_request(
                 )
                 .await;
             }
+
+            let bind_trust = trust_for_bind(&identity.harness, &principal);
+            if let RouteTarget::ManagementSurface { module_id } = &target {
+                if module_id != "aft" {
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "route_refused",
+                        "management route target is not AFT",
+                        metrics,
+                    )
+                    .await;
+                }
+                if !matches!(bind_trust, BindTrust::FirstParty) {
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "route_refused",
+                        "AFT management routes require a first-party principal",
+                        metrics,
+                    )
+                    .await;
+                }
+                if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
+                    if installed_epoch >= epoch {
+                        return send_route_bind_error(
+                            tx,
+                            frame,
+                            "config_divergence",
+                            "route bind generation is not newer than the installed generation",
+                            metrics,
+                        )
+                        .await;
+                    }
+                    teardown_installed_route(
+                        tx,
+                        metrics,
+                        executor,
+                        route_key(route_channel, installed_epoch),
+                        "higher-epoch RouteBind",
+                        None,
+                        installed_route_epochs,
+                        routes,
+                        management_routes,
+                        root_channels,
+                        bg_subs,
+                        bg_sub_by_session,
+                        bg_wake_pending,
+                        pending_bash_asks,
+                        live_roots,
+                        route_bash_cancels,
+                        active_tool_calls,
+                        pending_responses,
+                        pending_binds,
+                        retry_buffer,
+                        push_buffer,
+                        shutdown,
+                        tool_response_body_limit,
+                        lifecycle_probe,
+                    )
+                    .await?;
+                }
+                if pending_binds.contains_key(&route_id) {
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "config_divergence",
+                        "route bind is already pending for channel",
+                        metrics,
+                    )
+                    .await;
+                }
+
+                installed_route_epochs.insert(route_channel, epoch);
+                management_routes.insert(route_id);
+                return send_route_bind_ack(
+                    tx,
+                    frame.header.ver,
+                    frame.header.corr,
+                    frame.header.flags,
+                    metrics,
+                )
+                .await;
+            }
+            if matches!(&target, RouteTarget::InternalService { .. }) {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "route_refused",
+                    "AFT does not provide an internal-service route",
+                    metrics,
+                )
+                .await;
+            }
+
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -4366,6 +4402,7 @@ async fn handle_control_request(
                     Some(&replacement_root),
                     installed_route_epochs,
                     routes,
+                    management_routes,
                     root_channels,
                     bg_subs,
                     bg_sub_by_session,
@@ -4418,7 +4455,6 @@ async fn handle_control_request(
             let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
-            let bind_trust = trust_for_bind(&bind_harness, &principal);
             let bind_principal_id = principal_id(&principal);
             // Typed capability declaration from the consumer: the facade stamps it
             // from the MCP host's initialize-advertised capabilities. Absent
@@ -4611,6 +4647,208 @@ async fn handle_control_request(
     }
 }
 
+async fn handle_management_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    shared_app: &App,
+    executor: &Executor,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    health_rollup_cache: &HealthRollupCache,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
+    let operation = decoded
+        .as_ref()
+        .and_then(|value| value.get("op"))
+        .and_then(Value::as_str);
+    let Some(operation) = operation else {
+        let error = build_error_frame(
+            frame.header.ver,
+            frame.header.channel,
+            frame.header.epoch,
+            frame.header.corr,
+            frame.header.flags,
+            "unknown_management_op",
+            "management routes accept only declared operation envelopes",
+        )?;
+        return send_reliable_writer_frame(tx, metrics, error, "management refusal").await;
+    };
+
+    let result = match operation {
+        crate::commands::memory_census::MEMORY_CENSUS_OPERATION => Response::success(
+            "management-memory-census",
+            memory_census_with_lifecycle(
+                health_rollup_cache,
+                shared_app,
+                executor,
+                live_roots,
+                root_channels,
+            ),
+        ),
+        crate::commands::health_digest::HEALTH_DIGEST_OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let Some(params) = params.as_object() else {
+                return send_management_response(
+                    tx,
+                    frame,
+                    operation,
+                    Response::error(
+                        "management-health-digest",
+                        "invalid_request",
+                        "health.digest params must be an object",
+                    ),
+                    metrics,
+                )
+                .await;
+            };
+            let root = params
+                .get("project_root")
+                .or_else(|| params.get("root"))
+                .and_then(Value::as_str);
+            let Some(root) = root else {
+                return send_management_response(
+                    tx,
+                    frame,
+                    operation,
+                    Response::error(
+                        "management-health-digest",
+                        "invalid_request",
+                        "health.digest requires params.project_root",
+                    ),
+                    metrics,
+                )
+                .await;
+            };
+
+            let mut request = params.clone();
+            request.insert("id".to_string(), json!("management-health-digest"));
+            request.insert(
+                "command".to_string(),
+                json!(crate::commands::health_digest::HEALTH_DIGEST_OPERATION),
+            );
+            let request = serde_json::from_value::<RawRequest>(Value::Object(request))
+                .map_err(SubcError::Json)?;
+            match ProjectRootId::from_path(Path::new(root))
+                .ok()
+                .and_then(|root_id| executor.actor_context(&root_id))
+            {
+                Some(ctx) => crate::commands::health_digest::handle_health_digest(&request, &ctx),
+                None => crate::commands::health_digest::root_not_bound_response(&request, root),
+            }
+        }
+        _ => {
+            let error = build_error_frame(
+                frame.header.ver,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                frame.header.flags,
+                "unknown_management_op",
+                &format!("management operation {operation:?} is not declared by AFT"),
+            )?;
+            return send_reliable_writer_frame(tx, metrics, error, "management refusal").await;
+        }
+    };
+
+    send_management_response(tx, frame, operation, result, metrics).await
+}
+
+fn memory_census_with_lifecycle(
+    health_rollup_cache: &HealthRollupCache,
+    shared_app: &App,
+    executor: &Executor,
+    live_roots: &HashMap<ProjectRootId, RootMeta>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+) -> Value {
+    let mut census = health_rollup_cache.memory_census();
+    if let Some(rows) = census.get_mut("roots").and_then(Value::as_object_mut) {
+        let lifecycle = shared_app.lifecycle_census_snapshot();
+        for (root_id, meta) in live_roots {
+            let root = root_id.as_path().display().to_string();
+            let bound_routes = root_channels.get(root_id).map_or(0, HashSet::len);
+            let age_ms = Instant::now()
+                .saturating_duration_since(meta.last_touched)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let ttl_ms = root_idle_ttl(executor, root_id)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let lsp = lifecycle
+                .lsp
+                .children_by_root
+                .iter()
+                .find(|child| child.root == root);
+            if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
+                let evictable_bytes = row.get("evictable_bytes").cloned().unwrap_or(json!(0));
+                row.insert("root_id".to_string(), json!(root));
+                row.insert("bound_routes".to_string(), json!(bound_routes));
+                row.insert("last_request_age_ms".to_string(), json!(age_ms));
+                row.insert("idle_ttl_ms".to_string(), json!(ttl_ms));
+                row.insert(
+                    "lsp_idle_ttl_ms".to_string(),
+                    json!(executor
+                        .actor_context(root_id)
+                        .map(|ctx| ctx
+                            .config()
+                            .idle
+                            .lsp_ttl()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or(0)),
+                );
+                row.insert(
+                    "evictable_in_ms".to_string(),
+                    crate::commands::memory_census::evictable_in_ms(bound_routes, ttl_ms, age_ms)
+                        .map_or(Value::Null, |value| json!(value)),
+                );
+                row.insert(
+                    "evictable_bytes".to_string(),
+                    if bound_routes == 0 {
+                        evictable_bytes
+                    } else {
+                        json!(0)
+                    },
+                );
+                row.insert(
+                    "lsp_children".to_string(),
+                    json!({
+                        "count": lsp.map_or(0, |child| child.count),
+                        "rss_bytes": lsp.map_or(0, |child| child.rss_bytes),
+                    }),
+                );
+            }
+        }
+    }
+    census
+}
+
+async fn send_management_response(
+    tx: &WriterSender,
+    request: &Frame,
+    operation: &str,
+    result: Response,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let status = if result.success { "ok" } else { "error" };
+    let body = json!({ "op": operation, "status": status, "data": result.data });
+    let response = Frame::build_with_version(
+        request.header.ver,
+        FrameType::Response,
+        request.header.flags,
+        request.header.channel,
+        request.header.epoch,
+        request.header.corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "management response").await
+}
+
 fn install_bash_compressor(ctx: &AppContext) {
     // Mirrors main.rs per-actor compressor installation for subc-created actors.
     let filter_registry_handle = ctx.shared_filter_registry();
@@ -4632,6 +4870,20 @@ fn install_bash_compressor(ctx: &AppContext) {
             )
         },
     );
+}
+
+async fn send_route_bind_ack(
+    tx: &WriterSender,
+    ver: u8,
+    corr: u64,
+    flags: Flags,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let body =
+        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
+        .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await
 }
 
 async fn send_route_bind_error(
@@ -4789,17 +5041,19 @@ async fn handle_tool_call(
     let route_request = match serde_json::from_slice::<RouteRequest>(&frame.body) {
         Ok(request) => request,
         Err(error) => {
-            let is_census = serde_json::from_slice::<Value>(&frame.body)
-                .ok()
-                .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_owned))
-                .as_deref()
-                == Some("memory.census");
-            if !is_census {
+            let management_envelope = serde_json::from_slice::<Value>(&frame.body).ok();
+            let Some(operation) = management_envelope
+                .as_ref()
+                .and_then(|value| value.get("op"))
+                .and_then(Value::as_str)
+            else {
                 return Err(SubcError::Json(error));
-            }
+            };
             RouteRequest::ToolCall(ToolCallRequest {
-                name: "memory.census".to_string(),
-                arguments: Value::Object(serde_json::Map::new()),
+                name: operation.to_string(),
+                arguments: management_envelope
+                    .and_then(|value| value.get("params").cloned())
+                    .unwrap_or_else(|| json!({})),
                 edit_slot_survives: None,
                 preview: false,
             })

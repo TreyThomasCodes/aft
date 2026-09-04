@@ -2,8 +2,9 @@
 
 use super::{
     json, Bindings, Concurrency, ExecutionMode, Flags, IdentityBinding, IdentityScope, Lane,
-    LazyLock, ModuleManifest, Priority, ProviderRole, StorageBinding, StorageKind, StorageScope,
-    Tool, TrustTier, Value, MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
+    LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest, Priority, ProviderRole,
+    StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
+    MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
 
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
@@ -94,7 +95,6 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_regex_match"
             | "inspect_tier2_run"
             | "hashline_preflight"
-            | "memory.census"
     )
 }
 
@@ -118,8 +118,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "glob"
         | "grep"
         | "git_conflicts"
-        | "ast_search"
-        | "memory.census" => Some(Lane::PureRead),
+        | "ast_search" => Some(Lane::PureRead),
 
         // Lazy reads mutate parser/terminal/url caches on a miss, but are still
         // classified onto the reader pool; install races are handled at the
@@ -232,35 +231,59 @@ pub(super) fn build_manifest() -> ModuleManifest {
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ToolProvider {
-            tools: vec![
-                tool("status", ExecutionMode::Pure),
-                tool("bash", ExecutionMode::Mutating),
-                tool("powershell", ExecutionMode::Mutating),
-                tool("read", ExecutionMode::Pure),
-                tool("write", ExecutionMode::Mutating),
-                tool("edit", ExecutionMode::Mutating),
-                tool("apply_patch", ExecutionMode::Mutating),
-                tool("grep", ExecutionMode::Pure),
-                tool("glob", ExecutionMode::Pure),
-                tool("search", ExecutionMode::Pure),
-                tool("outline", ExecutionMode::Pure),
-                tool("zoom", ExecutionMode::Pure),
-                tool("inspect", ExecutionMode::Pure),
-                tool("callgraph", ExecutionMode::Pure),
-                tool("conflicts", ExecutionMode::Pure),
-                tool("ast_search", ExecutionMode::Pure),
-                tool("ast_replace", ExecutionMode::Mutating),
-                tool("delete", ExecutionMode::Mutating),
-                tool("move", ExecutionMode::Mutating),
-                tool("import", ExecutionMode::Mutating),
-                tool("safety", ExecutionMode::Mutating),
-            ],
-            identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: true,
-            sub_supervises: true,
-        }],
+        provides: vec![
+            ProviderRole::ToolProvider {
+                tools: vec![
+                    tool("status", ExecutionMode::Pure),
+                    tool("bash", ExecutionMode::Mutating),
+                    tool("powershell", ExecutionMode::Mutating),
+                    tool("read", ExecutionMode::Pure),
+                    tool("write", ExecutionMode::Mutating),
+                    tool("edit", ExecutionMode::Mutating),
+                    tool("apply_patch", ExecutionMode::Mutating),
+                    tool("grep", ExecutionMode::Pure),
+                    tool("glob", ExecutionMode::Pure),
+                    tool("search", ExecutionMode::Pure),
+                    tool("outline", ExecutionMode::Pure),
+                    tool("zoom", ExecutionMode::Pure),
+                    tool("inspect", ExecutionMode::Pure),
+                    tool("callgraph", ExecutionMode::Pure),
+                    tool("conflicts", ExecutionMode::Pure),
+                    tool("ast_search", ExecutionMode::Pure),
+                    tool("ast_replace", ExecutionMode::Mutating),
+                    tool("delete", ExecutionMode::Mutating),
+                    tool("move", ExecutionMode::Mutating),
+                    tool("import", ExecutionMode::Mutating),
+                    tool("safety", ExecutionMode::Mutating),
+                ],
+                identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: true,
+            },
+            // subc-protocol 0.10 manifest.rs:145-157 defines management
+            // operations as a name plus Query/Mutate kind. These queries carry
+            // their own optional root input and do not scope the route itself.
+            ProviderRole::ManagementSurface {
+                operations: vec![
+                    ManagementOperation {
+                        name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                    },
+                    ManagementOperation {
+                        name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                    },
+                ],
+                config_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                observability: Vec::new(),
+                identity_scope: Vec::new(),
+            },
+        ],
         consumes: Vec::new(),
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
@@ -283,7 +306,6 @@ pub(super) fn control_ops() -> Option<Vec<String>> {
         "route.bind".to_string(),
         "route.status".to_string(),
         MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
-        "memory.census".to_string(),
     ])
 }
 
@@ -393,6 +415,60 @@ mod tests {
             Some(false),
             "status schema must forbid additionalProperties"
         );
+    }
+
+    #[test]
+    fn build_manifest_declares_management_queries_outside_agent_tools() {
+        let manifest = build_manifest();
+        let tools = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ToolProvider { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .expect("tool provider role");
+        let operations = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => Some(operations),
+                _ => None,
+            })
+            .expect("management surface role");
+
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| (operation.name.as_str(), &operation.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    crate::commands::health_digest::HEALTH_DIGEST_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::commands::memory_census::MEMORY_CENSUS_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+            ]
+        );
+        for operation in operations {
+            assert!(
+                tools.iter().all(|tool| tool.name != operation.name),
+                "management operation {} must not enter the agent tool manifest",
+                operation.name
+            );
+            assert!(
+                !SUBC_TOOL_SCHEMAS.contains_key(&operation.name),
+                "management operation {} must not enter the subc tool schema artifact",
+                operation.name
+            );
+        }
+        assert!(!control_ops()
+            .expect("control operations")
+            .iter()
+            .any(|operation| operation == crate::commands::memory_census::MEMORY_CENSUS_OPERATION));
     }
 
     #[test]

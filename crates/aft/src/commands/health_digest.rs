@@ -100,13 +100,28 @@ fn insert_ticketed<T: Serialize>(
 /// quiescence, or constructing inspection work. Existing caches do not expose
 /// the required freshness tickets yet, so every category is omitted here.
 pub fn handle_health_digest(req: &RawRequest, _ctx: &AppContext) -> Response {
-    // `root` and `since` are conceptual operation inputs. Their transport
-    // encoding and interpretation remain intentionally outside this handler.
-    let _conceptual_inputs = (req.params.get("root"), req.params.get("since"));
+    // `project_root` is the management-wire spelling; `root` remains accepted
+    // for the standalone handler's original contract.
+    let _conceptual_inputs = (
+        req.params
+            .get("project_root")
+            .or_else(|| req.params.get("root")),
+        req.params.get("since"),
+    );
 
     Response::success(
         &req.id,
         render_current_values(&DigestCurrentValues::default()),
+    )
+}
+
+/// Preserve the operation's structured failure when its requested root has no
+/// registered actor. Management callers can observe the miss without creating one.
+pub fn root_not_bound_response(req: &RawRequest, root: &str) -> Response {
+    Response::error(
+        &req.id,
+        "root_not_bound",
+        format!("health.digest root is not bound: {root}"),
     )
 }
 

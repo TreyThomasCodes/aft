@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aft::bash_background::BgTaskStatus;
 use aft::config::Config;
 use aft::context::{
-    AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
+    App, AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
     SemanticRefreshWorkerSlot,
 };
 use aft::executor::{Executor, ExecutorConfig, Lane};
@@ -55,6 +55,7 @@ pub(super) struct FakeDaemonInput {
     pub(super) callgraph_root: std::path::PathBuf,
     pub(super) callgraph_file: std::path::PathBuf,
     pub(super) state: Arc<BridgeState>,
+    pub(super) app: Arc<App>,
     pub(super) executor: Arc<Executor>,
     pub(super) user_config_path: std::path::PathBuf,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
@@ -77,6 +78,7 @@ pub(super) struct FakeDaemonSession {
     pub(super) callgraph_root: std::path::PathBuf,
     pub(super) callgraph_file: std::path::PathBuf,
     pub(super) state: Arc<BridgeState>,
+    pub(super) app: Arc<App>,
     pub(super) executor: Arc<Executor>,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
 }
@@ -527,6 +529,14 @@ impl BridgeState {
                 .any(|event| event.request_id == request_id),
             "{request_id} configure started while same-root reads were still in flight"
         );
+    }
+
+    fn configure_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("bridge state lock")
+            .configure_events
+            .len()
     }
 
     fn assert_configure_root(&self, request_id: &str, root: &std::path::Path) {
@@ -1558,6 +1568,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
             ..Config::default()
         },
     ));
+    let app = ctx.app();
     let executor = Arc::new(Executor::with_config(executor_config));
     let executor_for_daemon = Arc::clone(&executor);
     let executor_for_check = Arc::clone(&executor);
@@ -1625,6 +1636,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
+                    app,
                     executor: executor_for_daemon,
                     user_config_path: user_config_path_for_daemon,
                     lifecycle_events,
@@ -2602,11 +2614,11 @@ fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
 }
 
 #[test]
-fn subc_bridge_memory_census_is_channel_zero_and_uncapped() {
-    run_subc_bridge_test(
-        "subc_bridge_memory_census_is_channel_zero_and_uncapped",
+fn subc_bridge_management_surface_is_passive_closed_and_first_party() {
+    run_subc_bridge_production_test(
+        "subc_bridge_management_surface_is_passive_closed_and_first_party",
         Duration::from_secs(30),
-        drive_memory_census_daemon,
+        drive_management_surface_daemon,
         |_, _, _| {},
     );
 }
@@ -3081,6 +3093,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
         callgraph_root,
         callgraph_file,
         state,
+        app,
         executor,
         user_config_path: _,
         lifecycle_events,
@@ -3131,6 +3144,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
             callgraph_root,
             callgraph_file,
             state,
+            app,
             executor,
             lifecycle_events,
         },
@@ -8052,11 +8066,38 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
         control_ops.iter().any(|op| op == "health.check"),
         "health.check missing from control_ops: {control_ops:?}"
     );
+    assert!(
+        !control_ops.iter().any(|op| op == "memory.census"),
+        "memory.census belongs to the management route, not channel 0: {control_ops:?}"
+    );
 
-    let tools = match hello_body.manifest.provides.first() {
-        Some(subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. }) => tools,
-        other => panic!("expected first provider role to be ToolProvider, got {other:?}"),
-    };
+    let tools = hello_body
+        .manifest
+        .provides
+        .iter()
+        .find_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .expect("manifest should provide agent tools");
+    let management_operations = hello_body
+        .manifest
+        .provides
+        .iter()
+        .find_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ManagementSurface { operations, .. } => {
+                Some(operations)
+            }
+            _ => None,
+        })
+        .expect("manifest should provide a management surface");
+    assert_eq!(
+        management_operations
+            .iter()
+            .map(|operation| operation.name.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from(["health.digest", "memory.census"])
+    );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
         "../../src/subc_tool_schemas.json"
     ))
@@ -8075,6 +8116,8 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "tool {} should have a non-empty description",
             tool.name
         );
+        assert_ne!(tool.name, "health.digest");
+        assert_ne!(tool.name, "memory.census");
     }
 
     send_connection_goodbye(&mut stream).await;
@@ -8128,21 +8171,112 @@ async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
-async fn drive_memory_census_daemon(input: FakeDaemonInput) {
-    let FakeDaemonSession { mut stream, .. } = open_fake_daemon_session(input).await;
-    send_raw_control_request(&mut stream, 30, json!({ "op": "memory.census" })).await;
-    let frame = read_frame_timeout(&mut stream, "memory.census response").await;
-    assert_eq!(frame.header.ty, FrameType::Response);
-    assert_eq!(frame.header.channel, 0);
-    let response: Value = serde_json::from_slice(&frame.body).expect("memory census response");
+async fn drive_management_surface_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        app,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    // Seed one live actor so both the digest's live-root path and the census's
+    // lifecycle join are exercised before opening the process-wide read plane.
+    bind_route1(&mut stream, &root1).await;
+    let actor_count = executor.try_actor_count().expect("actor count available");
+    let configure_count = state.configure_count();
+    let watcher_count = app.watcher_count();
+
+    send_management_route_bind(
+        &mut stream,
+        2,
+        20,
+        &root2,
+        Some(Principal::Reserved {
+            module_id: "prefrontal".to_string(),
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 20).await;
+    assert_eq!(
+        executor.try_actor_count(),
+        Some(actor_count),
+        "management bind must not register an actor"
+    );
+    assert_eq!(
+        state.configure_count(),
+        configure_count,
+        "management bind must not run configure"
+    );
+    assert_eq!(
+        app.watcher_count(),
+        watcher_count,
+        "management bind must not start a watcher"
+    );
+    let root2_id = ProjectRootId::from_path(&root2).expect("root2 id");
+    assert!(!executor.actor_registered(&root2_id));
+
+    send_management_request(&mut stream, 2, 30, json!({ "op": "memory.census" })).await;
+    let census = read_management_response(&mut stream, 2, 30, "memory.census").await;
     assert!(
-        response.pointer("/data/roots").is_some(),
-        "census must carry uncapped roots: {response:?}"
+        census.pointer("/data/roots").is_some(),
+        "census must carry uncapped roots: {census:?}"
     );
     assert!(
-        response.pointer("/data/process").is_some(),
-        "census must carry process header: {response:?}"
+        census.pointer("/data/process").is_some(),
+        "census must carry process header: {census:?}"
     );
+
+    send_management_request(
+        &mut stream,
+        2,
+        31,
+        json!({
+            "op": "health.digest",
+            "params": { "project_root": root1, "since": "cursor-1" }
+        }),
+    )
+    .await;
+    let digest = read_management_response(&mut stream, 2, 31, "health.digest").await;
+    assert_eq!(digest.get("status").and_then(Value::as_str), Some("ok"));
+    assert!(
+        digest.get("data").is_some_and(Value::is_object),
+        "digest must carry its structured response: {digest:?}"
+    );
+
+    send_management_request(
+        &mut stream,
+        2,
+        34,
+        json!({ "op": "health.digest", "params": { "root": root2 } }),
+    )
+    .await;
+    let unbound = read_management_response(&mut stream, 2, 34, "health.digest").await;
+    assert_eq!(unbound.get("status").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        unbound.pointer("/data/code").and_then(Value::as_str),
+        Some("root_not_bound")
+    );
+
+    send_tool_call(&mut stream, 2, 32, "status", json!({})).await;
+    expect_error_frame(&mut stream, 2, 32, "unknown_management_op").await;
+
+    send_management_request(&mut stream, 1, 33, json!({ "op": "memory.census" })).await;
+    let tool_route_refusal = read_frame_timeout(&mut stream, "tool-route management refusal").await;
+    assert_tool_error_code(
+        &tool_response_json(&tool_route_refusal),
+        "unknown_tool",
+        "management operation on a tool route",
+    );
+
+    send_management_route_bind(&mut stream, 3, 40, &root2, Some(Principal::Unverified)).await;
+    expect_route_bind_error(&mut stream, 40, "route_refused").await;
+    assert_eq!(executor.try_actor_count(), Some(actor_count));
+    assert_eq!(state.configure_count(), configure_count);
+    assert_eq!(app.watcher_count(), watcher_count);
+
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -8662,22 +8796,6 @@ async fn send_control_request(
     .await;
 }
 
-async fn send_raw_control_request(stream: &mut tokio::net::TcpStream, corr: u64, request: Value) {
-    send_frame(
-        stream,
-        Frame::build(
-            FrameType::Request,
-            control_flags(),
-            0,
-            0,
-            corr,
-            serde_json::to_vec(&request).expect("raw control request body"),
-        )
-        .expect("raw control request frame"),
-    )
-    .await;
-}
-
 async fn expect_health_check_report(stream: &mut tokio::net::TcpStream, corr: u64) -> HealthReport {
     let frame = read_frame_timeout(stream, "health.check response").await;
     assert_eq!(frame.header.ty, FrameType::Response);
@@ -8688,6 +8806,72 @@ async fn expect_health_check_report(stream: &mut tokio::net::TcpStream, corr: u6
     response
         .health_report()
         .expect("health.check response should carry a HealthReport")
+}
+
+async fn send_management_route_bind(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    identity_root: &std::path::Path,
+    principal: Option<Principal>,
+) {
+    send_control_request(
+        stream,
+        corr,
+        ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity {
+                project_root: identity_root.to_path_buf(),
+                harness: "prefrontal".to_string(),
+                session: "management-route-must-not-register-session".to_string(),
+            },
+            principal,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+        },
+    )
+    .await;
+}
+
+async fn send_management_request(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    body: Value,
+) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("management request body"),
+        )
+        .expect("management request frame"),
+    )
+    .await;
+}
+
+async fn read_management_response(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    operation: &str,
+) -> Value {
+    let frame = read_frame_timeout(stream, "management response").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, channel);
+    assert_eq!(frame.header.epoch, 1);
+    assert_eq!(frame.header.corr, corr);
+    let response: Value = serde_json::from_slice(&frame.body).expect("management response body");
+    assert_eq!(response.get("op").and_then(Value::as_str), Some(operation));
+    response
 }
 
 async fn send_route_bind(
