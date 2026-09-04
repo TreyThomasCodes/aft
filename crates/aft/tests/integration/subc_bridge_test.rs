@@ -8143,12 +8143,20 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
         let report = expect_health_check_report(&mut stream, 20).await;
         let metrics = report.metrics.clone().expect("health check metrics");
-        if report.status == subc_protocol::session::HealthStatus::Ok {
+        // The verdict turns Ok while a root is still warming, so settle on
+        // the component field the assertions below read, not the verdict
+        // alone: a cached rollup can still carry the pre-configure callgraph
+        // state for a beat after the verdict has settled.
+        let callgraph_settled = metrics
+            .pointer("/roots/0/callgraph_store/status")
+            .and_then(Value::as_str)
+            == Some("disabled");
+        if report.status == subc_protocol::session::HealthStatus::Ok && callgraph_settled {
             break (report, metrics);
         }
         assert!(
             Instant::now() < deadline,
-            "health check should settle to ok for disabled components: {report:?}"
+            "health check should settle to ok with disabled components: {report:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };

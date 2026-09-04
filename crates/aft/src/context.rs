@@ -2447,7 +2447,11 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
-        let callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
+        // The receiver contents no longer feed the status below (a disabled
+        // store must not report "building" from a lingering receiver), but a
+        // contended lock still means the snapshot would race a build state
+        // transition, so keep the probe for its busy signal.
+        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
             Some(guard) => guard,
             None => return RootHealthSummary::busy(),
         };
@@ -2539,9 +2543,15 @@ impl AppContext {
             // Read-only roots never cold-build; they query the shared store
             // via ReadonlyCallGraphStore on demand.
             "ready"
-        } else if callgraph_store_rx.is_some() || config.callgraph_store {
+        } else if config.callgraph_store {
+            // Either a build receiver is installed or the build has not been
+            // admitted yet; both resolve to ready under this configuration.
             "building"
         } else {
+            // A configure that disables the store publishes the new config
+            // before it retires the previous generation's build receiver.
+            // That lingering receiver must not report "building": no build it
+            // describes can ever publish into a disabled configuration.
             "disabled"
         };
         // dead_code is suppressed while the callgraph store is unavailable.

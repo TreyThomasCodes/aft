@@ -1521,6 +1521,44 @@ mod tests {
     }
 
     #[test]
+    fn disabled_callgraph_store_reports_disabled_despite_lingering_build_receiver() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("health-callgraph-disabled-lingering-rx");
+        let mut config = crate::config::Config::default();
+        config.callgraph_store = false;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        // Reproduce the configure window in which the disabling config is
+        // already published while the previous generation's build receiver
+        // has not been retired yet.
+        let (_tx, rx) = crossbeam_channel::unbounded::<crate::context::CallGraphStoreBuildEvent>();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        assert!(executor.register_actor(root.clone(), ctx));
+
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &crate::context::App::default_shared(),
+        );
+        assert_ne!(
+            report.status,
+            HealthStatus::Degraded,
+            "a disabled store is not a degradation: {report:?}"
+        );
+        // build_health_report reads one rollup Arc for both the verdict and
+        // the roots detail, so they describe the same moment: the component
+        // must not claim "building" for a store this config disables.
+        let metrics = report.metrics.expect("health metrics");
+        assert_eq!(
+            metrics["roots"][0]["callgraph_store"]["status"], "disabled",
+            "a disabled store must never report building: {metrics:#}"
+        );
+    }
+
+    #[test]
     fn pending_bind_breadcrumb_names_every_blocker_class() {
         let (_dir, root) = test_root("breadcrumb-blockers");
         let cases = [
