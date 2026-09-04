@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
@@ -31,6 +32,8 @@ use crate::slog_error;
 use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
+/// The total grace period for draining every LSP client during process shutdown.
+const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_secs(5);
 
 fn server_key_for_definition(
     def: &ServerDef,
@@ -359,6 +362,15 @@ impl IntoIterator for DrainedLspEvents {
     fn into_iter(self) -> Self::IntoIter {
         self.events.into_iter()
     }
+}
+
+/// Result of one bounded all-client shutdown. The same counts are emitted in
+/// the `lsp shutdown_all` summary log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LspShutdownAllOutcome {
+    pub graceful: usize,
+    pub forced: usize,
+    pub elapsed: Duration,
 }
 
 pub struct LspManager {
@@ -2200,13 +2212,80 @@ impl LspManager {
         clients
     }
 
-    /// Shutdown all servers gracefully.
-    pub fn shutdown_all(&mut self) {
-        for (key, mut client) in self.take_all_clients() {
-            if let Err(err) = client.shutdown() {
-                slog_error!("error shutting down {:?}: {}", key, err);
+    /// Shut down every server concurrently within one shared grace period.
+    pub fn shutdown_all(&mut self) -> LspShutdownAllOutcome {
+        let clients = self.take_all_clients();
+        Self::shutdown_all_clients(
+            clients,
+            self.child_registry.clone(),
+            LSP_SHUTDOWN_ALL_BUDGET,
+        )
+    }
+
+    fn shutdown_all_clients(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+        budget: Duration,
+    ) -> LspShutdownAllOutcome {
+        let started = Instant::now();
+        let mut pending_pids = clients
+            .iter()
+            .map(|(_, client)| client.child_pid())
+            .collect::<HashSet<_>>();
+        let (result_tx, result_rx) = unbounded();
+
+        for (key, mut client) in clients {
+            let pid = client.child_pid();
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                let result = client.shutdown();
+                // Do the drop before reporting completion so the registry cannot
+                // briefly report a reaped client as still live after this method
+                // has returned its shutdown summary.
+                drop(client);
+                let _ = result_tx.send((key, pid, result));
+            });
+        }
+        drop(result_tx);
+
+        let deadline = started + budget;
+        let mut outcome = LspShutdownAllOutcome::default();
+        while !pending_pids.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match result_rx.recv_timeout(remaining) {
+                Ok((key, pid, result)) => {
+                    if !pending_pids.remove(&pid) {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => outcome.graceful += 1,
+                        Err(err) => {
+                            outcome.forced += 1;
+                            slog_error!("error shutting down {:?}: {}", key, err);
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
+
+        if !pending_pids.is_empty() {
+            let pids = pending_pids.into_iter().collect::<Vec<_>>();
+            outcome.forced += pids.len();
+            // The shared registry owns process-group termination, so timed-out
+            // clients are reaped even though their graceful worker is still
+            // blocked in its per-client Shutdown request.
+            child_registry.reap_pids(&pids);
+        }
+
+        outcome.elapsed = started.elapsed();
+        slog_info!(
+            "lsp shutdown_all: graceful={} forced={} elapsed_ms={}",
+            outcome.graceful,
+            outcome.forced,
+            outcome.elapsed.as_millis()
+        );
+        outcome
     }
 
     /// Shut down taken clients on a detached thread named `aft-lsp-idle-reap`.

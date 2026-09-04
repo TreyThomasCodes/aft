@@ -746,11 +746,10 @@ impl LspClient {
             return self.abort_live_child_after_shutdown_error(err);
         }
 
-        self.state = ServerState::ShuttingDown;
-
         if let Err(err) = self.send_notification::<lsp_types::notification::Exit>(()) {
             return self.abort_live_child_after_shutdown_error(err);
         }
+        self.state = ServerState::ShuttingDown;
 
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
