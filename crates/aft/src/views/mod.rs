@@ -823,9 +823,17 @@ fn checkpoint_and_sync_database(
     observe(observer, PublicationStep::BlobWalCheckpointed);
     drop(connection);
     sync_file(path)?;
+    // SQLite deletes the WAL when the last connection to the database closes,
+    // so between an existence probe and the open the file can legitimately
+    // vanish when another connection on the same file closes (the checkpoint
+    // that removal implies already carried its frames into the main file).
+    // Open directly and treat NotFound as "nothing left to sync" instead of
+    // probing first.
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-    if wal_path.exists() {
-        sync_file(&wal_path)?;
+    match File::open(&wal_path) {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ViewError::Io(error)),
     }
     sync_parent(path)
 }
