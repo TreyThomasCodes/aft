@@ -138,8 +138,12 @@ fn publication_makes_dependencies_durable_before_sqlite_pointer_visibility() {
     assert_eq!(
         *recorded.0.lock().unwrap(),
         vec![
+            PublicationStep::BlobWalCheckpointed,
+            PublicationStep::BlobWalCheckpointed,
             PublicationStep::BlobWalFsync,
+            PublicationStep::BlobWalCheckpointed,
             PublicationStep::DerivedAndTrigramDurable,
+            PublicationStep::BlobWalCheckpointed,
             PublicationStep::AliasRowsDurable,
             PublicationStep::ClosureProbed,
             PublicationStep::ManifestFileWritten,

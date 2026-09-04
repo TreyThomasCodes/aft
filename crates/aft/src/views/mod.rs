@@ -510,6 +510,8 @@ pub struct PublicationRequest<'a> {
 /// tests. Production callers do not need to retain the sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationStep {
+    /// The SQLite WAL checkpoint completed; fsync has not begun yet.
+    BlobWalCheckpointed,
     BlobWalFsync,
     DerivedAndTrigramDurable,
     AliasRowsDurable,
@@ -633,15 +635,15 @@ impl ViewStore {
         }
 
         for path in &request.artifacts.blob_databases {
-            checkpoint_and_sync_database(path)?;
+            checkpoint_and_sync_database(path, observer)?;
         }
         observe(observer, PublicationStep::BlobWalFsync);
 
-        checkpoint_and_sync_database(&request.artifacts.derived_database)?;
+        checkpoint_and_sync_database(&request.artifacts.derived_database, observer)?;
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
         observe(observer, PublicationStep::DerivedAndTrigramDurable);
 
-        checkpoint_and_sync_database(&request.artifacts.alias_database)?;
+        checkpoint_and_sync_database(&request.artifacts.alias_database, observer)?;
         observe(observer, PublicationStep::AliasRowsDurable);
 
         probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
@@ -805,7 +807,10 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn checkpoint_and_sync_database(path: &Path) -> Result<()> {
+fn checkpoint_and_sync_database(
+    path: &Path,
+    observer: Option<&dyn PublicationObserver>,
+) -> Result<()> {
     if !path.is_file() {
         return Err(ViewError::InvalidManifest(format!(
             "durability input is not a SQLite file: {}",
@@ -815,6 +820,7 @@ fn checkpoint_and_sync_database(path: &Path) -> Result<()> {
     let connection = Connection::open(path)?;
     configure_connection(&connection)?;
     connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+    observe(observer, PublicationStep::BlobWalCheckpointed);
     drop(connection);
     sync_file(path)?;
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
