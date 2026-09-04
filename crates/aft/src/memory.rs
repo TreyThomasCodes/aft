@@ -270,6 +270,14 @@ impl AllocatorMemorySnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocatorSource {
+    /// Use the process-wide observation published by a sampler or health refresh.
+    Cached,
+    /// Walk allocator statistics now and publish the result for future cached reads.
+    Measure,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcessMemorySnapshot {
     pub rss_status: &'static str,
@@ -290,6 +298,11 @@ pub struct ProcessMemorySnapshot {
     /// Allocator bytes overlap the attributed subsystem totals and are an
     /// allocation envelope, not another amount to subtract from RSS.
     pub allocator: AllocatorMemorySnapshot,
+    /// Whether allocator slack came from an available allocator measurement.
+    pub allocator_slack_measured: bool,
+    /// Age of the cached allocator observation. A direct measurement is age zero;
+    /// a request-path read is null until the first process-wide observation exists.
+    pub allocator_observation_age_ms: Option<u64>,
     pub total_attributed_bytes: u64,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
@@ -312,13 +325,19 @@ impl ProcessMemorySnapshot {
         shared_semantic_bases: &MemoryEstimate,
     ) -> Self {
         let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
-        Self::from_root_rollups(rollups.iter(), roots.len(), shared_semantic_bases)
+        Self::from_root_rollups(
+            rollups.iter(),
+            roots.len(),
+            shared_semantic_bases,
+            AllocatorSource::Measure,
+        )
     }
 
     fn from_root_rollups<'a>(
         roots: impl Iterator<Item = &'a RootMemoryRollup>,
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
+        allocator_source: AllocatorSource,
     ) -> Self {
         let mut root_attributed_bytes = 0u64;
         let mut busy_subsystems = 0usize;
@@ -330,7 +349,7 @@ impl ProcessMemorySnapshot {
                 not_estimated_subsystems.saturating_add(root.not_estimated_subsystems);
         }
         let sqlite = SqliteMemorySnapshot::measure();
-        let allocator = allocator_memory_snapshot();
+        let (allocator, allocator_observation_age_ms) = allocator_observation(allocator_source);
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
             .saturating_add(sqlite.memory_used_bytes);
@@ -354,7 +373,9 @@ impl ProcessMemorySnapshot {
                 .is_none()
                 .then_some("platform_process_rss_unavailable"),
             sqlite,
+            allocator_slack_measured: allocator.retained_slack_bytes.is_some(),
             allocator,
+            allocator_observation_age_ms,
             total_attributed_bytes,
             unattributed_bytes,
             root_count,
@@ -411,6 +432,7 @@ impl MemoryRollupSnapshot {
             roots.values(),
             roots.len(),
             &shared_semantic_bases,
+            AllocatorSource::Measure,
         );
         let roots_total = roots.len();
         let (roots, roots_omitted, roots_omitted_bytes) =
@@ -428,7 +450,7 @@ impl MemoryRollupSnapshot {
 
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
-        Self::with_cap(roots_status, roots, true)
+        Self::with_cap(roots_status, roots, true, AllocatorSource::Cached)
     }
 
     /// Build the uncapped form used by the explicit memory census operation.
@@ -436,17 +458,24 @@ impl MemorySnapshot {
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemorySnapshot>,
     ) -> Self {
-        Self::with_cap(roots_status, roots, false)
+        Self::with_cap(roots_status, roots, false, AllocatorSource::Measure)
     }
 
     fn with_cap(
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemorySnapshot>,
         cap_detail: bool,
+        allocator_source: AllocatorSource,
     ) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
         // Totals cover EVERY root before the detail map is capped.
-        let process = ProcessMemorySnapshot::from_roots(&roots, &shared_semantic_bases);
+        let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
+        let process = ProcessMemorySnapshot::from_root_rollups(
+            rollups.iter(),
+            roots.len(),
+            &shared_semantic_bases,
+            allocator_source,
+        );
         let roots_total = roots.len();
         let (roots, roots_omitted, roots_omitted_bytes) = if cap_detail {
             cap_root_detail(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP)
@@ -748,6 +777,37 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
     allocator_memory_snapshot_impl()
 }
 
+fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, Option<u64>) {
+    match source {
+        AllocatorSource::Cached => cached_allocator_observation()
+            .map(|(snapshot, age_ms)| (snapshot, Some(age_ms)))
+            .unwrap_or_else(|| {
+                (
+                    AllocatorMemorySnapshot::not_estimated("allocator_observation_unavailable"),
+                    None,
+                )
+            }),
+        AllocatorSource::Measure => measure_allocator_observation(),
+    }
+}
+
+fn measure_allocator_observation() -> (AllocatorMemorySnapshot, Option<u64>) {
+    let sampled_at = std::time::Instant::now();
+    let snapshot = allocator_memory_snapshot();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let sampled_at_ms = allocator_slack_elapsed_ms(sampled_at);
+        publish_allocator_slack(&snapshot, sampled_at_ms);
+        let age_ms =
+            allocator_slack_elapsed_ms(std::time::Instant::now()).saturating_sub(sampled_at_ms);
+        (snapshot, Some(age_ms))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (snapshot, None)
+    }
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut libc::malloc_zone_t, goal: usize) -> usize;
@@ -773,11 +833,34 @@ const UNKNOWN_ALLOCATOR_SLACK: u64 = u64::MAX;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const UNSAMPLED_AT_MS: u64 = u64::MAX;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+const ALLOCATOR_OBSERVATION_UNSAMPLED: u8 = 0;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ALLOCATOR_OBSERVATION_MEASURED: u8 = 1;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ALLOCATOR_OBSERVATION_NOT_ESTIMATED: u8 = 2;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static ALLOCATOR_SLACK_CACHE_ORIGIN: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_OBSERVED_ALLOCATOR_SLACK_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_OBSERVED_ALLOCATOR_BYTES_IN_USE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_OBSERVATION_STATUS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(ALLOCATOR_OBSERVATION_UNSAMPLED);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_OBSERVATION_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static ALLOCATOR_OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static ALLOCATOR_OBSERVATION_PUBLISH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
@@ -800,6 +883,47 @@ pub(crate) fn allocator_snapshot_calls_for_test() -> u64 {
     ALLOCATOR_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+fn allocator_observation_test_mutex() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn allocator_observation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    allocator_observation_test_mutex()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_allocator_observation_for_test() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        ALLOCATOR_OBSERVATION_SEQUENCE.store(0, std::sync::atomic::Ordering::Release);
+        LAST_ALLOCATOR_OBSERVATION_STATUS.store(
+            ALLOCATOR_OBSERVATION_UNSAMPLED,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_OBSERVED_ALLOCATOR_BYTES_IN_USE.store(
+            UNKNOWN_ALLOCATOR_SLACK,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED.store(
+            UNKNOWN_ALLOCATOR_SLACK,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
+            UNKNOWN_ALLOCATOR_SLACK,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_ALLOCATOR_OBSERVATION_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+        LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
     let origin = ALLOCATOR_SLACK_CACHE_ORIGIN.get_or_init(|| now);
@@ -815,13 +939,108 @@ fn cached_allocator_slack() -> Option<u64> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cached_allocator_not_estimated_reason() -> &'static str {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        "mallinfo2_requires_glibc_2_33"
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        "platform_allocator_statistics_unavailable"
+    }
+}
+
+/// Return the last process-wide allocator observation without walking allocator
+/// zones. The observation timestamp is separate from the sampler reservation so
+/// a status request never mistakes an in-progress sample for a fresh reading.
+pub fn cached_allocator_observation() -> Option<(AllocatorMemorySnapshot, u64)> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        loop {
+            let sequence =
+                ALLOCATOR_OBSERVATION_SEQUENCE.load(std::sync::atomic::Ordering::Acquire);
+            if sequence % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let sampled_at_ms =
+                LAST_ALLOCATOR_OBSERVATION_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+            if sampled_at_ms == UNSAMPLED_AT_MS {
+                return None;
+            }
+            let status =
+                LAST_ALLOCATOR_OBSERVATION_STATUS.load(std::sync::atomic::Ordering::Acquire);
+            let bytes_in_use =
+                LAST_OBSERVED_ALLOCATOR_BYTES_IN_USE.load(std::sync::atomic::Ordering::Acquire);
+            let size_allocated =
+                LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED.load(std::sync::atomic::Ordering::Acquire);
+            let retained_slack =
+                LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
+            let sequence_after =
+                ALLOCATOR_OBSERVATION_SEQUENCE.load(std::sync::atomic::Ordering::Acquire);
+            if sequence != sequence_after || sequence_after % 2 != 0 {
+                continue;
+            }
+            let snapshot = match status {
+                ALLOCATOR_OBSERVATION_MEASURED
+                    if bytes_in_use != UNKNOWN_ALLOCATOR_SLACK
+                        && size_allocated != UNKNOWN_ALLOCATOR_SLACK
+                        && retained_slack != UNKNOWN_ALLOCATOR_SLACK =>
+                {
+                    AllocatorMemorySnapshot {
+                        status: "measured",
+                        bytes_in_use: Some(bytes_in_use),
+                        size_allocated: Some(size_allocated),
+                        retained_slack_bytes: Some(retained_slack),
+                        not_estimated: None,
+                    }
+                }
+                ALLOCATOR_OBSERVATION_NOT_ESTIMATED => {
+                    AllocatorMemorySnapshot::not_estimated(cached_allocator_not_estimated_reason())
+                }
+                _ => return None,
+            };
+            let age_ms =
+                allocator_slack_elapsed_ms(std::time::Instant::now()).saturating_sub(sampled_at_ms);
+            return Some((snapshot, age_ms));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u64) {
+    let _publish_guard = ALLOCATOR_OBSERVATION_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ALLOCATOR_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    LAST_ALLOCATOR_OBSERVATION_STATUS.store(
+        if snapshot.status == "measured" {
+            ALLOCATOR_OBSERVATION_MEASURED
+        } else {
+            ALLOCATOR_OBSERVATION_NOT_ESTIMATED
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LAST_OBSERVED_ALLOCATOR_BYTES_IN_USE.store(
+        snapshot.bytes_in_use.unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    LAST_OBSERVED_ALLOCATOR_SIZE_ALLOCATED.store(
+        snapshot.size_allocated.unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
         snapshot
             .retained_slack_bytes
             .unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
-        std::sync::atomic::Ordering::Release,
+        std::sync::atomic::Ordering::Relaxed,
     );
+    LAST_ALLOCATOR_OBSERVATION_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Relaxed);
+    ALLOCATOR_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Release);
     LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
 }
 

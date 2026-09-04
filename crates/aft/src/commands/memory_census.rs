@@ -11,7 +11,7 @@ pub fn evictable_in_ms(bound_routes: usize, idle_ttl_ms: u64, age_ms: u64) -> Op
     (bound_routes == 0).then_some(idle_ttl_ms.saturating_sub(age_ms))
 }
 
-/// Render a complete, uncapped census from non-blocking memory snapshots.
+/// Render a complete, uncapped census with a fresh allocator observation.
 pub fn handle_memory_census(req: &RawRequest, ctx: &AppContext) -> Response {
     let snapshot = ctx.memory_snapshot_uncapped();
     Response::success(&req.id, render_memory_census(&snapshot, None))
@@ -81,6 +81,8 @@ pub fn render_memory_census(
             "rss_bytes": process.rss_bytes,
             "allocator_slack_bytes": slack,
             "allocator_slack_label": "reclaimable by relief",
+            "allocator_slack_measured": process.allocator_slack_measured,
+            "allocator_observation_age_ms": process.allocator_observation_age_ms,
             "sqlite_bytes": process.sqlite.memory_used_bytes,
             "total_attributed_bytes": process.total_attributed_bytes,
             "unattributed_bytes": unattributed_bytes,
@@ -117,6 +119,31 @@ mod tests {
         let before = crate::memory::allocator_snapshot_calls_for_test();
         let _ = render_memory_census(&snapshot, None);
         assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
+    }
+
+    #[test]
+    fn memory_census_measures_allocator_once_per_call() {
+        let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
+        crate::memory::reset_allocator_observation_for_test();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request = RawRequest {
+            id: "memory-census".to_string(),
+            command: MEMORY_CENSUS_OPERATION.to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({}),
+        };
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        let response = handle_memory_census(&request, &ctx);
+
+        assert!(response.data.is_object());
+        assert_eq!(
+            crate::memory::allocator_snapshot_calls_for_test(),
+            before + 1
+        );
     }
 
     #[test]

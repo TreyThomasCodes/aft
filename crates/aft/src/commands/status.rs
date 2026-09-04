@@ -326,6 +326,8 @@ impl AppContext {
             })
             .unwrap_or_default();
         let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
+        // `MemorySnapshot::new` uses the process-wide allocator observation so
+        // status never walks allocator zones on a request worker.
         let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
             .unwrap_or(serde_json::Value::Null);
         // The control-path status response reads the health worker's published
@@ -508,6 +510,38 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn status_reuses_cached_allocator_observation_for_repeated_requests() {
+        let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
+        crate::memory::reset_allocator_observation_for_test();
+        let _ =
+            crate::memory::MemorySnapshot::new_uncapped("ready", std::collections::BTreeMap::new());
+
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        for _ in 0..50 {
+            let response = handle_status(&request(), &ctx);
+            assert!(response.data["memory"]["process"]["allocator_slack_measured"].is_boolean());
+        }
+        let memory = handle_status(&request(), &ctx).data["memory"]["process"].clone();
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
+        assert!(memory["allocator_observation_age_ms"].is_u64());
+    }
+
+    #[test]
+    fn status_reports_cold_allocator_observation_without_measuring() {
+        let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
+        crate::memory::reset_allocator_observation_for_test();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        let memory = handle_status(&request(), &ctx).data["memory"]["process"].clone();
+
+        assert_eq!(memory["allocator_slack_measured"], false);
+        assert!(memory["allocator_observation_age_ms"].is_null());
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
     }
 
     #[test]

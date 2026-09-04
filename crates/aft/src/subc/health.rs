@@ -829,6 +829,7 @@ fn memory_rollup_metrics(
             "status": "busy",
             "allocator_slack_bytes": 0,
             "allocator_slack_measured": false,
+            "allocator_observation_age_ms": Value::Null,
         });
     };
     let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
@@ -857,7 +858,8 @@ fn memory_rollup_metrics(
         // Zero means either measured zero slack or unavailable allocator counters;
         // the sibling boolean disambiguates "no slack" from "unmeasurable".
         "allocator_slack_bytes": snapshot.process.allocator.retained_slack_bytes.unwrap_or(0),
-        "allocator_slack_measured": snapshot.process.allocator.retained_slack_bytes.is_some(),
+        "allocator_slack_measured": snapshot.process.allocator_slack_measured,
+        "allocator_observation_age_ms": snapshot.process.allocator_observation_age_ms,
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
