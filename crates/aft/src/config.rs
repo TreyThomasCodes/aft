@@ -462,8 +462,6 @@ pub struct Config {
     pub index: IndexConfig,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
-    /// Tool names disabled for the active agent session.
-    pub disabled_tools: Vec<String>,
     /// Whether the plugin registered the `aft_search` tool for this surface
     /// (default: false). Forwarded by the plugin's resolved registration
     /// predicate (semantic on + not minimal + not disabled). Used only to pick
@@ -593,7 +591,6 @@ impl Default for Config {
             search_index: false,
             index: IndexConfig::default(),
             semantic_search: false,
-            disabled_tools: Vec::new(),
             aft_search_registered: false,
             callgraph_store: true,
             callgraph_chunk_size: 100,

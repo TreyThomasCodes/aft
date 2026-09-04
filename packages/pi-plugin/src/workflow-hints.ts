@@ -180,7 +180,6 @@ interface ToolSurfaceFlags {
   semantic: boolean;
   navigate: boolean;
   inspect: boolean;
-  hoistRead: boolean;
   hoistBuiltinTools: boolean;
   hoistGrep: boolean;
   hoistBash: boolean;
