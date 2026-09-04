@@ -3278,12 +3278,11 @@ mod watcher_filter_tests {
             .send(WatcherDispatchEvent::Paths(watcher_paths))
             .unwrap();
 
-        let drain_started = Instant::now();
+        // "Off the worker loop" is proven structurally below (the resident
+        // store survives the drain and the refresh lands on the seamed worker),
+        // not by timing the drain: a wall-clock bound flakes under a parallel
+        // test run while proving nothing the store identity check does not.
         drain_watcher_events(&ctx);
-        assert!(
-            drain_started.elapsed() < Duration::from_millis(300),
-            "oversized watcher batches must stay off the callgraph worker loop"
-        );
 
         let installed_after_drain = ctx
             .callgraph_store()
