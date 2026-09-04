@@ -180,6 +180,11 @@ const CASES: ParityCase[] = [
     project: { disabled_tools: ["aft_zoom"] },
   },
   {
+    name: "bash_watch_sync_project_override",
+    user: { bash: { watch_sync_max_ms: 120000 } },
+    project: { bash: { watch_sync_max_ms: 1800000 } },
+  },
+  {
     name: "index_roots_user_semantic_closure",
     user: { index: { roots: [{ path: "~/.aft-standing-root", indexes: ["semantic"] }] } },
   },

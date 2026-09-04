@@ -16,10 +16,11 @@ use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig,
     SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
-    DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
-    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_IDLE_LSP_TTL_MINUTES,
-    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
+    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
+    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
@@ -373,6 +374,8 @@ pub struct RawBashFeatures {
     pub long_running_reminder_interval_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub foreground_wait_window_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub watch_sync_max_ms: Option<u64>,
     pub powershell_tool: Option<bool>,
 }
 
@@ -600,7 +603,7 @@ pub fn resolve_config_for_harness(
     }
 
     let mut config = Config::default();
-    apply_resolved_config(&merged, &mut config);
+    apply_resolved_config(&merged, &mut config, &mut warnings);
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
     config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     ResolveResult {
@@ -1140,6 +1143,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 foreground_wait_window_ms: override_features
                     .foreground_wait_window_ms
                     .or(base.foreground_wait_window_ms),
+                watch_sync_max_ms: override_features
+                    .watch_sync_max_ms
+                    .or(base.watch_sync_max_ms),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
@@ -1158,6 +1164,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
+            watch_sync_max_ms: None,
             powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
@@ -1351,7 +1358,11 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
 /// scalar fields therefore retain defaults, while semantic, inspect, and LSP
 /// fields are fully resolved from the tiers. Process-state fields are not part
 /// of `RawAftConfig` and are preserved separately by `resolve_config_onto`.
-fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
+fn apply_resolved_config(
+    raw: &RawAftConfig,
+    config: &mut Config,
+    warnings: &mut Vec<ConfigWarning>,
+) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     if let Some(value) = raw.hoist_builtin_tools {
         config.hoist_builtin_tools = value;
@@ -1413,7 +1424,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
-    resolve_bash_fields(raw, config);
+    resolve_bash_fields(raw, config, warnings);
 }
 
 fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning>) -> IndexConfig {
@@ -1615,6 +1626,28 @@ fn resolve_clamped_minutes(
     clamped
 }
 
+fn resolve_clamped_bash_watch_sync_max_ms(
+    raw: Option<u64>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u64 {
+    let Some(raw) = raw else {
+        return DEFAULT_BASH_WATCH_SYNC_MAX_MS;
+    };
+    let clamped = raw.clamp(MIN_BASH_WATCH_SYNC_MAX_MS, MAX_BASH_WATCH_SYNC_MAX_MS);
+    if clamped != raw {
+        warnings.push(ConfigWarning {
+            code: "clamped_bash_watch_sync_max_ms",
+            key: "bash.watch_sync_max_ms",
+            tier: "config".to_string(),
+            value: raw.to_string(),
+            message: format!(
+                "bash.watch_sync_max_ms={raw} is outside {MIN_BASH_WATCH_SYNC_MAX_MS}..={MAX_BASH_WATCH_SYNC_MAX_MS}; clamped to {clamped}"
+            ),
+        });
+    }
+    clamped
+}
+
 fn json_integer(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) if number.is_i64() => number.as_i64(),
@@ -1786,17 +1819,19 @@ struct ResolvedBashConfig {
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
+    watch_sync_max_ms: u64,
     powershell_tool: bool,
 }
 
-fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
-    let bash = resolve_bash_config(raw);
+fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
+    let bash = resolve_bash_config(raw, warnings);
     // The plugins use `enabled` and `subagent_background` when registering bash
     // capabilities. Rust resolves them only to accept and merge the same config;
     // they do not control engine behavior.
     let _registration_only = (bash.enabled, bash.subagent_background);
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
+    config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
@@ -1810,7 +1845,10 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     }
 }
 
-fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
+fn resolve_bash_config(
+    raw: &RawAftConfig,
+    warnings: &mut Vec<ConfigWarning>,
+) -> ResolvedBashConfig {
     let top = raw.bash.as_ref();
     let legacy = raw
         .experimental
@@ -1839,6 +1877,8 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         .and_then(|features| features.detach_on_user_message)
         .unwrap_or(true);
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
+    let raw_watch_sync_max = top_features.and_then(|features| features.watch_sync_max_ms);
+    let watch_sync_max_ms = resolve_clamped_bash_watch_sync_max_ms(raw_watch_sync_max, warnings);
     let top_powershell_tool = top_features
         .and_then(|features| features.powershell_tool)
         .unwrap_or(false);
@@ -1857,6 +1897,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
+        watch_sync_max_ms,
         powershell_tool: false,
     };
 
@@ -2221,6 +2262,39 @@ mod tests {
         assert!(result.config.experimental_bash_rewrite);
         assert!(result.config.experimental_bash_compress);
         assert!(result.config.experimental_bash_background);
+    }
+
+    #[test]
+    fn bash_watch_sync_max_defaults_clamps_and_warns() {
+        let default_result = resolve_config(&[]);
+        assert_eq!(
+            default_result.config.bash.watch_sync_max_ms,
+            DEFAULT_BASH_WATCH_SYNC_MAX_MS
+        );
+        assert!(default_result
+            .warnings
+            .iter()
+            .all(|warning| warning.key != "bash.watch_sync_max_ms"));
+
+        let clamped = resolve_config(&[tier("user", r#"{ "bash": { "watch_sync_max_ms": 5 } }"#)]);
+        assert_eq!(
+            clamped.config.bash.watch_sync_max_ms,
+            MIN_BASH_WATCH_SYNC_MAX_MS
+        );
+        assert!(clamped.warnings.iter().any(|warning| {
+            warning.code == "clamped_bash_watch_sync_max_ms"
+                && warning.key == "bash.watch_sync_max_ms"
+                && warning.value == "5"
+        }));
+
+        let project_override = resolve_config(&[
+            tier("user", r#"{ "bash": { "watch_sync_max_ms": 120000 } }"#),
+            tier("project", r#"{ "bash": { "watch_sync_max_ms": 1800000 } }"#),
+        ]);
+        assert_eq!(
+            project_override.config.bash.watch_sync_max_ms,
+            MAX_BASH_WATCH_SYNC_MAX_MS
+        );
     }
 
     #[test]
@@ -2971,7 +3045,8 @@ mod tests {
         )) else {
             panic!("test tier should parse");
         };
-        let bash = resolve_bash_config(&raw);
+        let mut warnings = Vec::new();
+        let bash = resolve_bash_config(&raw, &mut warnings);
 
         assert_eq!(
             bash.foreground_wait_window_ms,

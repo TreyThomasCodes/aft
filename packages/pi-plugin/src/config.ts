@@ -262,6 +262,8 @@ export interface BashConfig {
    * Default 15000ms; values below the 5000ms floor are clamped up.
    */
   foreground_wait_window_ms?: number;
+  /** Maximum synchronous bash_watch wait; values outside 1000..1800000 are clamped. Default 120000. */
+  watch_sync_max_ms?: number;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
   powershell_tool?: boolean;
 }
@@ -361,6 +363,8 @@ export interface ResolvedBashConfig {
    * Always resolved: defaults to 15000, floored at 5000.
    */
   foreground_wait_window_ms: number;
+  /** Maximum synchronous bash_watch wait. Defaults to 120000 and is clamped to 1000..1800000. */
+  watch_sync_max_ms: number;
   /** Manual PowerShell registration fallback. Default false. */
   powershell_tool: boolean;
 }
@@ -369,6 +373,23 @@ export interface ResolvedBashConfig {
 export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 15_000;
 /** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
 export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
+/** Default maximum synchronous bash_watch wait (ms). */
+export const DEFAULT_BASH_WATCH_SYNC_MAX_MS = 120_000;
+/** Minimum synchronous bash_watch wait cap (ms). */
+export const MIN_BASH_WATCH_SYNC_MAX_MS = 1_000;
+/** Static schema maximum and hard upper bound for synchronous bash_watch waits (ms). */
+export const MAX_BASH_WATCH_SYNC_MAX_MS = 1_800_000;
+
+export function clampBashWatchSyncMaxMs(value: number | undefined): number {
+  const raw = value ?? DEFAULT_BASH_WATCH_SYNC_MAX_MS;
+  const clamped = Math.min(MAX_BASH_WATCH_SYNC_MAX_MS, Math.max(MIN_BASH_WATCH_SYNC_MAX_MS, raw));
+  if (clamped !== raw) {
+    warn(
+      `bash.watch_sync_max_ms=${raw} is outside ${MIN_BASH_WATCH_SYNC_MAX_MS}..=${MAX_BASH_WATCH_SYNC_MAX_MS}; clamped to ${clamped}`,
+    );
+  }
+  return clamped;
+}
 
 /**
  * Single source of truth for bash config across the Pi plugin. Resolution
@@ -412,6 +433,9 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     FOREGROUND_WAIT_WINDOW_MIN_MS,
     rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
   );
+  const rawWatchSyncMax =
+    typeof top === "object" && top !== null ? top.watch_sync_max_ms : undefined;
+  const watchSyncMaxMs = clampBashWatchSyncMaxMs(rawWatchSyncMax);
 
   const base: ResolvedBashConfig = {
     enabled: false,
@@ -423,6 +447,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
+    watch_sync_max_ms: watchSyncMaxMs,
     powershell_tool:
       typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
   };
@@ -633,6 +658,8 @@ const BashFeaturesSchema = z.object({
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   foreground_wait_window_ms: z.number().int().positive().optional(),
+  /** Maximum synchronous bash_watch wait in milliseconds; clamped to 1000..1800000. Default 120000. */
+  watch_sync_max_ms: z.number().int().positive().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
   powershell_tool: z.boolean().optional(),
@@ -932,6 +959,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     typeof config.bash === "object" &&
     (config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
+      config.bash.watch_sync_max_ms !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
@@ -940,6 +968,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+      ...(config.bash.watch_sync_max_ms !== undefined
+        ? { watch_sync_max_ms: config.bash.watch_sync_max_ms }
         : {}),
       ...(config.bash.powershell_tool !== undefined
         ? { powershell_tool: config.bash.powershell_tool }

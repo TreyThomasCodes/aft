@@ -10,6 +10,8 @@ Both files are JSONC (comments allowed). One location serves every harness:
 
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
+`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
+
 Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
 and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
 location automatically and leaves a `.MOVED_READPLEASE` marker behind.
@@ -292,7 +294,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // the background. Default true. Set false to keep the call blocking through
     // steering messages; even then, a message containing `&detach` forces the
     // detach (the token is stripped before the model sees the message).
-    "detach_on_user_message": true
+    "detach_on_user_message": true,
+
+    // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
+    // values outside 1000..=1800000 are clamped with a warning. Sync waits are
+    // intended for a short remaining wait; to restore the old 30-minute cap,
+    // set this to 1800000 in the user or project config.
+    "watch_sync_max_ms": 120000
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).

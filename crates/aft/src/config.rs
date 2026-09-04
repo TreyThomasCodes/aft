@@ -9,6 +9,9 @@ pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
+pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
+pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 
 /// Unbound-root artifact eviction idle window, in minutes.
 pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
@@ -29,6 +32,10 @@ const fn default_inspect_diagnostics_timeout_ms() -> u64 {
 
 const fn default_bash_detach_on_user_message() -> bool {
     true
+}
+
+pub(crate) const fn default_bash_watch_sync_max_ms() -> u64 {
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS
 }
 
 use crate::harness::Harness;
@@ -407,6 +414,10 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
     pub detach_on_user_message: bool,
+    /// Maximum synchronous `bash_watch` wait accepted by the hosting plugin.
+    /// Rust accepts this for cross-language config parity but never acts on it.
+    #[serde(default = "default_bash_watch_sync_max_ms")]
+    pub watch_sync_max_ms: u64,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
@@ -417,6 +428,7 @@ impl Default for BashConfig {
         Self {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
+            watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             powershell_tool: false,
         }
     }
@@ -684,6 +696,13 @@ mod tests {
             ..Config::default()
         };
         assert!(!unhoisted.read_slot_survives());
+    }
+
+    #[test]
+    fn bash_watch_sync_max_defaults_to_two_minutes_when_deserialized() {
+        let parsed: BashConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.watch_sync_max_ms, DEFAULT_BASH_WATCH_SYNC_MAX_MS);
+        assert_eq!(BashConfig::default().watch_sync_max_ms, 120_000);
     }
 
     #[test]
