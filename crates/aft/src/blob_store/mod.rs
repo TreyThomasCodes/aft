@@ -563,9 +563,40 @@ fn configure_connection(connection: &Connection) -> Result<(), BlobStoreError> {
     // concurrent first-open callers wait instead of failing immediately.
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    // Switching a rollback-journal file to WAL needs an exclusive lock, and
+    // SQLite skips the busy handler on that upgrade when another connection
+    // is mid-switch (it would risk a deadlock), so two first-openers racing on
+    // a fresh file see SQLITE_BUSY straight away. Wait it out ourselves within
+    // the same budget the busy handler would have used.
+    retry_while_busy(Duration::from_millis(BUSY_TIMEOUT_MS), || {
+        connection.pragma_update(None, "journal_mode", "WAL")
+    })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
+}
+
+/// Run `operation` until it stops failing with SQLITE_BUSY/SQLITE_LOCKED or
+/// `budget` elapses; the last error is returned when the budget runs out.
+fn retry_while_busy<T>(
+    budget: Duration,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match operation() {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn ensure_schema(connection: &mut Connection) -> Result<(), BlobStoreError> {
@@ -651,6 +682,35 @@ fn move_corrupt_database_aside(path: &Path) -> Result<PathBuf, BlobStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Eight racing first-openers on a fresh file trip the WAL-switch BUSY that
+    /// the busy handler does not cover. Without the retry this sees 1-3
+    /// failures per 60 rounds on an idle laptop; 150 rounds make the red
+    /// reliable while keeping the test under two seconds.
+    #[test]
+    fn concurrent_first_opens_never_see_busy() {
+        let mut failures = Vec::new();
+        for round in 0..150 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let storage = dir.path().to_path_buf();
+                    std::thread::spawn(move || {
+                        BlobStore::open(&storage, "fam", BlobPlane::Semantic).map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                if let Err(error) = handle.join().expect("opener thread") {
+                    failures.push(format!("round {round}: {error}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "concurrent first-open must wait out the WAL switch: {failures:?}"
+        );
+    }
 
     #[test]
     fn payload_schema_and_producer_version_pairs_are_pinned() {
