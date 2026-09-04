@@ -8,6 +8,7 @@
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
 use crate::context::SubcLifecycleAdmission;
+use crate::db::{SqliteStore, TrackedConnection};
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
@@ -1794,7 +1795,7 @@ pub struct CallGraphStore {
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
     write_metrics: Arc<CallgraphWriteMetrics>,
-    conn: Mutex<Connection>,
+    conn: Mutex<TrackedConnection>,
 }
 
 #[derive(Debug)]
@@ -3387,7 +3388,7 @@ impl CallGraphStore {
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut conn = Connection::open(&sqlite_path)?;
+        let mut conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration)?;
         if use_wal {
             configure_connection(&conn)?;
         } else {
@@ -3454,7 +3455,7 @@ impl CallGraphStore {
         generation: Option<String>,
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
-        conn: Connection,
+        conn: TrackedConnection,
     ) -> Self {
         let write_metrics = callgraph_write_metrics_for_key(&project_key);
         Self {
@@ -6534,7 +6535,7 @@ fn publish_backup_migration(
     remove_sqlite_file_set(&temp_path);
 
     let source_conn = open_readonly_connection(&source.sqlite_path)?;
-    let mut destination = Connection::open(&temp_path)?;
+    let mut destination = TrackedConnection::open(&temp_path, SqliteStore::CallgraphGeneration)?;
     destination.busy_timeout(Duration::from_secs(5))?;
     let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination)?;
     let started = Instant::now();
@@ -6861,11 +6862,12 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
     format!("legacy-{}", &digest[..16])
 }
 
-fn open_readonly_connection(path: &Path) -> Result<Connection> {
+fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     let uri = sqlite_readonly_uri(path);
-    let conn = Connection::open_with_flags(
+    let conn = TrackedConnection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::CallgraphGeneration,
     )?;
     conn.pragma_update(
         None,
@@ -15639,7 +15641,7 @@ mod cold_build_insert_tests {
         let generation = write_generation_with_age(dir.path(), &project_key, 100, Duration::ZERO);
         let sqlite_path = dir.path().join(&generation);
         fs::remove_file(&sqlite_path).unwrap();
-        let conn = Connection::open(&sqlite_path).unwrap();
+        let conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration).unwrap();
         let store = CallGraphStore::from_connection(
             dir.path().to_path_buf(),
             project_key,

@@ -71,7 +71,7 @@ impl SqliteGithubReadCacheStore {
         }
     }
 
-    fn connection(&self) -> Result<rusqlite::Connection, String> {
+    fn connection(&self) -> Result<crate::db::TrackedConnection, String> {
         crate::db::open(&self.database_path)
             .map_err(|error| format!("failed to open GitHub read cache: {error}"))
     }

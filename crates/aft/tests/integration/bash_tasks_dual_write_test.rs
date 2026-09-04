@@ -12,9 +12,9 @@ use aft::bash_background::persistence::{
 };
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use aft::db::bash_tasks::{upsert_bash_task, BashTaskRow};
+use aft::db::TrackedConnection as Connection;
 use aft::harness::Harness;
 use filetime::{set_file_mtime, FileTime};
-use rusqlite::Connection;
 
 const SESSION: &str = "dual-write-session";
 

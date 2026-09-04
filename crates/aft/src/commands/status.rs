@@ -328,6 +328,9 @@ impl AppContext {
         let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
         let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
             .unwrap_or(serde_json::Value::Null);
+        // The control-path status response reads the health worker's published
+        // lifecycle snapshot; it never probes processes or opens a database.
+        let lifecycle = self.app().lifecycle_census_snapshot();
         let mut runtime = serde_json::json!({
             "live_watchers": self.app().watcher_count(),
             "live_actor_roots": self.app().actor_root_count(),
@@ -371,6 +374,11 @@ impl AppContext {
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
             "memory": memory,
+            "lsp": lifecycle.lsp,
+            "threads": lifecycle.threads,
+            "sqlite": lifecycle.sqlite,
+            "children": lifecycle.children,
+            "fds": lifecycle.fds,
             "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,

@@ -8153,6 +8153,38 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
+    for (section, fields) in [
+        (
+            "lsp",
+            &[
+                "children_total",
+                "children_by_root",
+                "children_without_client",
+                "children_with_deleted_cwd",
+            ][..],
+        ),
+        ("threads", &["total", "classified", "by_class"][..]),
+        (
+            "sqlite",
+            &[
+                "open_connections",
+                "open_by_store",
+                "uninstrumented_openers",
+            ][..],
+        ),
+        ("children", &["detached_total"][..]),
+        ("fds", &["open", "soft_limit"][..]),
+    ] {
+        let value = metrics
+            .get(section)
+            .unwrap_or_else(|| panic!("health.check omitted {section}: {metrics:#}"));
+        for field in fields {
+            assert!(
+                value.get(*field).is_some(),
+                "health.check omitted {section}.{field}: {metrics:#}"
+            );
+        }
+    }
     assert_eq!(metrics.get("root_count").and_then(Value::as_u64), Some(1));
     assert_eq!(metrics.get("actor_count").and_then(Value::as_u64), Some(1));
     let roots = metrics

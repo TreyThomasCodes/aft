@@ -646,22 +646,28 @@ struct HealthDiagnosticRollup {
 
 impl HealthDiagnosticRollup {
     fn unavailable() -> Self {
+        let mut metrics = json!({
+            "actor_count": 0,
+            "root_count": 0,
+            "root_details_omitted": 0,
+            "callgraph_repair_entries_60s_total": 0,
+            "callgraph_repair_roots_annotated": 0,
+            "callgraph_repair_roots_total": 0,
+            "callgraph_commits_60s_total": 0,
+            "callgraph_pages_or_bytes_written_60s_total": 0,
+            "lsp_children": { "spawned": 0, "cwd_gone": 0 },
+            "memory": memory_rollup_metrics(None),
+            "mutating_lanes": { "scheduler_busy": true },
+            "roots": [],
+        });
+        insert_lifecycle_metrics(
+            &mut metrics,
+            crate::lifecycle_census::LifecycleCensusSnapshot::default(),
+        );
         Self {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
-            metrics: json!({
-                "actor_count": 0,
-                "root_count": 0,
-                "root_details_omitted": 0,
-                "callgraph_repair_entries_60s_total": 0,
-                "callgraph_repair_roots_annotated": 0,
-                "callgraph_repair_roots_total": 0,
-                "callgraph_commits_60s_total": 0,
-                "callgraph_pages_or_bytes_written_60s_total": 0,
-                "memory": memory_rollup_metrics(None),
-                "mutating_lanes": { "scheduler_busy": true },
-                "roots": [],
-            }),
+            metrics,
         }
     }
 }
@@ -872,6 +878,22 @@ fn mutating_lanes_metrics(executor: &Executor) -> Value {
     }
 }
 
+fn insert_lifecycle_metrics(
+    metrics: &mut Value,
+    snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
+) {
+    let census = serde_json::to_value(snapshot).expect("lifecycle census serializes");
+    let Some(target) = metrics.as_object_mut() else {
+        return;
+    };
+    let Some(census) = census.as_object() else {
+        return;
+    };
+    for (key, value) in census {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     match executor.try_dispatch_liveness_snapshot() {
         Some(snapshot) => json!({
@@ -919,6 +941,10 @@ fn build_health_diagnostic_rollup(
         };
     };
 
+    let lifecycle_contexts = actor_entries
+        .iter()
+        .map(|(_, context)| Arc::clone(context))
+        .collect::<Vec<_>>();
     let standing_entries = standing_health_entries(&actor_entries);
     let mut standing_matched = vec![false; standing_entries.len()];
     let actor_count = actor_entries.len();
@@ -1041,7 +1067,8 @@ fn build_health_diagnostic_rollup(
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     let memory = memory_rollup_metrics(Some(memory_roots));
-    let lsp_children = shared_app.lsp_child_registry().try_health_snapshot();
+    let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
+    shared_app.publish_lifecycle_census(lifecycle.clone());
     let detail = if busy_roots > 0 {
         Some(format!(
             "{busy_roots} root actor(s) could not be snapshotted without contention"
@@ -1058,6 +1085,24 @@ fn build_health_diagnostic_rollup(
         None
     };
 
+    let mut metrics = json!({
+        "actor_count": actor_count,
+        "root_count": root_count,
+        "root_details_omitted": root_details_omitted,
+        "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+        "callgraph_repair_roots_annotated": repair_roots_annotated,
+        "callgraph_repair_roots_total": actor_count,
+        "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
+        "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
+        "lsp_children": {
+            "spawned": lifecycle.lsp.children_total,
+            "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,
+        },
+        "memory": memory,
+        "mutating_lanes": mutating_lanes_metrics(executor),
+        "roots": roots,
+    });
+    insert_lifecycle_metrics(&mut metrics, lifecycle);
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -1065,23 +1110,7 @@ fn build_health_diagnostic_rollup(
             HealthStatus::Ok
         },
         detail,
-        metrics: json!({
-            "actor_count": actor_count,
-            "root_count": root_count,
-            "root_details_omitted": root_details_omitted,
-            "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
-            "callgraph_repair_roots_annotated": repair_roots_annotated,
-            "callgraph_repair_roots_total": actor_count,
-            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
-            "lsp_children": {
-                "spawned": lsp_children.map(|health| health.spawned),
-                "cwd_gone": lsp_children.map(|health| health.cwd_gone),
-            },
-            "memory": memory,
-            "mutating_lanes": mutating_lanes_metrics(executor),
-            "roots": roots,
-        }),
+        metrics,
     }
 }
 
@@ -1403,6 +1432,25 @@ mod tests {
         let cold = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         let cold_metrics = cold.metrics.expect("cold health metrics");
         let cold_runtime = &cold_metrics["runtime"];
+        for (section, field) in [
+            ("lsp", "children_total"),
+            ("lsp", "children_by_root"),
+            ("lsp", "children_without_client"),
+            ("lsp", "children_with_deleted_cwd"),
+            ("threads", "total"),
+            ("threads", "classified"),
+            ("threads", "by_class"),
+            ("sqlite", "open_connections"),
+            ("sqlite", "open_by_store"),
+            ("children", "detached_total"),
+            ("fds", "open"),
+            ("fds", "soft_limit"),
+        ] {
+            assert!(
+                cold_metrics[section].get(field).is_some(),
+                "health omitted {section}.{field}: {cold_metrics:#}"
+            );
+        }
         assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
         assert_eq!(cold_runtime["bg_wake_pending"].as_u64(), Some(0));
         assert_eq!(
@@ -2188,11 +2236,7 @@ fn standing_health_entries(
 
     let database_path =
         crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
-    let database = rusqlite::Connection::open_with_flags(
-        database_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok();
+    let database = crate::db::open_readonly(&database_path).ok();
     let mut entries = std::collections::BTreeMap::new();
     for root in &config.index.roots {
         entries
@@ -2204,7 +2248,7 @@ fn standing_health_entries(
 
 fn standing_health_entry(
     root: &crate::config::IndexRootConfig,
-    database: Option<&rusqlite::Connection>,
+    database: Option<&crate::db::TrackedConnection>,
 ) -> StandingHealthEntry {
     let recorded = database
         .and_then(|database| {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+use crate::db::TrackedConnection;
 use rusqlite::Connection;
 
 use crate::db::backups::BackupRow;
@@ -382,7 +383,7 @@ pub struct BackupStore {
     storage_dir: Option<PathBuf>,
     storage_harness: Option<String>,
     maintenance_ttl_hours: u32,
-    db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
+    db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     db_harness: RwLock<Option<String>>,
     db_project_key: RwLock<Option<String>>,
     /// Stacks whose SQLite mirror has a known-good baseline in this process.
@@ -479,7 +480,7 @@ impl BackupStore {
         self.fail_next_disk_write = true;
     }
 
-    pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         if let Ok(mut slot) = self.db_pool.write() {
             *slot = Some(conn);
         }
@@ -1166,7 +1167,7 @@ impl BackupStore {
         (format!("backup-{}", n), order)
     }
 
-    fn db_pool_and_harness(&self) -> Option<(Arc<Mutex<Connection>>, String)> {
+    fn db_pool_and_harness(&self) -> Option<(Arc<Mutex<TrackedConnection>>, String)> {
         let pool = self.db_pool.read().ok().and_then(|slot| slot.clone())?;
         let harness = self.db_harness.read().ok().and_then(|slot| slot.clone())?;
         Some((pool, harness))

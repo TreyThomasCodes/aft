@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use crate::db::TrackedConnection;
 use serde::Serialize;
 
 use crate::bash_permissions::PermissionAsk;
@@ -252,7 +252,7 @@ pub(crate) struct RegistryInner {
     /// uncompressed.
     pub(crate) compressor:
         Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
-    pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
+    pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
@@ -438,7 +438,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             *slot = Some(conn);
         }
@@ -889,7 +889,7 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<Connection>>)> {
+    fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
         let pool = self
             .inner
             .db_pool
@@ -4502,6 +4502,27 @@ impl BgTaskRegistry {
             running,
             pending_completions,
         })
+    }
+
+    /// Count background task PIDs that are still alive without keeping registry
+    /// locks across the OS liveness probes used by the lifecycle health rollup.
+    pub(crate) fn detached_live_process_count(&self) -> usize {
+        let Some(pids) = self.inner.tasks.try_lock().ok().map(|tasks| {
+            tasks
+                .values()
+                .filter_map(|task| {
+                    task.state
+                        .try_lock()
+                        .ok()
+                        .and_then(|state| state.metadata.child_pid)
+                })
+                .collect::<Vec<_>>()
+        }) else {
+            return 0;
+        };
+        pids.into_iter()
+            .filter(|pid| is_process_alive(*pid))
+            .count()
     }
 
     /// Estimate resident bash output caches without reading disk-backed task
@@ -8197,7 +8218,7 @@ mod tests {
         storage: &Path,
     ) -> (
         BgTaskRegistry,
-        Arc<Mutex<Connection>>,
+        Arc<Mutex<TrackedConnection>>,
         Arc<Mutex<Vec<PushFrame>>>,
     ) {
         let frames = Arc::new(Mutex::new(Vec::new()));
@@ -8228,7 +8249,7 @@ mod tests {
 
     fn install_delivered_terminal_with_pending_watch(
         registry: &BgTaskRegistry,
-        db: &Arc<Mutex<Connection>>,
+        db: &Arc<Mutex<TrackedConnection>>,
         storage: &Path,
         task_id: &str,
     ) -> TaskPaths {

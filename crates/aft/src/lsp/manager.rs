@@ -3614,6 +3614,25 @@ mod server_exit_reap_tests {
 
     #[cfg(unix)]
     #[test]
+    fn lifecycle_census_reports_dropped_client_until_reaper_cleans_child() {
+        let registry = LspChildRegistry::new();
+        let (events, _event_rx) = crossbeam_channel::unbounded();
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut client =
+            spawn_malformed_then_sleep_client(events, registry.clone(), root.path().to_path_buf());
+        client.suppress_kill_on_drop_for_test();
+        drop(client);
+
+        let leaked = registry.health_snapshot();
+        assert_eq!(leaked.children_without_client, 1);
+        assert_eq!(leaked.children_total, 1);
+        assert_eq!(registry.reap_children_without_client(), 1);
+        assert_eq!(registry.health_snapshot().children_without_client, 0);
+        assert_eq!(registry.health_snapshot().children_total, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ensure_server_reaps_unreferenced_children_before_spawn() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("workspace");

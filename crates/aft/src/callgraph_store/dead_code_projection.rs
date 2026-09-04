@@ -1,3 +1,4 @@
+use crate::db::{SqliteStore, TrackedConnection};
 use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -57,7 +58,11 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
     }
 
     notify_projection_before_open_observer(db_path);
-    let mut conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut conn = TrackedConnection::open_path_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        SqliteStore::CallgraphGeneration,
+    )?;
     conn.busy_timeout(Duration::from_millis(5_000))?;
     let tx = conn.transaction()?;
     if !database_ready(&tx).unwrap_or(false) {

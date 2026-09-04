@@ -11,8 +11,8 @@ use aft::bash_background::persistence::{
     resolve_task_layout, session_tasks_dir, task_paths, write_task, PersistedTask, TaskPaths,
 };
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
+use aft::db::TrackedConnection as Connection;
 use aft::harness::Harness;
-use rusqlite::Connection;
 
 const SESSION: &str = "db-read-fallback-session";
 const PROJECT_KEY: &str = "db-read-fallback-project";

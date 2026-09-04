@@ -405,6 +405,7 @@ impl LspClient {
         });
 
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
+        child_registry.mark_client_live(child_pid);
         Ok(Self {
             kind,
             root,
@@ -899,13 +900,21 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        // Untrack first so the signal handler can't race with this kill and
-        // try to SIGKILL a PID that's already been reaped.
-        self.child_registry.untrack(self.child_pid);
         #[cfg(test)]
         if self.suppress_kill_on_drop {
+            // Test-only crash seam: retain the tracked child so the reaper and
+            // lifecycle census observe the same orphan signature as a failed
+            // client teardown instead of hiding it by untracking first.
+            self.child_registry.mark_client_gone(self.child_pid);
             return;
         }
+        // Record the transition before normal teardown untracks it. A control
+        // thread that snapshots in this narrow window sees an honest orphan
+        // rather than a child that is still reported as client-owned.
+        self.child_registry.mark_client_gone(self.child_pid);
+        // Untrack before the synchronous kill so signal cleanup cannot race this
+        // normal teardown.
+        self.child_registry.untrack(self.child_pid);
         kill_lsp_child_group(&mut self.child);
     }
 }

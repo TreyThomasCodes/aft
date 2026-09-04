@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use aft::backup::{hash_session, BackupStore};
 use aft::db::backups::{upsert_backup, BackupRow};
+use aft::db::TrackedConnection as Connection;
 use aft::harness::Harness;
-use rusqlite::Connection;
 
 #[cfg(unix)]
 use super::helpers::{warm_executable, AftProcess};

@@ -4,6 +4,7 @@
 //! by its caller. It never treats database size, row count, cursor movement, or
 //! SQLite page reuse as progress.
 
+use crate::db::{SqliteStore, TrackedConnection};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,7 +152,7 @@ pub struct BuildDeathBreaker {
     /// connection safe when a health thread and a build overlap. Build paths may
     /// open the same WAL file independently: readers do not block writers, and
     /// each connection has a five-second busy timeout for contested operations.
-    connection: Mutex<Connection>,
+    connection: Mutex<TrackedConnection>,
 }
 
 impl BuildDeathBreaker {
@@ -164,7 +165,7 @@ impl BuildDeathBreaker {
                 BuildBreakerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
         }
-        let connection = Connection::open(&path)?;
+        let connection = TrackedConnection::open(&path, SqliteStore::BreakerFile)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;

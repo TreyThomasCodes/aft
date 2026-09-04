@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::db::TrackedConnection;
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
-use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::alert_state::{
@@ -1291,7 +1291,8 @@ pub struct App {
     /// One process-wide handle for the current AFT database. Every project
     /// actor points at this handle so roots do not open duplicate SQLite/WAL
     /// descriptors for the same database.
-    db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<Connection>>)>>,
+    db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<TrackedConnection>>)>>,
+    lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
     open_routes: AtomicUsize,
@@ -1307,6 +1308,7 @@ impl App {
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
+            lifecycle_census: crate::lifecycle_census::LifecycleCensusCache::default(),
             active_watchers: AtomicUsize::new(0),
             active_actor_roots: AtomicUsize::new(0),
             open_routes: AtomicUsize::new(0),
@@ -1332,6 +1334,19 @@ impl App {
 
     pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
         self.lsp_child_registry.clone()
+    }
+
+    pub(crate) fn publish_lifecycle_census(
+        &self,
+        snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
+    ) {
+        self.lifecycle_census.publish(snapshot);
+    }
+
+    pub(crate) fn lifecycle_census_snapshot(
+        &self,
+    ) -> crate::lifecycle_census::LifecycleCensusSnapshot {
+        self.lifecycle_census.snapshot()
     }
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
@@ -1432,7 +1447,10 @@ impl App {
     /// requested path is not already resident. The connection mutex serializes
     /// transactions from all roots; callers never hold the App lock while using
     /// the returned connection.
-    pub fn open_db(&self, path: &Path) -> Result<Arc<Mutex<Connection>>, crate::db::OpenError> {
+    pub fn open_db(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
         let mut slot = self.db.lock();
         if let Some((existing_path, conn)) = slot.as_ref() {
@@ -1446,7 +1464,7 @@ impl App {
         Ok(conn)
     }
 
-    pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         *self.db.lock() = Some((PathBuf::new(), conn));
     }
 
@@ -1467,7 +1485,7 @@ impl App {
         }
     }
 
-    pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
+    pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
     }
 
@@ -3617,7 +3635,7 @@ impl AppContext {
         &self.checkpoint
     }
 
-    pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
     }
@@ -3627,7 +3645,7 @@ impl AppContext {
         self.compression_aggregates.clear();
     }
 
-    pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
+    pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
     }
 

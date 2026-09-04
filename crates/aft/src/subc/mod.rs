@@ -3498,7 +3498,7 @@ where
                     .reap_children_with_gone_cwd_or_reclaimed_root();
                 if reaped_lsp_children > 0 {
                     log::warn!(
-                        "subc attach: reaped {reaped_lsp_children} LSP child process group(s) with a deleted cwd or reclaimed root"
+                        "subc attach: reaped {reaped_lsp_children} orphaned LSP child process group(s)"
                     );
                 }
                 let now = Instant::now();
