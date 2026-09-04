@@ -22,7 +22,7 @@ import {
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg, whenGhReadEnabled } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -96,7 +96,12 @@ const ZoomParams = Type.Object({
 });
 
 function isUrl(s: string): boolean {
-  return s.startsWith("http://") || s.startsWith("https://");
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("issue://") ||
+    s.startsWith("pr://")
+  );
 }
 
 async function assertReadPathPermissions(
@@ -346,11 +351,20 @@ export function registerReadingTools(
   surface: ReadingSurface,
 ): void {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
+  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const githubOutlineDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",
+  );
+  const githubZoomDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issue and pull-request discussion ordinals can be zoomed with `path: issue://…` or `path: pr://…` and `symbols`.",
+  );
   if (surface.outline) {
     const outlineTool = withPathAliasPreparation({
       name: "aft_outline",
       label: "outline",
-      description: `Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with ${zoomEnabled ? "aft_zoom" : "read"}. Set \`files: true\` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n${zoomEnabled ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces." : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping."}\n\nPass a single \`target\`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory`,
+      description: `Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with ${zoomEnabled ? "aft_zoom" : "read"}. Set \`files: true\` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n${zoomEnabled ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces." : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping."}\n\nPass a single \`target\`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory${githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""}`,
       parameters: OutlineParams,
       async execute(
         _toolCallId: string,
@@ -426,7 +440,8 @@ export function registerReadingTools(
         name: "aft_zoom",
         label: "zoom",
         description:
-          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them.",
+          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+          (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
         parameters: ZoomParams,
         async execute(
           _toolCallId: string,
@@ -523,7 +538,14 @@ export function registerReadingTools(
           // URL mode passes through to Rust; Rust fetches, validates, and caches.
           // File mode still resolves locally before dispatch so external-directory
           // permission checks approve the same path the server will read.
-          if (!hasUrl) {
+          const githubPath =
+            (hasPath &&
+              (String(params.path).startsWith("issue://") ||
+                String(params.path).startsWith("pr://"))) ||
+            (hasUrl &&
+              (String(params.url).startsWith("issue://") ||
+                String(params.url).startsWith("pr://")));
+          if (!hasUrl && !githubPath) {
             const file = await resolvePathArg(extCtx.cwd, params.path as string);
             await assertReadPathPermissions(extCtx, ctx, file);
           }

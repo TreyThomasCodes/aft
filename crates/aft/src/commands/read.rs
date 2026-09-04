@@ -897,13 +897,11 @@ pub(crate) fn handle_github_zoom(
 ) -> Response {
     let resource = match parse_resource(target) {
         Ok(resource) if resource.comment_selector.is_none() => resource,
-        Ok(_) => {
-            return Response::error(
-                &req.id,
-                "invalid_resource",
-                "GitHub zoom target must not include /comments; pass discussion ordinals in symbols",
-            )
-        }
+        Ok(_) => return Response::error(
+            &req.id,
+            "invalid_resource",
+            "GitHub zoom target must not include /comments; pass discussion ordinals in symbols",
+        ),
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
     let selected = format!("{}/comments/{selector}", resource.base_spelling());

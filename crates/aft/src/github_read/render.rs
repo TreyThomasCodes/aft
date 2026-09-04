@@ -274,7 +274,12 @@ fn render_timeline(output: &mut String, discussion: &[DiscussionItem<'_>]) {
             output.push_str("\n## Timeline\n\n");
             rendered_any = true;
         }
-        render_item_heading(output, ordinal, event.actor.as_deref(), event.created_at.as_deref());
+        render_item_heading(
+            output,
+            ordinal,
+            event.actor.as_deref(),
+            event.created_at.as_deref(),
+        );
         render_timeline_event_body(output, event);
     }
 }
@@ -335,7 +340,10 @@ fn render_selected_discussion(
         if let Some(state) = item.state().filter(|state| !state.is_empty()) {
             output.push_str(&format!("State: {state}\n\n"));
         }
-        append_body(&mut output, &structural_strip(item.body().unwrap_or_default()));
+        append_body(
+            &mut output,
+            &structural_strip(item.body().unwrap_or_default()),
+        );
     }
     Ok(output)
 }
@@ -426,6 +434,9 @@ fn discussion_items(document: &GithubDocument) -> Vec<DiscussionItem<'_>> {
             }
         }
     }
+    if document.timeline.is_empty() {
+        return items;
+    }
     for event in &document.timeline {
         items.push(DiscussionItem {
             kind: DiscussionItemKind::Event(event),
@@ -440,17 +451,20 @@ fn discussion_ordinal_for_comment(
     comment: &GithubComment,
     review_comment: bool,
 ) -> Option<usize> {
-    discussion.iter().position(|item| {
-        matches!(
-            item.kind,
-            DiscussionItemKind::ReviewComment(candidate)
-                if review_comment && std::ptr::eq(candidate, comment)
-        ) || matches!(
-            item.kind,
-            DiscussionItemKind::Comment(candidate)
-                if !review_comment && std::ptr::eq(candidate, comment)
-        )
-    }).map(|index| index + 1)
+    discussion
+        .iter()
+        .position(|item| {
+            matches!(
+                item.kind,
+                DiscussionItemKind::ReviewComment(candidate)
+                    if review_comment && std::ptr::eq(candidate, comment)
+            ) || matches!(
+                item.kind,
+                DiscussionItemKind::Comment(candidate)
+                    if !review_comment && std::ptr::eq(candidate, comment)
+            )
+        })
+        .map(|index| index + 1)
 }
 
 fn discussion_ordinal_for_review(
@@ -490,8 +504,16 @@ pub fn render_outline_for_resource(document: &GithubDocument, resource: &GithubR
     if document.kind == GithubDocumentKind::PullRequest {
         let base = document.base_ref_name.as_deref().unwrap_or("?");
         let head = document.head_ref_name.as_deref().unwrap_or("?");
-        let additions = document.files.iter().map(|file| file.additions.unwrap_or(0)).sum::<u64>();
-        let deletions = document.files.iter().map(|file| file.deletions.unwrap_or(0)).sum::<u64>();
+        let additions = document
+            .files
+            .iter()
+            .map(|file| file.additions.unwrap_or(0))
+            .sum::<u64>();
+        let deletions = document
+            .files
+            .iter()
+            .map(|file| file.deletions.unwrap_or(0))
+            .sum::<u64>();
         let decision = document
             .review_decision
             .as_deref()
@@ -539,16 +561,21 @@ fn render_outline_item(ordinal: usize, item: &DiscussionItem<'_>) -> String {
         DiscussionItemKind::ReviewComment(comment) => format!(
             "review-comment({}:{})",
             comment.path.as_deref().unwrap_or("unknown"),
-            comment.line.map(|line| line.to_string()).unwrap_or_else(|| "?".to_string())
+            comment
+                .line
+                .map(|line| line.to_string())
+                .unwrap_or_else(|| "?".to_string())
         ),
         DiscussionItemKind::Event(event) => format!("event({})", event.event),
     };
-    let author = item.author().map(format_author).unwrap_or_else(|| "@unknown".to_string());
+    let author = item
+        .author()
+        .map(format_author)
+        .unwrap_or_else(|| "@unknown".to_string());
     let date = outline_timestamp(item.date().unwrap_or("unknown"));
-    let body = item
-        .body()
-        .map(single_line_excerpt)
-        .unwrap_or_else(|| single_line_excerpt(&timeline_event_payload(item.event().expect("event item"))));
+    let body = item.body().map(single_line_excerpt).unwrap_or_else(|| {
+        single_line_excerpt(&timeline_event_payload(item.event().expect("event item")))
+    });
     format!("[{ordinal}] {kind} {author} {date} · {body}")
 }
 
@@ -565,7 +592,10 @@ fn single_line_excerpt(value: &str) -> String {
     if text.chars().count() <= MAX_CHARS {
         return text;
     }
-    let prefix = text.chars().take(MAX_CHARS.saturating_sub(1)).collect::<String>();
+    let prefix = text
+        .chars()
+        .take(MAX_CHARS.saturating_sub(1))
+        .collect::<String>();
     format!("{prefix}…")
 }
 
@@ -697,9 +727,7 @@ fn append_body(output: &mut String, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github_read::model::{
-        GithubDocument, GithubDocumentKind, GithubTimelineEvent,
-    };
+    use crate::github_read::model::{GithubDocument, GithubDocumentKind, GithubTimelineEvent};
     use crate::github_read::GithubResourceKind;
 
     #[test]

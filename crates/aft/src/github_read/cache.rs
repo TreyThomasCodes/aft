@@ -559,7 +559,8 @@ fn complete_with_optional_attachments(
     downloader: &dyn GithubImageDownloader,
     view: GithubReadView,
 ) -> Result<GithubReadCompletion, GithubReadError> {
-    let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true) {
+    let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true)
+    {
         download_github_image_attachments(&canonical_text, downloader)
     } else {
         Vec::new()

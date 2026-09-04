@@ -26,7 +26,7 @@ fn write_fake_gh(bin_dir: &Path) {
 if [ -n "${AFT_TEST_GH_STARTED:-}" ]; then
   : > "$AFT_TEST_GH_STARTED"
 fi
-if [ -n "${AFT_TEST_GH_DELAY_SECONDS:-}" ]; then
+if [ -n "${AFT_TEST_GH_DELAY_SECONDS:-}" ] && [ "$1" != "api" ]; then
   sleep "$AFT_TEST_GH_DELAY_SECONDS"
 fi
 case "$1" in
@@ -231,8 +231,14 @@ fn github_outline_zoom_and_read_share_timeline_ordinals() {
         .to_string(),
     );
     assert_eq!(zoom["success"], true, "zoom failed: {zoom:#}");
-    assert!(zoom["content"].as_str().unwrap_or_default().contains("Event: closed"));
-    assert!(zoom["content"].as_str().unwrap_or_default().contains("aft-alfonso[bot]"));
+    assert!(zoom["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Event: closed"));
+    assert!(zoom["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("aft-alfonso[bot]"));
 
     let selected = read_response(
         &mut aft,
@@ -259,14 +265,20 @@ fn github_outline_and_zoom_refuse_when_gh_read_is_disabled() {
         })
         .to_string(),
     );
-    assert_eq!(configured["success"], true, "configure failed: {configured:#}");
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:#}"
+    );
 
     for request in [
         json!({ "id": "outline-gate-off", "command": "outline", "target": "issue://7" }),
         json!({ "id": "zoom-gate-off", "command": "zoom", "file": "issue://7", "symbols": ["1"] }),
     ] {
         let response = aft.send(&request.to_string());
-        assert_eq!(response["success"], false, "gate unexpectedly passed: {response:#}");
+        assert_eq!(
+            response["success"], false,
+            "gate unexpectedly passed: {response:#}"
+        );
         assert_eq!(response["code"], "gh_read_disabled");
     }
     assert!(aft.shutdown().success());

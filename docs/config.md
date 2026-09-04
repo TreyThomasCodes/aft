@@ -385,7 +385,7 @@ AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends th
 
 ## GitHub resource reads
 
-Structured `issue://` and `pr://` reads are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
+Structured `issue://` and `pr://` reads, concise `aft_outline` indexes, and ordinal `aft_zoom` drill-downs are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
 
 ```jsonc
 {

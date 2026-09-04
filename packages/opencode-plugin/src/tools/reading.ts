@@ -3,7 +3,6 @@ import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugi
 import { tool } from "@opencode-ai/plugin";
 import { toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
-import { whenGhReadEnabled } from "./hoisted.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -12,6 +11,7 @@ import {
   optionalInt,
   resolvePathArg,
 } from "./_shared.js";
+import { whenGhReadEnabled } from "./hoisted.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -139,12 +139,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
             throw new Error("'target' must be a non-empty string or array of strings");
           }
 
-              const hasUrl =
-                !filesMode &&
-                (target.startsWith("http://") ||
-                  target.startsWith("https://") ||
-                  target.startsWith("issue://") ||
-                  target.startsWith("pr://"));
+          const hasUrl =
+            !filesMode &&
+            (target.startsWith("http://") ||
+              target.startsWith("https://") ||
+              target.startsWith("issue://") ||
+              target.startsWith("pr://"));
           if (!hasUrl) {
             const resolvedTarget = await resolvePathArg(ctx, context, target);
             const permissionDenied = await assertPathExternalPermissions(
@@ -166,9 +166,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
     },
 
     aft_zoom: {
-            description:
-              "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
-              (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
+      description:
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+        (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
       args: {
         path: z.string().optional().describe("Path to file (absolute or relative to project root)"),
         url: z

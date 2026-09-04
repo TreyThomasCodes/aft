@@ -190,8 +190,8 @@ fn first_party_opencode_pi_and_runner_binds_remain_permitted() {
             .expect("read first-party gh call log")
             .lines()
             .count(),
-        3,
-        "each first-party bind must reach the GitHub CLI under its normal trust posture"
+        6,
+        "each first-party bind must fetch the resource and its timeline through the GitHub CLI"
     );
 }
 
@@ -261,7 +261,10 @@ fn isolated_restriction_probe() {
             "zoom" => handle_zoom(&request, &ctx),
             _ => unreachable!(),
         });
-        assert!(!response.success, "restricted {command} unexpectedly succeeded");
+        assert!(
+            !response.success,
+            "restricted {command} unexpectedly succeeded"
+        );
         assert_eq!(response.data["code"], "external_fetch_restricted");
     }
     fs::write(completion_marker, case).expect("mark isolated restriction probe complete");
