@@ -262,6 +262,14 @@ pub struct BlobStorePragmas {
     pub wal_autocheckpoint_pages: i64,
 }
 
+/// Space and row usage for one immutable family/plane store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobUsage {
+    pub rows: u64,
+    pub payload_bytes: u64,
+    pub file_bytes: u64,
+}
+
 /// A breaker implementation is notified exactly once after a corrupt database
 /// has been moved aside and a clean replacement has opened successfully; the
 /// notification records that recovery event.
@@ -435,6 +443,28 @@ impl BlobStore {
 
     pub fn pragmas(&self) -> &BlobStorePragmas {
         &self.pragmas
+    }
+
+    /// Returns current payload rows plus the SQLite file allocation.  Quota
+    /// admission uses this before an insert so a rejected payload never enters
+    /// the immutable store.
+    pub fn usage(&self) -> Result<BlobUsage, BlobStoreError> {
+        let (rows, payload_bytes): (u64, u64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM blob_payloads",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let page_count: u64 = self
+            .connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let page_size: u64 = self
+            .connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))?;
+        Ok(BlobUsage {
+            rows,
+            payload_bytes,
+            file_bytes: page_count.saturating_mul(page_size),
+        })
     }
 
     /// Inserts a payload once.  An existing row is never updated, even if its
@@ -772,6 +802,20 @@ mod tests {
         }
 
         assert_eq!(store.get(&key).expect("read after aborted put"), None);
+    }
+
+    #[test]
+    fn usage_counts_rows_payloads_and_sqlite_pages() {
+        let directory = tempfile::tempdir().expect("create temporary storage");
+        let mut store = BlobStore::open(directory.path(), "family-a", BlobPlane::Semantic)
+            .expect("open blob store");
+        let key = SemanticKey::for_current(b"source", b"src/lib.rs", "model-a").full_key();
+        store.put(&key, b"payload").expect("insert payload");
+
+        let usage = store.usage().expect("read usage");
+        assert_eq!(usage.rows, 1);
+        assert_eq!(usage.payload_bytes, 7);
+        assert!(usage.file_bytes >= usage.payload_bytes);
     }
 
     #[test]
