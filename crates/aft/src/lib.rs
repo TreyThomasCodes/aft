@@ -56,6 +56,7 @@ pub mod backup;
 pub mod bash_background;
 pub mod bash_permissions;
 pub mod bash_rewrite;
+pub mod blob_store;
 pub mod build_breaker;
 pub mod cache_freshness;
 pub mod callgraph;

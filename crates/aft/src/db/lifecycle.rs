@@ -17,14 +17,16 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SqliteStore {
     AftDb,
+    BlobStore,
     CallgraphGeneration,
     InspectScopeCache,
     BreakerFile,
 }
 
 impl SqliteStore {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AftDb,
+        Self::BlobStore,
         Self::CallgraphGeneration,
         Self::InspectScopeCache,
         Self::BreakerFile,
@@ -33,6 +35,7 @@ impl SqliteStore {
     pub const fn label(self) -> &'static str {
         match self {
             Self::AftDb => "aft.db",
+            Self::BlobStore => "blob_stores",
             Self::CallgraphGeneration => "callgraph_generations",
             Self::InspectScopeCache => "inspect_scope_caches",
             Self::BreakerFile => "breaker_files",
@@ -209,6 +212,15 @@ impl Drop for TrackedConnection {
 mod tests {
     use super::*;
 
+    fn store_count(snapshot: &SqliteConnectionSnapshot, store: SqliteStore) -> u64 {
+        snapshot
+            .open_by_store
+            .iter()
+            .find(|row| row.store == store.label())
+            .expect("every store has a snapshot row")
+            .count
+    }
+
     #[test]
     fn tracked_connection_counts_open_and_close_at_each_seam() {
         use super::thread_counts::open_on_this_thread;
@@ -231,8 +243,8 @@ mod tests {
         // it may also contain other tests' connections, so only a lower bound
         // is a stable assertion here.
         let snapshot = connection_snapshot();
-        assert!(snapshot.open_by_store[0].count >= 1);
-        assert!(snapshot.open_by_store[1].count >= 1);
+        assert!(store_count(&snapshot, SqliteStore::AftDb) >= 1);
+        assert!(store_count(&snapshot, SqliteStore::CallgraphGeneration) >= 1);
         assert!(snapshot.open_connections >= 2);
 
         drop(aft);

@@ -22,6 +22,7 @@ mod bash_tasks_dual_write_test;
 mod bash_test;
 mod bash_token_count_test;
 mod bash_watch_test;
+mod blob_store_core_test;
 mod callgraph_store_name_match_test;
 mod callgraph_test;
 mod checkpoint_metadata_test;
@@ -109,6 +110,7 @@ mod state_commands_test;
 mod status_compression_test;
 mod status_disk_scope_test;
 mod status_memory_test;
+mod store_open_recovery_test;
 mod subc_bridge_test;
 #[cfg(unix)]
 mod subc_detach_test;
