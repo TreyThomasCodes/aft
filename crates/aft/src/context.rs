@@ -3,7 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
@@ -3748,44 +3748,45 @@ impl AppContext {
         self.storage_dir().join(self.harness().storage_segment())
     }
 
-    /// Refresh the in-memory list of durable build suspensions during health
-    /// maintenance so reply handling can return the cached snapshot instead of
-    /// querying storage.
-    pub(crate) fn refresh_build_suspensions_for_health(
-        &self,
-        project_root: &Path,
-        project_key: Option<&str>,
-    ) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        self.refresh_build_suspensions_for_health_at(project_root, project_key, now_ms);
-    }
-
+    #[cfg(test)]
     pub(crate) fn refresh_build_suspensions_for_health_at(
         &self,
         project_root: &Path,
         project_key: Option<&str>,
         now_ms: u64,
     ) {
-        let suspended_domains = project_key
-            .and_then(|key| {
-                let path = self
-                    .storage_dir()
-                    .join("callgraph")
-                    .join(key)
-                    .join("build-breaker.sqlite");
-                path.is_file().then_some(path)
-            })
+        let suspensions = self
+            .build_breaker_path_for_health(project_key)
             .and_then(|path| crate::build_breaker::BuildDeathBreaker::open(path).ok())
             .and_then(|breaker| {
                 breaker
                     .active_suspensions_for_root_at(&project_root.display().to_string(), now_ms)
                     .ok()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.publish_build_suspensions_for_health(suspensions, now_ms);
+    }
+
+    pub(crate) fn build_breaker_path_for_health(
+        &self,
+        project_key: Option<&str>,
+    ) -> Option<PathBuf> {
+        project_key.and_then(|key| {
+            let path = self
+                .storage_dir()
+                .join("callgraph")
+                .join(key)
+                .join("build-breaker.sqlite");
+            path.is_file().then_some(path)
+        })
+    }
+
+    pub(crate) fn publish_build_suspensions_for_health(
+        &self,
+        suspensions: Vec<crate::build_breaker::BuildSuspension>,
+        now_ms: u64,
+    ) {
+        let suspended_domains = suspensions
             .into_iter()
             .map(|suspension| {
                 let age_s = suspension.age_seconds_at(now_ms);

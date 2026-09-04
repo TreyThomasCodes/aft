@@ -7,6 +7,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ZERO_CREDIT_DEATH_LIMIT: u64 = 3;
@@ -139,6 +140,10 @@ pub type Result<T> = std::result::Result<T, BuildBreakerError>;
 /// SQLite-backed, root/domain/fingerprint-isolated death history.
 pub struct BuildDeathBreaker {
     path: PathBuf,
+    /// One connection retains SQLite's initialized schema/WAL state for callers
+    /// that repeatedly inspect a breaker, while the mutex keeps its non-Sync
+    /// connection safe when a health thread and a build overlap.
+    connection: Mutex<Connection>,
 }
 
 impl BuildDeathBreaker {
@@ -149,10 +154,10 @@ impl BuildDeathBreaker {
                 BuildBreakerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
         }
-        let breaker = Self { path };
-        breaker.with_connection(|conn| {
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL;
+        let connection = Connection::open(&path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
                  CREATE TABLE IF NOT EXISTS breaker_records (
                     root_id TEXT NOT NULL,
@@ -176,10 +181,11 @@ impl BuildDeathBreaker {
                     death_charged INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(root_id, domain, corpus_fingerprint, attempt_id)
                  );",
-            )?;
-            Ok(())
-        })?;
-        Ok(breaker)
+        )?;
+        Ok(Self {
+            path,
+            connection: Mutex::new(connection),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -425,9 +431,11 @@ impl BuildDeathBreaker {
     }
 
     fn with_connection<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        let mut conn = Connection::open(&self.path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        work(&mut conn)
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        work(&mut connection)
     }
 }
 

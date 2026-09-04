@@ -623,7 +623,7 @@ fn nonnegative_i64_to_u64(value: i64) -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
+fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
     let mut statistics = std::mem::MaybeUninit::<libc::malloc_statistics_t>::zeroed();
     unsafe {
         libc::malloc_zone_statistics(libc::malloc_default_zone(), statistics.as_mut_ptr());
@@ -636,7 +636,7 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
+fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
     // mallinfo2 exists only in glibc >= 2.33. Release Linux binaries link
     // against an older glibc floor (cross gnu images, kept old so dlopen and
     // wide distro compatibility hold), so a link-time reference to the symbol
@@ -690,8 +690,27 @@ fn resolved_malloc_trim() -> Option<MallocTrimFn> {
 }
 
 #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
+fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
     AllocatorMemorySnapshot::not_estimated("platform_allocator_statistics_unavailable")
+}
+
+/// Read allocator-wide statistics. Callers on the dispatch path must use the
+/// cached slack scheduler below instead: macOS walks allocator zones under
+/// their locks while producing this snapshot.
+fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
+    #[cfg(test)]
+    {
+        ALLOCATOR_SNAPSHOT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
+        ALLOCATOR_SNAPSHOT_THREADS
+            .lock()
+            .expect("allocator snapshot test thread log")
+            .push(name);
+    }
+    allocator_memory_snapshot_impl()
 }
 
 #[cfg(target_os = "macos")]
@@ -707,6 +726,103 @@ pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 /// legitimately cycles through large allocations does not thrash the allocator.
 pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
+
+/// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
+/// take allocator-zone locks, so cache a process-wide observation for 60s.
+/// This bounds allocator statistics walks to one per idle minute, or two for a
+/// relief pass that uses its before/after snapshots.
+const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const UNKNOWN_ALLOCATOR_SLACK: u64 = u64::MAX;
+const UNSAMPLED_AT_MS: u64 = u64::MAX;
+static ALLOCATOR_SLACK_CACHE_ORIGIN: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
+static LAST_OBSERVED_ALLOCATOR_SLACK_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
+static LAST_ALLOCATOR_SLACK_RELIEF_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
+
+#[cfg(test)]
+static ALLOCATOR_SNAPSHOT_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
+    let origin = ALLOCATOR_SLACK_CACHE_ORIGIN.get_or_init(|| now);
+    now.duration_since(*origin)
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn cached_allocator_slack() -> Option<u64> {
+    let slack = LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
+    (slack != UNKNOWN_ALLOCATOR_SLACK).then_some(slack)
+}
+
+fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u64) {
+    LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
+        snapshot
+            .retained_slack_bytes
+            .unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
+        std::sync::atomic::Ordering::Release,
+    );
+    LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
+}
+
+fn sample_is_stale(now_ms: u64) -> bool {
+    let sampled_at = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    sampled_at == UNSAMPLED_AT_MS
+        || now_ms.saturating_sub(sampled_at) >= ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64
+}
+
+fn reserve_sample(now_ms: u64) -> Option<u64> {
+    let previous = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    if !sample_is_stale(now_ms) {
+        return None;
+    }
+    LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS
+        .compare_exchange(
+            previous,
+            now_ms,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+}
+
+fn reserve_relief(now_ms: u64) -> Option<u64> {
+    let previous = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+    let due = cached_allocator_slack().is_some_and(|slack| {
+        slack >= ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES
+            && (previous == UNSAMPLED_AT_MS
+                || now_ms.saturating_sub(previous)
+                    >= ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL.as_millis() as u64)
+    });
+    due.then(|| {
+        LAST_ALLOCATOR_SLACK_RELIEF_AT_MS
+            .compare_exchange(
+                previous,
+                now_ms,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+    })?
+}
+
+fn log_allocator_relief(relief: AllocatorPressureRelief) {
+    log::info!(
+        "allocator slack relief: released={} allocator_slack_bytes_before={:?} allocator_slack_bytes_after={:?} rss_bytes_before={:?} rss_bytes_after={:?}",
+        relief.bytes_released,
+        relief.allocator_before.retained_slack_bytes,
+        relief.allocator_after.retained_slack_bytes,
+        relief.rss_before_bytes,
+        relief.rss_after_bytes,
+    );
+}
 
 /// Decide whether an opportunistic allocator relief pass is due.
 ///
@@ -730,38 +846,71 @@ pub fn allocator_slack_relief_due(
     }
 }
 
-/// Opportunistically return unused allocator pages when slack is large, even
-/// while sessions are active. The whole-process idle sweep only fires when
-/// every root has been quiet, so one long-lived chatty session used to block
-/// reclamation for the process lifetime (observed: 5.1 GB RSS over ~600 MB of
-/// live data). Runs the relief on a detached thread because allocator trimming
-/// walks allocator state under its lock and must not stall the dispatch loop or
-/// health probes.
+/// Opportunistically return unused allocator pages without reading allocator
+/// statistics on the module loop. The loop only reads cached atomics. When the
+/// cached observation is stale, one sampler takes an initial snapshot; if it
+/// finds enough slack, the page-return operation reuses it and takes only one
+/// additional after snapshot, limiting the pass to two statistics walks.
 ///
-/// Returns true when a pass was spawned (caller records the timestamp).
+/// `phys_footprint_bytes` cannot make this decision: it includes file mappings
+/// and other resident memory, so it cannot identify mapped-but-unused allocator
+/// arenas without allocator-zone statistics.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn spawn_allocator_slack_relief_if_due(
-    last_relief: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> bool {
-    let slack = allocator_memory_snapshot().retained_slack_bytes;
-    if !allocator_slack_relief_due(slack, last_relief, now) {
+pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
+    let now_ms = allocator_slack_elapsed_ms(now);
+    if sample_is_stale(now_ms) {
+        let Some(previous_sample) = reserve_sample(now_ms) else {
+            return false;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("aft-mem-slack-sample".to_string())
+            .spawn(move || {
+                let before = allocator_memory_snapshot();
+                publish_allocator_slack(&before, now_ms);
+                if reserve_relief(now_ms).is_some() {
+                    let relief = relieve_allocator_pressure_from_snapshot(before);
+                    publish_allocator_slack(
+                        &relief.allocator_after,
+                        allocator_slack_elapsed_ms(std::time::Instant::now()),
+                    );
+                    log_allocator_relief(relief);
+                }
+            })
+            .is_ok();
+        if !spawned {
+            let _ = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.compare_exchange(
+                now_ms,
+                previous_sample,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
         return false;
     }
-    std::thread::Builder::new()
+
+    let Some(previous_relief) = reserve_relief(now_ms) else {
+        return false;
+    };
+    let spawned = std::thread::Builder::new()
         .name("aft-mem-relief".to_string())
-        .spawn(|| {
+        .spawn(move || {
             let relief = relieve_allocator_pressure();
-            log::info!(
-                "allocator slack relief: released={} allocator_slack_bytes_before={:?} allocator_slack_bytes_after={:?} rss_bytes_before={:?} rss_bytes_after={:?}",
-                relief.bytes_released,
-                relief.allocator_before.retained_slack_bytes,
-                relief.allocator_after.retained_slack_bytes,
-                relief.rss_before_bytes,
-                relief.rss_after_bytes,
+            publish_allocator_slack(
+                &relief.allocator_after,
+                allocator_slack_elapsed_ms(std::time::Instant::now()),
             );
+            log_allocator_relief(relief);
         })
-        .is_ok()
+        .is_ok();
+    if !spawned {
+        let _ = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.compare_exchange(
+            now_ms,
+            previous_relief,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+    spawned
 }
 
 /// Ask the platform allocator to return unused pages after a process-wide idle
@@ -769,9 +918,10 @@ pub fn spawn_allocator_slack_relief_if_due(
 /// latency. Linux invokes glibc's optional `malloc_trim(0)` when the symbol is
 /// available; non-glibc allocators intentionally remain a no-op.
 #[cfg(target_os = "macos")]
-pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
+fn relieve_allocator_pressure_from_snapshot(
+    allocator_before: AllocatorMemorySnapshot,
+) -> AllocatorPressureRelief {
     let rss_before_bytes = process_rss_bytes();
-    let allocator_before = allocator_memory_snapshot();
     let bytes_released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     let allocator_after = allocator_memory_snapshot();
     let rss_after_bytes = process_rss_bytes();
@@ -784,10 +934,16 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
 pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
+    relieve_allocator_pressure_from_snapshot(allocator_memory_snapshot())
+}
+
+#[cfg(target_os = "linux")]
+fn relieve_allocator_pressure_from_snapshot(
+    allocator_before: AllocatorMemorySnapshot,
+) -> AllocatorPressureRelief {
     let rss_before_bytes = process_rss_bytes();
-    let allocator_before = allocator_memory_snapshot();
     #[cfg(target_env = "gnu")]
     if let Some(malloc_trim) = resolved_malloc_trim() {
         // SAFETY: resolved_malloc_trim verifies the symbol and its C ABI
@@ -808,6 +964,11 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
         allocator_before,
         allocator_after,
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
+    relieve_allocator_pressure_from_snapshot(allocator_memory_snapshot())
 }
 
 #[cfg(target_os = "macos")]
@@ -875,6 +1036,44 @@ mod tests {
     #[test]
     fn process_snapshot_preserves_negative_residuals() {
         assert_eq!(signed_difference(5, 8), -3);
+    }
+
+    #[test]
+    fn loop_slack_decision_never_reads_allocator_statistics() {
+        LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
+            UNKNOWN_ALLOCATOR_SLACK,
+            std::sync::atomic::Ordering::Release,
+        );
+        LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+        LAST_ALLOCATOR_SLACK_RELIEF_AT_MS
+            .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
+        ALLOCATOR_SNAPSHOT_CALLS.store(0, std::sync::atomic::Ordering::Release);
+        ALLOCATOR_SNAPSHOT_THREADS
+            .lock()
+            .expect("clear allocator snapshot thread log")
+            .clear();
+
+        for _ in 0..1_000 {
+            assert!(!spawn_allocator_slack_relief_if_due(
+                std::time::Instant::now()
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while ALLOCATOR_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "sampler did not run");
+            std::thread::yield_now();
+        }
+        let threads = ALLOCATOR_SNAPSHOT_THREADS
+            .lock()
+            .expect("read allocator snapshot thread log")
+            .clone();
+        assert!(
+            threads
+                .iter()
+                .all(|name| name == "aft-mem-slack-sample" || name == "aft-mem-relief"),
+            "allocator statistics must run only on sampler/relief threads: {threads:?}"
+        );
     }
 
     #[test]

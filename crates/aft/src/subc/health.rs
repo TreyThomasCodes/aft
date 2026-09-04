@@ -8,9 +8,7 @@ use super::{
     HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot, RouteChannel,
     StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::App;
-#[cfg(test)]
-use crate::context::AppContext;
+use crate::context::{App, AppContext};
 use crate::executor::BindBlockerSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -672,6 +670,8 @@ pub(super) struct HealthRollupCache {
     origin: Instant,
     generated_at_ms: AtomicU64,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
+    breakers:
+        std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
 }
 
 impl HealthRollupCache {
@@ -680,13 +680,14 @@ impl HealthRollupCache {
             origin: Instant::now(),
             generated_at_ms: AtomicU64::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
+            breakers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Assemble outside the cache lock, then hold the write lock only long
     /// enough to replace one `Arc`. Probe readers never wait for a refresh.
     pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
-        let rollup = Arc::new(build_health_diagnostic_rollup(executor, shared_app));
+        let rollup = Arc::new(build_health_diagnostic_rollup(self, executor, shared_app));
         let generated_at_ms = duration_millis_u64(self.origin.elapsed());
         match self.snapshot.write() {
             Ok(mut snapshot) => *snapshot = rollup,
@@ -694,6 +695,56 @@ impl HealthRollupCache {
         }
         self.generated_at_ms
             .store(generated_at_ms, Ordering::Release);
+    }
+
+    fn refresh_build_suspensions(
+        &self,
+        ctx: &AppContext,
+        project_root: &std::path::Path,
+        project_key: Option<&str>,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let Some(path) = ctx.build_breaker_path_for_health(project_key) else {
+            ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+            return;
+        };
+        let breaker = {
+            let mut breakers = self
+                .breakers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(breaker) = breakers.get(&path) {
+                Arc::clone(breaker)
+            } else {
+                match crate::build_breaker::BuildDeathBreaker::open(&path) {
+                    Ok(breaker) => {
+                        let breaker = Arc::new(breaker);
+                        breakers.insert(path, Arc::clone(&breaker));
+                        breaker
+                    }
+                    Err(error) => {
+                        log::debug!("health breaker open failed; retrying next rollup: {error}");
+                        ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+                        return;
+                    }
+                }
+            }
+        };
+        match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
+            Ok(suspensions) => ctx.publish_build_suspensions_for_health(suspensions, now_ms),
+            Err(error) => {
+                log::debug!("health breaker read failed; reopening next rollup: {error}");
+                self.breakers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
+                ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+            }
+        }
     }
 
     fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, u64) {
@@ -707,6 +758,46 @@ impl HealthRollupCache {
             }
         };
         (snapshot, age_ms)
+    }
+}
+
+pub(super) struct HealthRollupWorker {
+    wake_tx: std::sync::mpsc::SyncSender<bool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HealthRollupWorker {
+    pub(super) fn start(
+        cache: Arc<HealthRollupCache>,
+        executor: Arc<Executor>,
+        shared_app: Arc<App>,
+    ) -> Self {
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("aft-health-rollup".to_string())
+            .spawn(move || loop {
+                cache.refresh(&executor, &shared_app);
+                match wake_rx.recv_timeout(HEALTH_ROLLUP_TTL) {
+                    Ok(true) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .expect("spawn health rollup worker");
+        Self {
+            wake_tx,
+            join: Some(join),
+        }
+    }
+
+    pub(super) fn request_refresh(&self) {
+        let _ = self.wake_tx.try_send(true);
+    }
+
+    pub(super) fn shutdown(mut self) {
+        let _ = self.wake_tx.send(false);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -797,7 +888,11 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
-fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> HealthDiagnosticRollup {
+fn build_health_diagnostic_rollup(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    shared_app: &App,
+) -> HealthDiagnosticRollup {
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
@@ -856,7 +951,7 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
         // Durable breaker state is loaded during the off-path rollup, then the
         // cached health reply reads only the context snapshot. Standing keys can
         // be scoped or path-based, so they must not depend on the session-key memo.
-        ctx.refresh_build_suspensions_for_health(root_id.as_path(), artifact_key);
+        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key);
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -1113,6 +1208,36 @@ mod tests {
         }
         samples.sort_unstable();
         samples[samples.len() / 2]
+    }
+
+    #[test]
+    fn health_worker_publishes_a_fresh_snapshot_without_loop_refresh() {
+        let cache = Arc::new(HealthRollupCache::new());
+        let executor = Arc::new(Executor::new());
+        let app = crate::context::App::default_shared();
+        let worker = HealthRollupWorker::start(Arc::clone(&cache), executor, Arc::clone(&app));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cache.generated_at_ms.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "background health rollup did not publish"
+            );
+            std::thread::yield_now();
+        }
+        let report = build_health_report(
+            &cache,
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert!(
+            report.metrics.expect("health metrics")["snapshot_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age < 1_000),
+            "the background publication must reset snapshot age"
+        );
+        worker.shutdown();
     }
 
     #[test]

@@ -151,8 +151,8 @@ mod wire;
 
 use self::health::{
     build_health_report, warn_slow_pending_binds, warn_slow_running_interactive_jobs,
-    DispatchPathMetrics, HealthRollupCache, ReapBlockerCensus, ResponseTaskGuard,
-    HEALTH_ROLLUP_TTL,
+    DispatchPathMetrics, HealthRollupCache, HealthRollupWorker, ReapBlockerCensus,
+    ResponseTaskGuard,
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
@@ -2894,10 +2894,6 @@ where
     // this existing maintenance timer arm and never create a standing timer.
     standing_actor.reconcile_at_startup();
     let mut next_standing_pass_at = tokio::time::Instant::now();
-    // Rate-limit stamp for opportunistic allocator slack relief (checked on the
-    // maintenance tick; policy shared with standalone via memory.rs).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut last_slack_relief: Option<std::time::Instant> = None;
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
@@ -2941,16 +2937,15 @@ where
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
     let pending_deferred_setups = Arc::new(AtomicUsize::new(0));
     let mut pending_responses = PendingSubcResponses::default();
-    let health_rollup_cache = HealthRollupCache::new();
-    health_rollup_cache.refresh(&executor, &shared_app);
-    let mut next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
+    let health_rollup_cache = Arc::new(HealthRollupCache::new());
+    let health_rollup_worker = HealthRollupWorker::start(
+        Arc::clone(&health_rollup_cache),
+        Arc::clone(&executor),
+        Arc::clone(&shared_app),
+    );
 
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
         shared_app.set_open_route_count(routes.len());
-        if tokio::time::Instant::now() >= next_health_rollup_at {
-            health_rollup_cache.refresh(&executor, &shared_app);
-            next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
-        }
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
         let ready_inspects = pending_responses.poll_ready(executor.as_ref());
@@ -3009,8 +3004,7 @@ where
             Ok(drained) => {
                 if drained > 0 {
                     next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
-                    health_rollup_cache.refresh(&executor, &shared_app);
-                    next_health_rollup_at = tokio::time::Instant::now() + HEALTH_ROLLUP_TTL;
+                    health_rollup_worker.request_refresh();
                 }
             }
             Err(error) => break Err(error),
@@ -3118,7 +3112,7 @@ where
                     break Err(error);
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
-                next_health_rollup_at = tokio::time::Instant::now();
+                health_rollup_worker.request_refresh();
             }
             _ = shutdown.notified() => {
                 log::warn!("subc attach: fatal executor response requested teardown");
@@ -3565,12 +3559,7 @@ where
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     let now_std = std::time::Instant::now();
-                    if crate::memory::spawn_allocator_slack_relief_if_due(
-                        last_slack_relief,
-                        now_std,
-                    ) {
-                        last_slack_relief = Some(now_std);
-                    }
+                    let _ = crate::memory::spawn_allocator_slack_relief_if_due(now_std);
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
             }
@@ -3578,6 +3567,7 @@ where
     };
 
     shared_app.set_open_route_count(0);
+    health_rollup_worker.shutdown();
 
     connection_cancel.cancel();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
