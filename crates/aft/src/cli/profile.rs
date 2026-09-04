@@ -98,13 +98,28 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
         )));
     }
 
-    let debug = resolve_debug_artifact(
+    // Symbolization needs a debug artifact that may have to be fetched. If that
+    // step fails, the captured sample is still the evidence the operator came
+    // for: keep it on disk and name it, rather than discarding the only copy.
+    let symbolicated = resolve_debug_artifact(
         &target.image,
         &target_report.version,
         &target_report.debug_id,
         args.dsym.as_deref(),
-    )?;
-    symbolicate(&mut threads, &debug, &target.image)?;
+    )
+    .and_then(|debug| symbolicate(&mut threads, &debug, &target.image));
+    if let Err(error) = symbolicated {
+        let kept = preserve_raw_sample(target.pid, &captured.raw);
+        return Err(ProfileError::runtime(match kept {
+            Ok(path) => format!(
+                "{error}; the unsymbolicated sample was kept at {}",
+                path.display()
+            ),
+            Err(keep_error) => {
+                format!("{error}; the unsymbolicated sample could not be kept either: {keep_error}")
+            }
+        }));
+    }
 
     let mut report = build_report(target_report, captured.sampler, threads);
     if args.raw {
@@ -482,6 +497,21 @@ fn normalize_debug_id(value: impl AsRef<str>) -> String {
         .filter(|character| character.is_ascii_hexdigit())
         .flat_map(char::to_uppercase)
         .collect()
+}
+
+/// Write a captured-but-unsymbolicated sample where the operator can find it.
+/// The path carries the pid and a timestamp so repeated attempts never overwrite
+/// each other.
+fn preserve_raw_sample(pid: u32, raw: &str) -> Result<PathBuf, ProfileError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("aft-profile-{pid}-{stamp}.unsymbolicated.txt"));
+    fs::write(&path, raw).map_err(|error| {
+        ProfileError::runtime(format!("could not write {}: {error}", path.display()))
+    })?;
+    Ok(path)
 }
 
 fn command_text(command: &mut Command) -> Result<String, ProfileError> {
@@ -1075,15 +1105,31 @@ fn download_release_debug(
                 std::env::consts::OS
             ))
         })?;
-    let bytes = client
-        .get(asset_url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| {
-            ProfileError::runtime(format!("could not download {asset_name}: {error}"))
-        })?
-        .bytes()
-        .map_err(|error| ProfileError::runtime(format!("could not read {asset_name}: {error}")))?;
+    // The debug asset is an immutable release artifact of several MB; a body
+    // read cut mid-stream by a network blip is worth a couple of retries
+    // before the operator loses the profile over it.
+    let mut attempt = 0u32;
+    let bytes = loop {
+        attempt += 1;
+        let result = client
+            .get(&asset_url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| format!("could not download {asset_name}: {error}"))
+            .and_then(|response| {
+                response
+                    .bytes()
+                    .map_err(|error| format!("could not read {asset_name}: {error}"))
+            });
+        match result {
+            Ok(bytes) => break bytes,
+            Err(message) if attempt < 3 => {
+                std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+                eprintln!("{message}; retrying ({attempt}/3)");
+            }
+            Err(message) => return Err(ProfileError::runtime(message)),
+        }
+    };
     fs::create_dir_all(cache).map_err(|error| {
         ProfileError::runtime(format!(
             "could not create dSYM cache {}: {error}",
@@ -1662,6 +1708,19 @@ fn print_human(report: &ProfileReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsymbolicated_sample_is_kept_on_disk_and_named() {
+        let raw = "Sampling process 1 for 1 seconds\nThread_1\n  1 main\n";
+        let path = preserve_raw_sample(424242, raw).expect("keep sample");
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("aft-profile-424242-"));
+        assert_eq!(fs::read_to_string(&path).expect("read kept sample"), raw);
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn memory_renderer_sorts_and_keeps_all_roots() {
