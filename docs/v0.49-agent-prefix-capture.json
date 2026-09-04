@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+  "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -1061,7 +1061,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1071,7 +1071,6 @@
           "aft_inspect",
           "aft_move",
           "aft_outline",
-          "aft_refactor",
           "aft_safety",
           "aft_search",
           "aft_zoom",
@@ -1265,7 +1264,7 @@
             }
           },
           "aft_move": {
-            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames files at the OS level. To move a code symbol (function, class, type) between files while updating imports, use `aft_refactor` op='move' instead.",
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1999,66 +1998,6 @@
               ]
             }
           },
-          "aft_refactor": {
-            "description": "Workspace-wide refactoring that updates imports and references across files.\n\nOps:\n- 'move': move a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide. A checkpoint is created first. To move/rename a whole file, use aft_move.\n- 'extract': extract a line range into a new function with auto-detected parameters (TS/JS/TSX, Python).\n- 'inline': replace a function call with the function's body.",
-            "schema": {
-              "$schema": "https://json-schema.org/draft/2020-12/schema",
-              "type": "object",
-              "properties": {
-                "op": {
-                  "description": "Refactoring operation",
-                  "type": "string",
-                  "enum": [
-                    "move",
-                    "extract",
-                    "inline"
-                  ]
-                },
-                "path": {
-                  "description": "Path to the source file (absolute or relative to project root)",
-                  "type": "string"
-                },
-                "symbol": {
-                  "description": "Symbol name — required for 'move' and 'inline' ops",
-                  "type": "string"
-                },
-                "destination": {
-                  "description": "Target file path — required for 'move' op",
-                  "type": "string"
-                },
-                "scope": {
-                  "description": "Disambiguation scope for 'move' op — when multiple top-level symbols share the same name, specify the containing scope to disambiguate (e.g. 'MyClass'). Does NOT enable access to nested symbols or class methods.",
-                  "type": "string"
-                },
-                "name": {
-                  "description": "New function name — required for 'extract' op",
-                  "type": "string"
-                },
-                "startLine": {
-                  "description": "1-based start line — required for 'extract' op",
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991
-                },
-                "endLine": {
-                  "description": "1-based end line (inclusive) — required for 'extract' op",
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991
-                },
-                "callSiteLine": {
-                  "description": "1-based call site line — required for 'inline' op",
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 9007199254740991
-                }
-              },
-              "required": [
-                "op",
-                "path"
-              ]
-            }
-          },
           "aft_conflicts": {
             "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running).",
             "schema": {
@@ -2090,7 +2029,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2281,7 +2220,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3249,7 +3188,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "44bbbe5cb68435ef45c877271aefdac295c0d287",
+      "source_commit": "a10394e9a255eac6ef3ee808914be6ad7466f820",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -3259,7 +3198,6 @@
           "aft_inspect",
           "aft_move",
           "aft_outline",
-          "aft_refactor",
           "aft_safety",
           "aft_search",
           "aft_zoom",
@@ -4299,7 +4237,7 @@
           "aft_move": {
             "name": "aft_move",
             "label": "move",
-            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for the destination automatically. This operates on files at the OS level — to relocate a code symbol between files, use `aft_refactor` with op='move' instead.",
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for the destination automatically. This operates on whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
             "parameters": {
               "type": "object",
               "required": [
@@ -4314,88 +4252,6 @@
                 "destination": {
                   "type": "string",
                   "description": "Destination file path (absolute or relative to project root)"
-                }
-              }
-            }
-          },
-          "aft_refactor": {
-            "name": "aft_refactor",
-            "label": "refactor",
-            "description": "Workspace-wide refactoring that updates imports and references across files. `move` relocates a top-level symbol (not nested functions or class methods) to another file, rewriting imports workspace-wide; a checkpoint is created first. To move/rename a whole file, use aft_move. `extract` pulls a line range into a new function (TS/JS/TSX, Python). `inline` replaces a call with the function's body.",
-            "parameters": {
-              "type": "object",
-              "required": [
-                "op",
-                "path"
-              ],
-              "properties": {
-                "op": {
-                  "type": "string",
-                  "enum": [
-                    "move",
-                    "extract",
-                    "inline"
-                  ],
-                  "description": "Refactoring operation"
-                },
-                "path": {
-                  "type": "string",
-                  "description": "Source file (absolute or relative to project root)"
-                },
-                "symbol": {
-                  "type": "string",
-                  "description": "Symbol name (for move, inline)"
-                },
-                "destination": {
-                  "type": "string",
-                  "description": "Target file (for move)"
-                },
-                "scope": {
-                  "type": "string",
-                  "description": "Disambiguation scope for move op"
-                },
-                "name": {
-                  "type": "string",
-                  "description": "New function name (for extract)"
-                },
-                "startLine": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 9007199254740991
-                    },
-                    {
-                      "type": "string"
-                    }
-                  ],
-                  "description": "1-based start line for extract"
-                },
-                "endLine": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 9007199254740991
-                    },
-                    {
-                      "type": "string"
-                    }
-                  ],
-                  "description": "1-based end line (inclusive) for extract"
-                },
-                "callSiteLine": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 9007199254740991
-                    },
-                    {
-                      "type": "string"
-                    }
-                  ],
-                  "description": "1-based call site line for inline"
                 }
               }
             }
