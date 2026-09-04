@@ -1,9 +1,9 @@
 import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
-import { toolEnabled } from "../config.js";
 import {
   callToolCall,
   coerceOptionalInt,
