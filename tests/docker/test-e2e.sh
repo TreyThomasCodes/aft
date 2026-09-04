@@ -277,6 +277,15 @@ echo "  warm-up exit code: $WARMUP_RC"
 # 124/137 are the timeout wrapper's codes; any other non-zero exit still means
 # OpenCode came back on its own, which is all the warm-up needs.
 check "warm-up launch returned within 240s" "[ $WARMUP_RC -ne 124 ] && [ $WARMUP_RC -ne 137 ]"
+# The warm-up is the only launch that sees a fresh cache, so its plugin log is
+# the evidence for where a silent first start spends its time. Print it before
+# Scenario 1 resets the log.
+echo "  Plugin log after warm-up (last 40 lines):"
+if [ -s "$PLUGIN_LOG" ]; then
+    tail -n 40 "$PLUGIN_LOG" | sed 's/^/    /'
+else
+    echo "    (empty)"
+fi
 stop_aimock
 
 echo "── Scenario 1: Full session (no ONNX Runtime) ──"
