@@ -65,6 +65,30 @@ Delete the user and project config files listed above, then delete the data root
 
 The backup store treats its on-disk tree as authoritative across processes; deleting the storage root permanently deletes undo history for past edits, but does not delete project files.
 
+## CPU profile
+
+On macOS, profile a running AFT subc daemon with its matching release dSYM in one command:
+
+```sh
+npx @cortexkit/aft doctor --profile 4
+```
+
+`--profile` accepts an optional sampling duration in seconds. The command finds a single
+`aft --subc` or `ck-aft --subc` process (or use native `aft profile --pid <pid>`), verifies the
+running image UUID against a local or downloaded dSYM, and reports a running-versus-waiting
+thread census. Pass `--json` through to the native command for tooling.
+
+```text
+AFT CPU profile (macos-sample)
+pid: 48123
+Thread census (running / total):
+  48124 search-worker: 392 / 400 running (8 waiting) — search_index
+Top inclusive running symbols:
+    392 aft::search_index::build ...
+```
+
+Raw sampler output is withheld unless native `aft profile --raw` is explicitly requested.
+
 ## Config Options
 
 ```jsonc

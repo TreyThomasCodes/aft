@@ -86,6 +86,7 @@ oxc_semantic = "0.126"
 oxc_span = "0.126"
 oxc_str = "0.126"
 rustc-hash = "2"
+rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.55.1" }
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).

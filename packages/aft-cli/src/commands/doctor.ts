@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -125,6 +125,37 @@ export interface CacheClearSummary {
 export interface CacheClearOptions {
   clearLspCaches?: () => ClearResult;
   includePluginBytes?: boolean;
+}
+
+/** Build native arguments for `doctor --profile [seconds]` without changing profile semantics. */
+export function buildDoctorProfileArgs(argv: string[]): string[] {
+  const profileIndex = argv.indexOf("--profile");
+  const profileArgs = argv.slice(profileIndex + 1);
+  const seconds = profileArgs[0];
+  if (seconds && /^\d+$/.test(seconds)) {
+    return ["profile", "--seconds", seconds, ...profileArgs.slice(1)];
+  }
+  return ["profile", ...profileArgs];
+}
+
+/** Run the native sampler directly so doctor does not add its normal diagnostics output. */
+export function runDoctorProfile(argv: string[]): number {
+  const binary = findAftBinary();
+  if (!binary) {
+    console.error(
+      "aft doctor --profile requires a native AFT binary; run `aft doctor --fix` first.",
+    );
+    return 1;
+  }
+  const result = spawnSync(binary, buildDoctorProfileArgs(argv), {
+    stdio: "inherit",
+    env: process.env,
+  });
+  if (result.error) {
+    console.error(`aft profile failed to start ${binary}: ${result.error.message}`);
+    return 1;
+  }
+  return result.status ?? 1;
 }
 
 export async function runDoctor(options: DoctorOptions): Promise<number> {
