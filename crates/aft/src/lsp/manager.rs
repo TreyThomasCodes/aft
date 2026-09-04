@@ -3498,7 +3498,8 @@ mod inspect_path_tests {
     }
 }
 
-#[cfg(test)]
+// Every test in this module spawns a real child process, so the module is Unix-only.
+#[cfg(all(test, unix))]
 mod server_exit_reap_tests {
     use std::collections::HashMap;
     use std::path::Path;

@@ -4968,7 +4968,8 @@ mod watcher_slice_tests {
     }
 }
 
-#[cfg(test)]
+// Every test here spawns a real child process, so the module is Unix-only.
+#[cfg(all(test, unix))]
 mod idle_lsp_tests {
     use super::shutdown_idle_lsp_at;
     use crate::config::Config;

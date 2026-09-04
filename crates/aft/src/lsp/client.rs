@@ -1131,8 +1131,11 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the Unix-gated reap tests below spawn real children and name paths.
+    #[cfg(unix)]
     use std::collections::HashMap;
     use std::io::{BufReader, Cursor};
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
 
     #[test]
