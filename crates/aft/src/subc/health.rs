@@ -669,6 +669,10 @@ impl HealthDiagnosticRollup {
 pub(super) struct HealthRollupCache {
     origin: Instant,
     generated_at_ms: AtomicU64,
+    /// Count of completed refreshes. `generated_at_ms` cannot signal "published"
+    /// on its own: a refresh that finishes within the cache's first millisecond
+    /// stores 0, the same value as never-published.
+    refreshes: AtomicU64,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     breakers:
         std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
@@ -679,6 +683,7 @@ impl HealthRollupCache {
         Self {
             origin: Instant::now(),
             generated_at_ms: AtomicU64::new(0),
+            refreshes: AtomicU64::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             breakers: std::sync::Mutex::new(HashMap::new()),
         }
@@ -695,6 +700,7 @@ impl HealthRollupCache {
         }
         self.generated_at_ms
             .store(generated_at_ms, Ordering::Release);
+        self.refreshes.fetch_add(1, Ordering::AcqRel);
     }
 
     fn refresh_build_suspensions(
@@ -1216,8 +1222,10 @@ mod tests {
         let executor = Arc::new(Executor::new());
         let app = crate::context::App::default_shared();
         let worker = HealthRollupWorker::start(Arc::clone(&cache), executor, Arc::clone(&app));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while cache.generated_at_ms.load(Ordering::Acquire) == 0 {
+        // Generous under a loaded parallel suite: the property is "publishes
+        // without the loop", not how fast a starved thread gets scheduled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.refreshes.load(Ordering::Acquire) == 0 {
             assert!(
                 Instant::now() < deadline,
                 "background health rollup did not publish"
