@@ -74,6 +74,8 @@ fn register_open(store: SqliteStore) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *counts.entry(store).or_default() += 1;
+    #[cfg(test)]
+    thread_counts::record(store, 1);
 }
 
 fn register_close(store: SqliteStore) {
@@ -82,6 +84,31 @@ fn register_close(store: SqliteStore) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let count = counts.entry(store).or_default();
     *count = count.saturating_sub(1);
+    #[cfg(test)]
+    thread_counts::record(store, -1);
+}
+
+/// Per-thread mirror of the open/close seam. The process-wide counter above is
+/// shared with every other test in the binary, which open and close their own
+/// connections concurrently, so a test cannot assert a delta against it. This
+/// mirror only ever sees the calling thread's own opens and closes.
+#[cfg(test)]
+mod thread_counts {
+    use super::SqliteStore;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        static COUNTS: RefCell<BTreeMap<SqliteStore, i64>> = RefCell::new(BTreeMap::new());
+    }
+
+    pub(super) fn record(store: SqliteStore, delta: i64) {
+        COUNTS.with(|counts| *counts.borrow_mut().entry(store).or_default() += delta);
+    }
+
+    pub(super) fn open_on_this_thread(store: SqliteStore) -> i64 {
+        COUNTS.with(|counts| counts.borrow().get(&store).copied().unwrap_or(0))
+    }
 }
 
 /// Snapshot the current number of open connections. This takes a short counter
@@ -184,9 +211,9 @@ mod tests {
 
     #[test]
     fn tracked_connection_counts_open_and_close_at_each_seam() {
-        let baseline = connection_snapshot();
-        let baseline_aft = baseline.open_by_store[0].count;
-        let baseline_callgraph = baseline.open_by_store[1].count;
+        use super::thread_counts::open_on_this_thread;
+        let baseline_aft = open_on_this_thread(SqliteStore::AftDb);
+        let baseline_callgraph = open_on_this_thread(SqliteStore::CallgraphGeneration);
         let dir = tempfile::tempdir().expect("tempdir");
         let aft = TrackedConnection::open(&dir.path().join("aft.db"), SqliteStore::AftDb)
             .expect("open aft db");
@@ -195,22 +222,32 @@ mod tests {
             SqliteStore::CallgraphGeneration,
         )
         .expect("open callgraph");
+        assert_eq!(open_on_this_thread(SqliteStore::AftDb), baseline_aft + 1);
+        assert_eq!(
+            open_on_this_thread(SqliteStore::CallgraphGeneration),
+            baseline_callgraph + 1
+        );
+        // The process-wide snapshot must at least contain this thread's opens;
+        // it may also contain other tests' connections, so only a lower bound
+        // is a stable assertion here.
         let snapshot = connection_snapshot();
-        assert_eq!(snapshot.open_connections, baseline.open_connections + 2);
-        assert_eq!(snapshot.open_by_store[0].count, baseline_aft + 1);
-        assert_eq!(snapshot.open_by_store[1].count, baseline_callgraph + 1);
+        assert!(snapshot.open_by_store[0].count >= 1);
+        assert!(snapshot.open_by_store[1].count >= 1);
+        assert!(snapshot.open_connections >= 2);
 
         drop(aft);
-        let snapshot = connection_snapshot();
-        assert_eq!(snapshot.open_connections, baseline.open_connections + 1);
-        assert_eq!(snapshot.open_by_store[0].count, baseline_aft);
-        assert_eq!(snapshot.open_by_store[1].count, baseline_callgraph + 1);
+        assert_eq!(open_on_this_thread(SqliteStore::AftDb), baseline_aft);
+        assert_eq!(
+            open_on_this_thread(SqliteStore::CallgraphGeneration),
+            baseline_callgraph + 1
+        );
 
         drop(callgraph);
-        let snapshot = connection_snapshot();
-        assert_eq!(snapshot.open_connections, baseline.open_connections);
-        assert_eq!(snapshot.open_by_store[0].count, baseline_aft);
-        assert_eq!(snapshot.open_by_store[1].count, baseline_callgraph);
+        assert_eq!(open_on_this_thread(SqliteStore::AftDb), baseline_aft);
+        assert_eq!(
+            open_on_this_thread(SqliteStore::CallgraphGeneration),
+            baseline_callgraph
+        );
     }
 
     #[test]
