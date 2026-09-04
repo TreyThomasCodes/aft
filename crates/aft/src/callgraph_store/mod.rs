@@ -6962,7 +6962,10 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
 /// private temporary copy before publishing it; a busy reader is harmless because
 /// the next publication or cleanup pass can retry without affecting the source.
 fn checkpoint_sqlite_before_publication(path: &Path) {
-    let Ok(conn) = Connection::open(path) else {
+    let Ok(conn) = crate::db::lifecycle::TrackedConnection::open(
+        path,
+        crate::db::lifecycle::SqliteStore::CallgraphGeneration,
+    ) else {
         return;
     };
     let _ = conn.pragma_update(None, "synchronous", "NORMAL");

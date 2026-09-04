@@ -5,6 +5,7 @@
 //! waits behind filesystem/process enumeration.
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::sync::RwLock;
 
@@ -12,6 +13,9 @@ use serde::Serialize;
 
 use crate::context::{App, AppContext};
 
+// Thread enumeration is only wired on Linux and macOS; other targets report the
+// count unclassified.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const THREAD_CLASSIFICATION_CAP: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
