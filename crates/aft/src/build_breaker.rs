@@ -23,6 +23,12 @@ pub const BREAKER_CONFIGURATION_VERSION: &str = "v1";
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+static OPEN_CALLS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Every expensive background build must choose one explicit domain. The enum is
 /// intentionally exhaustive so new schedulers cannot silently bypass the breaker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -142,12 +148,16 @@ pub struct BuildDeathBreaker {
     path: PathBuf,
     /// One connection retains SQLite's initialized schema/WAL state for callers
     /// that repeatedly inspect a breaker, while the mutex keeps its non-Sync
-    /// connection safe when a health thread and a build overlap.
+    /// connection safe when a health thread and a build overlap. Build paths may
+    /// open the same WAL file independently: readers do not block writers, and
+    /// each connection has a five-second busy timeout for contested operations.
     connection: Mutex<Connection>,
 }
 
 impl BuildDeathBreaker {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        #[cfg(test)]
+        OPEN_CALLS_FOR_TEST.fetch_add(1, Ordering::Relaxed);
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -389,6 +399,10 @@ impl BuildDeathBreaker {
         root_id: &str,
         now_ms: u64,
     ) -> Result<Vec<BuildSuspension>> {
+        #[cfg(test)]
+        if FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.swap(false, Ordering::SeqCst) {
+            return Err(BuildBreakerError::Sqlite(rusqlite::Error::InvalidQuery));
+        }
         self.with_connection(|conn| {
             let mut statement = conn.prepare(
                 "SELECT domain, zero_credit_deaths, credited_deaths, suspended_reason, suspended_since_ms
@@ -428,6 +442,21 @@ impl BuildDeathBreaker {
             }
             Ok(suspensions)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_open_calls_for_test() {
+        OPEN_CALLS_FOR_TEST.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_calls_for_test() -> u64 {
+        OPEN_CALLS_FOR_TEST.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_active_suspensions_for_test() {
+        FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST.store(true, Ordering::SeqCst);
     }
 
     fn with_connection<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {

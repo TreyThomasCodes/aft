@@ -1241,6 +1241,46 @@ mod tests {
     }
 
     #[test]
+    fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
+        let (storage, root) = test_root("health-breaker-cache");
+        let mut config = crate::config::Config::default();
+        config.storage_dir = Some(storage.path().join("state"));
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let key = crate::search_index::artifact_cache_key(root.as_path());
+        let path = ctx
+            .storage_dir()
+            .join("callgraph")
+            .join(&key)
+            .join("build-breaker.sqlite");
+        crate::build_breaker::BuildDeathBreaker::open(path).expect("create fixture breaker");
+        crate::build_breaker::BuildDeathBreaker::reset_open_calls_for_test();
+
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        cache.refresh(&executor, &app);
+        cache.refresh(&executor, &app);
+        assert_eq!(
+            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
+            1,
+            "consecutive rollups over the same root reuse one cached breaker"
+        );
+
+        crate::build_breaker::BuildDeathBreaker::fail_next_active_suspensions_for_test();
+        cache.refresh(&executor, &app);
+        cache.refresh(&executor, &app);
+        assert_eq!(
+            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
+            2,
+            "a read error evicts the cached breaker and the next rollup reopens it"
+        );
+    }
+
+    #[test]
     fn bg_observability_rate_limit_reports_suppressed_count_and_lifecycle_lines() {
         let (_dir, root) = test_root("health-bg-observability-rate");
         let metrics = DispatchPathMetrics::new();
