@@ -344,7 +344,7 @@ fn assert_branch_state(ctx: &AppContext, root: &Path, branch: char) -> BranchSna
             && !exports.contains(&format!("dead{other}"));
         if ready {
             return BranchSnapshot {
-                search_matches: present["matches"].clone(),
+                search_matches: order_insensitive_matches(&present["matches"]),
                 callers: caller_result["callers"].clone(),
                 projected_exports: exports,
             };
@@ -355,6 +355,21 @@ fn assert_branch_state(ctx: &AppContext, root: &Path, branch: char) -> BranchSna
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// grep orders matches by file mtime, and a branch round trip rewrites the
+/// same files in a different order, so two projections of the same state can
+/// legitimately differ in match order. Compare them by content instead.
+fn order_insensitive_matches(matches: &Value) -> Value {
+    let mut sorted: Vec<Value> = matches.as_array().cloned().unwrap_or_default();
+    sorted.sort_by_key(|entry| {
+        (
+            entry["file"].as_str().unwrap_or("").to_string(),
+            entry["line"].as_u64().unwrap_or(0),
+            entry["column"].as_u64().unwrap_or(0),
+        )
+    });
+    Value::Array(sorted)
 }
 
 #[derive(Debug, PartialEq, Eq)]
