@@ -2108,7 +2108,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     |path| {
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && search_build_in_progress
                         {
                             let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
@@ -2117,7 +2116,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                         }
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
                             && watcher_path_is_semantic_source(path)
                         {
@@ -2150,7 +2148,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
-                heavy_root_work_allowed && !oversized_inline_batch,
+                heavy_root_work_allowed,
                 |ctx, changed| {
                     let _ = ctx.enqueue_callgraph_store_refresh_for_generation(
                         changed.iter().cloned(),
@@ -2165,10 +2163,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    if heavy_root_work_allowed
-                        && apply_ram_search_updates
-                        && !oversized_inline_batch
-                    {
+                    if heavy_root_work_allowed && apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                             let mut index_ref = ctx
                                 .search_index()
@@ -2198,7 +2193,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     |path| {
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && watcher_path_is_semantic_source(path)
                         {
                             invalidated_paths.push(path.to_path_buf());
@@ -2526,10 +2520,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         state.scheduler_changed_path_count = 0;
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
         let ignore_changed = state.ignore_changed;
-        let mut project_corpus_refresh_requested = false;
         if ignore_changed {
             state.status_changed |= refresh_corpus_after_ignore_change(ctx);
-            project_corpus_refresh_requested = true;
             // Same partial-sequence rule as the rescan path: acknowledge only
             // when the refresh ran fully under this lifecycle generation.
             if ctx
@@ -2588,14 +2580,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 let oversized_inline_batch = paths.len() > WATCHER_BATCH_INLINE_CAP;
                 if oversized_inline_batch {
                     aft::slog_warn!(
-                        "watcher batch of {} paths exceeds inline cap {}; scheduling corpus refresh",
+                        "watcher batch of {} paths exceeds inline cap {}; applying bounded incremental refresh",
                         paths.len(),
                         WATCHER_BATCH_INLINE_CAP
                     );
-                    if !project_corpus_refresh_requested {
-                        state.status_changed |=
-                            refresh_project_corpus(ctx, "oversized watcher batch", false);
-                    }
                 }
                 let remaining = paths.len();
                 state.phase = WatcherDrainPhase::Apply {

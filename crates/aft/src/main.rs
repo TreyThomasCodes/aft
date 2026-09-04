@@ -2390,7 +2390,7 @@ mod watcher_filter_tests {
         record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
         semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
-        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_BATCH_INLINE_CAP,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
     };
     use aft::semantic_index::SemanticIndex;
     use aft::watcher_filter::{
@@ -3171,18 +3171,37 @@ mod watcher_filter_tests {
             ctx.callgraph_store_rx().lock().is_none(),
             "drain must not start a synchronous/inline callgraph build"
         );
+        assert!(
+            ctx.pending_callgraph_store_force_token_for_test().is_some(),
+            "lost watcher events must retain a force-rebuild token"
+        );
         // The next callgraph op will see the force flag and background-build.
     }
 
     #[test]
-    fn watcher_large_batch_reschedules_indexes_instead_of_inline_refresh() {
+    fn watcher_large_batch_refreshes_every_index_incrementally() {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                30
+            ),),
+            "a prior callgraph refresh worker should fully stop before this test"
+        );
+
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::write(
-            root.join("main.ts"),
-            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
-        )
-        .unwrap();
+        let all_paths = (0..400)
+            .map(|index| root.join(format!("branch-{index:03}.ts")))
+            .collect::<Vec<_>>();
+        for (index, path) in all_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!("export function branchFile{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
 
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -3207,82 +3226,134 @@ mod watcher_filter_tests {
             .ensure_callgraph_store()
             .expect("ensure callgraph store")
             .expect("callgraph store should build on demand");
-        drop(resident);
-        assert!(ctx
-            .callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some());
-
-        let mut search_index = aft::search_index::SearchIndex::new();
-        search_index.ready = true;
+        let search_index = aft::search_index::SearchIndex::build(&root);
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_index);
 
+        let mut embed = |texts: Vec<String>| Ok(vec![vec![1.0, 0.0, 0.0]; texts.len()]);
+        let semantic_index = SemanticIndex::build(&root, &all_paths, &mut embed, 64)
+            .expect("build semantic fixture index");
         *ctx.semantic_index()
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SemanticIndex::new(root.clone(), 3));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
 
+        let changed_paths = all_paths[..300].to_vec();
+        for (index, path) in changed_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!(
+                    "export function switchedFile{index}() {{ return {}; }}\n",
+                    index + 1
+                ),
+            )
+            .unwrap();
+        }
+        let expected_paths = changed_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::from_millis(350),
+            false,
+        );
         let watcher_tx = install_watcher_rx(&ctx);
-        let paths = (0..=WATCHER_BATCH_INLINE_CAP)
-            .map(|i| root.join(format!("changed-{i}.ts")))
-            .collect::<Vec<_>>();
-        watcher_tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(changed_paths))
+            .unwrap();
 
+        let drain_started = Instant::now();
         drain_watcher_events(&ctx);
+        assert!(
+            drain_started.elapsed() < Duration::from_millis(300),
+            "oversized watcher batches must stay off the callgraph worker loop"
+        );
 
+        let installed_after_drain = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("oversized refresh must keep the resident callgraph store");
         assert!(
-            ctx.callgraph_store()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "oversized watcher batch must drop the resident store instead of refreshing inline"
+            std::sync::Arc::ptr_eq(&resident, &installed_after_drain),
+            "oversized refresh must not write None over the resident store"
         );
-        assert!(
-            ctx.callgraph_store_rx().lock().is_none(),
-            "drain must not start a callgraph cold build on the dispatch thread"
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            None,
+            "ordinary watcher paths must not mint a force-rebuild token"
         );
-        assert!(
-            matches!(
-                ctx.callgraph_store_for_ops(),
-                CallgraphStoreAccess::Building
-            ),
-            "next callgraph op should start the forced background rebuild and return Building"
-        );
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert!(std::sync::Arc::ptr_eq(&resident, &store))
+            }
+            _ => panic!("resident store should remain ready without a cold-build decision"),
+        }
         assert!(
             ctx.search_index_rx()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some(),
-            "oversized watcher batch should spawn a background search corpus refresh"
+                .is_none(),
+            "oversized paths must not escalate search to a corpus rebuild"
         );
         assert!(
-            !ctx.search_index()
+            ctx.search_index()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .expect("resident search index")
                 .ready,
-            "resident search index should be marked not-ready while the corpus refresh runs"
+            "search should stay resident while paths update incrementally"
         );
         match request_rx
             .recv_timeout(RECV_DISPATCH_TIMEOUT)
-            .expect("semantic corpus refresh request")
+            .expect("semantic file refresh request")
         {
-            SemanticRefreshRequest::Corpus => {}
             SemanticRefreshRequest::Files { paths } => {
-                panic!("expected semantic corpus refresh for oversized batch, got {paths:?}")
+                assert_eq!(
+                    paths.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                    expected_paths,
+                    "semantic incremental refresh must receive every changed path"
+                );
+            }
+            SemanticRefreshRequest::Corpus => {
+                panic!("oversized paths must not escalate semantic to a corpus refresh")
             }
         }
-        assert!(request_rx
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_err());
+
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                10
+            ),),
+            "oversized callgraph refresh should finish"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
+            expected_paths,
+            "the callgraph refresh worker must receive every changed path exactly once"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0,
+            1,
+            "one watcher event should produce one coalesced refresh_files call"
+        );
+        let installed_after_refresh = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("incremental refresh must leave the store resident");
+        assert!(std::sync::Arc::ptr_eq(&resident, &installed_after_refresh));
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
     }
 
     #[test]

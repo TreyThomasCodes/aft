@@ -4071,6 +4071,11 @@ impl AppContext {
         (requested > fulfilled).then_some(requested)
     }
 
+    #[doc(hidden)]
+    pub fn pending_callgraph_store_force_token_for_test(&self) -> Option<u64> {
+        self.pending_callgraph_store_force_token()
+    }
+
     pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
         self.callgraph_store_force_fulfilled
             .fetch_max(token, Ordering::SeqCst);

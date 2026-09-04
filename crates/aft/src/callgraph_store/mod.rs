@@ -1486,7 +1486,7 @@ fn process_callgraph_refresh_batch(
     if paths.is_empty() {
         return None;
     }
-    note_refresh_worker_batch_for_test(&batch.root.project_root);
+    note_refresh_worker_batch_for_test(&batch.root.project_root, &paths);
     if batch
         .ticket
         .as_ref()
@@ -1617,7 +1617,7 @@ fn workspace_crate_prefix_cache_for_root(
     caches.entry(root.clone()).or_default().clone()
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
     delay: Duration,
     fail_refresh: bool,
@@ -1625,6 +1625,7 @@ struct RefreshWorkerTestSeam {
     refresh_calls: usize,
     worker_calls: usize,
     stale_marks: usize,
+    received_paths: BTreeSet<PathBuf>,
 }
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
@@ -1677,11 +1678,11 @@ fn refresh_worker_test_seam(project_root: &Path) -> RefreshWorkerTestSeam {
         .lock()
         .expect("callgraph refresh test seam mutex poisoned")
         .get(project_root)
-        .copied()
+        .cloned()
         .unwrap_or_default()
 }
 
-fn note_refresh_worker_batch_for_test(project_root: &Path) {
+fn note_refresh_worker_batch_for_test(project_root: &Path, paths: &[PathBuf]) {
     if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
         if let Some(seam) = seams
             .lock()
@@ -1689,6 +1690,7 @@ fn note_refresh_worker_batch_for_test(project_root: &Path) {
             .get_mut(project_root)
         {
             seam.worker_calls += 1;
+            seam.received_paths.extend(paths.iter().cloned());
         }
     }
 }
@@ -1759,6 +1761,11 @@ pub fn callgraph_refresh_worker_test_counts(project_root: &Path) -> (usize, usiz
 #[doc(hidden)]
 pub fn callgraph_refresh_worker_test_worker_calls(project_root: &Path) -> usize {
     refresh_worker_test_seam(project_root).worker_calls
+}
+
+#[doc(hidden)]
+pub fn callgraph_refresh_worker_test_paths(project_root: &Path) -> BTreeSet<PathBuf> {
+    refresh_worker_test_seam(project_root).received_paths
 }
 
 #[doc(hidden)]
