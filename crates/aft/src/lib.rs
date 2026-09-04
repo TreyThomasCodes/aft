@@ -100,6 +100,7 @@ pub mod lsp;
 pub mod lsp_hints;
 pub mod memory;
 pub mod migrate_storage;
+pub mod migration;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;

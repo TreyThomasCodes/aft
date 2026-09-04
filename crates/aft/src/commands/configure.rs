@@ -3819,6 +3819,22 @@ fn schedule_artifact_loads(
 
                     let mut verified_artifact_generation = None;
                     if let Some(ref dir) = semantic_storage {
+                        // Use the legacy semantic snapshot as the query source while
+                        // migrating to the durable semantic view. Importing it first
+                        // persists the view without re-embedding the data; an
+                        // incompatible snapshot records that the view must be rebuilt
+                        // and lets the normal builder handle it.
+                        let migration = crate::migration::SemanticMigrationRequest::for_root(
+                            dir.clone(),
+                            root_clone.clone(),
+                            fingerprint_key.clone(),
+                        );
+                        if let Err(error) = crate::migration::import_legacy_semantic(&migration) {
+                            // Migration cannot make semantic indexing unavailable:
+                            // the established cold-build path remains the recovery
+                            // mechanism for a damaged or temporarily unwritable view.
+                            slog_warn!("semantic view migration deferred: {}", error);
+                        }
                         let data_path = dir
                             .join("semantic")
                             .join(&semantic_project_key)
