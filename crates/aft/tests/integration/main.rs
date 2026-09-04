@@ -22,6 +22,7 @@ mod bash_tasks_dual_write_test;
 mod bash_test;
 mod bash_token_count_test;
 mod bash_watch_test;
+mod bind_trust_quota_test;
 mod blob_store_core_test;
 mod callgraph_store_name_match_test;
 mod callgraph_test;

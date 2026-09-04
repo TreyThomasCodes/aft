@@ -11,6 +11,8 @@
 //! edge never dispatches against `AppContext` inline; per-actor executor lanes
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
+pub mod blob_store;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
@@ -633,7 +635,7 @@ fn cancel_all_active_tool_calls(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BindTrust {
+pub enum BindTrust {
     FirstParty,
     Untrusted,
 }
