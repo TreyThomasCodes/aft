@@ -49,6 +49,7 @@
 pub mod agent_child_env;
 pub mod alert_records;
 pub mod alert_state;
+pub mod alias;
 pub mod artifact_owner;
 pub mod ast_grep_hints;
 pub mod ast_grep_lang;

@@ -4,6 +4,7 @@ mod test_helpers;
 mod helpers;
 
 mod aft_search_contract_test;
+mod alias_path_identity_test;
 mod apply_patch_leaf_test;
 mod ast_commands_test;
 mod backups_dual_write_test;

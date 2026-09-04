@@ -74,6 +74,7 @@ regex = "1"
 regex-syntax = "0.8"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 globset = "0.4"
+sha1 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
 blake3 = "1"
