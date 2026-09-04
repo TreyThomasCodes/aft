@@ -727,19 +727,26 @@ pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 /// The module loop ticks every 250ms. Sampling at this cadence would repeatedly
 /// take allocator-zone locks, so cache a process-wide observation for 60s.
 /// This bounds allocator statistics walks to one per idle minute, or two for a
 /// relief pass that uses its before/after snapshots.
 const ALLOCATOR_SLACK_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const UNKNOWN_ALLOCATOR_SLACK: u64 = u64::MAX;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const UNSAMPLED_AT_MS: u64 = u64::MAX;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static ALLOCATOR_SLACK_CACHE_ORIGIN: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_OBSERVED_ALLOCATOR_SLACK_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_RELIEF_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
 
@@ -750,6 +757,7 @@ static ALLOCATOR_SNAPSHOT_CALLS: std::sync::atomic::AtomicU64 =
 static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
     let origin = ALLOCATOR_SLACK_CACHE_ORIGIN.get_or_init(|| now);
     now.duration_since(*origin)
@@ -757,11 +765,13 @@ fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cached_allocator_slack() -> Option<u64> {
     let slack = LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.load(std::sync::atomic::Ordering::Acquire);
     (slack != UNKNOWN_ALLOCATOR_SLACK).then_some(slack)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u64) {
     LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
         snapshot
@@ -772,12 +782,14 @@ fn publish_allocator_slack(snapshot: &AllocatorMemorySnapshot, sampled_at_ms: u6
     LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.store(sampled_at_ms, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn sample_is_stale(now_ms: u64) -> bool {
     let sampled_at = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     sampled_at == UNSAMPLED_AT_MS
         || now_ms.saturating_sub(sampled_at) >= ALLOCATOR_SLACK_SAMPLE_INTERVAL.as_millis() as u64
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn reserve_sample(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     if !sample_is_stale(now_ms) {
@@ -793,6 +805,7 @@ fn reserve_sample(now_ms: u64) -> Option<u64> {
         .ok()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn reserve_relief(now_ms: u64) -> Option<u64> {
     let previous = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
     let due = cached_allocator_slack().is_some_and(|slack| {
@@ -813,6 +826,7 @@ fn reserve_relief(now_ms: u64) -> Option<u64> {
     })?
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn log_allocator_relief(relief: AllocatorPressureRelief) {
     log::info!(
         "allocator slack relief: released={} allocator_slack_bytes_before={:?} allocator_slack_bytes_after={:?} rss_bytes_before={:?} rss_bytes_after={:?}",
@@ -824,6 +838,7 @@ fn log_allocator_relief(relief: AllocatorPressureRelief) {
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 /// Decide whether an opportunistic allocator relief pass is due.
 ///
 /// Pure so the policy is unit-testable: fires only when the allocator reports
@@ -911,6 +926,13 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
         );
     }
     spawned
+}
+
+/// No allocator-statistics API is wired on this target; the loop-side decision
+/// is a no-op and the cache statics above stay at their unsampled sentinels.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
+    false
 }
 
 /// Ask the platform allocator to return unused pages after a process-wide idle
@@ -1038,6 +1060,7 @@ mod tests {
         assert_eq!(signed_difference(5, 8), -3);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn loop_slack_decision_never_reads_allocator_statistics() {
         LAST_OBSERVED_ALLOCATOR_SLACK_BYTES.store(
@@ -1088,6 +1111,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn slack_relief_fires_on_large_slack_and_respects_spacing() {
         use std::time::{Duration, Instant};
