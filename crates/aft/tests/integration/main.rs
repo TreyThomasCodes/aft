@@ -95,6 +95,7 @@ mod outline_zoom_test;
 mod parser_audit_fixes_test;
 mod parser_test;
 mod pascal_test;
+mod pins_gc_test;
 mod preview_diff_test;
 mod protocol_test;
 mod publication_cas_test;

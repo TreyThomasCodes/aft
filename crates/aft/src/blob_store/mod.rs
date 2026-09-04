@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS blob_payloads (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32),
     payload BLOB NOT NULL,
     payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
-    payload_schema INTEGER NOT NULL
+    payload_schema INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS blob_quarantine (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
@@ -489,14 +490,16 @@ impl BlobStore {
 
         let payload_digest = blake3::hash(payload);
         let inserted = tx.execute(
-            "INSERT INTO blob_payloads (full_key, payload, payload_digest, payload_schema)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO blob_payloads
+             (full_key, payload, payload_digest, payload_schema, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(full_key) DO NOTHING",
             params![
                 full_key.as_bytes().as_slice(),
                 payload,
                 payload_digest.as_bytes().as_slice(),
                 i64::from(self.plane.payload_schema()),
+                unix_millis_now(),
             ],
         )?;
         tx.commit()?;
@@ -632,8 +635,29 @@ fn retry_while_busy<T>(
 fn ensure_schema(connection: &mut Connection) -> Result<(), BlobStoreError> {
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(BLOB_SCHEMA)?;
+    let has_created_at = tx
+        .prepare("PRAGMA table_info(blob_payloads)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "created_at_ms");
+    if !has_created_at {
+        // Existing immutable rows predate per-row timestamps and are eligible for
+        // the normal age-floor policy immediately after this migration.
+        tx.execute(
+            "ALTER TABLE blob_payloads ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     tx.commit()?;
     Ok(())
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn read_and_assert_pragmas(connection: &Connection) -> Result<BlobStorePragmas, BlobStoreError> {
