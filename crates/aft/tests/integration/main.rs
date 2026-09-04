@@ -36,6 +36,7 @@ mod config_parity_test;
 mod configure_test;
 mod conflicts_discovery_test;
 mod db_read_fallback_test;
+mod durable_restart_test;
 mod edit_append_test;
 mod edit_match_test;
 mod edit_test;
