@@ -400,6 +400,8 @@ fn binary_debug_id(path: &Path) -> Result<String, ProfileError> {
     }
 }
 
+// Only the macOS arm of `binary_debug_id` reads `dwarfdump --uuid` output.
+#[cfg(target_os = "macos")]
 fn parse_mach_uuid(output: &str) -> Option<String> {
     output
         .lines()
