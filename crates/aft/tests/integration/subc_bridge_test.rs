@@ -2602,6 +2602,16 @@ fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
 }
 
 #[test]
+fn subc_bridge_memory_census_is_channel_zero_and_uncapped() {
+    run_subc_bridge_test(
+        "subc_bridge_memory_census_is_channel_zero_and_uncapped",
+        Duration::from_secs(30),
+        drive_memory_census_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_health_check_returns_root_status_report() {
     run_subc_bridge_production_test(
         "subc_bridge_health_check_returns_root_status_report",
@@ -8118,6 +8128,24 @@ async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_memory_census_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession { mut stream, .. } = open_fake_daemon_session(input).await;
+    send_raw_control_request(&mut stream, 30, json!({ "op": "memory.census" })).await;
+    let frame = read_frame_timeout(&mut stream, "memory.census response").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, 0);
+    let response: Value = serde_json::from_slice(&frame.body).expect("memory census response");
+    assert!(
+        response.pointer("/data/roots").is_some(),
+        "census must carry uncapped roots: {response:?}"
+    );
+    assert!(
+        response.pointer("/data/process").is_some(),
+        "census must carry process header: {response:?}"
+    );
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_health_check_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -8630,6 +8658,22 @@ async fn send_control_request(
             serde_json::to_vec(&request).expect("control request body"),
         )
         .expect("control request frame"),
+    )
+    .await;
+}
+
+async fn send_raw_control_request(stream: &mut tokio::net::TcpStream, corr: u64, request: Value) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&request).expect("raw control request body"),
+        )
+        .expect("raw control request frame"),
     )
     .await;
 }

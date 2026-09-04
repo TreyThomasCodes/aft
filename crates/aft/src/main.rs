@@ -855,6 +855,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         aft::commands::health_digest::HEALTH_DIGEST_OPERATION => {
             aft::commands::health_digest::handle_health_digest(&req, ctx)
         }
+        aft::commands::memory_census::MEMORY_CENSUS_OPERATION => {
+            aft::commands::memory_census::handle_memory_census(&req, ctx)
+        }
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
         "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),

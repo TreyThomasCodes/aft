@@ -4227,6 +4227,87 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
+    // `memory.census` is newer than the pinned subc protocol enum, so older
+    // enum-based protocol crates would reject it. Decode this operation locally
+    // before normal protocol handling to preserve compatibility.
+    if serde_json::from_slice::<Value>(&frame.body)
+        .ok()
+        .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("memory.census")
+    {
+        let mut census = health_rollup_cache.memory_census();
+        if let Some(rows) = census.get_mut("roots").and_then(Value::as_object_mut) {
+            let lifecycle = shared_app.lifecycle_census_snapshot();
+            for (root_id, meta) in live_roots.iter() {
+                let root = root_id.as_path().display().to_string();
+                let bound_routes = root_channels.get(root_id).map_or(0, HashSet::len);
+                let age_ms = Instant::now()
+                    .saturating_duration_since(meta.last_touched)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let ttl_ms = root_idle_ttl(executor, root_id)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let lsp = lifecycle
+                    .lsp
+                    .children_by_root
+                    .iter()
+                    .find(|child| child.root == root);
+                if let Some(row) = rows.get_mut(&root).and_then(Value::as_object_mut) {
+                    let evictable_bytes = row.get("evictable_bytes").cloned().unwrap_or(json!(0));
+                    row.insert("root_id".to_string(), json!(root));
+                    row.insert("bound_routes".to_string(), json!(bound_routes));
+                    row.insert("last_request_age_ms".to_string(), json!(age_ms));
+                    row.insert("idle_ttl_ms".to_string(), json!(ttl_ms));
+                    row.insert(
+                        "lsp_idle_ttl_ms".to_string(),
+                        json!(executor
+                            .actor_context(root_id)
+                            .map(|ctx| ctx
+                                .config()
+                                .idle
+                                .lsp_ttl()
+                                .as_millis()
+                                .min(u128::from(u64::MAX))
+                                as u64)
+                            .unwrap_or(0)),
+                    );
+                    row.insert(
+                        "evictable_in_ms".to_string(),
+                        crate::commands::memory_census::evictable_in_ms(
+                            bound_routes,
+                            ttl_ms,
+                            age_ms,
+                        )
+                        .map_or(Value::Null, |value| json!(value)),
+                    );
+                    row.insert(
+                        "evictable_bytes".to_string(),
+                        if bound_routes == 0 {
+                            evictable_bytes
+                        } else {
+                            json!(0)
+                        },
+                    );
+                    row.insert("lsp_children".to_string(), json!({ "count": lsp.map_or(0, |child| child.count), "rss_bytes": lsp.map_or(0, |child| child.rss_bytes) }));
+                }
+            }
+        }
+        let body = json!({ "op": "memory.census", "status": "ok", "data": census });
+        let response = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Response,
+            frame.header.flags,
+            0,
+            0,
+            frame.header.corr,
+            serde_json::to_vec(&body).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)?;
+        return send_frame(tx, metrics, response).await;
+    }
+
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
     match request {
@@ -4705,8 +4786,25 @@ async fn handle_tool_call(
         }
     }
 
-    let route_request =
-        serde_json::from_slice::<RouteRequest>(&frame.body).map_err(SubcError::Json)?;
+    let route_request = match serde_json::from_slice::<RouteRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => {
+            let is_census = serde_json::from_slice::<Value>(&frame.body)
+                .ok()
+                .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("memory.census");
+            if !is_census {
+                return Err(SubcError::Json(error));
+            }
+            RouteRequest::ToolCall(ToolCallRequest {
+                name: "memory.census".to_string(),
+                arguments: Value::Object(serde_json::Map::new()),
+                edit_slot_survives: None,
+                preview: false,
+            })
+        }
+    };
     if matches!(
         route_request,
         RouteRequest::BgEvents(BgEventsRequest {

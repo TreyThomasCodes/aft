@@ -847,7 +847,7 @@ fn determine_rung_from_doc(
     determination
 }
 
-fn configured_connection_file() -> Option<PathBuf> {
+pub fn configured_connection_file() -> Option<PathBuf> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     configured_connection_file_from(xdg_config_home.as_deref(), home.as_deref())

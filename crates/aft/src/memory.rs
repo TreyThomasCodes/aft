@@ -194,6 +194,22 @@ impl RootMemorySnapshot {
     pub fn not_estimated_subsystem_count(&self) -> usize {
         self.rollup().not_estimated_subsystems
     }
+
+    /// Bytes released by `evict_idle_artifacts`: retained index handles, symbol
+    /// data, and inspect caches. This deliberately shares the already-collected
+    /// estimates instead of taking a second estimate on the reply path.
+    pub fn evictable_bytes(&self) -> u64 {
+        [
+            &self.trigram,
+            &self.semantic,
+            &self.symbols,
+            &self.callgraph,
+            &self.inspect,
+        ]
+        .into_iter()
+        .filter_map(|estimate| estimate.estimated_bytes)
+        .fold(0, u64::saturating_add)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -412,12 +428,31 @@ impl MemoryRollupSnapshot {
 
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
+        Self::with_cap(roots_status, roots, true)
+    }
+
+    /// Build the uncapped form used by the explicit memory census operation.
+    pub fn new_uncapped(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemorySnapshot>,
+    ) -> Self {
+        Self::with_cap(roots_status, roots, false)
+    }
+
+    fn with_cap(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemorySnapshot>,
+        cap_detail: bool,
+    ) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
         // Totals cover EVERY root before the detail map is capped.
         let process = ProcessMemorySnapshot::from_roots(&roots, &shared_semantic_bases);
         let roots_total = roots.len();
-        let (roots, roots_omitted, roots_omitted_bytes) =
-            cap_root_detail(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
+        let (roots, roots_omitted, roots_omitted_bytes) = if cap_detail {
+            cap_root_detail(roots, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP)
+        } else {
+            (roots, 0, 0)
+        };
         Self {
             roots_status,
             roots,
@@ -749,6 +784,9 @@ static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static LAST_ALLOCATOR_SLACK_RELIEF_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 static ALLOCATOR_SNAPSHOT_CALLS: std::sync::atomic::AtomicU64 =
@@ -756,6 +794,11 @@ static ALLOCATOR_SNAPSHOT_CALLS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn allocator_snapshot_calls_for_test() -> u64 {
+    ALLOCATOR_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn allocator_slack_elapsed_ms(now: std::time::Instant) -> u64 {
@@ -838,12 +881,31 @@ fn log_allocator_relief(relief: AllocatorPressureRelief) {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn last_allocator_relief_at_ms() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let value = LAST_ALLOCATOR_SLACK_RELIEF_AT_MS.load(std::sync::atomic::Ordering::Acquire);
+        return (value != UNSAMPLED_AT_MS).then_some(value);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+pub fn last_allocator_relief_freed_bytes() -> u64 {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        return LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES.load(std::sync::atomic::Ordering::Acquire);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
 /// Decide whether an opportunistic allocator relief pass is due.
-///
-/// Pure so the policy is unit-testable: fires only when the allocator reports
-/// at least the threshold of retained slack AND the previous pass is old
-/// enough. Callers own actually measuring the snapshot and running the pass.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn allocator_slack_relief_due(
     retained_slack_bytes: Option<u64>,
     last_relief: Option<std::time::Instant>,
@@ -888,6 +950,8 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
                         &relief.allocator_after,
                         allocator_slack_elapsed_ms(std::time::Instant::now()),
                     );
+                    LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES
+                        .store(relief.bytes_released, std::sync::atomic::Ordering::Release);
                     log_allocator_relief(relief);
                 }
             })
@@ -914,6 +978,8 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
                 &relief.allocator_after,
                 allocator_slack_elapsed_ms(std::time::Instant::now()),
             );
+            LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES
+                .store(relief.bytes_released, std::sync::atomic::Ordering::Release);
             log_allocator_relief(relief);
         })
         .is_ok();

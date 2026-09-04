@@ -94,6 +94,7 @@ pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_regex_match"
             | "inspect_tier2_run"
             | "hashline_preflight"
+            | "memory.census"
     )
 }
 
@@ -117,7 +118,8 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "glob"
         | "grep"
         | "git_conflicts"
-        | "ast_search" => Some(Lane::PureRead),
+        | "ast_search"
+        | "memory.census" => Some(Lane::PureRead),
 
         // Lazy reads mutate parser/terminal/url caches on a miss, but are still
         // classified onto the reader pool; install races are handled at the
@@ -281,6 +283,7 @@ pub(super) fn control_ops() -> Option<Vec<String>> {
         "route.bind".to_string(),
         "route.status".to_string(),
         MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
+        "memory.census".to_string(),
     ])
 }
 

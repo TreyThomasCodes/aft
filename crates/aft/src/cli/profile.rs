@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::Read;
 // The atos stdin write happens only on macOS.
@@ -19,6 +20,8 @@ use std::process::Stdio;
 use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+
+use subc_client_rs::ConsumerOptions;
 
 const DEFAULT_SECONDS: u64 = 4;
 const TOP_THREADS: usize = 5;
@@ -56,6 +59,26 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
     let args = ProfileArgs::parse(args)?;
     if args.help {
         print_usage();
+        return Ok(());
+    }
+    if args.memory {
+        let census = match fetch_memory_census() {
+            Ok(census) => census,
+            Err(reason) => {
+                println!("AFT memory census unavailable: no daemon is connected ({reason}).");
+                return Ok(());
+            }
+        };
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&census).map_err(|error| {
+                    ProfileError::runtime(format!("could not render memory census JSON: {error}"))
+                })?
+            );
+        } else {
+            print!("{}", render_memory_census_human(&census));
+        }
         return Ok(());
     }
     if cfg!(target_os = "windows") {
@@ -134,6 +157,32 @@ impl fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
+fn fetch_memory_census() -> Result<serde_json::Value, String> {
+    let connection_file = aft::gh_shim::configured_connection_file()
+        .ok_or_else(|| "no daemon connection file was discovered".to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start daemon client: {error}"))?;
+    runtime.block_on(async move {
+        let consumer =
+            aft::fleet_status::connect_subc_consumer(&connection_file, ConsumerOptions::default())
+                .await
+                .map_err(|error| format!("daemon connection failed: {error}"))?;
+        // subc-client-rs 0.3.0 exposes catalog_list as its only public
+        // channel-0 control primitive; it does not expose a generic control
+        // request method. Do not substitute call(): that opens a data route.
+        let _catalog = consumer
+            .catalog_list()
+            .await
+            .map_err(|error| format!("channel-0 control connection failed: {error}"))?;
+        Err(
+            "subc-client-rs has no generic channel-0 control request API for memory.census"
+                .to_string(),
+        )
+    })
+}
+
 #[derive(Debug)]
 struct ProfileArgs {
     pid: Option<u32>,
@@ -141,6 +190,7 @@ struct ProfileArgs {
     dsym: Option<PathBuf>,
     json: bool,
     raw: bool,
+    memory: bool,
     help: bool,
 }
 
@@ -152,6 +202,7 @@ impl ProfileArgs {
             dsym: None,
             json: false,
             raw: false,
+            memory: false,
             help: false,
         };
         let mut iter = args.into_iter();
@@ -165,6 +216,7 @@ impl ProfileArgs {
                 "--dsym" => parsed.dsym = Some(PathBuf::from(next_value(&mut iter, "--dsym")?)),
                 "--json" => parsed.json = true,
                 "--raw" => parsed.raw = true,
+                "--memory" => parsed.memory = true,
                 "--help" | "-h" => parsed.help = true,
                 value if value.starts_with("--pid=") => {
                     parsed.pid = Some(parse_pid(value.trim_start_matches("--pid=").to_string())?)
@@ -222,7 +274,9 @@ fn parse_seconds(value: String) -> Result<u64, ProfileError> {
 }
 
 fn print_usage() {
-    println!("aft profile [--pid <pid>] [--seconds <N>] [--dsym <path>] [--json] [--raw]");
+    println!(
+        "aft profile [--pid <pid>] [--seconds <N>] [--dsym <path>] [--json] [--raw] [--memory]"
+    );
     println!("  Profiles the running AFT subc daemon when --pid is omitted.");
     println!("  --raw includes the platform sampler output; it is omitted by default.");
 }
@@ -1465,6 +1519,93 @@ fn is_runtime_prologue(frame: &str) -> bool {
         || frame.contains("FnOnce") && frame.contains("call_once")
 }
 
+/// Render the daemon census without truncating roots. Keeping this separate
+/// from sampling makes the column contract testable without a live daemon.
+pub fn render_memory_census_human(value: &serde_json::Value) -> String {
+    let mut output = String::new();
+    let process = &value["process"];
+    writeln!(&mut output, "AFT memory census").unwrap();
+    writeln!(
+        &mut output,
+        "phys footprint: {} MB",
+        mb(process["phys_footprint_bytes"].as_u64().unwrap_or(0))
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "rss: {} MB",
+        mb(process["rss_bytes"].as_u64().unwrap_or(0))
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "allocator slack (reclaimable by relief): {} MB",
+        mb(process["allocator_slack_bytes"].as_u64().unwrap_or(0))
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "sqlite: {} MB",
+        mb(process["sqlite_bytes"].as_u64().unwrap_or(0))
+    )
+    .unwrap();
+    writeln!(
+        &mut output,
+        "total attributed: {} MB; unattributed: {} MB",
+        mb(process["total_attributed_bytes"].as_u64().unwrap_or(0)),
+        mb_signed(process["unattributed_bytes"].as_i64().unwrap_or(0))
+    )
+    .unwrap();
+    writeln!(&mut output, "\nroot (short: basename, worktree pool ids kept) | bound | idle | search semantic symbols callgraph inspect | attributed | evictable | evicts in | lsp").unwrap();
+    let mut roots = value["roots"]
+        .as_object()
+        .map(|roots| roots.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    roots.sort_by(|(_, left), (_, right)| {
+        right["attributed_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&left["attributed_bytes"].as_u64().unwrap_or(0))
+    });
+    for (root, row) in roots {
+        let planes = &row["planes"];
+        let short = std::path::Path::new(root)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(root);
+        let horizon = row["evictable_in_ms"]
+            .as_u64()
+            .map(|ms| format!("{}ms", ms))
+            .unwrap_or_else(|| "—".to_string());
+        writeln!(
+            &mut output,
+            "{} ({}) | {} | {}ms | {} {} {} {} {} | {} | {} | {} | {}",
+            root,
+            short,
+            row["bound_routes"],
+            row["last_request_age_ms"],
+            mb(planes["search"].as_u64().unwrap_or(0)),
+            mb(planes["semantic"].as_u64().unwrap_or(0)),
+            mb(planes["symbols"].as_u64().unwrap_or(0)),
+            mb(planes["callgraph"].as_u64().unwrap_or(0)),
+            mb(planes["inspect"].as_u64().unwrap_or(0)),
+            mb(row["attributed_bytes"].as_u64().unwrap_or(0)),
+            mb(row["evictable_bytes"].as_u64().unwrap_or(0)),
+            horizon,
+            row["lsp_children"]["count"].as_u64().unwrap_or(0)
+        )
+        .unwrap();
+    }
+    output
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+fn mb_signed(bytes: i64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
 fn print_human(report: &ProfileReport) {
     println!("AFT CPU profile ({})", report.sampler);
     println!("pid: {}", report.target.pid);
@@ -1521,6 +1662,37 @@ fn print_human(report: &ProfileReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_renderer_sorts_and_keeps_all_roots() {
+        let mut roots = serde_json::Map::new();
+        for index in 0..30 {
+            roots.insert(
+                format!("/worktree/pool-{index:02}"),
+                serde_json::json!({
+                    "bound_routes": 0,
+                    "last_request_age_ms": 0,
+                    "evictable_in_ms": 0,
+                    "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "inspect": 0},
+                    "attributed_bytes": 30 - index,
+                    "evictable_bytes": 0,
+                    "lsp_children": {"count": 0}
+                }),
+            );
+        }
+        let rendered = render_memory_census_human(&serde_json::json!({
+            "roots": roots,
+            "process": {}
+        }));
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let root_lines = lines
+            .iter()
+            .filter(|line| line.contains("/worktree/pool-"))
+            .collect::<Vec<_>>();
+        assert_eq!(root_lines.len(), 30);
+        assert!(root_lines[0].contains("pool-00"));
+        assert!(root_lines[29].contains("pool-29"));
+    }
 
     #[test]
     fn parses_real_stripped_macos_sample_into_census_and_symbolication_queue() {

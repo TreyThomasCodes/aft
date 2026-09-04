@@ -7191,6 +7191,18 @@ impl AppContext {
     /// Attribute all actor roots registered in this process. Standalone mode
     /// has no actor registry, so the current context is inserted directly.
     pub fn memory_snapshot(&self, current_root: Option<&Path>) -> crate::memory::MemorySnapshot {
+        self.memory_snapshot_with_cap(current_root, true)
+    }
+
+    pub fn memory_snapshot_uncapped(&self) -> crate::memory::MemorySnapshot {
+        self.memory_snapshot_with_cap(None, false)
+    }
+
+    fn memory_snapshot_with_cap(
+        &self,
+        current_root: Option<&Path>,
+        cap_detail: bool,
+    ) -> crate::memory::MemorySnapshot {
         let mut roots = BTreeMap::new();
         let (roots_status, contexts) = match self.app.try_memory_contexts() {
             Some(contexts) => ("ready", contexts),
@@ -7212,7 +7224,11 @@ impl AppContext {
         roots
             .entry(current_label)
             .or_insert_with(|| self.memory_root_snapshot());
-        crate::memory::MemorySnapshot::new(roots_status, roots)
+        if cap_detail {
+            crate::memory::MemorySnapshot::new(roots_status, roots)
+        } else {
+            crate::memory::MemorySnapshot::new_uncapped(roots_status, roots)
+        }
     }
 }
 

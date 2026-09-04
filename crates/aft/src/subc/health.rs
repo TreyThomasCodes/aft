@@ -642,6 +642,7 @@ struct HealthDiagnosticRollup {
     status: HealthStatus,
     detail: Option<String>,
     metrics: Value,
+    memory_census: Value,
 }
 
 impl HealthDiagnosticRollup {
@@ -668,6 +669,7 @@ impl HealthDiagnosticRollup {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
             metrics,
+            memory_census: json!({ "roots": {}, "process": {} }),
         }
     }
 }
@@ -770,6 +772,10 @@ impl HealthRollupCache {
             }
         };
         (snapshot, age_ms)
+    }
+
+    pub(super) fn memory_census(&self) -> Value {
+        self.snapshot().0.memory_census.clone()
     }
 }
 
@@ -938,6 +944,7 @@ fn build_health_diagnostic_rollup(
                 "executor scheduler state could not be snapshotted without contention".to_string(),
             ),
             metrics: HealthDiagnosticRollup::unavailable().metrics,
+            memory_census: json!({ "roots": {}, "process": {} }),
         };
     };
 
@@ -949,6 +956,7 @@ fn build_health_diagnostic_rollup(
     let mut standing_matched = vec![false; standing_entries.len()];
     let actor_count = actor_entries.len();
     let mut memory_roots = std::collections::BTreeMap::new();
+    let mut census_roots = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
     for (root_id, ctx) in actor_entries {
@@ -967,6 +975,8 @@ fn build_health_diagnostic_rollup(
             .as_ref()
             .and_then(|entry| entry.artifact_key.clone())
             .unwrap_or_else(|| root_label.clone());
+        let census_memory = ctx.memory_root_snapshot();
+        census_roots.insert(root_label.clone(), census_memory);
         let memory = if standing.is_some() {
             ctx.memory_root_rollup().with_standing()
         } else {
@@ -1067,6 +1077,9 @@ fn build_health_diagnostic_rollup(
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     let memory = memory_rollup_metrics(Some(memory_roots));
+    let census_snapshot = crate::memory::MemorySnapshot::new_uncapped("ready", census_roots);
+    let memory_census =
+        crate::commands::memory_census::render_memory_census(&census_snapshot, None);
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     shared_app.publish_lifecycle_census(lifecycle.clone());
     let detail = if busy_roots > 0 {
@@ -1111,6 +1124,7 @@ fn build_health_diagnostic_rollup(
         },
         detail,
         metrics,
+        memory_census,
     }
 }
 
