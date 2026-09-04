@@ -212,8 +212,17 @@ run_opencode_session() {
     set +e
     # OPENAI_API_KEY required for OpenCode's openai adapter to make requests.
     # `timeout` is only a safety bound; a healthy scripted session must exit 0.
+    #
+    # OPENCODE_DISABLE_DEFAULT_PLUGINS: on a cold cache, OpenCode's config load
+    # forks an `npm install` of its own default plugin (@opencode-ai/plugin) into
+    # .opencode/node_modules and plugin init joins that fiber under a 5-minute
+    # lock before any external plugin loads (bootstrap.ts:34-38, config.ts:452-471,
+    # plugin/index.ts:199, npm.ts:80-113). A slow registry turned that join into a
+    # silent multi-minute stall with no log line and no provider request. AFT
+    # does not need the host's default plugins, so skip the install.
     TMPDIR="$AIMOCK_RUN_DIR" \
     OPENAI_API_KEY=sk-mock-e2e-test \
+    OPENCODE_DISABLE_DEFAULT_PLUGINS=true \
     timeout --signal=KILL "$timeout_secs" opencode run \
         --model "mock/mock-model" \
         "$prompt" \
