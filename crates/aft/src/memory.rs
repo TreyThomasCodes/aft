@@ -1059,20 +1059,32 @@ mod tests {
                 std::time::Instant::now()
             ));
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while ALLOCATOR_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let sampler_ran = || {
+            ALLOCATOR_SNAPSHOT_THREADS
+                .lock()
+                .expect("read allocator snapshot thread log")
+                .iter()
+                .any(|name| name == "aft-mem-slack-sample")
+        };
+        while !sampler_ran() {
             assert!(std::time::Instant::now() < deadline, "sampler did not run");
             std::thread::yield_now();
         }
+        // The thread log is process-global and other tests in the parallel suite
+        // read allocator statistics on their own threads; the property under
+        // test is only that THIS thread (the loop stand-in) never did.
+        let loop_thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
         let threads = ALLOCATOR_SNAPSHOT_THREADS
             .lock()
             .expect("read allocator snapshot thread log")
             .clone();
         assert!(
-            threads
-                .iter()
-                .all(|name| name == "aft-mem-slack-sample" || name == "aft-mem-relief"),
-            "allocator statistics must run only on sampler/relief threads: {threads:?}"
+            !threads.iter().any(|name| *name == loop_thread),
+            "the loop-side decision must never read allocator statistics: {threads:?}"
         );
     }
 
