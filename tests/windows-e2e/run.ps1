@@ -498,6 +498,11 @@ function Run-OpencodeSession {
             -RedirectStandardOutput $ResultFile `
             -RedirectStandardError  ($ResultFile + ".err") `
             -PassThru -NoNewWindow
+        # Windows PowerShell 5.1 leaves $proc.ExitCode null after WaitForExit
+        # unless the process handle was touched before the child exited; a
+        # null exit code then fails every "session completed" check on a run
+        # that actually finished. Touching the handle caches it.
+        $null = $proc.Handle
 
         if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
             Write-Host "  (opencode run timed out at ${TimeoutSec}s -- stopping process)" -ForegroundColor Yellow
@@ -1159,6 +1164,7 @@ $ExitCode = Run-OpencodeSession `
 $S2bDuration = (Get-Date) - $S2bStart
 Write-Host "  (S2b wall-clock: $([Math]::Round($S2bDuration.TotalSeconds, 1))s)"
 
+Write-Host "  (S2b exit code: $ExitCode)"
 Check "interactive-prompt session completed" {
     $ExitCode -eq 0 -or $ExitCode -eq 124 -or $ExitCode -eq -1
 }
