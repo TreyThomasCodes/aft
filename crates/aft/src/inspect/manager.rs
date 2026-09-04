@@ -4788,9 +4788,12 @@ mod guard_tests {
         let dir = write_ts_project(2);
         let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
         let snapshot = tier1_snapshot(&root);
+        // The property under test is that a worker panic reaches the waiter as
+        // `Failed`, not how fast the pool unwinds it; a loaded runner took 359ms
+        // to deliver the panic result, so the soft deadline is generous.
         let manager = InspectManager::with_worker(
             Arc::new(|_| panic!("forced Tier-1 worker panic")),
-            Duration::from_millis(250),
+            Duration::from_secs(10),
         );
 
         let outcome = manager.submit_category(
