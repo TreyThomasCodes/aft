@@ -371,12 +371,19 @@ describe("npmInvocation", () => {
           signalCode: { value: null },
         });
 
+        // The fake child never exits, so this call resolves only at the grace
+        // deadline, and only if taskkill's exit event has been delivered by
+        // then. Under Bun 1.4.0 on macOS a fast-exiting child's exit event is
+        // occasionally delivered about 1 s late (measured 2-5 per 200 spawns
+        // of this exact shape; 0 per 200 under Node 24), so a 1 s grace reads
+        // that runtime hiccup as "taskkill did not confirm". 3 s keeps the
+        // assertion about the code's late-exit handling, not the runtime's.
         await expect(
           terminateNpmProcessTree(
             child,
             { command: "cmd.exe", args: [], windowsCmdShim: true },
             { SystemRoot: systemRoot },
-            1_000,
+            3_000,
           ),
         ).resolves.toBeUndefined();
       } finally {
