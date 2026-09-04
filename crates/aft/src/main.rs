@@ -123,13 +123,21 @@ fn main() {
     aft::logging::init();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
-        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-        match cli::profile::run(args) {
-            Ok(()) => return,
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(error.exit_code());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+            match cli::profile::run(args) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
             }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            eprintln!("aft profile unavailable: CPU sampling is only supported on macOS and Linux");
+            std::process::exit(1);
         }
     }
 
