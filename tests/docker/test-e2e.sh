@@ -223,6 +223,14 @@ run_opencode_session() {
 
     if [ $exit_code -eq 124 ] || [ $exit_code -eq 137 ]; then
         echo "OpenCode timed out after ${timeout_secs}s (exit ${exit_code})" >&2
+        # A stall before the first model request leaves the plugin log empty,
+        # so OpenCode's own output is the only trace of where startup blocked.
+        echo "  OpenCode output (last 40 lines of ${result_file}):" >&2
+        if [ -s "$result_file" ]; then
+            tail -n 40 "$result_file" | sed 's/^/    /' >&2
+        else
+            echo "    (empty)" >&2
+        fi
     fi
     return "$exit_code"
 }
