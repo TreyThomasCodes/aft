@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
@@ -2403,6 +2403,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             canonical_cache_root.clone(),
             req.session().to_string(),
         );
+        debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
         if first_session_bind {
             let storage_root =
@@ -2876,13 +2877,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
+    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    configure_database_runtime(ctx, &canonical_cache_root, &storage_root);
     ctx.begin_configure_ack_phase("maintenance_enqueue");
     let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
         generation: configure_generation,
         root_path: root_path.clone(),
         canonical_cache_root: canonical_cache_root.clone(),
         harness: harness.clone(),
-        storage_root: crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+        storage_root,
         harness_dir: ctx.harness_dir(),
         session_id: req.session().to_string(),
         home_match,
@@ -4369,15 +4372,61 @@ fn schedule_artifact_loads(
     (search_artifact_load_start, semantic_artifact_load_start)
 }
 
+fn configure_database_runtime(ctx: &AppContext, canonical_cache_root: &Path, storage_root: &Path) {
+    ctx.backup()
+        .lock()
+        .set_db_project_key(crate::path_identity::project_scope_key(
+            canonical_cache_root,
+        ));
+
+    let db_path = storage_root.join("aft.db");
+    match ctx.app().open_db(&db_path) {
+        Ok(shared) => {
+            ctx.backup().lock().set_db_pool(shared.clone());
+            ctx.bash_background().set_db_pool(shared);
+        }
+        Err(err) => {
+            // Do not clear the process-shared handle if another root is already
+            // using it. A failed root configure must not close that root's SQLite
+            // connection and WAL descriptors.
+            ctx.app().clear_db_for_path(&db_path);
+            ctx.backup().lock().clear_db_pool();
+            ctx.bash_background().clear_db_pool();
+            slog_warn!(
+                "failed to open aft.db at {}: {} — running with JSON-only persistence",
+                db_path.display(),
+                err
+            );
+        }
+    }
+}
+
 fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
-    crate::bash_background::repair_legacy_root_tasks(&job.storage_root, job.harness.clone());
-    #[cfg(test)]
-    CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
-    if let Err(error) = ctx.bash_background().replay_session_for_project(
+    replay_configure_session_parts(
+        ctx,
+        &job.storage_root,
+        job.harness.clone(),
         &job.harness_dir,
         &job.session_id,
         &job.root_path,
-    ) {
+    );
+}
+
+fn replay_configure_session_parts(
+    ctx: &AppContext,
+    storage_root: &Path,
+    harness: Harness,
+    harness_dir: &Path,
+    session_id: &str,
+    root_path: &Path,
+) {
+    crate::bash_background::repair_legacy_root_tasks(storage_root, harness);
+    #[cfg(test)]
+    CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Err(error) =
+        ctx.bash_background()
+            .replay_session_for_project(harness_dir, session_id, root_path)
+    {
         slog_warn!("failed to replay background bash tasks: {error}");
     }
 }
@@ -4415,306 +4464,458 @@ fn should_wait_for_callgraph_start(access: &CallgraphStoreAccess, receiver_prese
     matches!(access, CallgraphStoreAccess::Building) && receiver_present
 }
 
-pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
-    let mut jobs = ctx.drain_configure_maintenance().into_iter();
-    while let Some(job) = jobs.next() {
-        if ctx.subc_unbound_quiesced() {
-            cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-            return;
-        }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ConfigureMaintenanceStage {
+    #[default]
+    Admission,
+    SessionReplay,
+    ProjectRuntime,
+    StorageSweeps,
+    BashRuntime,
+    Watcher,
+    ProcessFlags,
+    Callgraph,
+    SemanticRelease,
+    Status,
+}
 
-        if ctx.configure_generation() != job.generation {
-            slog_info!(
-                "dropping stale configure maintenance for generation {} (current {})",
-                job.generation,
-                ctx.configure_generation()
-            );
-            // The superseding configure re-runs everything root-scoped, but
-            // bash replay is per-(root, session) and gated on the first bind
-            // of that session; forget the binding so the session's next bind
-            // replays its tasks instead of losing them to the dropped job.
-            forget_configure_job_binding(ctx, &job);
-            continue;
-        }
+#[derive(Debug)]
+struct ConfigureMaintenanceContinuation {
+    job: ConfigureMaintenanceJob,
+    stage: ConfigureMaintenanceStage,
+    callgraph_start_baseline: u64,
+    semantic_waits_for_callgraph_start: bool,
+}
 
-        let session_only = job.run_bash_replay
-            && !job.format_tool_cache_clear_needed
-            && !job.refresh_project_runtime
-            && !job.sync_bash_compress_flag
-            && !job.reset_filter_registry
-            && !job.clear_failed_spawns
-            && !job.warm_callgraph_store
-            && job.search_artifact_load_start.is_none()
-            && job.semantic_artifact_load_start.is_none();
-        if session_only {
-            replay_configure_session(ctx, &job);
-            continue;
+impl ConfigureMaintenanceContinuation {
+    fn new(job: ConfigureMaintenanceJob) -> Self {
+        Self {
+            job,
+            stage: ConfigureMaintenanceStage::Admission,
+            callgraph_start_baseline: 0,
+            semantic_waits_for_callgraph_start: false,
         }
+    }
+}
 
-        delay_configure_deferred_maintenance_for_test(&job.root_path);
-        // Artifact workers are created in a blocked state during configure so
-        // no deserialization can race ahead of the bind acknowledgement. The
-        // lifecycle gate makes the bound check and gate release one admission:
-        // final-route teardown either precedes all starts or follows all starts.
-        if ctx
-            .run_if_subc_bound_generation(job.generation, || {
-                if job.supersede_search_artifact_persistence {
-                    ctx.next_search_persist_epoch();
-                    if job.supersede_semantic_artifact_persistence {
-                        ctx.next_semantic_persist_epoch();
-                    }
-                }
-                if job.supersede_callgraph_artifact_persistence {
-                    ctx.next_callgraph_persist_epoch();
-                }
-                if let Some(start) = &job.search_artifact_load_start {
-                    let _ = start.send(());
-                }
-            })
-            .is_none()
-        {
-            if ctx.subc_unbound_quiesced() {
-                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-                return;
-            }
-            forget_configure_job_binding(ctx, &job);
-            continue;
+#[derive(Debug, Default)]
+pub(crate) struct ConfigureMaintenanceState {
+    jobs: VecDeque<ConfigureMaintenanceContinuation>,
+    detach_storage_sweeps: bool,
+}
+
+impl ConfigureMaintenanceState {
+    pub(crate) fn standalone() -> Self {
+        Self {
+            detach_storage_sweeps: true,
+            ..Self::default()
         }
+    }
 
-        if job.format_tool_cache_clear_needed {
-            crate::format::clear_tool_cache_for_root(Some(&job.root_path));
-        }
-
-        ctx.backup()
-            .lock()
-            .set_db_project_key(crate::path_identity::project_scope_key(
-                &job.canonical_cache_root,
-            ));
-
-        if let Some(storage_dir) = ctx.config().storage_dir.clone() {
-            // Ensure the storage root exists for persistence subsystems. This is
-            // maintenance work: the configure ack only needs the accepted config
-            // snapshot, while disk-backed stores can converge immediately after.
-            if let Err(err) = fs::create_dir_all(&storage_dir) {
-                slog_warn!(
-                    "failed to create storage directory {}: {}",
-                    storage_dir.display(),
-                    err
-                );
-            }
-            ctx.backup().lock().set_storage_dir_for_harness(
-                storage_dir.clone(),
-                job.harness.clone(),
-                ctx.config().checkpoint_ttl_hours,
-            );
-            ctx.checkpoint()
-                .lock()
-                .set_storage_dir_for_harness(storage_dir, job.harness.clone());
-        }
-
-        if job.refresh_project_runtime {
-            // Rebuild gitignore matcher used by the watcher event filter to honor
-            // the user's `.gitignore` files instead of a hardcoded directory list.
-            // Skipped entirely for home roots because that walk would traverse
-            // `$HOME`.
-            if !job.home_match {
-                ctx.rebuild_gitignore();
-            } else {
-                ctx.clear_gitignore();
-            }
-        }
-
-        match crate::url_fetch::cleanup_url_cache(&job.storage_root) {
-            Ok(0) => {}
-            Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
-            Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
-        }
-        match crate::fs_lock::sweep_stale_reclaim_tokens(&job.storage_root) {
-            Ok(None | Some(0)) => {}
-            Ok(Some(n)) => slog_info!(
-                "filesystem lock cleanup: removed {} stale reclaim tokens",
-                n
-            ),
-            Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
-        }
-        crate::search_index::sweep_orphaned_index_dirs(&job.storage_root);
-        crate::search_index::sweep_transient_search_cache_dirs();
-
-        let db_path = job.storage_root.join("aft.db");
-        match ctx.app().open_db(&db_path) {
-            Ok(shared) => {
-                ctx.backup().lock().set_db_pool(shared.clone());
-                ctx.bash_background().set_db_pool(shared);
-            }
-            Err(err) => {
-                // Do not clear the process-shared handle if another root is
-                // already using it. A failed root configure must not close that
-                // root's SQLite connection and WAL descriptors.
-                ctx.app().clear_db_for_path(&db_path);
-                ctx.backup().lock().clear_db_pool();
-                ctx.bash_background().clear_db_pool();
-                slog_warn!(
-                    "failed to open aft.db at {}: {} — running with JSON-only persistence",
-                    db_path.display(),
-                    err
-                );
-            }
-        }
-
-        match crate::migrate_storage::cleanup_staging_dirs(&job.storage_root, job.harness.clone()) {
-            Ok(0) => {}
-            Ok(n) => slog_info!(
-                "swept {} staging directory orphans from prior migrations",
-                n
-            ),
-            Err(err) => slog_warn!(
-                "staging cleanup failed: {} (will retry next configure)",
-                err
-            ),
-        }
-
-        let config = ctx.config();
-        ctx.bash_background().configure_long_running_reminders(
-            config.bash_long_running_reminder_enabled,
-            config.bash_long_running_reminder_interval_ms,
+    fn absorb_enqueued(&mut self, ctx: &AppContext) {
+        self.jobs.extend(
+            ctx.drain_configure_maintenance()
+                .into_iter()
+                .map(ConfigureMaintenanceContinuation::new),
         );
-        drop(config);
+    }
+}
 
-        if job.run_bash_replay {
-            replay_configure_session(ctx, &job);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigureMaintenanceUnitResult {
+    Continue,
+    Complete,
+    CancelAll,
+}
+
+pub(crate) fn standalone_configure_maintenance_pending(
+    ctx: &AppContext,
+    state: &mut ConfigureMaintenanceState,
+) -> bool {
+    state.absorb_enqueued(ctx);
+    !state.jobs.is_empty()
+}
+
+pub(crate) fn drain_standalone_configure_admission(
+    ctx: &AppContext,
+    state: &mut ConfigureMaintenanceState,
+) -> bool {
+    state.absorb_enqueued(ctx);
+    if !state
+        .jobs
+        .front()
+        .is_some_and(|job| job.stage == ConfigureMaintenanceStage::Admission)
+    {
+        return false;
+    }
+    drain_deferred_configure_maintenance_unit(ctx, state);
+    true
+}
+
+/// Run one unit of deferred configure work after sending the acknowledgement.
+/// In standalone mode, returning after each unit lets newly queued stdin requests
+/// run before more maintenance work.
+pub(crate) fn drain_deferred_configure_maintenance_unit(
+    ctx: &AppContext,
+    state: &mut ConfigureMaintenanceState,
+) -> bool {
+    state.absorb_enqueued(ctx);
+    let Some(mut continuation) = state.jobs.pop_front() else {
+        return false;
+    };
+
+    if ctx.subc_unbound_quiesced() {
+        cancel_unbound_configure_jobs(
+            ctx,
+            std::iter::once(continuation.job)
+                .chain(state.jobs.drain(..).map(|pending| pending.job))
+                .chain(ctx.drain_configure_maintenance()),
+        );
+        return false;
+    }
+
+    let result =
+        run_configure_maintenance_unit(ctx, &mut continuation, state.detach_storage_sweeps);
+    match result {
+        ConfigureMaintenanceUnitResult::Continue => state.jobs.push_front(continuation),
+        ConfigureMaintenanceUnitResult::Complete => {}
+        ConfigureMaintenanceUnitResult::CancelAll => {
+            cancel_unbound_configure_jobs(
+                ctx,
+                std::iter::once(continuation.job)
+                    .chain(state.jobs.drain(..).map(|pending| pending.job))
+                    .chain(ctx.drain_configure_maintenance()),
+            );
+            return false;
         }
+    }
 
-        if job.refresh_project_runtime {
-            if ctx
-                .run_if_subc_bound_generation(job.generation, || ())
-                .is_none()
-            {
-                if ctx.subc_unbound_quiesced() {
-                    cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-                    return;
-                }
-                forget_configure_job_binding(ctx, &job);
-                continue;
+    !state.jobs.is_empty()
+}
+
+pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
+    let mut state = ConfigureMaintenanceState::default();
+    while drain_deferred_configure_maintenance_unit(ctx, &mut state) {}
+}
+
+fn run_configure_maintenance_unit(
+    ctx: &AppContext,
+    continuation: &mut ConfigureMaintenanceContinuation,
+    detach_storage_sweeps: bool,
+) -> ConfigureMaintenanceUnitResult {
+    let job = &continuation.job;
+    match continuation.stage {
+        ConfigureMaintenanceStage::Admission => {
+            if ctx.configure_generation() != job.generation {
+                slog_info!(
+                    "dropping stale configure maintenance for generation {} (current {})",
+                    job.generation,
+                    ctx.configure_generation()
+                );
+                // The superseding configure re-runs everything root-scoped, but
+                // bash replay is per-(root, session) and gated on the first bind
+                // of that session; forget the binding so the session's next bind
+                // replays its tasks instead of losing them to the dropped job.
+                forget_configure_job_binding(ctx, job);
+                return ConfigureMaintenanceUnitResult::Complete;
             }
 
-            // Joining a prior FSEvents thread can block in the OS. Do that
-            // outside lifecycle admission, then reacquire admission only for
-            // the atomic watcher start. An unbind or superseding configure that
-            // wins during the join prevents the replacement from being started.
-            ctx.stop_watcher_runtime();
+            let session_only = job.run_bash_replay
+                && !job.format_tool_cache_clear_needed
+                && !job.refresh_project_runtime
+                && !job.sync_bash_compress_flag
+                && !job.reset_filter_registry
+                && !job.clear_failed_spawns
+                && !job.warm_callgraph_store
+                && job.search_artifact_load_start.is_none()
+                && job.semantic_artifact_load_start.is_none();
+            if session_only {
+                replay_configure_session(ctx, job);
+                return ConfigureMaintenanceUnitResult::Complete;
+            }
+
+            delay_configure_deferred_maintenance_for_test(&job.root_path);
+            // Start artifact workers only after sending the configure acknowledgement,
+            // and only if this job's configure generation is still active.
             if ctx
                 .run_if_subc_bound_generation(job.generation, || {
-                    if !job.home_match {
-                        start_project_watcher(ctx, &job.canonical_cache_root);
+                    if job.supersede_search_artifact_persistence {
+                        ctx.next_search_persist_epoch();
+                        if job.supersede_semantic_artifact_persistence {
+                            ctx.next_semantic_persist_epoch();
+                        }
+                    }
+                    if job.supersede_callgraph_artifact_persistence {
+                        ctx.next_callgraph_persist_epoch();
+                    }
+                    if let Some(start) = &job.search_artifact_load_start {
+                        let _ = start.send(());
                     }
                 })
                 .is_none()
             {
                 if ctx.subc_unbound_quiesced() {
-                    cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-                    return;
+                    return ConfigureMaintenanceUnitResult::CancelAll;
                 }
-                forget_configure_job_binding(ctx, &job);
-                continue;
+                forget_configure_job_binding(ctx, job);
+                return ConfigureMaintenanceUnitResult::Complete;
             }
-        }
 
-        if job.sync_bash_compress_flag {
-            ctx.sync_bash_compress_flag();
-        }
-        if job.reset_filter_registry {
-            ctx.reset_filter_registry();
-        }
-
-        if job.clear_failed_spawns {
-            // Forget cached LSP spawn FAILURES when configure inputs changed. A
-            // pure equivalent rebind keeps this cache hot; a real config/root
-            // change lets the next file event retry previously missing servers.
-            let cleared = ctx.lsp().clear_failed_spawns();
-            if cleared > 0 {
-                slog_debug!(
-                    "configure: cleared {} cached LSP spawn failure(s) for retry",
-                    cleared
-                );
+            if job.format_tool_cache_clear_needed {
+                crate::format::clear_tool_cache_for_root(Some(&job.root_path));
             }
-        }
-
-        // The search worker has already received its start signal. Delay only the
-        // semantic worker until the callgraph emits `build_started`; this preserves
-        // admission order without requiring either index to wait for the other to finish.
-        let callgraph_start_baseline = crate::logging::index_build_start_sequence(
-            crate::logging::IndexPlane::Callgraph,
-            &job.canonical_cache_root,
-        );
-        let mut semantic_waits_for_callgraph_start = false;
-        if job.warm_callgraph_store && callgraph_configure_warm_allowed(ctx) {
-            let access = ctx.schedule_callgraph_store_warm();
-            semantic_waits_for_callgraph_start =
-                should_wait_for_callgraph_start(&access, ctx.callgraph_store_rx().lock().is_some());
-            match access {
-                CallgraphStoreAccess::Ready(_) => {
-                    slog_debug!("callgraph store ready at configure maintenance");
-                }
-                CallgraphStoreAccess::Building => {
-                    slog_info!("callgraph store warm build scheduled by configure maintenance");
-                }
-                CallgraphStoreAccess::Suspended(suspension) => {
+            if let Some(storage_dir) = ctx.config().storage_dir.clone() {
+                if let Err(err) = fs::create_dir_all(&storage_dir) {
                     slog_warn!(
-                        "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
-                        suspension.domain.as_str(),
-                        suspension.death_count
+                        "failed to create storage directory {}: {}",
+                        storage_dir.display(),
+                        err
                     );
                 }
-                CallgraphStoreAccess::Unavailable => {
-                    slog_info!(
-                        "callgraph store unavailable at configure maintenance; dead_code will retry later"
-                    );
-                }
-                CallgraphStoreAccess::Error(error) => {
-                    slog_warn!("callgraph store configure warm failed: {}", error);
-                }
+                ctx.backup().lock().set_storage_dir_for_harness(
+                    storage_dir.clone(),
+                    job.harness.clone(),
+                    ctx.config().checkpoint_ttl_hours,
+                );
+                ctx.checkpoint()
+                    .lock()
+                    .set_storage_dir_for_harness(storage_dir, job.harness.clone());
             }
-            if ctx.subc_unbound_quiesced() {
-                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-                return;
-            }
-            if ctx.configure_generation() != job.generation {
-                forget_configure_job_binding(ctx, &job);
-                continue;
-            }
-        } else if job.warm_callgraph_store {
-            // Non-git roots still build semantic and search indexes eagerly. Their
-            // callgraph is intentionally on-demand, so configure cannot trigger a
-            // corpus-scale cold build while the user is idle.
-            slog_debug!("callgraph configure warm deferred for non-git root");
+            continuation.stage = ConfigureMaintenanceStage::SessionReplay;
         }
+        ConfigureMaintenanceStage::SessionReplay => {
+            if job.run_bash_replay {
+                replay_configure_session(ctx, job);
+            }
+            continuation.stage = ConfigureMaintenanceStage::ProjectRuntime;
+        }
+        ConfigureMaintenanceStage::ProjectRuntime => {
+            if job.refresh_project_runtime {
+                // Rebuild the watcher matcher outside the acknowledgement path. Keep
+                // this project walk separate so queued requests can run before artifact
+                // loading and callgraph work.
+                if !job.home_match {
+                    ctx.rebuild_gitignore();
+                } else {
+                    ctx.clear_gitignore();
+                }
+            }
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+        }
+        ConfigureMaintenanceStage::StorageSweeps => {
+            if detach_storage_sweeps {
+                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
+            } else {
+                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
+            }
+            continuation.stage = ConfigureMaintenanceStage::BashRuntime;
+        }
+        ConfigureMaintenanceStage::BashRuntime => {
+            let config = ctx.config();
+            ctx.bash_background().configure_long_running_reminders(
+                config.bash_long_running_reminder_enabled,
+                config.bash_long_running_reminder_interval_ms,
+            );
+            drop(config);
 
-        if ctx
-            .run_if_subc_bound_generation(job.generation, || {
-                if let Some(start) = &job.semantic_artifact_load_start {
-                    if semantic_waits_for_callgraph_start {
-                        crate::logging::signal_after_index_build_start(
-                            crate::logging::IndexPlane::Callgraph,
-                            &job.canonical_cache_root,
-                            callgraph_start_baseline,
-                            start.clone(),
+            continuation.stage = ConfigureMaintenanceStage::Watcher;
+        }
+        ConfigureMaintenanceStage::Watcher => {
+            if job.refresh_project_runtime {
+                if ctx
+                    .run_if_subc_bound_generation(job.generation, || ())
+                    .is_none()
+                {
+                    if ctx.subc_unbound_quiesced() {
+                        return ConfigureMaintenanceUnitResult::CancelAll;
+                    }
+                    forget_configure_job_binding(ctx, job);
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
+
+                // Joining a prior FSEvents thread can block in the OS. Do that
+                // outside lifecycle admission, then reacquire admission only for
+                // the atomic watcher start. An unbind or superseding configure that
+                // wins during the join prevents the replacement from being started.
+                ctx.stop_watcher_runtime();
+                if ctx
+                    .run_if_subc_bound_generation(job.generation, || {
+                        if !job.home_match {
+                            start_project_watcher(ctx, &job.canonical_cache_root);
+                        }
+                    })
+                    .is_none()
+                {
+                    if ctx.subc_unbound_quiesced() {
+                        return ConfigureMaintenanceUnitResult::CancelAll;
+                    }
+                    forget_configure_job_binding(ctx, job);
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
+            }
+            continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
+        }
+        ConfigureMaintenanceStage::ProcessFlags => {
+            if job.sync_bash_compress_flag {
+                ctx.sync_bash_compress_flag();
+            }
+            if job.reset_filter_registry {
+                ctx.reset_filter_registry();
+            }
+
+            if job.clear_failed_spawns {
+                // Forget cached LSP spawn FAILURES when configure inputs changed. A
+                // pure equivalent rebind keeps this cache hot; a real config/root
+                // change lets the next file event retry previously missing servers.
+                let cleared = ctx.lsp().clear_failed_spawns();
+                if cleared > 0 {
+                    slog_debug!(
+                        "configure: cleared {} cached LSP spawn failure(s) for retry",
+                        cleared
+                    );
+                }
+            }
+
+            continuation.callgraph_start_baseline = crate::logging::index_build_start_sequence(
+                crate::logging::IndexPlane::Callgraph,
+                &job.canonical_cache_root,
+            );
+            continuation.stage = ConfigureMaintenanceStage::Callgraph;
+        }
+        ConfigureMaintenanceStage::Callgraph => {
+            // Start semantic indexing only after the callgraph reports `build_started`.
+            // This preserves the intended start order without waiting for either build.
+            if job.warm_callgraph_store && callgraph_configure_warm_allowed(ctx) {
+                let access = ctx.schedule_callgraph_store_warm();
+                continuation.semantic_waits_for_callgraph_start = should_wait_for_callgraph_start(
+                    &access,
+                    ctx.callgraph_store_rx().lock().is_some(),
+                );
+                match access {
+                    CallgraphStoreAccess::Ready(_) => {
+                        slog_debug!("callgraph store ready at configure maintenance");
+                    }
+                    CallgraphStoreAccess::Building => {
+                        slog_info!("callgraph store warm build scheduled by configure maintenance");
+                    }
+                    CallgraphStoreAccess::Suspended(suspension) => {
+                        slog_warn!(
+                            "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
+                            suspension.domain.as_str(),
+                            suspension.death_count
                         );
-                    } else {
-                        let _ = start.send(());
+                    }
+                    CallgraphStoreAccess::Unavailable => {
+                        slog_info!(
+                            "callgraph store unavailable at configure maintenance; dead_code will retry later"
+                        );
+                    }
+                    CallgraphStoreAccess::Error(error) => {
+                        slog_warn!("callgraph store configure warm failed: {}", error);
                     }
                 }
-            })
-            .is_none()
-        {
-            if ctx.subc_unbound_quiesced() {
-                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
-                return;
+                if ctx.subc_unbound_quiesced() {
+                    return ConfigureMaintenanceUnitResult::CancelAll;
+                }
+                if ctx.configure_generation() != job.generation {
+                    forget_configure_job_binding(ctx, job);
+                    return ConfigureMaintenanceUnitResult::Complete;
+                }
+            } else if job.warm_callgraph_store {
+                // Non-git roots still build semantic and search indexes eagerly. Their
+                // callgraph is intentionally on-demand, so configure cannot trigger a
+                // corpus-scale cold build while the user is idle.
+                slog_debug!("callgraph configure warm deferred for non-git root");
             }
-            forget_configure_job_binding(ctx, &job);
-            continue;
+            continuation.stage = ConfigureMaintenanceStage::SemanticRelease;
         }
+        ConfigureMaintenanceStage::SemanticRelease => {
+            if ctx
+                .run_if_subc_bound_generation(job.generation, || {
+                    if let Some(start) = &job.semantic_artifact_load_start {
+                        if continuation.semantic_waits_for_callgraph_start {
+                            crate::logging::signal_after_index_build_start(
+                                crate::logging::IndexPlane::Callgraph,
+                                &job.canonical_cache_root,
+                                continuation.callgraph_start_baseline,
+                                start.clone(),
+                            );
+                        } else {
+                            let _ = start.send(());
+                        }
+                    }
+                })
+                .is_none()
+            {
+                if ctx.subc_unbound_quiesced() {
+                    return ConfigureMaintenanceUnitResult::CancelAll;
+                }
+                forget_configure_job_binding(ctx, job);
+                return ConfigureMaintenanceUnitResult::Complete;
+            }
+            continuation.stage = ConfigureMaintenanceStage::Status;
+        }
+        ConfigureMaintenanceStage::Status => {
+            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            return ConfigureMaintenanceUnitResult::Complete;
+        }
+    }
 
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+    ConfigureMaintenanceUnitResult::Continue
+}
+
+fn spawn_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
+    let storage_root = storage_root.to_path_buf();
+    let thread_name = format!("aft-storage-sweep-{}", std::process::id());
+    if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+        delay_configure_storage_sweeps_for_debug();
+        run_configure_storage_sweeps(&storage_root, harness);
+    }) {
+        slog_warn!("failed to spawn configure storage maintenance thread: {error}");
+    }
+}
+
+fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
+    match crate::url_fetch::cleanup_url_cache(storage_root) {
+        Ok(0) => {}
+        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+    }
+    match crate::fs_lock::sweep_stale_reclaim_tokens(storage_root) {
+        Ok(None | Some(0)) => {}
+        Ok(Some(n)) => slog_info!(
+            "filesystem lock cleanup: removed {} stale reclaim tokens",
+            n
+        ),
+        Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
+    }
+    crate::search_index::sweep_orphaned_index_dirs(storage_root);
+    crate::search_index::sweep_transient_search_cache_dirs();
+    match crate::migrate_storage::cleanup_staging_dirs(storage_root, harness) {
+        Ok(0) => {}
+        Ok(n) => slog_info!(
+            "swept {} staging directory orphans from prior migrations",
+            n
+        ),
+        Err(err) => slog_warn!(
+            "staging cleanup failed: {} (will retry next configure)",
+            err
+        ),
+    }
+}
+
+fn delay_configure_storage_sweeps_for_debug() {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_STORAGE_SWEEP_START_FILE") {
+            let _ = fs::write(path, "started\n");
+        }
+        if let Some(delay_ms) = std::env::var("AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
     }
 }
 

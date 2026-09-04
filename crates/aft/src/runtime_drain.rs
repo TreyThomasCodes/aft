@@ -12,7 +12,8 @@ use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -284,6 +285,106 @@ fn delay_watcher_unit_for_test() {}
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
+}
+
+/// Tracks deferred configure work for the standalone NDJSON loop. The attached-
+/// daemon (`subc`) path schedules this work through its executor instead.
+#[derive(Debug)]
+pub struct StandaloneConfigureMaintenance {
+    inner: crate::commands::configure::ConfigureMaintenanceState,
+}
+
+impl Default for StandaloneConfigureMaintenance {
+    fn default() -> Self {
+        Self {
+            inner: crate::commands::configure::ConfigureMaintenanceState::standalone(),
+        }
+    }
+}
+
+impl StandaloneConfigureMaintenance {
+    pub fn has_pending(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
+    }
+
+    pub fn drain_admission(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::drain_standalone_configure_admission(ctx, &mut self.inner)
+    }
+
+    pub fn drain_one(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::drain_deferred_configure_maintenance_unit(ctx, &mut self.inner)
+    }
+}
+
+const STANDALONE_LOG_SWEEP_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIGURE_MAINTENANCE_YIELD_LOG_INTERVAL: Duration = Duration::from_secs(5);
+static STANDALONE_LOG_SWEEP_LAST_ATTEMPT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static STANDALONE_LOG_SWEEP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static CONFIGURE_MAINTENANCE_YIELD_LAST_LOG: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Keep shared log-retention I/O off the standalone request loop. The logging
+/// module retains its hourly sweep cadence; this coarser gate avoids spawning a
+/// no-op thread on every 250 ms idle tick.
+pub fn spawn_standalone_log_maintenance() {
+    let now = Instant::now();
+    let should_attempt = STANDALONE_LOG_SWEEP_LAST_ATTEMPT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map(|mut last_attempt| {
+            if last_attempt.is_some_and(|last| {
+                now.duration_since(last) < STANDALONE_LOG_SWEEP_ATTEMPT_INTERVAL
+            }) {
+                false
+            } else {
+                *last_attempt = Some(now);
+                true
+            }
+        })
+        .unwrap_or(false);
+    if !should_attempt || STANDALONE_LOG_SWEEP_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    if let Err(error) = thread::Builder::new()
+        .name("aft-log-retention-sweep".to_string())
+        .spawn(|| {
+            crate::logging::maybe_sweep_logs();
+            STANDALONE_LOG_SWEEP_IN_FLIGHT.store(false, Ordering::Release);
+        })
+    {
+        STANDALONE_LOG_SWEEP_IN_FLIGHT.store(false, Ordering::Release);
+        crate::slog_warn!("failed to spawn log retention maintenance thread: {error}");
+    }
+}
+
+/// Report cooperative configure work displaced by already-buffered requests.
+/// Bursty clients may trigger many unit boundaries, so emit at most once per
+/// five seconds while preserving the queued count from the observed boundary.
+pub fn note_configure_maintenance_yield(queued: usize) {
+    if queued == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let should_log = CONFIGURE_MAINTENANCE_YIELD_LAST_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map(|mut last_log| {
+            if last_log.is_some_and(|last| {
+                now.duration_since(last) < CONFIGURE_MAINTENANCE_YIELD_LOG_INTERVAL
+            }) {
+                false
+            } else {
+                *last_log = Some(now);
+                true
+            }
+        })
+        .unwrap_or(false);
+    if should_log {
+        crate::slog_info!(
+            "configure maintenance yielded to {} queued request(s)",
+            queued
+        );
+    }
 }
 
 pub fn drain_configure_warning_events(ctx: &AppContext) {

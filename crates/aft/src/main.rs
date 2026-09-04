@@ -22,6 +22,7 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -231,6 +232,8 @@ fn main() {
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
     const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut pending = PendingResponses::default();
+    let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
+    let mut queued_lines = VecDeque::new();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     let mut graceful_stdin_shutdown = false;
     thread::spawn(move || {
@@ -248,37 +251,50 @@ fn main() {
             break;
         }
 
-        let recv_timeout = if pending.is_empty() {
+        let configure_pending = configure_maintenance.has_pending(registry.current());
+        let recv_timeout = if configure_pending {
+            Duration::from_millis(100)
+        } else if pending.is_empty() {
             DRAIN_INTERVAL
         } else {
             PENDING_POLL_INTERVAL
         };
-        let line_result = match line_rx.recv_timeout(recv_timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic drain so push frames flow even without requests.
-                // Cheap on the idle path: each drain just checks try_recv
-                // on a channel and bails if empty.
-                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
-                    aft::slog_error!("stdout write error: {}", e);
+        let line_result = if let Some(result) = queued_lines.pop_front() {
+            result
+        } else {
+            match line_rx.recv_timeout(recv_timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Periodic drain so push frames flow even without requests.
+                    // Each deferred configure step returns to the request loop so
+                    // queued input can run; storage-wide sweeps run on separate threads.
+                    let mut collect_queued = || collect_queued_lines(&line_rx, &mut queued_lines);
+                    if let Err(e) = drain_runtime_events_and_write_pending_cooperatively(
+                        &registry,
+                        &mut pending,
+                        &mut configure_maintenance,
+                        &mut collect_queued,
+                    ) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    {
+                        let now = std::time::Instant::now();
+                        let _ = aft::memory::spawn_allocator_slack_relief_if_due(now);
+                    }
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Human-readable reason line; the phase markers below cover the
+                    // shutdown sequence itself. protocol_test asserts this banner.
+                    aft::slog_info!("stdin closed, shutting down");
+                    graceful_stdin_shutdown = true;
                     break;
                 }
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                {
-                    let now = std::time::Instant::now();
-                    let _ = aft::memory::spawn_allocator_slack_relief_if_due(now);
-                }
-                if shutdown_requested.load(Ordering::SeqCst) {
-                    break;
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Human-readable reason line; the phase markers below cover the
-                // shutdown sequence itself. protocol_test asserts this banner.
-                aft::slog_info!("stdin closed, shutting down");
-                graceful_stdin_shutdown = true;
-                break;
             }
         };
 
@@ -298,14 +314,20 @@ fn main() {
         let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
-                // Drain search index FIRST so watcher events apply to the latest index.
-                // If reversed, watcher updates applied to the old index would be lost
-                // when the background-built index replaces it.
-                aft::logging::note_drain_slice();
-                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
-                    aft::slog_error!("stdout write error: {}", e);
-                    break;
+                // Ping bypasses deferred configure work. Other commands run at most
+                // one setup step before dispatch, so persistence-backed mutations can
+                // initialize without blocking on the remaining maintenance queue.
+                if req.command != "ping"
+                    && configure_maintenance.drain_admission(registry.current())
+                    && configure_maintenance.has_pending(registry.current())
+                {
+                    aft::runtime_drain::note_configure_maintenance_yield(queued_lines.len() + 1);
                 }
+                // Install any completed search index before applying watcher changes.
+                // These bounded, non-blocking drains let each request use the freshest
+                // available index without waiting for configure maintenance.
+                aft::logging::note_drain_slice();
+                drain_non_configure_runtime_events(&registry);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
@@ -367,8 +389,21 @@ fn main() {
             }
         }
         drain_configure_warning_events_for_registry(&registry);
+        if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+            aft::slog_error!("stdout write error: {}", e);
+            break;
+        }
         if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
+        }
+
+        let queued = collect_queued_lines(&line_rx, &mut queued_lines);
+        if queued > 0 {
+            if configure_maintenance.has_pending(registry.current()) {
+                aft::runtime_drain::note_configure_maintenance_yield(queued);
+            }
+        } else {
+            drain_non_configure_runtime_events(&registry);
         }
     }
 
@@ -408,6 +443,7 @@ fn main() {
     );
 }
 
+#[cfg(test)]
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
@@ -422,7 +458,55 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::shutdown_idle_lsp(runtime);
     }
     aft::logging::perf_tick(None);
-    aft::logging::maybe_sweep_logs();
+}
+
+fn drain_runtime_events_cooperatively(
+    registry: &RuntimeRegistry,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
+) {
+    // Standalone mode keeps this progress state with its runtime so deferred
+    // configure work resumes at the next step.
+    let runtime = registry.current();
+    if configure.has_pending(runtime) {
+        let has_more = configure.drain_one(runtime);
+        let queued = queued_requests();
+        if queued > 0 && has_more {
+            aft::runtime_drain::note_configure_maintenance_yield(queued);
+        }
+        if has_more || queued > 0 {
+            return;
+        }
+    }
+
+    drain_non_configure_runtime_events(registry);
+}
+
+fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
+    let runtime = registry.current();
+    // Preserve the dependency order: install finished search artifacts before
+    // watcher deltas, then advance the other build channels and diagnostics.
+    aft::runtime_drain::drain_configure_warning_events(runtime);
+    aft::runtime_drain::drain_search_index_events(runtime);
+    aft::runtime_drain::drain_callgraph_store_events(runtime);
+    aft::runtime_drain::drain_semantic_index_events(runtime);
+    aft::runtime_drain::drain_semantic_refresh_events(runtime);
+    aft::runtime_drain::drain_inspect_events(runtime);
+    aft::runtime_drain::drain_watcher_events(runtime);
+    aft::runtime_drain::drain_lsp_events(runtime);
+    aft::runtime_drain::shutdown_idle_lsp(runtime);
+    aft::logging::perf_tick(None);
+    aft::runtime_drain::spawn_standalone_log_maintenance();
+}
+
+fn collect_queued_lines(
+    line_rx: &mpsc::Receiver<io::Result<String>>,
+    queued_lines: &mut VecDeque<io::Result<String>>,
+) -> usize {
+    while let Ok(line) = line_rx.try_recv() {
+        queued_lines.push_back(line);
+    }
+    queued_lines.len()
 }
 
 #[cfg(test)]
@@ -464,13 +548,15 @@ fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     );
 }
 
-fn drain_runtime_events_and_write_pending(
+fn drain_runtime_events_and_write_pending_cooperatively(
     registry: &RuntimeRegistry,
     pending: &mut PendingResponses,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
 ) -> io::Result<usize> {
     let ctx = registry.current();
     let mut written = write_ready_pending(ctx, pending)?;
-    drain_runtime_events(registry);
+    drain_runtime_events_cooperatively(registry, configure, queued_requests);
     written += write_ready_pending(ctx, pending)?;
     Ok(written)
 }
@@ -524,7 +610,6 @@ fn finalize_ready_pending(
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
-        aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
     }
 }
