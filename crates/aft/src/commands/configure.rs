@@ -273,7 +273,55 @@ fn semantic_refresh_quiet_window() -> Duration {
 }
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
+const SEMANTIC_COLD_BUILD_LIMITER_KIND: &str = "semantic post-configure cold build";
+#[cfg(not(test))]
+const INDEX_ORDER_GRACE: Duration = Duration::from_secs(30);
 const SUPERSEDED_SEMANTIC_BUILD: &str = "semantic build superseded";
+
+#[cfg(test)]
+static INDEX_ORDER_GRACE_MS: AtomicU64 = AtomicU64::new(30_000);
+#[cfg(test)]
+static INDEX_ORDER_TIMEOUT_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+#[cfg(test)]
+static INDEX_ORDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn index_order_grace() -> Duration {
+    #[cfg(test)]
+    {
+        return Duration::from_millis(INDEX_ORDER_GRACE_MS.load(Ordering::SeqCst));
+    }
+    #[cfg(not(test))]
+    INDEX_ORDER_GRACE
+}
+
+fn wait_for_semantic_artifact_start(
+    start_rx: &crossbeam_channel::Receiver<()>,
+    root: &Path,
+) -> bool {
+    let grace = index_order_grace();
+    match start_rx.recv_timeout(grace) {
+        Ok(()) => true,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            let message = format!(
+                "semantic artifact load proceeding without callgraph build_started after {}s",
+                grace.as_secs()
+            );
+            #[cfg(test)]
+            INDEX_ORDER_TIMEOUT_LOGS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.clone());
+            slog_info!("{}", message);
+            crate::logging::release_index_build_start_waiters(
+                crate::logging::IndexPlane::Callgraph,
+                root,
+            );
+            true
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => false,
+    }
+}
 
 #[derive(Clone)]
 struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
@@ -2378,7 +2426,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 supersede_search_artifact_persistence: false,
                 supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
-                artifact_load_starts: Vec::new(),
+                search_artifact_load_start: None,
+                semantic_artifact_load_start: None,
             });
             if enqueue_result.is_err() {
                 ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
@@ -2626,6 +2675,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         workspace_manifests.as_deref(),
     );
     let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
+    release_callgraph_start_waiters_for_generation_change(
+        previous_canonical_cache_root.as_deref(),
+        &canonical_cache_root,
+        equivalent_warm_config,
+    );
     let callgraph_build_key = configure_callgraph_build_key(
         &canonical_cache_root,
         &next_config,
@@ -2682,7 +2736,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some();
-    let mut artifact_load_starts = Vec::new();
+    let (search_artifact_load_start, semantic_artifact_load_start);
     if equivalent_warm_config {
         // The zero-work rebind path keeps the live index serving; report that
         // honestly instead of implying the cache was dropped.
@@ -2716,11 +2770,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &project_key,
             &ctx.config().semantic,
         );
-        artifact_load_starts.extend(schedule_missing_artifact_loads(
-            ctx,
-            search_index,
-            semantic_search,
-        ));
+        (search_artifact_load_start, semantic_artifact_load_start) =
+            schedule_missing_artifact_loads(ctx, search_index, semantic_search);
     } else {
         // Semantic and callgraph workers keep their receiver and dedicated
         // build epoch when that lane's inputs are unchanged. Changed lane inputs
@@ -2811,11 +2862,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &project_key,
             &ctx.config().semantic,
         );
-        artifact_load_starts.extend(schedule_missing_artifact_loads(
-            ctx,
-            search_index,
-            semantic_search,
-        ));
+        (search_artifact_load_start, semantic_artifact_load_start) =
+            schedule_missing_artifact_loads(ctx, search_index, semantic_search);
 
         // Clear the workspace package caches here because reconfigure can point AFT at a
         // different root; reset them before warming the callgraph store for the new project.
@@ -2851,7 +2899,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         supersede_search_artifact_persistence: !equivalent_warm_config,
         supersede_callgraph_artifact_persistence: !equivalent_callgraph_build,
         supersede_semantic_artifact_persistence: !equivalent_warm_config && !semantic_build_adopted,
-        artifact_load_starts,
+        search_artifact_load_start,
+        semantic_artifact_load_start,
     });
     if enqueue_result.is_err() {
         if first_session_bind {
@@ -2965,6 +3014,28 @@ fn adopt_resident_semantic_index_if_available(
     true
 }
 
+fn release_callgraph_start_waiters_for_generation_change(
+    previous_root: Option<&Path>,
+    configured_root: &Path,
+    equivalent_generation: bool,
+) {
+    if equivalent_generation {
+        return;
+    }
+    if let Some(previous_root) = previous_root {
+        crate::logging::release_index_build_start_waiters(
+            crate::logging::IndexPlane::Callgraph,
+            previous_root,
+        );
+    }
+    if previous_root != Some(configured_root) {
+        crate::logging::release_index_build_start_waiters(
+            crate::logging::IndexPlane::Callgraph,
+            configured_root,
+        );
+    }
+}
+
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
     let search_enabled = config.search_index;
@@ -3010,24 +3081,32 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     }
 }
 
+type ArtifactLoadStarts = (
+    Option<crossbeam_channel::Sender<()>>,
+    Option<crossbeam_channel::Sender<()>>,
+);
+
 fn schedule_missing_artifact_loads(
     ctx: &AppContext,
     request_search: bool,
     request_semantic: bool,
-) -> Vec<crossbeam_channel::Sender<()>> {
+) -> ArtifactLoadStarts {
     let _reload_guard = ctx.artifact_reload_guard();
     let missing = missing_artifact_loads(ctx);
     let load_search = request_search && missing.search;
     let load_semantic = request_semantic && missing.semantic;
     if !load_search && !load_semantic {
-        return Vec::new();
+        return (None, None);
     }
     schedule_artifact_loads(ctx, load_search, load_semantic)
 }
 
-fn start_artifact_loads(starts: Vec<crossbeam_channel::Sender<()>>) -> bool {
-    let started = !starts.is_empty();
-    for start in starts {
+fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
+    let started = starts.0.is_some() || starts.1.is_some();
+    if let Some(start) = starts.0 {
+        let _ = start.send(());
+    }
+    if let Some(start) = starts.1 {
         let _ = start.send(());
     }
     started
@@ -3226,7 +3305,10 @@ fn schedule_artifact_loads(
     ctx: &AppContext,
     load_search: bool,
     load_semantic: bool,
-) -> Vec<crossbeam_channel::Sender<()>> {
+) -> (
+    Option<crossbeam_channel::Sender<()>>,
+    Option<crossbeam_channel::Sender<()>>,
+) {
     let canonical_cache_root = ctx.canonical_cache_root();
     let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let config = ctx.config();
@@ -3246,7 +3328,8 @@ fn schedule_artifact_loads(
     } else {
         0
     };
-    let mut artifact_load_starts = Vec::new();
+    let mut search_artifact_load_start = None;
+    let mut semantic_artifact_load_start = None;
 
     if load_search {
         let cache_dir = resolve_cache_dir_with_key(&project_key, storage_dir.as_deref());
@@ -3269,7 +3352,7 @@ fn schedule_artifact_loads(
         let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
         let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-        artifact_load_starts.push(start_tx);
+        search_artifact_load_start = Some(start_tx);
 
         #[cfg(debug_assertions)]
         mark_search_rebuild_spawn_for_debug();
@@ -3526,7 +3609,7 @@ fn schedule_artifact_loads(
         let semantic_rx_epoch = ctx.install_semantic_index_rx(rx, configure_generation);
         let semantic_rx_terminal_guard = ctx.semantic_index_rx_terminal_guard(semantic_rx_epoch);
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-        artifact_load_starts.push(start_tx);
+        semantic_artifact_load_start = Some(start_tx);
         let semantic_root = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
         let semantic_load_generation = configure_generation;
@@ -3535,7 +3618,7 @@ fn schedule_artifact_loads(
         let session_id = log_ctx::current_session();
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
-            if start_rx.recv().is_err() {
+            if !wait_for_semantic_artifact_start(&start_rx, &semantic_root) {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
                 return;
@@ -3641,10 +3724,10 @@ fn schedule_artifact_loads(
         let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
         let session_id_for_bg2 = log_ctx::current_session();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
-        artifact_load_starts.push(start_tx);
+        semantic_artifact_load_start = Some(start_tx);
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
-            if start_rx.recv().is_err() {
+            if !wait_for_semantic_artifact_start(&start_rx, &root_clone) {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
                 return;
@@ -3933,6 +4016,24 @@ fn schedule_artifact_loads(
                         }
                     }
 
+                    let Some(_cold_build_permit) =
+                        crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                            &semantic_cold_build_limiter,
+                            SEMANTIC_COLD_BUILD_LIMITER_KIND,
+                            || {
+                                semantic_lifecycle.is_current(
+                                    semantic_generation_flag.as_ref(),
+                                    semantic_generation,
+                                ) && semantic_build_epoch_flag.load(Ordering::SeqCst)
+                                    == semantic_build_epoch
+                            },
+                        )
+                    else {
+                        return Err(
+                            "semantic post-configure cold build cancelled because root is unbound or superseded"
+                                .to_string(),
+                        );
+                    };
                     set_cold_seed_active();
 
                     let files = match walk_semantic_project_files_bounded(
@@ -4265,7 +4366,7 @@ fn schedule_artifact_loads(
         });
     }
 
-    artifact_load_starts
+    (search_artifact_load_start, semantic_artifact_load_start)
 }
 
 fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
@@ -4310,6 +4411,10 @@ pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
 }
 
 #[doc(hidden)]
+fn should_wait_for_callgraph_start(access: &CallgraphStoreAccess, receiver_present: bool) -> bool {
+    matches!(access, CallgraphStoreAccess::Building) && receiver_present
+}
+
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     let mut jobs = ctx.drain_configure_maintenance().into_iter();
     while let Some(job) = jobs.next() {
@@ -4339,7 +4444,8 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             && !job.reset_filter_registry
             && !job.clear_failed_spawns
             && !job.warm_callgraph_store
-            && job.artifact_load_starts.is_empty();
+            && job.search_artifact_load_start.is_none()
+            && job.semantic_artifact_load_start.is_none();
         if session_only {
             replay_configure_session(ctx, &job);
             continue;
@@ -4361,7 +4467,7 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
                 if job.supersede_callgraph_artifact_persistence {
                     ctx.next_callgraph_persist_epoch();
                 }
-                for start in &job.artifact_load_starts {
+                if let Some(start) = &job.search_artifact_load_start {
                     let _ = start.send(());
                 }
             })
@@ -4525,35 +4631,39 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             }
         }
 
+        // The search worker has already received its start signal. Delay only the
+        // semantic worker until the callgraph emits `build_started`; this preserves
+        // admission order without requiring either index to wait for the other to finish.
+        let callgraph_start_baseline = crate::logging::index_build_start_sequence(
+            crate::logging::IndexPlane::Callgraph,
+            &job.canonical_cache_root,
+        );
+        let mut semantic_waits_for_callgraph_start = false;
         if job.warm_callgraph_store && callgraph_configure_warm_allowed(ctx) {
-            if ctx.semantic_cold_seed_active() {
-                ctx.defer_callgraph_store_warm_for_semantic_cold_seed();
-                slog_info!(
-                    "callgraph store warm deferred until semantic cold seed gate clears or completes"
-                );
-            } else {
-                match ctx.schedule_callgraph_store_warm() {
-                    CallgraphStoreAccess::Ready(_) => {
-                        slog_debug!("callgraph store ready at configure maintenance");
-                    }
-                    CallgraphStoreAccess::Building => {
-                        slog_info!("callgraph store warm build scheduled by configure maintenance");
-                    }
-                    CallgraphStoreAccess::Suspended(suspension) => {
-                        slog_warn!(
-                            "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
-                            suspension.domain.as_str(),
-                            suspension.death_count
-                        );
-                    }
-                    CallgraphStoreAccess::Unavailable => {
-                        slog_info!(
-                            "callgraph store unavailable at configure maintenance; dead_code will retry later"
-                        );
-                    }
-                    CallgraphStoreAccess::Error(error) => {
-                        slog_warn!("callgraph store configure warm failed: {}", error);
-                    }
+            let access = ctx.schedule_callgraph_store_warm();
+            semantic_waits_for_callgraph_start =
+                should_wait_for_callgraph_start(&access, ctx.callgraph_store_rx().lock().is_some());
+            match access {
+                CallgraphStoreAccess::Ready(_) => {
+                    slog_debug!("callgraph store ready at configure maintenance");
+                }
+                CallgraphStoreAccess::Building => {
+                    slog_info!("callgraph store warm build scheduled by configure maintenance");
+                }
+                CallgraphStoreAccess::Suspended(suspension) => {
+                    slog_warn!(
+                        "callgraph store warm suspended for {} after {} deaths; run doctor reset-build-breaker",
+                        suspension.domain.as_str(),
+                        suspension.death_count
+                    );
+                }
+                CallgraphStoreAccess::Unavailable => {
+                    slog_info!(
+                        "callgraph store unavailable at configure maintenance; dead_code will retry later"
+                    );
+                }
+                CallgraphStoreAccess::Error(error) => {
+                    slog_warn!("callgraph store configure warm failed: {}", error);
                 }
             }
             if ctx.subc_unbound_quiesced() {
@@ -4569,6 +4679,31 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
             // callgraph is intentionally on-demand, so configure cannot trigger a
             // corpus-scale cold build while the user is idle.
             slog_debug!("callgraph configure warm deferred for non-git root");
+        }
+
+        if ctx
+            .run_if_subc_bound_generation(job.generation, || {
+                if let Some(start) = &job.semantic_artifact_load_start {
+                    if semantic_waits_for_callgraph_start {
+                        crate::logging::signal_after_index_build_start(
+                            crate::logging::IndexPlane::Callgraph,
+                            &job.canonical_cache_root,
+                            callgraph_start_baseline,
+                            start.clone(),
+                        );
+                    } else {
+                        let _ = start.send(());
+                    }
+                }
+            })
+            .is_none()
+        {
+            if ctx.subc_unbound_quiesced() {
+                cancel_unbound_configure_jobs(ctx, std::iter::once(job).chain(jobs));
+                return;
+            }
+            forget_configure_job_binding(ctx, &job);
+            continue;
         }
 
         ctx.status_emitter().signal(ctx.build_status_snapshot());
@@ -4606,15 +4741,19 @@ mod tests {
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
-        parse_lsp_paths_extra, reset_configure_artifact_load_attempts_for_test,
+        parse_lsp_paths_extra, release_callgraph_start_waiters_for_generation_change,
+        reset_configure_artifact_load_attempts_for_test,
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
-        validate_storage_dir,
+        should_wait_for_callgraph_start, validate_storage_dir, wait_for_semantic_artifact_start,
+        INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
-    use crate::context::{App, AppContext, SemanticRefreshEvent, SemanticRefreshRequest};
+    use crate::context::{
+        App, AppContext, CallgraphStoreAccess, SemanticRefreshEvent, SemanticRefreshRequest,
+    };
     use crate::parser::{FileParser, SymbolCache, TreeSitterProvider};
     use crate::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use crate::search_index::{CacheLock, SearchIndex};
@@ -7197,7 +7336,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let starts = super::schedule_artifact_loads(&ctx, true, false);
-        assert_eq!(starts.len(), 1);
+        assert!(starts.0.is_some());
+        assert!(starts.1.is_none());
         assert!(super::start_artifact_loads(starts));
         wait_for_search_index_ready(&ctx, Duration::from_secs(2));
         assert!(ctx
@@ -7236,7 +7376,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let starts = super::schedule_artifact_loads(&ctx, true, false);
-        assert_eq!(starts.len(), 1);
+        assert!(starts.0.is_some());
+        assert!(starts.1.is_none());
         assert!(super::start_artifact_loads(starts));
         std::thread::sleep(Duration::from_millis(150));
         crate::runtime_drain::drain_build_completions(&ctx);
@@ -7273,7 +7414,8 @@ mod tests {
         ctx.set_cache_writer_capabilities(false, true);
 
         let starts = super::schedule_artifact_loads(&ctx, true, false);
-        assert_eq!(starts.len(), 1);
+        assert!(starts.0.is_some());
+        assert!(starts.1.is_none());
         assert!(super::start_artifact_loads(starts));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -7642,6 +7784,274 @@ mod tests {
                 panic!("configure maintenance gate assertion timed out: {error}");
             }
         }
+    }
+
+    struct IndexOrderTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for IndexOrderTestGuard {
+        fn drop(&mut self) {
+            INDEX_ORDER_GRACE_MS.store(30_000, Ordering::SeqCst);
+            clear_index_order_timeout_logs();
+        }
+    }
+
+    fn index_order_test_guard() -> IndexOrderTestGuard {
+        IndexOrderTestGuard {
+            _guard: INDEX_ORDER_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    fn clear_index_order_timeout_logs() {
+        INDEX_ORDER_TIMEOUT_LOGS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn callgraph_event(
+        root: &Path,
+        kind: crate::logging::IndexEventKind,
+    ) -> crate::logging::IndexEvent {
+        crate::logging::IndexEvent::new(
+            kind,
+            crate::logging::IndexPlane::Callgraph,
+            "configure-order-test-build",
+            root,
+            "configure-order-test-key",
+        )
+    }
+
+    #[test]
+    fn adopted_callgraph_start_before_maintenance_releases_semantic_immediately() {
+        let _guard = index_order_test_guard();
+        INDEX_ORDER_GRACE_MS.store(1_000, Ordering::SeqCst);
+        let root = tempfile::tempdir().unwrap();
+        crate::logging::log_index_event(callgraph_event(
+            root.path(),
+            crate::logging::IndexEventKind::BuildStarted,
+        ));
+        let baseline = crate::logging::index_build_start_sequence(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+        );
+        let (start_tx, start_rx) = crossbeam_channel::bounded(1);
+        crate::logging::signal_after_index_build_start(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+            baseline,
+            start_tx,
+        );
+
+        let started = Instant::now();
+        assert!(wait_for_semantic_artifact_start(&start_rx, root.path()));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an adopted build whose build_started predates maintenance must release semantic immediately"
+        );
+        crate::logging::log_index_event(callgraph_event(
+            root.path(),
+            crate::logging::IndexEventKind::BuildCancelled,
+        ));
+    }
+
+    #[test]
+    fn cancelled_callgraph_releases_semantic_and_missing_terminal_uses_bounded_grace() {
+        let _guard = index_order_test_guard();
+        INDEX_ORDER_GRACE_MS.store(1_000, Ordering::SeqCst);
+        clear_index_order_timeout_logs();
+        let root = tempfile::tempdir().unwrap();
+        let baseline = crate::logging::index_build_start_sequence(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+        );
+        let (cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        crate::logging::signal_after_index_build_start(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+            baseline,
+            cancel_tx,
+        );
+        crate::logging::log_index_event(callgraph_event(
+            root.path(),
+            crate::logging::IndexEventKind::BuildCancelled,
+        ));
+
+        let terminal_started = Instant::now();
+        assert!(wait_for_semantic_artifact_start(&cancel_rx, root.path()));
+        assert!(
+            terminal_started.elapsed() < Duration::from_millis(100),
+            "a terminal callgraph event must release semantic before the grace period"
+        );
+
+        let (orphan_tx, orphan_rx) = crossbeam_channel::bounded(1);
+        crate::logging::signal_after_index_build_start(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+            baseline,
+            orphan_tx,
+        );
+        let timeout_started = Instant::now();
+        assert!(wait_for_semantic_artifact_start(&orphan_rx, root.path()));
+        assert!(
+            timeout_started.elapsed() >= Duration::from_secs(1),
+            "the semantic start backstop must wait through the configured grace"
+        );
+        let timeout_logs = INDEX_ORDER_TIMEOUT_LOGS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            timeout_logs.iter().any(|line| line
+                == "semantic artifact load proceeding without callgraph build_started after 1s"),
+            "bounded semantic start must emit its operational log: {timeout_logs:?}"
+        );
+    }
+
+    #[test]
+    fn ready_callgraph_with_stale_receiver_does_not_delay_semantic() {
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = tempfile::tempdir().unwrap();
+        let (writable, _) = crate::callgraph_store::CallGraphStore::ensure_built_with_lease(
+            artifacts.path().to_path_buf(),
+            root.path().to_path_buf(),
+            &[],
+        )
+        .unwrap();
+        drop(writable);
+        let readonly = crate::callgraph_store::CallGraphStore::open_readonly(
+            artifacts.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .unwrap()
+        .unwrap();
+        let ready = CallgraphStoreAccess::Ready(Arc::new(readonly));
+        assert!(
+            !should_wait_for_callgraph_start(&ready, true),
+            "a Ready warm result must ignore a stale receiver"
+        );
+        assert!(should_wait_for_callgraph_start(
+            &CallgraphStoreAccess::Building,
+            true
+        ));
+        assert!(!should_wait_for_callgraph_start(
+            &CallgraphStoreAccess::Building,
+            false
+        ));
+    }
+
+    #[test]
+    fn configure_generation_change_releases_callgraph_start_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = crate::logging::index_build_start_sequence(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+        );
+        let (start_tx, start_rx) = crossbeam_channel::bounded(1);
+        crate::logging::signal_after_index_build_start(
+            crate::logging::IndexPlane::Callgraph,
+            root.path(),
+            baseline,
+            start_tx,
+        );
+        release_callgraph_start_waiters_for_generation_change(
+            Some(root.path()),
+            root.path(),
+            false,
+        );
+        assert_eq!(
+            start_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(()),
+            "generation changes must release the prior root's semantic start waiter"
+        );
+    }
+
+    #[test]
+    fn cold_configure_starts_callgraph_before_semantic() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "pub fn entry() { leaf(); }\npub fn leaf() {}\n",
+        )
+        .unwrap();
+        let server = CountingEmbeddingServer::start();
+        let ctx = Arc::new(test_context());
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let req = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": true,
+                "callgraph_store": true,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "counting-test-embedding",
+                    "base_url": server.base_url.clone(),
+                    "timeout_ms": 5_000,
+                    "max_batch_size": 64,
+                    "max_files": 1_000
+                }
+            }))],
+        }));
+
+        let (_, events) = crate::logging::capture_index_events(|| {
+            let response = handle_configure_for_test(&req, &ctx);
+            assert!(response.success, "configure failed: {response:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            server.release_responses();
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                crate::runtime_drain::drain_search_index_events(&ctx);
+                crate::runtime_drain::drain_callgraph_store_events(&ctx);
+                crate::runtime_drain::drain_semantic_index_events(&ctx);
+                let search_done = ctx.search_index_rx().read().unwrap().is_none();
+                let callgraph_done = ctx.callgraph_store_rx().lock().is_none();
+                let semantic_done = ctx.semantic_index_rx().lock().is_none();
+                if search_done && callgraph_done && semantic_done {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cold configure index builds did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let started = |plane: &str| {
+            events
+                .iter()
+                .position(|line| {
+                    line.contains("kind=build_started") && line.contains(&format!("plane={plane}"))
+                })
+                .unwrap_or_else(|| panic!("missing {plane} build_started event: {events:#?}"))
+        };
+        let search_started = started("search");
+        let callgraph_started = started("callgraph");
+        let semantic_started = started("semantic");
+        assert!(
+            search_started < callgraph_started,
+            "configure must admit search before callgraph: {events:#?}"
+        );
+        assert!(
+            callgraph_started < semantic_started,
+            "configure must admit callgraph before semantic: {events:#?}"
+        );
     }
 
     #[test]

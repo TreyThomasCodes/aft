@@ -587,6 +587,12 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     if !terminal {
         return;
     }
+    if let Some(project_root) = ctx.callgraph_project_root() {
+        crate::logging::release_index_build_start_waiters(
+            crate::logging::IndexPlane::Callgraph,
+            &project_root,
+        );
+    }
     wait_on_artifact_drain_commit_gate_for_test(ctx);
 
     let mut reopened = None;
@@ -2767,7 +2773,8 @@ pub(crate) fn configure_search_order_context_for_test(
         supersede_search_artifact_persistence: false,
         supersede_callgraph_artifact_persistence: false,
         supersede_semantic_artifact_persistence: false,
-        artifact_load_starts: Vec::new(),
+        search_artifact_load_start: None,
+        semantic_artifact_load_start: None,
     })
     .expect("test configure maintenance queue has capacity");
 

@@ -780,9 +780,12 @@ pub(crate) struct ConfigureMaintenanceJob {
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
     pub(crate) supersede_semantic_artifact_persistence: bool,
-    /// One-shot gates for artifact workers created during configure. The
-    /// configure tail opens them only after the bind response has been produced.
-    pub(crate) artifact_load_starts: Vec<crossbeam_channel::Sender<()>>,
+    /// Allows the search worker to start once. Final configuration maintenance
+    /// sends this signal before starting the callgraph warm-up operation.
+    pub(crate) search_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
+    /// Allows the semantic worker to start once. Final configuration maintenance
+    /// waits until callgraph warm-up starts or determines that no build is needed.
+    pub(crate) semantic_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
 }
 
 impl StatusEmitter {
@@ -860,7 +863,6 @@ struct SemanticRefreshCircuit {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SemanticColdSeedResume {
     request_tier2: bool,
-    warm_callgraph: bool,
 }
 
 fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1800,7 +1802,6 @@ pub struct AppContext {
     /// reopening the cold-seed gate after a later configure has reset it.
     semantic_cold_seed_generation: Arc<AtomicU64>,
     semantic_fingerprint_generation: Arc<AtomicU64>,
-    semantic_callgraph_warm_deferred: AtomicBool,
     pending_semantic_index_paths: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
     pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
     semantic_refresh_tx:
@@ -2259,7 +2260,6 @@ impl AppContext {
             semantic_cold_seed_active,
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
-            semantic_callgraph_warm_deferred: AtomicBool::new(false),
             pending_semantic_index_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
             semantic_refresh_tx: Arc::new(parking_lot::Mutex::new(None)),
@@ -4396,11 +4396,6 @@ impl AppContext {
                 return CallgraphStoreAccess::Unavailable;
             }
 
-            if self.semantic_cold_seed_active() {
-                self.defer_callgraph_store_warm_for_semantic_cold_seed();
-                return CallgraphStoreAccess::Building;
-            }
-
             // Cold build required: run it off the request thread and return
             // `Building` so the agent retries (the watcher keeps the store fresh
             // once it lands). By default this never blocks the request thread.
@@ -4575,10 +4570,6 @@ impl AppContext {
             || !self.callgraph_writer()
             || !self.heavy_root_work_allowed()
         {
-            return;
-        }
-        if self.semantic_cold_seed_active() {
-            self.defer_callgraph_store_warm_for_semantic_cold_seed();
             return;
         }
         let _ = self.spawn_callgraph_store_cold_build(
@@ -4782,6 +4773,10 @@ impl AppContext {
                     }
                 }
             });
+            crate::logging::release_index_build_start_waiters(
+                crate::logging::IndexPlane::Callgraph,
+                &project_root,
+            );
         });
         true
     }
@@ -5800,8 +5795,6 @@ impl AppContext {
     pub fn reset_semantic_cold_seed_gate_for_configure(&self) -> u64 {
         self.semantic_cold_seed_active
             .store(false, Ordering::SeqCst);
-        self.semantic_callgraph_warm_deferred
-            .store(false, Ordering::SeqCst);
         self.semantic_cold_seed_generation
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
@@ -5827,15 +5820,6 @@ impl AppContext {
         self.semantic_cold_seed_active.store(true, Ordering::SeqCst);
     }
 
-    pub fn defer_callgraph_store_warm_for_semantic_cold_seed(&self) {
-        self.semantic_callgraph_warm_deferred
-            .store(true, Ordering::SeqCst);
-    }
-
-    fn semantic_callgraph_warm_deferred(&self) -> bool {
-        self.semantic_callgraph_warm_deferred.load(Ordering::SeqCst)
-    }
-
     /// Clear the cold-seed gate and resume work that was intentionally held back
     /// while the full semantic corpus was accumulating. This entry point is used
     /// by the code that drains events from the semantic worker.
@@ -5851,56 +5835,14 @@ impl AppContext {
 
     pub(crate) fn take_semantic_cold_seed_resume(&self, force: bool) -> SemanticColdSeedResume {
         let was_active = self.semantic_cold_seed_active.swap(false, Ordering::SeqCst);
-        let warm_callgraph = self
-            .semantic_callgraph_warm_deferred
-            .swap(false, Ordering::SeqCst);
         SemanticColdSeedResume {
-            request_tier2: force || was_active || warm_callgraph,
-            warm_callgraph,
+            request_tier2: force || was_active,
         }
     }
 
     pub(crate) fn apply_semantic_cold_seed_resume(&self, resume: SemanticColdSeedResume) {
         if resume.request_tier2 {
             let _ = self.request_tier2_refresh_pull();
-        }
-
-        if !resume.warm_callgraph
-            || !self.config().callgraph_store
-            || !self.heavy_root_work_allowed()
-        {
-            return;
-        }
-
-        match self.schedule_callgraph_store_warm() {
-            CallgraphStoreAccess::Ready(_) => {
-                crate::slog_debug!(
-                    "deferred callgraph store warm completed after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Building => {
-                crate::slog_info!(
-                    "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Suspended(suspension) => {
-                crate::slog_warn!(
-                    "deferred callgraph store warm suspended for {} after {} deaths",
-                    suspension.domain.as_str(),
-                    suspension.death_count
-                );
-            }
-            CallgraphStoreAccess::Unavailable => {
-                crate::slog_info!(
-                    "deferred callgraph store warm unavailable after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Error(error) => {
-                crate::slog_warn!(
-                    "deferred callgraph store warm failed after semantic cold seed gate cleared: {}",
-                    error
-                );
-            }
         }
     }
 
@@ -5913,11 +5855,6 @@ impl AppContext {
     pub fn set_semantic_cold_seed_active_for_test(&self, active: bool) {
         self.semantic_cold_seed_active
             .store(active, Ordering::SeqCst);
-    }
-
-    #[doc(hidden)]
-    pub fn semantic_callgraph_warm_deferred_for_test(&self) -> bool {
-        self.semantic_callgraph_warm_deferred()
     }
 
     pub fn install_semantic_refresh_worker(
@@ -8071,7 +8008,7 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn semantic_ready_event_resumes_deferred_callgraph_and_tier2() {
+    fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
@@ -8083,7 +8020,11 @@ mod callgraph_store_for_ops_tests {
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Building
         ));
-        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "the semantic cold seed must not block callgraph admission"
+        );
         tx.send(SemanticIndexEvent::Ready(empty_semantic_index_for_ctx(
             &ctx,
         )))
@@ -8102,21 +8043,21 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "semantic Ready must resume the deferred callgraph warm"
+            "semantic Ready must not schedule a duplicate callgraph warm"
         );
         let rx = ctx
             .callgraph_store_rx
             .lock()
             .as_ref()
             .cloned()
-            .expect("ready resume should install an in-flight callgraph receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
     }
 
     #[test]
-    fn semantic_gate_cleared_event_resumes_deferred_callgraph_and_tier2() {
+    fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
@@ -8126,7 +8067,11 @@ mod callgraph_store_for_ops_tests {
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Building
         ));
-        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "the semantic cold seed must not block callgraph admission"
+        );
         ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
 
         assert!(
@@ -8140,45 +8085,41 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "cached-load or retry-wait clear must resume deferred callgraph warm"
+            "clearing the semantic gate must not schedule a duplicate callgraph warm"
         );
         let rx = ctx
             .callgraph_store_rx
             .lock()
             .as_ref()
             .cloned()
-            .expect("gate-clear resume should install an in-flight callgraph receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
     }
 
     #[test]
-    fn semantic_cold_seed_gate_defers_callgraph_cold_spawn_until_resume() {
+    fn semantic_cold_seed_gate_allows_callgraph_cold_spawn_immediately() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
 
         ctx.set_semantic_cold_seed_active_for_test(true);
-        assert!(
-            matches!(
-                ctx.callgraph_store_for_ops(),
-                CallgraphStoreAccess::Building
-            ),
-            "callgraph ops should degrade as building while the semantic cold gate is active"
-        );
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
-            0,
-            "semantic cold gate must not spawn a competing callgraph cold build"
+            1,
+            "callgraph navigation must start while the semantic cold seed is active"
         );
-        assert!(ctx.semantic_callgraph_warm_deferred_for_test());
 
         ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "clearing the semantic cold gate should resume the deferred callgraph warm"
+            "clearing the semantic cold gate must not schedule a second callgraph warm"
         );
 
         let rx = ctx
@@ -8186,7 +8127,7 @@ mod callgraph_store_for_ops_tests {
             .lock()
             .as_ref()
             .cloned()
-            .expect("deferred warm should install an in-flight receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;

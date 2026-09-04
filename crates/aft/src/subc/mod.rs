@@ -8183,7 +8183,8 @@ mod tests {
             supersede_search_artifact_persistence: false,
             supersede_callgraph_artifact_persistence: false,
             supersede_semantic_artifact_persistence: false,
-            artifact_load_starts: Vec::new(),
+            search_artifact_load_start: None,
+            semantic_artifact_load_start: None,
         })
         .expect("queue configure maintenance");
         let (_gate, maintenance_reached, release_maintenance) =
