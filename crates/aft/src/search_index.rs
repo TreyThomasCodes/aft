@@ -7090,7 +7090,8 @@ mod tests {
         index.update_file(&file);
         let state = index.compaction_state.lock().expect("compaction state");
         assert!(state.requested_again || !index.delta.postings.is_empty());
-        assert!(state.buffered_paths.contains(&file));
+        let canonical_file = fs::canonicalize(&file).expect("canonical source path");
+        assert!(state.buffered_paths.contains(&canonical_file));
     }
 
     fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {

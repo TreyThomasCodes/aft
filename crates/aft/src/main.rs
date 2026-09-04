@@ -3192,6 +3192,8 @@ mod watcher_filter_tests {
 
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let watcher_alias_dir = root.join("watcher-alias");
+        std::fs::create_dir(&watcher_alias_dir).unwrap();
         let all_paths = (0..400)
             .map(|index| root.join(format!("branch-{index:03}.ts")))
             .collect::<Vec<_>>();
@@ -3226,6 +3228,7 @@ mod watcher_filter_tests {
             .ensure_callgraph_store()
             .expect("ensure callgraph store")
             .expect("callgraph store should build on demand");
+        let callgraph_generation = resident.sqlite_path().to_path_buf();
         let search_index = aft::search_index::SearchIndex::build(&root);
         *ctx.search_index()
             .write()
@@ -3253,7 +3256,15 @@ mod watcher_filter_tests {
             )
             .unwrap();
         }
-        let expected_paths = changed_paths
+        let watcher_paths = changed_paths
+            .iter()
+            .map(|path| {
+                watcher_alias_dir
+                    .join("..")
+                    .join(path.file_name().expect("fixture file name"))
+            })
+            .collect::<Vec<_>>();
+        let expected_paths = watcher_paths
             .iter()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
@@ -3264,7 +3275,7 @@ mod watcher_filter_tests {
         );
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
-            .send(WatcherDispatchEvent::Paths(changed_paths))
+            .send(WatcherDispatchEvent::Paths(watcher_paths))
             .unwrap();
 
         let drain_started = Instant::now();
@@ -3303,14 +3314,24 @@ mod watcher_filter_tests {
                 .is_none(),
             "oversized paths must not escalate search to a corpus rebuild"
         );
-        assert!(
-            ctx.search_index()
+        let search_matches = {
+            let search_index = ctx
+                .search_index()
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .expect("resident search index")
-                .ready,
-            "search should stay resident while paths update incrementally"
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let search_index = search_index.as_ref().expect("resident search index");
+            assert!(
+                search_index.ready,
+                "search should stay resident while paths update incrementally"
+            );
+            search_index
+                .grep("switchedFile0", true, &[], &[], &root, 10)
+                .matches
+                .len()
+        };
+        assert_eq!(
+            search_matches, 1,
+            "search must expose content refreshed through a non-canonical watcher path"
         );
         match request_rx
             .recv_timeout(RECV_DISPATCH_TIMEOUT)
@@ -3352,6 +3373,11 @@ mod watcher_filter_tests {
             .map(std::sync::Arc::clone)
             .expect("incremental refresh must leave the store resident");
         assert!(std::sync::Arc::ptr_eq(&resident, &installed_after_refresh));
+        assert_eq!(
+            installed_after_refresh.sqlite_path(),
+            callgraph_generation,
+            "incremental refresh must not replace the callgraph store generation"
+        );
         assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
         aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
     }
