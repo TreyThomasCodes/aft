@@ -256,6 +256,29 @@ echo ""
 # Verifies: trigram index builds, semantic search degrades gracefully
 # ══════════════════════════════════════════════════════════════════
 
+echo "── Warm-up: first OpenCode launch (cold caches) ──"
+echo ""
+
+# The very first `opencode run` on a fresh image pays every cold-cache cost at
+# once (plugin install from the file:// tarball, LSP server npm installs, the
+# ONNX Runtime download) before it makes a single model request, and on a slow
+# runner that alone can exceed a scenario budget while emitting nothing. Pay it
+# here under its own generous budget so Scenario 1 measures the session, not
+# the install. Success means only "OpenCode came back"; scenario assertions
+# stay unchanged and the plugin log is reset before Scenario 1.
+start_aimock
+WARMUP_RESULT="$AIMOCK_RUN_DIR/result-warmup.txt"
+if run_opencode_session "Say hello." "$WARMUP_RESULT" 240; then
+    WARMUP_RC=0
+else
+    WARMUP_RC=$?
+fi
+echo "  warm-up exit code: $WARMUP_RC"
+# 124/137 are the timeout wrapper's codes; any other non-zero exit still means
+# OpenCode came back on its own, which is all the warm-up needs.
+check "warm-up launch returned within 240s" "[ $WARMUP_RC -ne 124 ] && [ $WARMUP_RC -ne 137 ]"
+stop_aimock
+
 echo "── Scenario 1: Full session (no ONNX Runtime) ──"
 echo ""
 
