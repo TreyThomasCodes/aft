@@ -210,7 +210,7 @@ impl RelPath {
             path.as_os_str().as_bytes().to_vec()
         };
         #[cfg(windows)]
-        let bytes = path
+        let bytes: Vec<u8> = path
             .as_os_str()
             .as_encoded_bytes()
             .iter()
