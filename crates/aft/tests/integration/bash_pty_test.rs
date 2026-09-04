@@ -772,7 +772,18 @@ fn pty_kill_terminates_sighup_ignoring_cat() {
     );
 
     let killed = registry.kill(&task_id, SESSION).unwrap();
-    assert_eq!(killed.info.status, BgTaskStatus::Killing);
+    // The reply reports Killing while the TERM grace runs, or Killed when the
+    // watchdog escalated and reaped the child before the reply was built (a
+    // slow CI runner); both mean the kill was accepted. The wait below is the
+    // real assertion.
+    assert!(
+        matches!(
+            killed.info.status,
+            BgTaskStatus::Killing | BgTaskStatus::Killed
+        ),
+        "unexpected kill status {:?}",
+        killed.info.status
+    );
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
 }
 
