@@ -1,9 +1,8 @@
-# Content-addressed index artifacts and per-view assembly (v2 design, 2026-09-04)
+# Content-addressed index artifacts and per-view assembly (v3 design, 2026-09-04)
 
-Status: v2 after the Athena pre-draft consult `ct_…4d2449c5c708` (4 seats, all "directionally right,
-invariants not yet true of the code"). Every panel finding is either folded into a ruling below
-(R1–R14) or listed under open questions. v2 goes back to the panel once; the spec campaign fires on
-that verdict. No implementation before then.
+Status: v3 after two Athena consults (`ct_…4d2449c5c708`, `ct_…55da31faedf0`). Round 1 ruled R1–R14;
+round 2 found four of those rulings not self-sufficient and is answered by R15–R25 below, which
+supersede the earlier text where they conflict. The spec campaign fires on this version.
 
 ## Problem, with evidence
 
@@ -169,7 +168,82 @@ generations. A coverage manifest is this design's view manifest; segments are bl
 converge on the split and differ on the unit and on trigram participation. The #286 reply is written
 in this frame after the OSS matrix numbers.
 
-## Open questions for round 2
+## Round-2 rulings (supersede R1/R4/R6/R7/R8/R9/R13 where they conflict)
+
+**R15 — Source key and payload digest are separate (supersedes R7's read rule).** A blob's key is
+input-addressed and cannot be recomputed from a derived vector or a lossy parse. Each row therefore
+stores, beside the key, `payload_digest = blake3(canonical payload bytes)` and `payload_schema`. Writers
+compute both; readers verify `payload_digest` on read and treat a mismatch as absent (logged). The put
+remains one transaction with a completeness marker. Source-key attestation (the key was derived from
+the bytes it claims) is the writer's obligation under R12; nothing at read time can prove it.
+
+**R16 — Embed template version is a key component.** `build_embed_text_with_lines`
+(`semantic_index.rs:4579-4646`) is versioned code outside the chunker and the model fingerprint; the
+semantic key becomes `(blake3, rel_path, chunker_version, embed_template_version, model_fingerprint)`.
+
+**R17 — Alias entries are proven, never assumed (supersedes R4's alias rule).** Git symlinks, EOL
+normalization, clean/smudge filters and LFS make oid→bytes one-to-many. An alias row
+`(git_oid → blake3)` is written only when the daemon has the working-tree bytes in hand AND
+`sha1("blob <len>\0" + bytes) == git_oid` for a regular (mode 100644/100755) entry; symlinks, submodules
+and filtered paths never alias. The zero-read checkout uses aliases only for rows that passed that
+check; everything else reads and hashes.
+
+**R18 — CAS is a SQLite transaction, not compare-then-rename (supersedes R6).** The per-view manifest
+pointer is a row in the view's SQLite; publication is `UPDATE pointer SET generation = ?new WHERE
+generation = ?base` inside one transaction with `busy_timeout`; zero rows updated = conflict, the loser
+re-derives from the new base. No long-lived writer lease; the lock is held for the transaction only,
+so a daemon restart mid-publication leaves either the old or the new generation, never both.
+
+**R19 — Pins are durable and owned (supersedes R9's age floor as sufficient).** Before the first put
+of an assembly, the view writes a pin `(family, view, generation, owner = pid + process start time)`
+and fsyncs it; the sweep treats pinned keys as referenced; a pin whose owner is dead (the `fs_lock`
+liveness rule) or older than `PIN_TTL` is reclaimable. The blob age floor stays as a second guard, not
+the primary one.
+
+**R20 — Durability composition (extends R8).** Before pointer visibility: blob rows committed and the
+plane store's WAL fsynced; derived tables and trigram state for the generation committed and fsynced;
+alias rows committed; manifest file written, fsynced, and its parent directory fsynced (today's
+semantic write syncs the temp file but not its parent; the pointer path already does both,
+`mod.rs:7836-7858`). `synchronous=NORMAL` is the floor; the spec states the exact PRAGMA set.
+
+**R21 — Breaker scope and work dedup are different keys (extends R13).** The breaker is per
+`(family, plane)`; work admission dedups on the full blob key and fans completion out to every waiting
+view; a blob whose put fails deterministically is quarantined by key so it cannot suspend the plane
+for sibling views.
+
+**R22 — The callgraph resolution family is rewritten over manifest data, not moved.** The panel's
+enumeration (`import_dependencies`, `collect_reexport_refs`, `collect_rust_pub_use_reexport_refs`,
+`build_import_refs`, `build_rust_module_refs`, node/ref ID materialization in `mod.rs`; the
+`resolve_module_path*`, `resolve_workspace_module_path`, `resolve_rust_module_path`,
+`resolve_file_like_path` family and the Cargo workspace walk in `callgraph.rs`) is the work list. All of
+them derive answers from the live filesystem today; at the join they read manifest membership and
+manifest blobs (tsconfig, package.json, Cargo.toml as blobs). Symlink topology is recorded in the
+manifest (entry kind + target) so canonicalization becomes a manifest lookup; submodules are manifest
+entries of kind `gitlink` and are not descended into in v1.
+
+**R23 — Path identity.** `rel_path` in keys and manifests is the exact byte string relative to the
+view root, no case folding, `/` separators, NFC not applied; a `path_identity_version` component on
+the manifest allows changing this later without silent reinterpretation. Payloads never contain
+absolute paths; anything absolute is bound at read from the view root.
+
+**R24 — Invariant 2 is logical.** Equal manifests yield equal derived *row sets* (canonical order,
+canonical serialization when compared), not byte-identical SQLite files.
+
+**R25 — Pending and failed refreshes.** Queries serve the previous complete generation and annotate
+the paths whose blobs are pending or failed; they never omit paths silently and never mix
+generations. The manifest closure includes global ignore state and directory membership so that
+"which paths exist" is itself part of the view.
+
+**Open-question verdicts (round 2).** OQ1: keep `rel_path` in the key and in the embed text; the
+LeBench A/B (path-in-text vs path-free vs path as a separate rerank feature) decides only retrieval
+quality and is scheduled after the first views ship. OQ2: ordinals are deterministic within an
+extractor version only; a bump rebuilds derived tables (resumable). OQ3: R18.
+
+**R10 clarified.** Ordinary forks and mirrors preserve root commits and stay in the family; only
+history-rewritten mirrors (filter-repo, squashed re-creations) pay a full index. Stated so it is not
+rediscovered as a regression.
+
+## Open questions for round 2 (historical; answered above)
 
 1. R1 keeps `rel_path` in the semantic key. Is there a retrieval-quality argument for stripping the
    path from the embed text (and taking the one-time re-embed) that outweighs lossless migration?
