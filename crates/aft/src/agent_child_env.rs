@@ -1119,6 +1119,13 @@ mod tests {
         assert!(status.success(), "git {args:?} failed: {status}");
     }
 
+    // The timeout turns a dispatcher that re-enters itself (an infinite hook
+    // loop) into a failure; it is not a bound on commit latency. A hook-chained
+    // commit spawns several git and shell processes, which under a parallel test
+    // gate on macOS can take multiple seconds each, so keep it far above that.
+    #[cfg(unix)]
+    const HOOK_REENTRY_GUARD: Duration = Duration::from_secs(60);
+
     #[cfg(unix)]
     fn run_git_with_timeout(
         repo: &Path,
@@ -1588,7 +1595,7 @@ mod tests {
             &repo,
             &["commit", "--quiet", "-m", "no repository hook"],
             &environment,
-            Duration::from_secs(5),
+            HOOK_REENTRY_GUARD,
         );
 
         assert!(
@@ -1617,7 +1624,7 @@ mod tests {
             &repo,
             &["commit", "--quiet", "-m", "self guard"],
             &environment,
-            Duration::from_secs(5),
+            HOOK_REENTRY_GUARD,
         );
 
         assert!(
