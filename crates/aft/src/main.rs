@@ -395,6 +395,16 @@ fn main() {
             break;
         }
 
+        // One suffix unit per served request, whether or not more requests are
+        // queued. Yielding only on idle gaps starves the suffix under a steady
+        // request stream: an agent polling right after configure never left
+        // the 100 ms silence the idle branch waits for, so the project watcher
+        // (a suffix unit) never started and ignore-rule changes went unseen.
+        // Units are bounded by construction, and the cost lands after the
+        // response is written, so the served request's latency is unchanged.
+        if configure_maintenance.has_pending(registry.current()) {
+            configure_maintenance.drain_one(registry.current());
+        }
         let queued = collect_queued_lines(&line_rx, &mut queued_lines);
         if queued > 0 {
             if configure_maintenance.has_pending(registry.current()) {
