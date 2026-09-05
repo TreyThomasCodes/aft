@@ -792,6 +792,9 @@ fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, O
 }
 
 fn measure_allocator_observation() -> (AllocatorMemorySnapshot, Option<u64>) {
+    // Only the platforms that publish an observation stamp its start; the
+    // Windows deny-warnings lane rejects the unused binding otherwise.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let sampled_at = std::time::Instant::now();
     let snapshot = allocator_memory_snapshot();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
