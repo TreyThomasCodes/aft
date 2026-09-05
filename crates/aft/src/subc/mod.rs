@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
-use crate::executor::{Executor, JobCancellation, Lane};
+use crate::executor::{Executor, JobCancellation, Lane, PreExecutionCancelOutcome};
 use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
@@ -548,6 +548,7 @@ fn cancel_active_tool_call(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RouteWorkDisposition {
     RetainForReplay,
+    RetainStartedForReplay,
     Abandon,
 }
 
@@ -558,36 +559,56 @@ fn apply_route_work_disposition(
     disposition: RouteWorkDisposition,
     reason: &str,
 ) -> usize {
-    if disposition == RouteWorkDisposition::RetainForReplay {
-        let (retained, cancelled) = {
-            let mut calls = active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut retained = 0usize;
-            let mut cancelled = Vec::new();
-            calls.retain(|(call_route, _), call| {
-                if *call_route != route {
-                    return true;
+    if disposition != RouteWorkDisposition::Abandon {
+        let route_calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|((call_route, _), _)| *call_route == route)
+            .map(|(key, call)| (*key, call.clone()))
+            .collect::<Vec<_>>();
+        let mut retained = 0usize;
+        let mut cancelled_before_execution = 0usize;
+        let mut cancelled_terminal = 0usize;
+
+        for (key, call) in route_calls {
+            let remove = match (call.detach_policy, disposition) {
+                (RouteDetachPolicy::RetainForReplay, RouteWorkDisposition::RetainForReplay) => {
+                    retained += 1;
+                    false
                 }
-                match call.detach_policy {
-                    RouteDetachPolicy::RetainForReplay => {
-                        retained += 1;
-                        true
-                    }
-                    RouteDetachPolicy::CancelOnDetach => {
-                        cancelled.push(call.clone());
-                        false
+                (
+                    RouteDetachPolicy::RetainForReplay,
+                    RouteWorkDisposition::RetainStartedForReplay,
+                ) => {
+                    match executor.cancel_job_before_execution(&call.root_id, &call.cancellation) {
+                        PreExecutionCancelOutcome::AlreadyStarted => {
+                            retained += 1;
+                            false
+                        }
+                        PreExecutionCancelOutcome::QueuedRemoved
+                        | PreExecutionCancelOutcome::DispatchedCancelled => {
+                            cancelled_before_execution += 1;
+                            true
+                        }
                     }
                 }
-            });
-            (retained, cancelled)
-        };
-        let cancelled_count = cancelled.len();
-        for call in cancelled {
-            executor.cancel_job(&call.root_id, &call.cancellation);
+                (RouteDetachPolicy::CancelOnDetach, _) => {
+                    executor.cancel_job(&call.root_id, &call.cancellation);
+                    cancelled_terminal += 1;
+                    true
+                }
+                (_, RouteWorkDisposition::Abandon) => unreachable!("handled below"),
+            };
+            if remove {
+                active
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key);
+            }
         }
         log::debug!(
-            "subc attach: retained {retained} replayable active tool call(s) and cancelled {cancelled_count} teardown-terminal call(s) route={route} reason={reason}"
+            "subc attach: retained {retained} replayable tool call(s), cancelled {cancelled_before_execution} replayable call(s) before execution, and cancelled {cancelled_terminal} teardown-terminal call(s) route={route} reason={reason}"
         );
         return retained;
     }
@@ -2199,14 +2220,20 @@ async fn teardown_installed_route(
         )
         .await?;
     }
-    // Closing a route does not abandon its session: reliable responses are
-    // retained for detach/rebind replay. Cancellation belongs to explicit
-    // Cancel frames, whole-connection teardown, or root reclamation.
+    // A higher-epoch replacement keeps replayable work because the logical
+    // route remains live. A route that actually closes keeps only calls that
+    // already started; pre-execution work has no response to replay and must
+    // not retain scheduler capacity or an epoch-reader admission.
+    let work_disposition = if replacement_root.is_some() {
+        RouteWorkDisposition::RetainForReplay
+    } else {
+        RouteWorkDisposition::RetainStartedForReplay
+    };
     apply_route_work_disposition(
         active_tool_calls,
         executor,
         channel,
-        RouteWorkDisposition::RetainForReplay,
+        work_disposition,
         cancellation_reason,
     );
     if let Some(pending) = pending_binds.get_mut(&channel) {

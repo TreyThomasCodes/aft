@@ -528,11 +528,17 @@ fn warn_slow_running_interactive_jobs_after(executor: &Executor, minimum_age: Du
         return;
     };
     for job in jobs {
+        let state = if job.execution_started {
+            "executing"
+        } else {
+            "zombie_reader"
+        };
         let line = format!(
-            "executor occupancy census: class=Interactive job={} command={} lane={:?} age_ms={} root={}",
+            "executor occupancy census: class=Interactive job={} command={} lane={:?} state={} age_ms={} root={}",
             job.request_id,
             job.command,
             job.lane,
+            state,
             job.age.as_millis(),
             job.root_id,
         );
@@ -610,11 +616,12 @@ fn pending_bind_breadcrumb(
         .iter()
         .map(|reader| {
             format!(
-                "job={} command={} lane={:?} age_ms={} started_before_oldest_writer={}",
+                "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
                 reader.request_id,
                 reader.command,
                 reader.lane,
                 reader.started_age_ms,
+                reader.execution_started,
                 reader.started_before_oldest_writer
             )
         })
@@ -1431,6 +1438,7 @@ mod tests {
         assert!(line.contains("job=long-search"));
         assert!(line.contains("command="));
         assert!(line.contains("lane=PureRead"));
+        assert!(line.contains("state=executing"));
         assert!(line.contains("age_ms="));
         assert!(line.contains(&format!("root={root}")));
     }
