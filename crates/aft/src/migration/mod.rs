@@ -3,6 +3,17 @@
 //! The importer deliberately leaves `semantic.bin` untouched until a complete
 //! manifest is visible.  A caller can therefore roll back by removing the view
 //! directory and continue to use the legacy snapshot.
+//!
+//! Nothing calls [`import_legacy_semantic`] on a live root yet. The call-site
+//! contract for the integrator: run it under a `ColdBuildLimiter` slot, only
+//! for a root with writer capability on the family (a borrow-only worktree
+//! must not open the shared blob store), off the bind/artifact-load path, and
+//! after the view has been checked for a current generation (done inside).
+//! It reads the whole snapshot, re-reads and hashes every source row, and
+//! writes every row into the blob store, so its cost scales with the corpus.
+//! A `RebuildRequired` outcome only records `migration-state.json` in the view
+//! directory; the semantic builder does not consume that marker yet, and the
+//! hand-off from the marker to a scheduled rebuild belongs to the integrator.
 
 use std::collections::BTreeMap;
 use std::fmt;
