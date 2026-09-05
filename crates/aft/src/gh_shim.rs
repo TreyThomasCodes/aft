@@ -61,6 +61,10 @@ const ISSUE_CLOSE_REASONS: &[&str] = &["completed", "not_planned"];
 // surface. `run cancel` remains deliberately absent because it is destructive
 // and rarely needed, so the operator bypass cannot enable it by accident.
 const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
+// v13 adds operator-only release maintenance while keeping release deletion
+// and release delete-prefixed flags outside the bypass allowlist.
+const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
+const DESTRUCTIVE_TUPLES: &[&str] = &["release delete", "release delete-asset"];
 // The v10 manifest version is the first version whose code-side allowlist
 // permits these native comment mutations. The allowlist covers only the exact
 // flag variants below and does not broaden raw API writes.
@@ -295,6 +299,10 @@ fn run(args: &[OsString]) -> i32 {
                 RefusalCode::Unclassified,
                 &unclassified_refusal_text(manifest_version),
             ),
+            GovernanceDisposition::Destructive => refuse(
+                RefusalCode::DestructiveFlag,
+                "destructive GitHub operations are not available through the shim",
+            ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
                 match invalid_manifest_problem.as_ref() {
                     Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
@@ -362,6 +370,10 @@ fn run(args: &[OsString]) -> i32 {
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
             &unclassified_refusal_text(manifest.manifest_version),
+        ),
+        Classification::Destructive => refuse(
+            RefusalCode::DestructiveFlag,
+            "destructive GitHub operations are not available through the shim",
         ),
     }
 }
@@ -662,6 +674,7 @@ enum GovernanceDisposition {
     Ready,
     Unavailable(AgentBinding),
     Unclassified { manifest_version: u64 },
+    Destructive,
 }
 
 fn structural_governance_disposition(
@@ -685,6 +698,7 @@ fn structural_governance_disposition(
             GovernanceDisposition::Unavailable(agent_binding)
         }
         Classification::Unclassified => GovernanceDisposition::Unclassified { manifest_version },
+        Classification::Destructive => GovernanceDisposition::Destructive,
         Classification::Mechanical => GovernanceDisposition::Delegate,
     }
 }
@@ -703,6 +717,9 @@ fn non_r3_governance_disposition(
     let classification = classify(args, manifest, platform);
     if matches!(classification, Classification::Mechanical) {
         return GovernanceDisposition::Delegate;
+    }
+    if matches!(classification, Classification::Destructive) {
+        return GovernanceDisposition::Destructive;
     }
 
     // Binding resolution runs `git` to inspect the origin. Classify first so
@@ -1959,6 +1976,10 @@ fn regressed_disposition(
                 text,
             }
         }
+        Classification::Destructive => RegressedDisposition::Refuse {
+            code: RefusalCode::DestructiveFlag,
+            text: "destructive GitHub operations are not available through the shim".to_string(),
+        },
         Classification::Unclassified => RegressedDisposition::Refuse {
             code: RefusalCode::Unclassified,
             text:
@@ -2146,6 +2167,7 @@ enum Classification {
         tuple: String,
     },
     Unclassified,
+    Destructive,
 }
 
 fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -2153,6 +2175,7 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 11 && V11_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -2198,6 +2221,15 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         Some(subcommand) => format!("{verb} {subcommand}"),
         None => verb,
     };
+    if DESTRUCTIVE_TUPLES.contains(&tuple.as_str())
+        || (tuple.starts_with("release ")
+            && args.iter().any(|arg| {
+                arg.to_str()
+                    .is_some_and(|value| value.starts_with("--delete-"))
+            }))
+    {
+        return Classification::Destructive;
+    }
     // `--edit-last` is the native gh operation that edits the authenticated
     // user's own last comment. Keep this exact author-scoped form limited to
     // the explicitly allowed comment tuples. An id-addressed API PATCH remains
@@ -5834,6 +5866,92 @@ mod tests {
             ["pr", "reopen"].as_slice(),
         ] {
             let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+    }
+
+    #[test]
+    fn v13_release_maintenance_rows_allow_reviewed_flags_and_refuse_destructive_forms() {
+        let mut manifest = v12_fixture_manifest();
+        manifest.manifest_version = 13;
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v13 admin tier");
+        for tuple in ["release edit", "release upload"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
+        manifest.validate().expect("valid v13 admin extensions");
+
+        for args in [
+            vec![
+                "release",
+                "edit",
+                "v1.2.3",
+                "--notes",
+                "notes",
+                "--notes-file",
+                "notes.md",
+                "--title",
+                "Dashboard",
+                "--draft=false",
+                "--latest",
+                "--prerelease",
+            ],
+            vec!["release", "upload", "v1.2.3", "dashboard.json", "--clobber"],
+        ] {
+            let args = os_args(&args);
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { ref tuple }
+                    if tuple == if args[1] == "edit" { "release edit" } else { "release upload" }
+            ));
+        }
+        assert!(is_reviewed_admin_tuple(13, "release edit"));
+        assert!(is_reviewed_admin_tuple(13, "release upload"));
+        assert!(!is_reviewed_admin_tuple(12, "release edit"));
+        assert!(!is_reviewed_admin_tuple(12, "release upload"));
+
+        for args in [
+            os_args(&["release", "delete", "v1.2.3"]),
+            os_args(&["release", "delete-asset", "v1.2.3", "dashboard.json"]),
+            os_args(&["release", "edit", "v1.2.3", "--delete-tag"]),
+            os_args(&["release", "upload", "v1.2.3", "--delete-asset"]),
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Destructive
+            ));
+            assert_eq!(
+                RefusalCode::DestructiveFlag.as_str(),
+                "gh_shim_destructive_flag"
+            );
+            assert_eq!(
+                refuse(
+                    RefusalCode::DestructiveFlag,
+                    "destructive GitHub operations are not available through the shim"
+                ),
+                REFUSAL_EXIT_STATUS
+            );
+        }
+    }
+
+    #[test]
+    fn release_api_mutations_remain_unclassified_because_api_rules_are_get_only() {
+        let manifest = v12_fixture_manifest();
+        // The v1 audit keeps api_rules GET-only; do not widen them for REST writes.
+        for args in [
+            os_args(&["api", "-X", "PATCH", "repos/owner/repo/releases/42"]),
+            os_args(&["api", "-X", "POST", "repos/owner/repo/releases/42/assets"]),
+        ] {
             assert!(matches!(
                 classify(&args, &manifest, "macos"),
                 Classification::Unclassified
