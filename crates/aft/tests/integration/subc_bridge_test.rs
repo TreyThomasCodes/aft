@@ -439,6 +439,10 @@ impl BridgeState {
         guard.epoch_started
     }
 
+    fn epoch_started_count(&self) -> usize {
+        self.inner.lock().expect("bridge state lock").epoch_started
+    }
+
     fn release_epoch_reads(&self) {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.epoch_release = true;
@@ -2131,6 +2135,16 @@ fn subc_bridge_routebind_nonblocking_slow_configure() {
 }
 
 #[test]
+fn subc_bridge_heavy_response_egress_is_root_epoch_independent() {
+    run_subc_bridge_test(
+        "heavy-response-egress-is-root-epoch-independent",
+        Duration::from_secs(20),
+        drive_heavy_response_egress_is_root_epoch_independent_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood() {
     run_subc_bridge_test(
         "subc_bridge_routebind_ack_is_prioritized_over_reliable_flood",
@@ -2167,6 +2181,24 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
         Duration::from_secs(30),
         drive_goodbye_cancels_pending_bind_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "goodbye-cancels-queued-read-before-rebind",
+        Duration::from_secs(20),
+        drive_goodbye_cancels_queued_read_before_rebind_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
     );
 }
 
@@ -4772,6 +4804,77 @@ async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_heavy_response_egress_is_root_epoch_independent_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_route_bind(&mut stream, 2, 20, &root2).await;
+    expect_route_bind_ack(&mut stream, 20).await;
+
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        root_id,
+        aft::executor::Lane::MaintenanceCommit,
+        "test-held-root-epoch".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx
+                .send(())
+                .expect("signal root epoch holder");
+            release_maintenance_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release root epoch holder");
+            Response::success("test-held-root-epoch", json!({}))
+        }),
+    );
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance holds root1 epoch");
+
+    send_tool_call(
+        &mut stream,
+        1,
+        130,
+        "semantic_search",
+        json!({ "query": "finalize while root epoch is held" }),
+    )
+    .await;
+    state.wait_until("root1 heavy call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 2, 230, "echo", json!({ "case": "fast" })).await;
+    let other_root = read_frame_timeout(&mut stream, "other-root response").await;
+    assert_eq!(other_root.header.channel, 2);
+    assert_eq!(other_root.header.corr, 230);
+
+    state.release_heavy();
+    let heavy_response = read_frame_within(
+        &mut stream,
+        Duration::from_secs(1),
+        "HeavyInit response while root epoch remains held",
+    )
+    .await;
+    release_maintenance_tx
+        .send(())
+        .expect("release root epoch holder");
+    let maintenance_response = tokio::time::timeout(Duration::from_secs(1), maintenance)
+        .await
+        .expect("maintenance completion timed out")
+        .expect("maintenance completion channel closed");
+    assert!(maintenance_response.success);
+
+    let heavy_response = heavy_response
+        .expect("response finalization and egress must not reacquire the actor epoch");
+    assert_eq!(heavy_response.header.channel, 1);
+    assert_eq!(heavy_response.header.corr, 130);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -5045,6 +5148,83 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
         "request on a closed route generation",
     )
     .await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    let epoch_base = state.begin_epoch_wave();
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "semantic_search",
+        json!({ "query": "hold the only interactive actor slot" }),
+    )
+    .await;
+    state.wait_until("heavy route call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 1, 121, "echo", json!({ "case": "epoch" })).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 122, Vec::new())
+            .expect("queued-read barrier ping"),
+    )
+    .await;
+    let queued_barrier = read_frame_timeout(&mut stream, "queued-read barrier pong").await;
+    assert_eq!(queued_barrier.header.ty, FrameType::Pong);
+    assert_eq!(queued_barrier.header.corr, 122);
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "the actor-cap blocker must leave the read queued"
+    );
+
+    send_route_goodbye(&mut stream, 1, 123).await;
+    send_route_bind(&mut stream, 2, 220, &root1).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 124, Vec::new())
+            .expect("rebind submission barrier ping"),
+    )
+    .await;
+    let rebind_barrier = read_frame_timeout(&mut stream, "rebind submission barrier pong").await;
+    assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
+    assert_eq!(rebind_barrier.header.corr, 124);
+
+    let released_at = Instant::now();
+    state.release_heavy();
+    let deadline = released_at + Duration::from_secs(6);
+    let mut bind_ack = None;
+    while let Some(frame) =
+        read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
+    {
+        if frame.header.channel == 0
+            && frame.header.corr == 220
+            && frame.header.ty == FrameType::Response
+        {
+            bind_ack = Some(frame);
+            break;
+        }
+    }
+    state.release_epoch_reads();
+    assert!(
+        bind_ack.is_some(),
+        "same-root RouteBind must ack within the 6s grace after the old route closes"
+    );
+    assert!(released_at.elapsed() < Duration::from_secs(6));
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "a queued call from the dead route must never execute after rebind"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }
