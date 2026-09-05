@@ -1331,6 +1331,15 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "crates/aft/tests/integration/standalone_search_deferred_test.rs",
+      "location": "line 450, column 14",
+      "line": 450,
+      "column": 14,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
       "location": "line 7152, column 18",
       "line": 7152,
