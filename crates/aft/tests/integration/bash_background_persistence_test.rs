@@ -1092,6 +1092,37 @@ fn replay_session_recovers_killing_state() {
     );
 }
 
+/// The persisted GC walks the whole shared storage root, so it must not run
+/// on the thread that called replay: in standalone mode that caller is the
+/// request loop, and the first request after configure waited on it (2.4 s on
+/// a warm box; past the plugin's 5 s timeout under load). The GC thread name
+/// is recorded by the run itself, so the assertion is about where it ran, not
+/// how long it took.
+#[test]
+fn replay_runs_persisted_gc_off_the_calling_thread() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let thread = loop {
+        if let Some(name) = registry.persisted_gc_thread() {
+            break name;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "persisted GC never ran after replay"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(thread, "aft-bash-task-gc");
+    assert_ne!(
+        Some(thread.as_str()),
+        std::thread::current().name(),
+        "persisted GC ran on the replay caller's thread"
+    );
+}
+
 #[test]
 fn replay_runs_maybe_gc_persisted_once() {
     let project = tempfile::tempdir().unwrap();

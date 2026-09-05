@@ -245,6 +245,10 @@ pub(crate) struct RegistryInner {
     persisted_gc_started: AtomicBool,
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
+    /// Name of the thread the once-per-process persisted GC ran on. Lets the
+    /// integration suite pin that the GC stays off the configure/replay thread
+    /// (the replay caller is the standalone request loop).
+    persisted_gc_thread: Mutex<Option<String>>,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -325,6 +329,7 @@ impl BgTaskRegistry {
                 persisted_gc_started: AtomicBool::new(false),
                 #[cfg(test)]
                 persisted_gc_runs: AtomicU64::new(0),
+                persisted_gc_thread: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
@@ -1882,6 +1887,16 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, None)
     }
 
+    /// Thread name recorded by the last `maybe_gc_persisted` run, if any.
+    #[doc(hidden)]
+    pub fn persisted_gc_thread(&self) -> Option<String> {
+        self.inner
+            .persisted_gc_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn replay_session_for_project(
         &self,
         storage_dir: &Path,
@@ -1899,8 +1914,26 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
-            if let Err(error) = self.maybe_gc_persisted(storage_dir) {
-                crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
+            // The persisted GC walks every session under the shared storage root
+            // (liveness probes, row deletes, quarantines) and scales with the
+            // machine's task history, not this session's. Replay runs before the
+            // first request after configure, so keeping the GC inline made that
+            // request wait on storage-wide housekeeping: 2.4 s on a warm box,
+            // past the plugin's 5 s request timeout under load. Replay itself
+            // needs only this project's rows, so the GC runs detached; a row it
+            // would have deleted is at worst rehydrated as terminal and reaped
+            // by the watchdog.
+            let registry = self.clone();
+            let storage_dir = storage_dir.to_path_buf();
+            let spawned = std::thread::Builder::new()
+                .name("aft-bash-task-gc".to_string())
+                .spawn(move || {
+                    if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
+                        crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                crate::slog_warn!("failed to spawn persisted background task GC: {error}");
             }
         }
 
@@ -2800,6 +2833,16 @@ impl BgTaskRegistry {
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
+        *self
+            .inner
+            .persisted_gc_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string(),
+        );
 
         let mut deleted = 0usize;
 
