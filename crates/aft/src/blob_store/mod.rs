@@ -610,7 +610,9 @@ fn configure_connection(connection: &Connection) -> Result<(), BlobStoreError> {
 
 /// Run `operation` until it stops failing with SQLITE_BUSY/SQLITE_LOCKED or
 /// `budget` elapses; the last error is returned when the budget runs out.
-fn retry_while_busy<T>(
+/// Shared with the view store, whose pointer database has the same first-open
+/// WAL-switch race.
+pub(crate) fn retry_while_busy<T>(
     budget: Duration,
     mut operation: impl FnMut() -> rusqlite::Result<T>,
 ) -> rusqlite::Result<T> {

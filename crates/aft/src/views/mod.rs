@@ -801,7 +801,14 @@ fn validate_scope_key(project_scope_key: &str) -> Result<()> {
 
 fn configure_connection(connection: &Connection) -> Result<()> {
     connection.busy_timeout(POINTER_BUSY_TIMEOUT)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    // Two publishers opening the pointer database at once both switch it to
+    // WAL; SQLite skips the busy handler on that lock upgrade when another
+    // connection is mid-switch, so the loser sees SQLITE_BUSY immediately
+    // (seen as `database is locked` 0.36 s into the CAS race test under a
+    // full parallel gate). Wait it out within the busy budget instead.
+    crate::blob_store::retry_while_busy(POINTER_BUSY_TIMEOUT, || {
+        connection.pragma_update(None, "journal_mode", "WAL")
+    })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
     Ok(())
@@ -929,6 +936,42 @@ fn observe(observer: Option<&dyn PublicationObserver>, step: PublicationStep) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two publishers checkpoint the same artifact database before publishing.
+    /// An artifact written in rollback-journal mode is switched to WAL by the
+    /// first checkpoint connection, and SQLite skips the busy handler on that
+    /// lock upgrade when another connection is mid-switch (the same first-open
+    /// race the blob store pins), so the loser saw `database is locked` 0.36 s
+    /// into the CAS race test under a full parallel gate. Eight racing
+    /// checkpointers on a fresh rollback-journal file redden without the retry
+    /// in `configure_connection` within 150 rounds.
+    #[test]
+    fn concurrent_artifact_checkpoints_never_see_busy() {
+        let mut failures = Vec::new();
+        for round in 0..150 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let artifact = dir.path().join("artifact.sqlite");
+            Connection::open(&artifact)
+                .expect("artifact")
+                .execute_batch("CREATE TABLE t (x INTEGER);")
+                .expect("schema");
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let artifact = artifact.clone();
+                    std::thread::spawn(move || checkpoint_and_sync_database(&artifact, None))
+                })
+                .collect();
+            for handle in handles {
+                if let Err(error) = handle.join().expect("opener thread") {
+                    failures.push(format!("round {round}: {error}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "concurrent artifact checkpoints must wait out the WAL switch: {failures:?}"
+        );
+    }
 
     #[test]
     fn byte_string_uses_base64_only_when_utf8_cannot_represent_the_path() {
