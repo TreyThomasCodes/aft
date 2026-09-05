@@ -110,6 +110,112 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
 }
 
 #[test]
+fn standalone_configure_replays_completed_task_before_queued_completion_drain() {
+    const SESSION: &str = "standalone-replay-session";
+
+    let project = tempfile::tempdir().expect("create replay project");
+    let storage = tempfile::tempdir().expect("create replay storage");
+    let configure = |id: &str| {
+        json!({
+            "id": id,
+            "session_id": SESSION,
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "experimental": { "bash": { "background": true } }
+            })),
+            "max_background_bash_tasks": 4
+        })
+        .to_string()
+    };
+
+    let task_id = {
+        let mut aft = AftProcess::spawn();
+        let configured = aft.send(&configure("seed-configure"));
+        assert_eq!(
+            configured["success"], true,
+            "seed configure failed: {configured:?}"
+        );
+        let spawned = aft.send(
+            &json!({
+                "id": "seed-background-task",
+                "session_id": SESSION,
+                "command": "bash",
+                "params": { "command": "printf replay-before-drain", "background": true }
+            })
+            .to_string(),
+        );
+        assert_eq!(spawned["success"], true, "task spawn failed: {spawned:?}");
+        let task_id = spawned["task_id"]
+            .as_str()
+            .expect("spawned task id")
+            .to_string();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = aft.send(
+                &json!({
+                    "id": "seed-task-status",
+                    "session_id": SESSION,
+                    "command": "bash_status",
+                    "params": { "task_id": task_id }
+                })
+                .to_string(),
+            );
+            assert_eq!(status["success"], true, "task status failed: {status:?}");
+            if status["status"] == "completed" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "task did not complete: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(aft.shutdown().success());
+        task_id
+    };
+
+    let mut aft = AftProcess::spawn();
+    let queued_drain = json!({
+        "id": "queued-completion-drain",
+        "session_id": SESSION,
+        "command": "bash_drain_completions"
+    })
+    .to_string();
+    aft.send_silent(&format!(
+        "{}\n{}",
+        configure("restart-configure"),
+        queued_drain
+    ));
+
+    let (configured, _) = read_response(&mut aft, "restart-configure", Duration::from_secs(5));
+    assert_eq!(
+        configured["success"], true,
+        "restart configure failed: {configured:?}"
+    );
+    let (drained, _) = read_response(&mut aft, "queued-completion-drain", Duration::from_secs(5));
+    assert_eq!(
+        drained["success"], true,
+        "completion drain failed: {drained:?}"
+    );
+    assert!(
+        drained["bg_completions"]
+            .as_array()
+            .expect("completion array")
+            .iter()
+            .any(|completion| completion["task_id"] == task_id),
+        "queued drain missed replayed completion: {drained:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
     let project = tempfile::tempdir().expect("create detached-sweep project");
     let storage = tempfile::tempdir().expect("create shared storage fixture");

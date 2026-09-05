@@ -307,8 +307,8 @@ impl StandaloneConfigureMaintenance {
         crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
     }
 
-    pub fn drain_admission(&mut self, ctx: &AppContext) -> bool {
-        crate::commands::configure::drain_standalone_configure_admission(ctx, &mut self.inner)
+    pub fn drain_prefix(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
     }
 
     pub fn drain_one(&mut self, ctx: &AppContext) -> bool {

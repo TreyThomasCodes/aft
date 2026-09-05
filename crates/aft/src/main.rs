@@ -266,8 +266,8 @@ fn main() {
                 Ok(result) => result,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Periodic drain so push frames flow even without requests.
-                    // Each deferred configure step returns to the request loop so
-                    // queued input can run; storage-wide sweeps run on separate threads.
+                    // The request-critical configure prefix runs before a cooperative
+                    // suffix step; storage-wide sweeps run on separate threads.
                     let mut collect_queued = || collect_queued_lines(&line_rx, &mut queued_lines);
                     if let Err(e) = drain_runtime_events_and_write_pending_cooperatively(
                         &registry,
@@ -314,13 +314,11 @@ fn main() {
         let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
-                // Ping bypasses deferred configure work. Other commands run at most
-                // one setup step before dispatch, so persistence-backed mutations can
-                // initialize without blocking on the remaining maintenance queue.
-                if req.command != "ping"
-                    && configure_maintenance.drain_admission(registry.current())
-                    && configure_maintenance.has_pending(registry.current())
-                {
+                // The first request after each configure waits for the request-critical
+                // prefix. The remaining project-runtime and indexing work stays
+                // cooperative, so even ping runs before another suffix unit.
+                configure_maintenance.drain_prefix(registry.current());
+                if configure_maintenance.has_pending(registry.current()) {
                     aft::runtime_drain::note_configure_maintenance_yield(queued_lines.len() + 1);
                 }
                 // Install any completed search index before applying watcher changes.
@@ -469,7 +467,8 @@ fn drain_runtime_events_cooperatively(
     // configure work resumes at the next step.
     let runtime = registry.current();
     if configure.has_pending(runtime) {
-        let has_more = configure.drain_one(runtime);
+        configure.drain_prefix(runtime);
+        let has_more = configure.has_pending(runtime) && configure.drain_one(runtime);
         let queued = queued_requests();
         if queued > 0 && has_more {
             aft::runtime_drain::note_configure_maintenance_yield(queued);

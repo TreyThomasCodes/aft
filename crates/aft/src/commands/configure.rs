@@ -4469,14 +4469,23 @@ enum ConfigureMaintenanceStage {
     #[default]
     Admission,
     SessionReplay,
+    BashRuntime,
     ProjectRuntime,
     StorageSweeps,
-    BashRuntime,
     Watcher,
     ProcessFlags,
     Callgraph,
     SemanticRelease,
     Status,
+}
+
+impl ConfigureMaintenanceStage {
+    fn is_non_yielding_prefix(self) -> bool {
+        matches!(
+            self,
+            Self::Admission | Self::SessionReplay | Self::BashRuntime
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -4536,20 +4545,64 @@ pub(crate) fn standalone_configure_maintenance_pending(
     !state.jobs.is_empty()
 }
 
-pub(crate) fn drain_standalone_configure_admission(
+/// Finish request-critical configure work before standalone dispatch resumes.
+/// Cooperative suffixes retain their relative queue order while each pending
+/// prefix advances through bash replay and reminder configuration.
+pub(crate) fn drain_standalone_configure_prefix(
     ctx: &AppContext,
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
-    if !state
-        .jobs
-        .front()
-        .is_some_and(|job| job.stage == ConfigureMaintenanceStage::Admission)
-    {
-        return false;
+    let jobs_to_visit = state.jobs.len();
+    let mut ran_prefix = false;
+
+    for _ in 0..jobs_to_visit {
+        let Some(mut continuation) = state.jobs.pop_front() else {
+            break;
+        };
+        if !continuation.stage.is_non_yielding_prefix() {
+            state.jobs.push_back(continuation);
+            continue;
+        }
+        ran_prefix = true;
+
+        loop {
+            if ctx.subc_unbound_quiesced() {
+                cancel_unbound_configure_jobs(
+                    ctx,
+                    std::iter::once(continuation.job)
+                        .chain(state.jobs.drain(..).map(|pending| pending.job))
+                        .chain(ctx.drain_configure_maintenance()),
+                );
+                return ran_prefix;
+            }
+
+            match run_configure_maintenance_unit(
+                ctx,
+                &mut continuation,
+                state.detach_storage_sweeps,
+            ) {
+                ConfigureMaintenanceUnitResult::Continue
+                    if continuation.stage.is_non_yielding_prefix() => {}
+                ConfigureMaintenanceUnitResult::Continue => {
+                    state.jobs.push_back(continuation);
+                    break;
+                }
+                ConfigureMaintenanceUnitResult::Complete => break,
+                ConfigureMaintenanceUnitResult::CancelAll => {
+                    cancel_unbound_configure_jobs(
+                        ctx,
+                        std::iter::once(continuation.job)
+                            .chain(state.jobs.drain(..).map(|pending| pending.job))
+                            .chain(ctx.drain_configure_maintenance()),
+                    );
+                    return ran_prefix;
+                }
+            }
+        }
     }
-    drain_deferred_configure_maintenance_unit(ctx, state);
-    true
+
+    ran_prefix
 }
 
 /// Run one unit of deferred configure work after sending the acknowledgement.
@@ -4687,6 +4740,16 @@ fn run_configure_maintenance_unit(
             if job.run_bash_replay {
                 replay_configure_session(ctx, job);
             }
+            continuation.stage = ConfigureMaintenanceStage::BashRuntime;
+        }
+        ConfigureMaintenanceStage::BashRuntime => {
+            let config = ctx.config();
+            ctx.bash_background().configure_long_running_reminders(
+                config.bash_long_running_reminder_enabled,
+                config.bash_long_running_reminder_interval_ms,
+            );
+            drop(config);
+
             continuation.stage = ConfigureMaintenanceStage::ProjectRuntime;
         }
         ConfigureMaintenanceStage::ProjectRuntime => {
@@ -4708,16 +4771,6 @@ fn run_configure_maintenance_unit(
             } else {
                 run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             }
-            continuation.stage = ConfigureMaintenanceStage::BashRuntime;
-        }
-        ConfigureMaintenanceStage::BashRuntime => {
-            let config = ctx.config();
-            ctx.bash_background().configure_long_running_reminders(
-                config.bash_long_running_reminder_enabled,
-                config.bash_long_running_reminder_interval_ms,
-            );
-            drop(config);
-
             continuation.stage = ConfigureMaintenanceStage::Watcher;
         }
         ConfigureMaintenanceStage::Watcher => {
