@@ -4480,10 +4480,15 @@ enum ConfigureMaintenanceStage {
 }
 
 impl ConfigureMaintenanceStage {
+    /// Stages a request's correctness depends on. They run to completion before
+    /// the first request after a configure is served: bash replay (a queued
+    /// `bash_drain_completions` must see the previous process's tasks) and the
+    /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
+    /// matcher). Everything after them is housekeeping and yields to requests.
     fn is_non_yielding_prefix(self) -> bool {
         matches!(
             self,
-            Self::Admission | Self::SessionReplay | Self::BashRuntime
+            Self::Admission | Self::SessionReplay | Self::BashRuntime | Self::ProjectRuntime
         )
     }
 }
