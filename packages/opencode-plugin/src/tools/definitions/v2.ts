@@ -31,6 +31,7 @@ export interface V2PermissionRequest {
 
 export interface V2DefinitionRuntime extends V2ExecutionContext {
   directory: string;
+  effectAbort: AbortSignal;
   worktree: string;
   abort: AbortSignal;
   metadata(update: Record<string, unknown>): void;
@@ -147,6 +148,7 @@ function runtimeFor(
     directory,
     worktree,
     abort: signal,
+    effectAbort: signal,
     metadata: (update) => {
       void Effect.runPromise(
         context.progress({

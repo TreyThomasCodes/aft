@@ -417,9 +417,10 @@ async function writeV2LifecycleProbe(hostRoot: string): Promise<string> {
   await writeFile(
     probe,
     `
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { Effect } from "effect";
+import { DatabaseSync } from "node:sqlite";
+import { Effect, Exit, Fiber } from "effect";
 import { load } from "@opencode-ai/core/plugin/module";
 import { Host } from "@opencode-ai/plugin/host";
 import { Npm } from "@opencode-ai/util/npm";
@@ -487,7 +488,7 @@ function locationContext(id) {
   let rpcDisposals = 0;
   const permissionCreates = [];
   const subscriptions = [];
-  const replyPlan = ["once", "once", "reject", "reject"];
+  const replyPlan = ["once", "once", "reject", "reject", "once", "once"]; 
   const client = {
     event: {
       subscribe: async () => {
@@ -542,6 +543,16 @@ function locationContext(id) {
           add: (tool) => tools.push(tool),
           remove: () => {},
         })),
+      },
+      session: {
+        prompt: (input) => Effect.sync(() => {
+          appendFileSync(marker, "session-prompt:" + JSON.stringify(input) + "\\n");
+          return { id: "wake-" + input.sessionID };
+        }),
+        synthetic: (input) => Effect.sync(() => {
+          appendFileSync(marker, "session-synthetic:" + JSON.stringify(input) + "\\n");
+          return { id: "status-" + input.sessionID };
+        }),
       },
     },
   };
@@ -690,6 +701,70 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     throw new Error("reloaded Location did not deliver the index-progress event");
   }
   appendFileSync(marker, "rpc-reload-event:indexProgress\\n");
+
+  const executionContext = {
+    sessionID: "lifecycle-reload",
+    messageID: "message-bash-abort",
+    agent: "load-matrix",
+    id: "bash-abort",
+    progress: () => Effect.succeed(undefined),
+  };
+  const bash = reloaded.tools.find((tool) => tool.name === "bash");
+  if (!bash) throw new Error("enabled V2 effect did not register bash");
+  const bashFiber = Effect.runFork(
+    bash.execute({ command: "sleep 30", description: "cancellation probe" }, executionContext),
+  );
+  yield* Effect.sleep(750);
+  const abortExit = yield* Effect.gen(function* () {
+    yield* Fiber.interrupt(bashFiber);
+    return yield* Fiber.await(bashFiber);
+  }).pipe(Effect.timeout("10 seconds"));
+  appendFileSync(marker, "bash-abort-exit:" + JSON.stringify(abortExit) + "\\n");
+  if (!Exit.hasInterrupts(abortExit)) {
+    throw new Error("foreground bash did not exit through Effect interruption: " + JSON.stringify(abortExit));
+  }
+
+  const database = new DatabaseSync(
+    resolve(process.env.XDG_DATA_HOME, "cortexkit", "aft", "aft.db"),
+    { readOnly: true },
+  );
+  const abortQuery = database.prepare(
+    "SELECT task_id, status, metadata FROM bash_tasks " +
+      "WHERE harness = ? AND session_id = ? ORDER BY started_at DESC LIMIT 1",
+  );
+  const abortRowDeadline = Date.now() + 10_000;
+  let abortRow;
+  while (abortRow?.status_reason !== "call_aborted" && Date.now() < abortRowDeadline) {
+    const persisted = abortQuery.get("opencode", executionContext.sessionID);
+    abortRow = persisted && {
+      task_id: persisted.task_id,
+      status: persisted.status,
+      status_reason: JSON.parse(persisted.metadata).status_reason,
+    };
+    if (abortRow?.status_reason !== "call_aborted") yield* Effect.sleep(100);
+  }
+  database.close();
+  appendFileSync(marker, "bash-abort-row:" + JSON.stringify(abortRow) + "\\n");
+  if (abortRow?.status !== "killed" || abortRow.status_reason !== "call_aborted") {
+    throw new Error("Rust task row did not record call_aborted: " + JSON.stringify(abortRow));
+  }
+  let promptLines = [];
+  const backgroundResult = yield* bash.execute(
+    { command: "pwd", background: true, description: "wake probe" },
+    { ...executionContext, messageID: "message-background", id: "bash-background" },
+  );
+  appendFileSync(marker, "background-start:" + backgroundResult.content + "\\n");
+  const wakeDeadline = Date.now() + 45_000;
+  while (promptLines.length < 1 && Date.now() < wakeDeadline) {
+    promptLines = readFileSync(marker, "utf8").split(/\\r?\\n/).filter((line) => line.startsWith("session-prompt:"));
+    if (promptLines.length < 1) yield* Effect.sleep(100);
+  }
+  yield* Effect.sleep(250);
+  promptLines = readFileSync(marker, "utf8").split(/\\r?\\n/).filter((line) => line.startsWith("session-prompt:"));
+  if (promptLines.length !== 1) {
+    throw new Error("background completion did not deliver exactly one wake: " + JSON.stringify(promptLines));
+  }
+
   const topology = getBridgeLifecycleTopology();
   appendFileSync(marker, "topology-reload:" + JSON.stringify(topology) + "\\n");
   if (topology.daemonProcesses !== 1 || topology.routes !== 1 || topology.locations !== 1) {
@@ -948,7 +1023,7 @@ export default { id: original.id, effect, setup };
       semantic_search: false,
       tool_surface: "all",
       hoist_builtin_tools: true,
-      bash: false,
+      bash: true,
       lsp: { auto_install: false },
     });
     const manifestPath = join(packageRoot, "package.json");
@@ -985,6 +1060,11 @@ export default { id: original.id, effect };
     console.log(`[v2-lifecycle-host-transcript]\n${transcript}`);
     expect(transcript).toContain("[load-matrix-host:v2-lifecycle]");
     const events = await readFile(marker, "utf8");
+    const abortEvidence = events
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("bash-abort-exit:") || line.startsWith("bash-abort-row:"));
+    console.log(`[v2-abort-evidence]\n${abortEvidence.join("\n")}`);
+    expect(abortEvidence).toHaveLength(2);
     expect(events.match(/effect-init/g)).toHaveLength(3);
     expect(events.match(/effect-dispose/g)).toHaveLength(3);
     expect(events).toContain(
@@ -1002,6 +1082,11 @@ export default { id: original.id, effect };
     expect(events).toContain("rpc-call:0:lifecycle-0");
     expect(events).toContain("rpc-call:1:lifecycle-1");
     expect(events).toContain("rpc-reload-event:indexProgress");
+    expect(events).toContain('bash-abort-exit:{"_id":"Exit","_tag":"Failure"');
+    expect(events).toContain('bash-abort-row:{"task_id":"bash-');
+    expect(events).toContain('"status":"killed"');
+    expect(events).toContain('"status_reason":"call_aborted"');
+    expect(events.match(/session-prompt:/g)).toHaveLength(1);
     expect(events).toContain(
       'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
     );

@@ -14,6 +14,7 @@ import {
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
+import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
   buildAftToolDefinitions,
   openCodeHashlineEffective,
@@ -27,6 +28,7 @@ const defaults = {
   registerRpc: registerAftRpc,
   toolConsumers: (context) => ({
     ...hoistedV2ToolConsumers(context),
+    ...createV2RuntimeConsumer(context),
   }),
   acquireBridge,
   loadConfig: loadAftConfig,
@@ -50,10 +52,14 @@ async function bootLocation(context, location, dependencies) {
   });
   const binaryPath = await dependencies.resolveBinary(dependencies.resolveVersion());
   const canonicalDirectory = location.project?.canonical ?? directory;
+  const consumers = dependencies.toolConsumers(context);
   const pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
     binaryPath,
-    poolOptions: dependencies.resolvePoolOptions(config),
+    poolOptions: {
+      ...dependencies.resolvePoolOptions(config),
+      ...consumers.bridgeOptions,
+    },
     configOverrides,
     subcConnectionFile: config.subc?.connection_file,
   });
@@ -67,7 +73,7 @@ async function bootLocation(context, location, dependencies) {
       projectRoot === directory ? true : dependencies.loadConfig(projectRoot).enabled !== false,
   };
   const tools = dependencies.buildToolMap(toolContext, config);
-  return { pool, tools };
+  return { consumers, pool, tools };
 }
 
 export function makeServerEffect(overrides = {}) {
@@ -83,7 +89,10 @@ export function makeServerEffect(overrides = {}) {
       if (!runtime) return;
 
       yield* Effect.addFinalizer(() =>
-        Effect.promise(() => dependencies.releaseBridge(runtime.pool)),
+        Effect.promise(async () => {
+          runtime.consumers.dispose?.();
+          await dependencies.releaseBridge(runtime.pool);
+        }),
       );
       const rpc = yield* Effect.promise(() =>
         dependencies.registerRpc(context, location, runtime.pool),
@@ -93,7 +102,7 @@ export function makeServerEffect(overrides = {}) {
         context,
         location,
         runtime.tools,
-        dependencies.toolConsumers(context),
+        runtime.consumers,
       );
     });
   };

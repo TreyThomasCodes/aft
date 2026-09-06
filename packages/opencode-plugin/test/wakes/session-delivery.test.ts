@@ -1,0 +1,217 @@
+import { describe, expect, test } from "bun:test";
+import { Effect } from "effect";
+
+import { createV2RuntimeConsumer } from "../../src/wakes/runtime-consumer.js";
+import {
+  V2SessionDelivery,
+  type V2SessionPromptInput,
+  type V2SessionSyntheticInput,
+} from "../../src/wakes/session-delivery.js";
+
+function recordingSession() {
+  const prompts: V2SessionPromptInput[] = [];
+  const synthetic: V2SessionSyntheticInput[] = [];
+  const modelHistory: string[] = [];
+  return {
+    prompts,
+    synthetic,
+    modelHistory,
+    session: {
+      prompt: (input: V2SessionPromptInput) =>
+        Effect.sync(() => {
+          prompts.push(input);
+          modelHistory.push(input.text);
+          return { id: "wake-1" };
+        }),
+      synthetic: (input: V2SessionSyntheticInput) =>
+        Effect.sync(() => {
+          synthetic.push(input);
+          return { id: "status-1" };
+        }),
+    },
+  };
+}
+
+describe("V2 session delivery", () => {
+  test("admits one steer wake per completed task and uses the default resume behavior", async () => {
+    const host = recordingSession();
+    const delivery = new V2SessionDelivery(host.session);
+    const wake = {
+      sessionID: "session-v2",
+      taskIDs: ["bash-aborted-then-completed"],
+      text: "[BACKGROUND BASH COMPLETED] bash-aborted-then-completed",
+    };
+    const startedAt = Date.now();
+
+    await Effect.runPromise(delivery.completion(wake));
+    await Effect.runPromise(delivery.completion(wake));
+
+    expect(Date.now() - startedAt).toBeLessThan(45_000);
+    expect(host.prompts).toEqual([
+      {
+        sessionID: "session-v2",
+        text: wake.text,
+        delivery: "steer",
+        metadata: { task_ids: ["bash-aborted-then-completed"] },
+      },
+    ]);
+    expect(host.prompts[0]).not.toHaveProperty("resume");
+    expect(host.synthetic).toEqual([]);
+  });
+
+  test("records status-only updates as non-resuming synthetic entries", async () => {
+    const host = recordingSession();
+    const delivery = new V2SessionDelivery(host.session);
+
+    await Effect.runPromise(
+      delivery.status({
+        sessionID: "session-v2",
+        text: "AFT index is ready",
+        description: "AFT status",
+        metadata: { phase: "ready" },
+      }),
+    );
+
+    expect(host.prompts).toEqual([]);
+    expect(host.modelHistory).toEqual([]);
+    expect(host.synthetic).toEqual([
+      {
+        sessionID: "session-v2",
+        text: "AFT index is ready",
+        description: "AFT status",
+        metadata: { phase: "ready" },
+        resume: false,
+      },
+    ]);
+  });
+
+  test("delivers and acknowledges an idle bridge completion exactly once", async () => {
+    const host = recordingSession();
+    const consumer = createV2RuntimeConsumer({
+      location: { directory: "/work/project", project: { canonical: "/work/project" } },
+      session: host.session,
+    });
+    const sends: Array<{ command: string; params: unknown }> = [];
+    const bridge = {
+      getCwd: () => "/work/project",
+      send: async (command: string, params: unknown) => {
+        sends.push({ command, params });
+        return { success: true };
+      },
+    };
+    const completion = {
+      type: "bash_completed" as const,
+      session_id: "session-v2",
+      task_id: "bash-1",
+      status: "completed",
+      exit_code: 0,
+      command: "sleep 1",
+      output_preview: "done",
+    };
+
+    const execution = consumer.executeBash?.({
+      name: "bash",
+      input: { command: "sleep 1", background: true },
+      context: {
+        sessionID: "session-v2",
+        directory: "/work/project",
+        worktree: "/work/project",
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: async () => {},
+        progress: () => Effect.succeed(undefined),
+      },
+      definition: {
+        description: "background bash",
+        args: {},
+        execute: async () => "bash-1",
+      },
+    });
+    await execution;
+    await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
+    await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
+
+    expect(host.prompts).toHaveLength(1);
+    expect(host.prompts[0]).toMatchObject({
+      sessionID: "session-v2",
+      delivery: "steer",
+      metadata: {
+        source: "aft",
+        kind: "bash_completion",
+        task_ids: ["bash-1"],
+      },
+    });
+    expect(sends).toEqual([
+      {
+        command: "bash_ack_completions",
+        params: { session_id: "session-v2", task_ids: ["bash-1"] },
+      },
+    ]);
+    consumer.dispose();
+  });
+
+  test("routes long-running status through synthetic without waking the model", async () => {
+    const host = recordingSession();
+    const consumer = createV2RuntimeConsumer({
+      location: { directory: "/work/project", project: { canonical: "/work/project" } },
+      session: host.session,
+    });
+    await consumer.executeBash?.({
+      name: "bash",
+      input: { command: "sleep 60", background: true },
+      context: {
+        sessionID: "session-v2",
+        directory: "/work/project",
+        worktree: "/work/project",
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: async () => {},
+        progress: () => Effect.succeed(undefined),
+      },
+      definition: {
+        description: "background bash",
+        args: {},
+        execute: async () => "bash-1",
+      },
+    });
+
+    await consumer.bridgeOptions.onBashLongRunning?.(
+      {
+        type: "bash_long_running",
+        session_id: "session-v2",
+        task_id: "bash-1",
+        command: "sleep 60",
+        elapsed_ms: 45_000,
+      },
+      { getCwd: () => "/work/project" } as never,
+    );
+
+    expect(host.prompts).toEqual([]);
+    expect(host.modelHistory).toEqual([]);
+    expect(host.synthetic).toHaveLength(1);
+    expect(host.synthetic[0]).toMatchObject({
+      sessionID: "session-v2",
+      resume: false,
+      metadata: { source: "aft", kind: "bash_long_running", task_id: "bash-1" },
+    });
+    consumer.dispose();
+  });
+
+  test("does not admit a wake or status update after disposal begins", async () => {
+    const host = recordingSession();
+    const delivery = new V2SessionDelivery(host.session);
+    delivery.dispose();
+
+    await Effect.runPromise(
+      delivery.completion({
+        sessionID: "session-v2",
+        taskIDs: ["bash-1"],
+        text: "completed",
+      }),
+    );
+    await Effect.runPromise(delivery.status({ sessionID: "session-v2", text: "still indexing" }));
+
+    expect(host.prompts).toEqual([]);
+    expect(host.synthetic).toEqual([]);
+  });
+});

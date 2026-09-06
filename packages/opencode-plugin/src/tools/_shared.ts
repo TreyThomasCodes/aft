@@ -97,6 +97,8 @@ export interface ToolRuntime {
   directory: string;
   /** Opaque OpenCode session identifier. Missing in CLI tests / some hosts. */
   sessionID?: string;
+  /** Effect-owned cancellation is explicit so V1 ToolContext signals remain unchanged. */
+  effectAbort?: AbortSignal;
 }
 
 /**
@@ -258,6 +260,7 @@ export async function callBridge(
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
+    ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
     ...options,
   };
   markBridgeStart();
@@ -304,6 +307,7 @@ export async function callToolCall(
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
+    ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
     ...options,
   };
   markBridgeStart();
@@ -340,6 +344,10 @@ export async function callBashBridge(
   return await callBridge(ctx, runtime, command, params, {
     transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS,
     ...options,
+    // Bash execution maps Effect interruption to bash_abort_inflight instead of
+    // generic cancel_request. Both the bash request and its abort RPC omit the
+    // Effect signal so that the abort RPC can still reach Rust after interruption.
+    ...(command === "bash" || command === "bash_abort_inflight" ? { abortSignal: undefined } : {}),
     keepBridgeOnTimeout: true,
   });
 }
