@@ -750,7 +750,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   let promptLines = [];
   const backgroundResult = yield* bash.execute(
-    { command: "pwd", background: true, description: "wake probe" },
+    { command: "sleep 1", background: true, description: "idle sleeper wake probe" },
     { ...executionContext, messageID: "message-background", id: "bash-background" },
   );
   appendFileSync(marker, "background-start:" + backgroundResult.content + "\\n");
@@ -764,6 +764,11 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   if (promptLines.length !== 1) {
     throw new Error("background completion did not deliver exactly one wake: " + JSON.stringify(promptLines));
   }
+  const wakePrompt = JSON.parse(promptLines[0].slice("session-prompt:".length));
+  if (wakePrompt.delivery !== "steer") {
+    throw new Error("background completion did not use steer delivery: " + JSON.stringify(wakePrompt));
+  }
+  appendFileSync(marker, "idle-sleeper-wake:" + JSON.stringify(wakePrompt) + "\\n");
 
   const topology = getBridgeLifecycleTopology();
   appendFileSync(marker, "topology-reload:" + JSON.stringify(topology) + "\\n");
@@ -1060,11 +1065,15 @@ export default { id: original.id, effect };
     console.log(`[v2-lifecycle-host-transcript]\n${transcript}`);
     expect(transcript).toContain("[load-matrix-host:v2-lifecycle]");
     const events = await readFile(marker, "utf8");
-    const abortEvidence = events
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith("bash-abort-exit:") || line.startsWith("bash-abort-row:"));
+    const evidence = events.split(/\r?\n/);
+    const abortEvidence = evidence.filter(
+      (line) => line.startsWith("bash-abort-exit:") || line.startsWith("bash-abort-row:"),
+    );
+    const wakeEvidence = evidence.filter((line) => line.startsWith("idle-sleeper-wake:"));
     console.log(`[v2-abort-evidence]\n${abortEvidence.join("\n")}`);
+    console.log(`[v2-wake-evidence]\n${wakeEvidence.join("\n")}`);
     expect(abortEvidence).toHaveLength(2);
+    expect(wakeEvidence).toHaveLength(1);
     expect(events.match(/effect-init/g)).toHaveLength(3);
     expect(events.match(/effect-dispose/g)).toHaveLength(3);
     expect(events).toContain(
@@ -1087,6 +1096,8 @@ export default { id: original.id, effect };
     expect(events).toContain('"status":"killed"');
     expect(events).toContain('"status_reason":"call_aborted"');
     expect(events.match(/session-prompt:/g)).toHaveLength(1);
+    expect(wakeEvidence[0]).toContain('"sessionID":"lifecycle-reload"');
+    expect(wakeEvidence[0]).toContain('"delivery":"steer"');
     expect(events).toContain(
       'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
     );
