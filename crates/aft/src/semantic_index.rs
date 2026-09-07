@@ -4596,6 +4596,7 @@ fn build_embed_text_with_lines(
 
     let kind_label = match &symbol.kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -4799,6 +4800,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "cxx"
                 | "hpp"
                 | "hh"
+                | "cu"
+                | "cuh"
                 | "zig"
                 | "cs"
                 | "sh"
@@ -5152,6 +5155,7 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
         SymbolKind::Variable => 7,
         SymbolKind::Heading => 8,
         SymbolKind::FileSummary => 9,
+        SymbolKind::Kernel => 10,
     }
 }
 
@@ -5167,6 +5171,7 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         7 => SymbolKind::Variable,
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
+        10 => SymbolKind::Kernel,
         _ => SymbolKind::Heading,
     }
 }
@@ -7037,6 +7042,36 @@ Connection: close
         let snippet = build_snippet(&symbol, source);
 
         assert_eq!(snippet, "export const answer = 42;");
+    }
+
+    #[test]
+    fn cuda_chunk_collection_uses_function_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("sample.cu");
+        let source = include_str!("../tests/fixtures/sample.cu");
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Cuda,
+            source,
+        )
+        .expect("collect CUDA chunks");
+
+        let kernel = chunks
+            .iter()
+            .find(|chunk| chunk.name == "transform")
+            .expect("kernel chunk");
+        assert_eq!(kernel.kind, SymbolKind::Kernel);
+        assert_eq!((kernel.start_line, kernel.end_line), (4, 7));
+        assert!(kernel.snippet.contains("scale(data[index])"));
+        assert!(!kernel.snippet.contains("launch_transform"));
+
+        let host = chunks
+            .iter()
+            .find(|chunk| chunk.name == "launch_transform")
+            .expect("host function chunk");
+        assert_eq!((host.start_line, host.end_line), (9, 11));
+        assert!(host.snippet.contains("transform<<<grid, block>>>(data)"));
     }
 
     #[test]

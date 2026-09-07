@@ -7,7 +7,7 @@ use aft::semantic_index::is_semantic_indexed_extension;
 fn semantic_extension_policy_stays_in_sync_with_parser_code_arms() {
     let code_extensions = [
         "ts", "tsx", "js", "jsx", "py", "rs", "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
-        "zig", "cs", "sh", "bash", "zsh", "sol", "vue", "pas", "pp", "dpr", "dpk", "lpr", "java",
+        "cu", "cuh", "zig", "cs", "sh", "bash", "zsh", "sol", "vue", "pas", "pp", "dpr", "dpk", "lpr", "java",
         "kt", "kts", "rb", "swift", "scala", "sc", "lua", "pl", "pm", "t", "r", "R", "m", "mm",
         "toml",
     ];

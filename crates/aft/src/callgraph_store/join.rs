@@ -461,6 +461,7 @@ fn language_id(language: &str) -> Option<LangId> {
         "go" => LangId::Go,
         "c" => LangId::C,
         "cpp" => LangId::Cpp,
+        "cuda" => LangId::Cuda,
         "zig" => LangId::Zig,
         "csharp" => LangId::CSharp,
         "bash" => LangId::Bash,
@@ -739,6 +740,7 @@ fn line_for_byte(source: &str, byte_start: usize) -> u32 {
 fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",

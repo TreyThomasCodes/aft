@@ -2738,7 +2738,7 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool {
         self.file_index(file)
             .and_then(|index| index.node_kind_by_id.get(node_id).cloned())
-            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "kernel" | "method"))
     }
 
     fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
@@ -10876,7 +10876,7 @@ impl<'a> ProjectIndex<'a> {
         self.files
             .get(rel_path)
             .and_then(|file| file.node_kind_by_id.get(node_id))
-            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "kernel" | "method"))
     }
 }
 
@@ -11938,7 +11938,7 @@ fn load_name_match_candidates(
          FROM nodes n JOIN files f ON f.path = n.file_path
          WHERE n.name = ?1
            AND f.lang = ?2
-           AND n.kind IN ('method', 'function')
+           AND n.kind IN ('method', 'function', 'kernel')
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col, n.id",
     )?;
     let rows = stmt.query_map(params![method_name, lang], |row| {
@@ -14400,6 +14400,7 @@ fn import_kind_label(kind: ImportKind) -> &'static str {
 fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -14433,6 +14434,7 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -14469,6 +14471,7 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "go" => Some(LangId::Go),
         "c" => Some(LangId::C),
         "cpp" => Some(LangId::Cpp),
+        "cuda" => Some(LangId::Cuda),
         "zig" => Some(LangId::Zig),
         "csharp" => Some(LangId::CSharp),
         "bash" => Some(LangId::Bash),

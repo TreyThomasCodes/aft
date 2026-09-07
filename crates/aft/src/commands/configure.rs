@@ -1174,6 +1174,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -1331,6 +1332,7 @@ fn formatter_candidates(
         }
         LangId::C
         | LangId::Cpp
+        | LangId::Cuda
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -1403,6 +1405,7 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         }
         LangId::C
         | LangId::Cpp
+        | LangId::Cuda
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash

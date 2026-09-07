@@ -47,7 +47,12 @@ impl IndentStyle {
             | LangId::Toml => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
-            LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {
+            LangId::C
+            | LangId::Cpp
+            | LangId::Cuda
+            | LangId::Zig
+            | LangId::CSharp
+            | LangId::Bash => {
                 IndentStyle::Spaces(4)
             }
             LangId::Solidity

@@ -1449,6 +1449,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",

@@ -666,6 +666,7 @@ pub enum LangId {
     Go,
     C,
     Cpp,
+    Cuda,
     Zig,
     CSharp,
     Bash,
@@ -707,6 +708,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "go" => Some(LangId::Go),
         "c" | "h" => Some(LangId::C),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(LangId::Cpp),
+        "cu" | "cuh" => Some(LangId::Cuda),
         "zig" => Some(LangId::Zig),
         "cs" => Some(LangId::CSharp),
         "sh" | "bash" | "zsh" => Some(LangId::Bash),
@@ -745,6 +747,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Go => tree_sitter_go::LANGUAGE.into(),
         LangId::C => tree_sitter_c::LANGUAGE.into(),
         LangId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        LangId::Cuda => tree_sitter_cuda::LANGUAGE.into(),
         LangId::Zig => tree_sitter_zig::LANGUAGE.into(),
         LangId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         LangId::Bash => tree_sitter_bash::LANGUAGE.into(),
@@ -780,7 +783,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Rust => None,
         LangId::Go => Some(GO_QUERY),
         LangId::C => Some(C_QUERY),
-        LangId::Cpp => Some(CPP_QUERY),
+        LangId::Cpp | LangId::Cuda => Some(CPP_QUERY),
         LangId::Zig => Some(ZIG_QUERY),
         LangId::CSharp => Some(CSHARP_QUERY),
         LangId::Bash => Some(BASH_QUERY),
@@ -820,6 +823,8 @@ static GO_QUERY_CACHE: LazyLock<Result<Query, String>> =
 static C_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::C));
 static CPP_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Cpp));
+static CUDA_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Cuda));
 static ZIG_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Zig));
 static CSHARP_QUERY_CACHE: LazyLock<Result<Query, String>> =
@@ -870,6 +875,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Go => Some(&*GO_QUERY_CACHE),
         LangId::C => Some(&*C_QUERY_CACHE),
         LangId::Cpp => Some(&*CPP_QUERY_CACHE),
+        LangId::Cuda => Some(&*CUDA_QUERY_CACHE),
         LangId::Zig => Some(&*ZIG_QUERY_CACHE),
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
@@ -1678,7 +1684,7 @@ pub fn extract_symbols_from_tree(
         LangId::Python => extract_py_symbols(source, &root, query),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
-        LangId::Cpp => extract_cpp_symbols(source, &root, query),
+        LangId::Cpp | LangId::Cuda => extract_cpp_symbols(source, &root, query, lang),
         LangId::Zig => extract_zig_symbols(source, &root, query),
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
@@ -1782,6 +1788,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             LangId::Go
             | LangId::C
             | LangId::Cpp
+            | LangId::Cuda
             | LangId::ObjC
             | LangId::Zig
             | LangId::CSharp
@@ -3424,9 +3431,25 @@ fn extract_c_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sym
     Ok(symbols)
 }
 
+fn cpp_function_kind(source: &str, definition: &Node, lang: LangId) -> SymbolKind {
+    let is_cuda_kernel = lang == LangId::Cuda
+        && node_text(source, definition)
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .any(|token| token == "__global__");
+    if is_cuda_kernel {
+        SymbolKind::Kernel
+    } else {
+        SymbolKind::Function
+    }
+}
+
 /// Extract symbols from C++ source.
-fn extract_cpp_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
-    let lang = LangId::Cpp;
+fn extract_cpp_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+    lang: LangId,
+) -> Result<Vec<Symbol>, AftError> {
     let capture_names = query.capture_names();
 
     let mut type_names = HashSet::new();
@@ -3537,7 +3560,7 @@ fn extract_cpp_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
                 let scope_chain = cpp_parent_scope_chain(&def_node, source);
                 symbols.push(Symbol {
                     name: node_text(source, &name_node).to_string(),
-                    kind: SymbolKind::Function,
+                    kind: cpp_function_kind(source, &def_node, lang),
                     range: node_range_with_decorators(&def_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: scope_chain.clone(),

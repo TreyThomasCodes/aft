@@ -3351,6 +3351,7 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
     match strength {
         SemanticKindPriorStrength::NaturalLanguage => match kind {
             SymbolKind::Function
+            | SymbolKind::Kernel
             | SymbolKind::Class
             | SymbolKind::Method
             | SymbolKind::Struct
@@ -3363,6 +3364,7 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
         },
         SemanticKindPriorStrength::Mixed => match kind {
             SymbolKind::Function
+            | SymbolKind::Kernel
             | SymbolKind::Class
             | SymbolKind::Method
             | SymbolKind::Struct
@@ -4496,6 +4498,7 @@ fn display_line_number(line: u32) -> u32 {
 fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",

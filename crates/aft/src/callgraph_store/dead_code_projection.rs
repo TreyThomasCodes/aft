@@ -440,6 +440,7 @@ struct EntryPointSymbolRow {
 fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
     match label {
         "function" => Some(SymbolKind::Function),
+        "kernel" => Some(SymbolKind::Kernel),
         "class" => Some(SymbolKind::Class),
         "method" => Some(SymbolKind::Method),
         "struct" => Some(SymbolKind::Struct),

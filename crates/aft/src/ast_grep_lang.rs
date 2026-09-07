@@ -24,6 +24,7 @@ pub enum AstGrepLang {
     Go,
     C,
     Cpp,
+    Cuda,
     Zig,
     CSharp,
     Solidity,
@@ -104,6 +105,7 @@ impl AstGrepLang {
             "go" | "golang" => Some(Self::Go),
             "c" => Some(Self::C),
             "cpp" | "c++" | "cplusplus" => Some(Self::Cpp),
+            "cuda" | "cu" => Some(Self::Cuda),
             "zig" => Some(Self::Zig),
             "csharp" | "c#" | "cs" => Some(Self::CSharp),
             "solidity" | "sol" => Some(Self::Solidity),
@@ -159,6 +161,7 @@ impl AstGrepLang {
             Self::Go => &["go"],
             Self::C => &["c", "h"],
             Self::Cpp => &["cc", "cpp", "cxx", "hpp", "hh"],
+            Self::Cuda => &["cu", "cuh"],
             Self::Zig => &["zig"],
             Self::CSharp => &["cs"],
             Self::Solidity => &["sol"],
@@ -324,6 +327,7 @@ impl Language for AstGrepLang {
             | Self::Rust
             | Self::C
             | Self::Cpp
+            | Self::Cuda
             | Self::Zig
             | Self::CSharp
             | Self::Java
@@ -355,6 +359,7 @@ impl LanguageExt for AstGrepLang {
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
@@ -468,6 +473,11 @@ mod tests {
     #[test]
     fn test_new_language_ast_grep_pattern_probes() {
         let probes = [
+            (
+                AstGrepLang::Cuda,
+                "__global__ void transform(float *data) { data[0] = 1.0f; }",
+                "__global__ void transform(float *data) { data[0] = 1.0f; }",
+            ),
             (
                 AstGrepLang::Java,
                 "class Greeter { String greet(String who) { return who; } }",
