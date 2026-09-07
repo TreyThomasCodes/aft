@@ -764,7 +764,7 @@ fn allocator_memory_snapshot_impl() -> AllocatorMemorySnapshot {
 fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
     #[cfg(test)]
     {
-        ALLOCATOR_SNAPSHOT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        THREAD_ALLOCATOR_SNAPSHOT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let name = std::thread::current()
             .name()
             .unwrap_or("unnamed")
@@ -875,15 +875,23 @@ static LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
-static ALLOCATOR_SNAPSHOT_CALLS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
 static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+thread_local! {
+    /// Per-thread count of allocator statistics walks. Tests that assert a
+    /// synchronous render path took no walk read this: the walk, if it
+    /// happened, ran on the calling thread. A process-global counter is
+    /// wrong for that assertion - sibling tests and the health thread walk
+    /// concurrently, and a parallel run read a delta of 1 for a render that
+    /// walked nothing. Which-thread questions use the thread-name log.
+    static THREAD_ALLOCATOR_SNAPSHOT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 pub(crate) fn allocator_snapshot_calls_for_test() -> u64 {
-    ALLOCATOR_SNAPSHOT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    THREAD_ALLOCATOR_SNAPSHOT_CALLS.with(|calls| calls.get())
 }
 
 #[cfg(test)]
@@ -1359,7 +1367,6 @@ mod tests {
             .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
         LAST_ALLOCATOR_SLACK_RELIEF_AT_MS
             .store(UNSAMPLED_AT_MS, std::sync::atomic::Ordering::Release);
-        ALLOCATOR_SNAPSHOT_CALLS.store(0, std::sync::atomic::Ordering::Release);
         ALLOCATOR_SNAPSHOT_THREADS
             .lock()
             .expect("clear allocator snapshot thread log")
