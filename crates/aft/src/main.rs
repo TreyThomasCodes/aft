@@ -2600,8 +2600,22 @@ mod watcher_filter_tests {
     fn callgraph_watcher_gate_covers_all_indexed_languages() {
         use std::path::Path;
         for ok in [
-            "Foo.java", "x.cpp", "y.c", "Svc.cs", "m.kt", "a.rb", "z.php", "s.scala", "C.sol",
-            "app.ts", "main.rs", "h.go", "p.py",
+            "Foo.java",
+            "x.cpp",
+            "kernel.cu",
+            "shader.metal",
+            "y.c",
+            "Svc.cs",
+            "m.kt",
+            "a.rb",
+            "z.php",
+            "s.scala",
+            "C.sol",
+            "app.ts",
+            "main.rs",
+            "h.go",
+            "p.py",
+            "config.toml",
         ] {
             assert!(
                 watcher_path_is_callgraph_indexed(Path::new(ok)),
@@ -2609,15 +2623,9 @@ mod watcher_filter_tests {
             );
         }
         // Genuinely-undetected extensions (detect_language → None). Note md/json/
-        // yaml ARE detected (the store walks them at cold-build), so matching
+        // yaml/toml ARE detected (the store walks them at cold-build), so matching
         // cold-build means they refresh too — refresh coverage == index coverage.
-        for skip in [
-            "notes.txt",
-            "image.png",
-            "Cargo.lock",
-            "data.csv",
-            "config.toml",
-        ] {
+        for skip in ["notes.txt", "image.png", "Cargo.lock", "data.csv"] {
             assert!(
                 !watcher_path_is_callgraph_indexed(Path::new(skip)),
                 "{skip} should not be callgraph-indexed"

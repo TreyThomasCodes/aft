@@ -53,9 +53,7 @@ impl IndentStyle {
             | LangId::Metal
             | LangId::Zig
             | LangId::CSharp
-            | LangId::Bash => {
-                IndentStyle::Spaces(4)
-            }
+            | LangId::Bash => IndentStyle::Spaces(4),
             LangId::Solidity
             | LangId::ObjC
             | LangId::Java

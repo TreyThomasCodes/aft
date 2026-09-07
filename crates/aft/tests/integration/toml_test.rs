@@ -29,7 +29,8 @@ fn toml_extension_and_workspace_manifest_symbols_are_supported() {
         .any(|symbol| symbol.name == "name" && symbol.parent.as_deref() == Some("package")));
     assert!(symbols
         .iter()
-        .any(|symbol| symbol.name == "dependencies" && symbol.range.end_line > symbol.range.start_line));
+        .any(|symbol| symbol.name == "dependencies"
+            && symbol.range.end_line > symbol.range.start_line));
 }
 
 #[test]

@@ -7116,7 +7116,7 @@ Connection: close
             crate::parser::LangId::Toml,
             source,
         )
-            .expect("collect TOML chunks");
+        .expect("collect TOML chunks");
 
         let package = chunks
             .iter()

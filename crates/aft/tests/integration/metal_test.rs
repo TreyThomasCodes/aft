@@ -66,7 +66,9 @@ fn metal_store_records_shader_to_helper_edge() {
 
     let store = CallGraphStore::open(root.join(".callgraph-store"), root.clone())
         .expect("open callgraph store");
-    store.cold_build(std::slice::from_ref(&file)).expect("build Metal callgraph");
+    store
+        .cold_build(std::slice::from_ref(&file))
+        .expect("build Metal callgraph");
 
     let response = response_json(callgraph_store_adapter::callers_result(
         &store, &file, "brighten", 1, true,
