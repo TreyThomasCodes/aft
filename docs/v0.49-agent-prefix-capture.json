@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+  "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -812,7 +812,7 @@
             }
           },
           "ast_grep_search": {
-            "description": "Search code patterns across filesystem using AST-aware matching. Supports 9 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+            "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -831,6 +831,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -887,6 +889,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -1061,7 +1065,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1780,7 +1784,7 @@
             }
           },
           "ast_grep_search": {
-            "description": "Search code patterns across filesystem using AST-aware matching. Supports 9 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+            "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1799,6 +1803,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -1855,6 +1861,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -2029,7 +2037,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2220,7 +2228,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3078,6 +3086,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -3143,6 +3153,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -3188,7 +3200,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3d2083aa4c992cadbfde5276b1ec9a67340c34f8",
+      "source_commit": "8d18c79c4231184da8e454e67e4b1b0d3c2e8ae3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -4117,6 +4129,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
@@ -4182,6 +4196,8 @@
                     "python",
                     "rust",
                     "go",
+                    "cuda",
+                    "metal",
                     "pascal",
                     "r",
                     "objc"
