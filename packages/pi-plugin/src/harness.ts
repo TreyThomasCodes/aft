@@ -62,7 +62,7 @@ export function detectPiHarness(api?: unknown): PiHarness {
     return testHarnessOverride;
   }
 
-  const target = api ?? recordedApi;
+  const target = api === undefined ? recordedApi : api;
   if (target && typeof target === "object") {
     const candidate = target as Record<string, unknown>;
     if (
