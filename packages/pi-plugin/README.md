@@ -1,6 +1,6 @@
 # @cortexkit/aft-pi
 
-**AFT (Agent File Tools) extension for the [Pi coding agent](https://github.com/badlogic/pi-mono)**
+**AFT (Agent File Tools) extension for the [Pi coding agent](https://github.com/badlogic/pi-mono) and [OMP (oh-my-pi)](https://omp.sh)**
 
 AFT is a high-performance file-manipulation toolkit for AI coding agents. It replaces Pi's built-in `read`, `write`, `edit`, and `grep` tools with an indexed Rust backend that adds trigram search, semantic search, fuzzy edits, auto-format, LSP diagnostics, call-graph navigation, and more — all backed by one warm long-running `aft` process per session.
 
@@ -91,6 +91,14 @@ All keys are optional. Example:
 
   // Disable specific tool names (applied after tool_surface selection).
   "disabled_tools": ["aft_move"],
+
+  // Pi / OMP harness options:
+  "pi": {
+    // "top_level" (default) | "host_default"
+    // On OMP, "top_level" registers tools with loadMode: "essential" so they appear
+    // directly in the model tools array. "host_default" mounts tools under xd://.
+    "tool_presentation": "top_level"
+  },
 
   "formatter": {
     "typescript": "biome",
