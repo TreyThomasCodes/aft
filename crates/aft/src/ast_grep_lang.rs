@@ -407,6 +407,8 @@ mod tests {
         assert_eq!(AstGrepLang::from_str("go"), Some(AstGrepLang::Go));
         assert_eq!(AstGrepLang::from_str("c"), Some(AstGrepLang::C));
         assert_eq!(AstGrepLang::from_str("cpp"), Some(AstGrepLang::Cpp));
+        assert_eq!(AstGrepLang::from_str("cuda"), Some(AstGrepLang::Cuda));
+        assert_eq!(AstGrepLang::from_str("metal"), Some(AstGrepLang::Metal));
         assert_eq!(AstGrepLang::from_str("zig"), Some(AstGrepLang::Zig));
         assert_eq!(AstGrepLang::from_str("c#"), Some(AstGrepLang::CSharp));
         assert_eq!(
