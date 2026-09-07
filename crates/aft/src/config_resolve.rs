@@ -1297,10 +1297,7 @@ fn merge_worktree_config(
     (!worktree.is_empty()).then_some(worktree)
 }
 
-fn merge_pi_config(
-    base: Option<RawPi>,
-    override_pi: Option<RawPi>,
-) -> Option<RawPi> {
+fn merge_pi_config(base: Option<RawPi>, override_pi: Option<RawPi>) -> Option<RawPi> {
     let Some(override_pi) = override_pi else {
         return base;
     };

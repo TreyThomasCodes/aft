@@ -285,7 +285,7 @@ pub fn format_response_with_context(
         "apply_patch" => format_apply_patch(data),
         "read" => format_read(data, ctx.agent_specified_range),
         "grep" => format_grep(data),
-        "glob" => data["text"].as_str().unwrap_or_default().to_string(),
+        "glob" => format_glob_response(data),
         "search" => format_search(data),
         "outline" => format_outline(response, ctx.outline_mode),
         "zoom" => format_zoom(data, ctx),
@@ -1207,50 +1207,93 @@ fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
 }
 
 // Mirrors packages/opencode-plugin/src/tools/search.ts formatGrepOutput.
+fn format_glob_response(data: &Value) -> String {
+    let base = data["text"].as_str().unwrap_or_default();
+    let envelope = data
+        .get("files_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+    if let Some(env) = envelope {
+        const GLOB_TRUNCATED_MESSAGE: &str =
+            "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)";
+        let clean = base
+            .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
+            .replace(GLOB_TRUNCATED_MESSAGE, "");
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            format!("{clean}\n\n{trailer}")
+        } else {
+            clean
+        }
+    } else {
+        base.to_string()
+    }
+}
+
 fn format_grep(data: &Value) -> String {
-    if let Some(text) = data.get("text").and_then(Value::as_str) {
-        return text.to_string();
-    }
+    let envelope = data
+        .get("matches_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
-    let matches = data
-        .get("matches")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let total_matches = data
-        .get("total_matches")
-        .and_then(Value::as_u64)
-        .unwrap_or(matches.len() as u64);
-    let files_with_matches = data
-        .get("files_with_matches")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| {
-            matches
+    let base = if let Some(text) = data.get("text").and_then(Value::as_str) {
+        if envelope.is_some() {
+            text.replace(" (capped)", "")
+        } else {
+            text.to_string()
+        }
+    } else {
+        let matches = data
+            .get("matches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total_matches = data
+            .get("total_matches")
+            .and_then(Value::as_u64)
+            .unwrap_or(matches.len() as u64);
+        let files_with_matches = data
+            .get("files_with_matches")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                matches
+                    .iter()
+                    .filter_map(|m| m.get("file").and_then(Value::as_str))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as u64
+            });
+
+        if matches.is_empty() {
+            format!("Found {total_matches} match across {files_with_matches} file")
+        } else {
+            let body = matches
                 .iter()
-                .filter_map(|m| m.get("file").and_then(Value::as_str))
-                .collect::<std::collections::BTreeSet<_>>()
-                .len() as u64
-        });
+                .map(|m| {
+                    let file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
+                    let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+                    let text = m
+                        .get("line_text")
+                        .or_else(|| m.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    format!("{file}:{line}: {text}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{body}\n\nFound {total_matches} match across {files_with_matches} file")
+        }
+    };
 
-    if matches.is_empty() {
-        return format!("Found {total_matches} match across {files_with_matches} file");
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            if base.is_empty() {
+                trailer
+            } else {
+                format!("{base}\n\n{trailer}")
+            }
+        } else {
+            base
+        }
+    } else {
+        base
     }
-
-    let body = matches
-        .iter()
-        .map(|m| {
-            let file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
-            let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
-            let text = m
-                .get("line_text")
-                .or_else(|| m.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            format!("{file}:{line}: {text}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{body}\n\nFound {total_matches} match across {files_with_matches} file")
 }
 
 fn format_ast_search(data: &Value) -> String {
@@ -1505,18 +1548,62 @@ fn js_template_string(value: &Value) -> String {
 
 // Mirrors packages/opencode-plugin/src/tools/semantic.ts semanticTools.
 fn format_search(data: &Value) -> String {
-    let note = extra_honesty_note(data);
-    if let Some(text) = data
+    let envelope = data
+        .get("results_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
+    let note = if envelope.is_some() {
+        search_status_only_note(data)
+    } else {
+        extra_honesty_note(data)
+    };
+
+    let base = if let Some(text) = data
         .get("text")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
-        return match note {
+        match note {
             Some(n) => format!("{text}\n{n}"),
             None => text.to_string(),
-        };
+        }
+    } else if envelope.is_some() {
+        match note {
+            Some(n) => format!("No results.\n{n}"),
+            None => "No results.".to_string(),
+        }
+    } else {
+        semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
+    };
+
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            if base.is_empty() {
+                trailer
+            } else {
+                format!("{base}\n\n{trailer}")
+            }
+        } else {
+            base
+        }
+    } else {
+        base
     }
-    semantic_honesty_note(data).unwrap_or_else(|| "No results.".to_string())
+}
+
+fn search_status_only_note(data: &Value) -> Option<String> {
+    let mut notes = Vec::new();
+    if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
+        notes.push("fully degraded");
+    }
+    if data.get("complete").and_then(Value::as_bool) == Some(false) {
+        notes.push("partial/incomplete");
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(format!("Search status: {}.", notes.join("; ")))
+    }
 }
 
 fn semantic_honesty_note(data: &Value) -> Option<String> {
@@ -1568,6 +1655,21 @@ fn format_outline(response: &Response, mode: OutlineMode) -> String {
 // Mirrors packages/opencode-plugin/src/tools/reading.ts formatOutlineFilesText.
 fn format_outline_files_text(data: &Value) -> String {
     let text = format_outline_text(data);
+    let envelope = data
+        .get("files_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            if text.is_empty() {
+                return trailer;
+            } else {
+                return format!("{text}\n\n{trailer}");
+            }
+        }
+        return text;
+    }
+
     let unchecked: Vec<String> = data
         .get("unchecked_files")
         .and_then(Value::as_array)
@@ -2299,15 +2401,28 @@ fn format_call_tree_sections(
     record: &serde_json::Map<String, Value>,
     include_unresolved: bool,
 ) -> Vec<String> {
+    let envelope = record
+        .get("tree_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
     let mut lines = Vec::new();
     render_call_tree_node(record, 0, &mut lines, include_unresolved);
-    let warning = depth_warning(record, "depth_limited", "truncated");
+    let warning = if envelope.is_some() {
+        String::new()
+    } else {
+        depth_warning(record, "depth_limited", "truncated")
+    };
     if !warning.is_empty() {
         lines.push(warning);
     }
     if lines.is_empty() {
         vec!["No call tree available.".to_string()]
     } else {
+        if let Some(env) = envelope {
+            if let Some(trailer) = render_envelope_trailer(&env) {
+                lines.push(trailer);
+            }
+        }
         lines
     }
 }
@@ -2406,9 +2521,21 @@ fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String 
 }
 
 fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let envelope = record
+        .get("callers_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
     let groups = records_field(record, "callers");
-    let warning = depth_warning(record, "depth_limited", "truncated");
-    let hub_summary = hub_summary_line(record);
+    let warning = if envelope.is_some() {
+        String::new()
+    } else {
+        depth_warning(record, "depth_limited", "truncated")
+    };
+    let hub_summary = if envelope.is_some() {
+        None
+    } else {
+        hub_summary_line(record)
+    };
     let total = number_field(record, "total_callers").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
@@ -2427,6 +2554,11 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     }
     for group in groups {
         sections.push(render_callers_group_lines(group).join("\n"));
+    }
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(trailer);
+        }
     }
     sections
 }
@@ -2507,9 +2639,21 @@ fn format_trace_to_symbol_sections(record: &serde_json::Map<String, Value>) -> V
 }
 
 fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let envelope = record
+        .get("paths_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
     let paths = records_field(record, "paths");
-    let warning = depth_warning(record, "max_depth_reached", "truncated_paths");
-    let hub_summary = hub_summary_line(record);
+    let warning = if envelope.is_some() {
+        String::new()
+    } else {
+        depth_warning(record, "max_depth_reached", "truncated_paths")
+    };
+    let hub_summary = if envelope.is_some() {
+        None
+    } else {
+        hub_summary_line(record)
+    };
     let total_paths = number_field(record, "total_paths").unwrap_or(paths.len() as i64);
     let total_paths_is_lower_bound = record
         .get("total_paths_is_lower_bound")
@@ -2543,6 +2687,11 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
         render_trace_path(path, index, &mut lines);
         sections.push(lines.join("\n"));
     }
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(trailer);
+        }
+    }
     sections
 }
 
@@ -2570,9 +2719,22 @@ fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines:
 }
 
 fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let envelope = record
+        .get("sites_list_envelope")
+        .or_else(|| record.get("callers_list_envelope"))
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
     let callers = records_field(record, "callers");
-    let warning = depth_warning(record, "depth_limited", "truncated");
-    let hub_summary = hub_summary_line(record);
+    let warning = if envelope.is_some() {
+        String::new()
+    } else {
+        depth_warning(record, "depth_limited", "truncated")
+    };
+    let hub_summary = if envelope.is_some() {
+        None
+    } else {
+        hub_summary_line(record)
+    };
     let total_affected = number_field(record, "total_affected").unwrap_or(callers.len() as i64);
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
@@ -2626,19 +2788,33 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         }
         sections.push(lines.join("\n"));
     }
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(trailer);
+        }
+    }
     sections
 }
 
 fn format_trace_data_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
+    let envelope = record
+        .get("hops_list_envelope")
+        .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
+
     let hops = records_field(record, "hops");
+    let depth_warning_text = if envelope.is_some() {
+        None
+    } else {
+        (record.get("depth_limited").and_then(Value::as_bool) == Some(true))
+            .then_some("(depth limited)".to_string())
+    };
     let mut sections = vec![join_non_empty(&[
         Some(format!(
             "{} hop{}",
             hops.len(),
             if hops.len() == 1 { "" } else { "s" }
         )),
-        (record.get("depth_limited").and_then(Value::as_bool) == Some(true))
-            .then_some("(depth limited)".to_string()),
+        depth_warning_text,
     ])];
     if hops.is_empty() {
         sections.push("No data-flow hops found.".to_string());
@@ -2659,6 +2835,11 @@ fn format_trace_data_sections(record: &serde_json::Map<String, Value>) -> Vec<St
             index,
             &format!("{variable} {flow_type} {symbol} [{file}:{line}]{approximate}{name_match}"),
         ));
+    }
+    if let Some(env) = envelope {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(trailer);
+        }
     }
     sections
 }
@@ -2744,6 +2925,80 @@ fn hub_summary_line(response: &serde_json::Map<String, Value>) -> Option<String>
         .and_then(Value::as_object)
         .and_then(|summary| string_field(summary, "message"))
         .map(str::to_string)
+}
+
+/// Single authorized call-site for `render_trailer` in the subc formatter (R13).
+fn render_envelope_trailer(envelope: &crate::list_envelope::ListEnvelope) -> Option<String> {
+    crate::list_envelope::render_trailer(envelope)
+}
+
+/// Count of rendered match rows in a grep response after applying display-only selectors (R24).
+pub fn rendered_grep_match_count(data: &Value) -> usize {
+    let matches = data.get("matches").and_then(Value::as_array);
+    let Some(matches) = matches else {
+        return 0;
+    };
+    let mut counts_by_file: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut file_order: Vec<String> = Vec::new();
+    for m in matches {
+        let file = m
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !counts_by_file.contains_key(&file) {
+            file_order.push(file.clone());
+        }
+        *counts_by_file.entry(file).or_default() += 1;
+    }
+    const MAX_DISPLAY_MATCHES: usize = 5;
+    file_order
+        .iter()
+        .map(|f| counts_by_file[f].min(MAX_DISPLAY_MATCHES))
+        .sum()
+}
+
+/// Count of rendered file rows in a glob response after applying display-only selectors (R24).
+pub fn rendered_glob_file_count(data: &Value) -> usize {
+    let files = data.get("files").and_then(Value::as_array);
+    let Some(files) = files else {
+        return 0;
+    };
+    const MAX_FLAT_FILES: usize = 20;
+    const MAX_DISPLAY_DIRECTORIES: usize = 6;
+    const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
+
+    if files.len() <= MAX_FLAT_FILES {
+        return files.len();
+    }
+    let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dir_order: Vec<String> = Vec::new();
+    for f in files {
+        let path_str = f.as_str().unwrap_or("");
+        let dir = std::path::Path::new(path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !dir_counts.contains_key(&dir) {
+            dir_order.push(dir.clone());
+        }
+        *dir_counts.entry(dir).or_default() += 1;
+    }
+    dir_order
+        .iter()
+        .take(MAX_DISPLAY_DIRECTORIES)
+        .map(|d| dir_counts[d].min(MAX_DISPLAY_FILES_PER_DIRECTORY))
+        .sum()
+}
+
+/// Generic rendered-row count reporting for list surfaces (R24).
+pub fn report_rendered_row_count(command: &str, data: &Value) -> Option<usize> {
+    match command {
+        "grep" => Some(rendered_grep_match_count(data)),
+        "glob" => Some(rendered_glob_file_count(data)),
+        _ => None,
+    }
 }
 
 fn join_non_empty(parts: &[Option<String>]) -> String {
