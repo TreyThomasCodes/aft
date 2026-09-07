@@ -1,0 +1,66 @@
+name: Beta-pin gate
+
+# Path-filtered gate: runs the full OpenCode V2 load and acceptance matrix
+# when matrix paths or version pins change.
+# Per branch-protection rules: paths-filtered jobs must never be a required check on main.
+
+on:
+  pull_request:
+    paths:
+      - "packages/opencode-plugin/test/matrix/**"
+      - "packages/opencode-plugin/test/load-matrix/**"
+      - ".github/opencode-version.txt"
+      - ".github/workflows/beta-pin-gate.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: beta-pin-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Load and acceptance matrix
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: beta-pin-gate
+          cache-on-failure: true
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build aft binary (load matrix probe requirement)
+        run: cargo build --bin aft
+
+      - name: Build bridge and plugin packages
+        run: |
+          bun run --cwd packages/aft-bridge build
+          bun run --cwd packages/opencode-plugin build
+
+      - name: Run load and acceptance matrix with isolated HOME and XDG roots
+        run: |
+          set -euo pipefail
+          ISOLATION="${{ runner.temp }}/beta-pin-isolation"
+          mkdir -p "$ISOLATION/home" "$ISOLATION/config" "$ISOLATION/data" "$ISOLATION/state" "$ISOLATION/cache"
+          export HOME="$ISOLATION/home"
+          export XDG_CONFIG_HOME="$ISOLATION/config"
+          export XDG_DATA_HOME="$ISOLATION/data"
+          export XDG_STATE_HOME="$ISOLATION/state"
+          export XDG_CACHE_HOME="$ISOLATION/cache"
+          export OPENCODE_FLAGS="--standalone"
+          export AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR=0
+          bun test ./packages/opencode-plugin/test/matrix/acceptance-matrix.test.ts ./packages/opencode-plugin/test/load-matrix/load-matrix.ts
