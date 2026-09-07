@@ -38,17 +38,23 @@ struct CallSite {
 }
 
 /// Finds all call sites of a function in `crates/aft/src/`.
+/// Registry file keys are written with `/` (`commands/grep.rs`); a Windows
+/// walk yields `\`, so the key is rebuilt from path components rather than
+/// taken from `display()`, which would never match an entry on that host.
+fn registry_file_key(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn find_call_sites(fn_name: &str, files: &[PathBuf]) -> Vec<CallSite> {
     let mut sites = Vec::new();
     let src_dir = aft_src_dir();
 
     for file in files {
         let content = fs::read_to_string(file).unwrap_or_default();
-        let rel_file = file
-            .strip_prefix(&src_dir)
-            .unwrap_or(file)
-            .display()
-            .to_string();
+        let rel_file = registry_file_key(file.strip_prefix(&src_dir).unwrap_or(file));
 
         let mut in_test_cfg = false;
         for (idx, line) in content.lines().enumerate() {
@@ -249,11 +255,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
             continue;
         }
         let content = fs::read_to_string(&file).unwrap_or_default();
-        let rel_path = file
-            .strip_prefix(&src_dir)
-            .unwrap_or(&file)
-            .display()
-            .to_string();
+        let rel_path = registry_file_key(file.strip_prefix(&src_dir).unwrap_or(&file));
 
         let raw_lines: Vec<&str> = content.lines().collect();
 
