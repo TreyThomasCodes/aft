@@ -235,7 +235,7 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
             function_nodes: &["function_definition"],
             decisions: C_LIKE,
         },
-        LangId::Cpp | LangId::Cuda => LanguageSpec {
+        LangId::Cpp | LangId::Cuda | LangId::Metal => LanguageSpec {
             function_nodes: &["function_definition", "lambda_expression"],
             decisions: C_LIKE,
         },

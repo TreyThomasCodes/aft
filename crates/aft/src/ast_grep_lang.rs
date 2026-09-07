@@ -25,6 +25,7 @@ pub enum AstGrepLang {
     C,
     Cpp,
     Cuda,
+    Metal,
     Zig,
     CSharp,
     Solidity,
@@ -106,6 +107,7 @@ impl AstGrepLang {
             "c" => Some(Self::C),
             "cpp" | "c++" | "cplusplus" => Some(Self::Cpp),
             "cuda" | "cu" => Some(Self::Cuda),
+            "metal" => Some(Self::Metal),
             "zig" => Some(Self::Zig),
             "csharp" | "c#" | "cs" => Some(Self::CSharp),
             "solidity" | "sol" => Some(Self::Solidity),
@@ -162,6 +164,7 @@ impl AstGrepLang {
             Self::C => &["c", "h"],
             Self::Cpp => &["cc", "cpp", "cxx", "hpp", "hh"],
             Self::Cuda => &["cu", "cuh"],
+            Self::Metal => &["metal"],
             Self::Zig => &["zig"],
             Self::CSharp => &["cs"],
             Self::Solidity => &["sol"],
@@ -328,6 +331,7 @@ impl Language for AstGrepLang {
             | Self::C
             | Self::Cpp
             | Self::Cuda
+            | Self::Metal
             | Self::Zig
             | Self::CSharp
             | Self::Java
@@ -360,6 +364,7 @@ impl LanguageExt for AstGrepLang {
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
+            Self::Metal => tree_sitter_cpp::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Self::Solidity => tree_sitter_solidity::LANGUAGE.into(),
@@ -477,6 +482,11 @@ mod tests {
                 AstGrepLang::Cuda,
                 "__global__ void transform(float *data) { data[0] = 1.0f; }",
                 "__global__ void transform(float *data) { data[0] = 1.0f; }",
+            ),
+            (
+                AstGrepLang::Metal,
+                "kernel void transform(device float *data) { data[0] = 1.0f; }",
+                "kernel void transform(device float *data) { data[0] = 1.0f; }",
             ),
             (
                 AstGrepLang::Java,

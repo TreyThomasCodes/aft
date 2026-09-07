@@ -667,6 +667,7 @@ pub enum LangId {
     C,
     Cpp,
     Cuda,
+    Metal,
     Zig,
     CSharp,
     Bash,
@@ -709,6 +710,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "c" | "h" => Some(LangId::C),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(LangId::Cpp),
         "cu" | "cuh" => Some(LangId::Cuda),
+        "metal" => Some(LangId::Metal),
         "zig" => Some(LangId::Zig),
         "cs" => Some(LangId::CSharp),
         "sh" | "bash" | "zsh" => Some(LangId::Bash),
@@ -748,6 +750,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::C => tree_sitter_c::LANGUAGE.into(),
         LangId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         LangId::Cuda => tree_sitter_cuda::LANGUAGE.into(),
+        LangId::Metal => tree_sitter_cpp::LANGUAGE.into(),
         LangId::Zig => tree_sitter_zig::LANGUAGE.into(),
         LangId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         LangId::Bash => tree_sitter_bash::LANGUAGE.into(),
@@ -783,7 +786,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Rust => None,
         LangId::Go => Some(GO_QUERY),
         LangId::C => Some(C_QUERY),
-        LangId::Cpp | LangId::Cuda => Some(CPP_QUERY),
+        LangId::Cpp | LangId::Cuda | LangId::Metal => Some(CPP_QUERY),
         LangId::Zig => Some(ZIG_QUERY),
         LangId::CSharp => Some(CSHARP_QUERY),
         LangId::Bash => Some(BASH_QUERY),
@@ -876,6 +879,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::C => Some(&*C_QUERY_CACHE),
         LangId::Cpp => Some(&*CPP_QUERY_CACHE),
         LangId::Cuda => Some(&*CUDA_QUERY_CACHE),
+        LangId::Metal => Some(&*CPP_QUERY_CACHE),
         LangId::Zig => Some(&*ZIG_QUERY_CACHE),
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
@@ -1684,7 +1688,9 @@ pub fn extract_symbols_from_tree(
         LangId::Python => extract_py_symbols(source, &root, query),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
-        LangId::Cpp | LangId::Cuda => extract_cpp_symbols(source, &root, query, lang),
+        LangId::Cpp | LangId::Cuda | LangId::Metal => {
+            extract_cpp_symbols(source, &root, query, lang)
+        }
         LangId::Zig => extract_zig_symbols(source, &root, query),
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
@@ -1789,6 +1795,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             | LangId::C
             | LangId::Cpp
             | LangId::Cuda
+            | LangId::Metal
             | LangId::ObjC
             | LangId::Zig
             | LangId::CSharp

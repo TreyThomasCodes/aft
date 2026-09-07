@@ -662,6 +662,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::C => "c",
         LangId::Cpp => "cpp",
         LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -903,6 +904,7 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         LangId::C
         | LangId::Cpp
         | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -1025,6 +1027,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         LangId::C
         | LangId::Cpp
         | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -1263,6 +1266,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::C => "aft_tool_detection.c",
         LangId::Cpp => "aft_tool_detection.cpp",
         LangId::Cuda => "aft_tool_detection.cu",
+        LangId::Metal => "aft_tool_detection.metal",
         LangId::Zig => "aft_tool_detection.zig",
         LangId::CSharp => "aft_tool_detection.cs",
         LangId::Bash => "aft_tool_detection.sh",

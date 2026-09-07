@@ -93,6 +93,7 @@ mod manifest_schema_test;
 mod markdown_test;
 mod migrate_storage_test;
 mod migration_import_test;
+mod metal_test;
 mod move_file_test;
 mod move_symbol_test;
 mod objc_test;

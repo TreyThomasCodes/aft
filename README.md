@@ -152,6 +152,7 @@ _Coming soon._
 | Go | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | C / C++ / C# | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | CUDA (`.cu`, `.cuh`) | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Metal (`.metal`) | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Java / Kotlin | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Scala | ✓ | ✓ | | ✓ | ✓ | |
 | Swift | ✓ | ✓ | ✓ | ✓ | ✓ | |
@@ -203,7 +204,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (29 lang)│
+                   │ • tree-sitter (30 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │

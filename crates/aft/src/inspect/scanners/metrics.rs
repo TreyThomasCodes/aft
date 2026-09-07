@@ -205,6 +205,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::C) => "c",
         Some(LangId::Cpp) => "cpp",
         Some(LangId::Cuda) => "cuda",
+        Some(LangId::Metal) => "metal",
         Some(LangId::Zig) => "zig",
         Some(LangId::CSharp) => "csharp",
         Some(LangId::Bash) => "bash",

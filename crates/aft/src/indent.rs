@@ -50,6 +50,7 @@ impl IndentStyle {
             LangId::C
             | LangId::Cpp
             | LangId::Cuda
+            | LangId::Metal
             | LangId::Zig
             | LangId::CSharp
             | LangId::Bash => {

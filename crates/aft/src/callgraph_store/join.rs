@@ -462,6 +462,7 @@ fn language_id(language: &str) -> Option<LangId> {
         "c" => LangId::C,
         "cpp" => LangId::Cpp,
         "cuda" => LangId::Cuda,
+        "metal" => LangId::Metal,
         "zig" => LangId::Zig,
         "csharp" => LangId::CSharp,
         "bash" => LangId::Bash,

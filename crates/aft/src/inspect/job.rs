@@ -381,6 +381,7 @@ fn callgraph_store_dead_code_supports_language(language: LangId) -> bool {
             | LangId::C
             | LangId::Cpp
             | LangId::Cuda
+            | LangId::Metal
             | LangId::Zig
             | LangId::CSharp
     );
@@ -398,6 +399,7 @@ pub(crate) fn language_name(language: LangId) -> &'static str {
         LangId::C => "c",
         LangId::Cpp => "cpp",
         LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",

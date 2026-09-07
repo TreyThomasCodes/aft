@@ -1080,6 +1080,7 @@ fn language_id(lang: LangId) -> &'static str {
         LangId::C => "c",
         LangId::Cpp => "cpp",
         LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",

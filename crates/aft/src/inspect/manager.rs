@@ -4411,6 +4411,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::C => "c",
         crate::parser::LangId::Cpp => "cpp",
         crate::parser::LangId::Cuda => "cuda",
+        crate::parser::LangId::Metal => "metal",
         crate::parser::LangId::Zig => "zig",
         crate::parser::LangId::CSharp => "csharp",
         crate::parser::LangId::Bash => "bash",

@@ -4802,6 +4802,7 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "hh"
                 | "cu"
                 | "cuh"
+                | "metal"
                 | "zig"
                 | "cs"
                 | "sh"
@@ -7042,6 +7043,36 @@ Connection: close
         let snippet = build_snippet(&symbol, source);
 
         assert_eq!(snippet, "export const answer = 42;");
+    }
+
+    #[test]
+    fn metal_chunk_collection_uses_shader_function_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("sample.metal");
+        let source = include_str!("../tests/fixtures/sample.metal");
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Metal,
+            source,
+        )
+        .expect("collect Metal chunks");
+
+        let helper = chunks
+            .iter()
+            .find(|chunk| chunk.name == "brighten")
+            .expect("helper chunk");
+        assert_eq!((helper.start_line, helper.end_line), (3, 5));
+        assert!(!helper.snippet.contains("brighten_buffer"));
+
+        let shader = chunks
+            .iter()
+            .find(|chunk| chunk.name == "brighten_buffer")
+            .expect("shader chunk");
+        assert_eq!(shader.kind, SymbolKind::Function);
+        assert_eq!((shader.start_line, shader.end_line), (7, 9));
+        assert!(shader.snippet.starts_with("kernel void brighten_buffer"));
+        assert!(shader.snippet.contains("brighten(values[id])"));
     }
 
     #[test]

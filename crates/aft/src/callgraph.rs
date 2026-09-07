@@ -626,6 +626,7 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         LangId::C
         | LangId::Cpp
         | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
