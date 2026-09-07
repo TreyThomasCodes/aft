@@ -23,11 +23,33 @@ import {
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
 const packageName = "@cortexkit/aft-opencode";
-const v2Version = "0.0.0-beta-19059";
+const v2Version = "0.0.0-beta-19234";
+const v2CoreVersion = v2Version;
 const allowLiveOperatorWrites = process.env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "1";
 const suiteTempParent = join(pluginRoot, "tmp");
 const operatorDb = join(homedir(), ".local", "share", "opencode", "opencode.db");
 const operatorLogDir = join(homedir(), ".local", "share", "opencode", "log");
+
+function assertNodeVersion(): void {
+  const result = spawnSync("node", ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: process.platform === "win32",
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `OpenCode V2 load matrix requires Node >= 24, but failed to execute 'node --version': ${result.error?.message ?? result.stderr}`,
+    );
+  }
+  const version = result.stdout.trim();
+  const major = Number.parseInt(version.replace(/^v/, "").split(".")[0], 10);
+  if (Number.isNaN(major) || major < 24) {
+    throw new Error(
+      `OpenCode V2 load matrix requires Node >= 24 for '@opencode-ai/core' await using support (found ${version}).`,
+    );
+  }
+}
+assertNodeVersion();
 
 type CommandResult = {
   status: number | null;
@@ -209,6 +231,22 @@ async function installHost(
     )}\n`,
   );
   const result = run("npm", ["install", "--no-audit", "--no-fund"], root);
+  const watcherDir = join(root, "node_modules", "@parcel", "watcher");
+  if (existsSync(watcherDir) && !existsSync(join(watcherDir, "wrapper"))) {
+    try {
+      await writeFile(
+        join(watcherDir, "wrapper.js"),
+        await readFile(join(watcherDir, "wrapper.js")),
+      );
+      const wrapperTarget = join(watcherDir, "wrapper");
+      if (!existsSync(wrapperTarget)) {
+        await writeFile(
+          wrapperTarget,
+          'export * from "./wrapper.js";\nexport { default } from "./wrapper.js";\n',
+        );
+      }
+    } catch {}
+  }
   return { root, output: `${result.stdout}\n${result.stderr}` };
 }
 
@@ -217,7 +255,7 @@ async function ensureHostInstalls(): Promise<HostInstalls> {
     const v1 = await installHost("host-v1", modernV1, { "opencode-ai": modernV1 });
     const v2 = await installHost("host-v2", v2Version, {
       "@opencode-ai/cli": v2Version,
-      "@opencode-ai/core": v2Version,
+      "@opencode-ai/core": v2CoreVersion,
     });
     const peerWarning = /ERESOLVE|overrid(?:e|ing).*peer|peer dependency|peer dep missing/i;
     expect(v1.output).not.toMatch(peerWarning);
@@ -364,7 +402,8 @@ async function writeV2CoreProbe(hostRoot: string, mode: "load" | "reject"): Prom
     probe,
     `
 import { Effect } from "effect";
-import { load } from "@opencode-ai/core/plugin/module";
+import { PluginModule } from "@opencode-ai/core/plugin/module";
+import { Watcher } from "@opencode-ai/core/filesystem/watcher";
 import { Host } from "@opencode-ai/plugin/host";
 import { Npm } from "@opencode-ai/util/npm";
 
@@ -383,6 +422,9 @@ const npm = {
   which: () => Effect.succeed(undefined),
 };
 const operation = { type: "add", target: ${JSON.stringify(packageName)}, options: {} };
+const { load } = await Effect.runPromise(
+  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+);
 const program = load(operation, { install: false }).pipe(Effect.provideService(Npm.Service, npm));
 ${
   mode === "load"
@@ -421,7 +463,8 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Effect, Exit, Fiber } from "effect";
-import { load } from "@opencode-ai/core/plugin/module";
+import { PluginModule } from "@opencode-ai/core/plugin/module";
+import { Watcher } from "@opencode-ai/core/filesystem/watcher";
 import { Host } from "@opencode-ai/plugin/host";
 import { Npm } from "@opencode-ai/util/npm";
 import {
@@ -446,6 +489,9 @@ const npm = {
   which: () => Effect.succeed(undefined),
 };
 const operation = { type: "add", target: ${JSON.stringify(packageName)}, options: {} };
+const { load } = await Effect.runPromise(
+  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+);
 const loaded = await Effect.runPromise(
   load(operation, { install: false }).pipe(Effect.provideService(Npm.Service, npm)),
 );
