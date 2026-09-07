@@ -84,9 +84,16 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     const locate = hasSearch
       ? "`aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals."
       : `\`${grepName}\` (the tool — indexed and ranked) locates code.`;
+    const zoomSteer = hasZoom ? ", or `aft_zoom`" : "";
+    const searchSteer = hasSearch
+      ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readName}\`, \`aft_outline\`${zoomSteer} instead`
+      : `use the \`${grepName}\` tool, \`${readName}\`, \`aft_outline\`${zoomSteer} instead`;
+    const bashSteer = hasBash
+      ? ` If you are about to run grep, rg, sed, awk, find, or cat through ${bashName} to locate or read code: STOP — ${searchSteer}.`
+      : "";
     sections.push(
       [
-        `**Code exploration**: ${locate} Then \`aft_outline\` for structure → \`${hasZoom ? "aft_zoom" : readName}\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\`/\`sed\`/\`cat\` through \`bash\` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes). Reflex translations:`,
+        `**Code exploration**: ${locate} Then \`aft_outline\` for structure → \`${hasZoom ? "aft_zoom" : readName}\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\`/\`sed\`/\`cat\` through \`bash\` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes).${bashSteer} Reflex translations:`,
         `- \`grep -rn "handleAuth" src/\` in bash → \`${searchName}({ query: "handleAuth" })\``,
         `- \`find . -name "*.ts" | xargs grep watcher\` in bash → \`${searchName}({ query: "watcher invalidation" })\` (concepts work too)`,
         `- \`sed -n '100,160p' app.ts\` / \`cat app.ts\` in bash → \`${readName}({ path: "app.ts", startLine: 100, endLine: 160 })\``,
