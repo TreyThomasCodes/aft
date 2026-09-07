@@ -1306,9 +1306,9 @@ export class BinaryBridge implements AftProjectTransport {
         ? null
         : join(
             ortDir,
-              this.platform === "win32"
-                ? "onnxruntime.dll"
-                : this.platform === "darwin"
+            this.platform === "win32"
+              ? "onnxruntime.dll"
+              : this.platform === "darwin"
                 ? "libonnxruntime.dylib"
                 : "libonnxruntime.so",
           );

@@ -102,8 +102,6 @@ describe("hostFallbackPathWithShims", () => {
       AFT_STORAGE_DIR: "C:\\nonexistent-aft-storage-root",
     };
 
-    expect(hostFallbackPathWithShims(env, "win32")).toBe(
-      "C:\\Windows\\System32;C:\\Git\\cmd",
-    );
+    expect(hostFallbackPathWithShims(env, "win32")).toBe("C:\\Windows\\System32;C:\\Git\\cmd");
   });
 });

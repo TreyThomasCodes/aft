@@ -6,11 +6,7 @@ function windowsPathKeys(env: NodeJS.ProcessEnv): string[] {
   return Object.keys(env).filter((key) => key.toLowerCase() === "path");
 }
 
-function expectSingleWindowsPath(
-  env: NodeJS.ProcessEnv,
-  key: string,
-  value: string,
-): void {
+function expectSingleWindowsPath(env: NodeJS.ProcessEnv, key: string, value: string): void {
   expect(windowsPathKeys(env)).toEqual([key]);
   expect(env[key]).toBe(value);
 }
@@ -21,11 +17,7 @@ describe("withPathPrepended", () => {
 
     const output = withPathPrepended(input, "C:\\onnxruntime", "win32");
 
-    expectSingleWindowsPath(
-      output,
-      "Path",
-      "C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd",
-    );
+    expectSingleWindowsPath(output, "Path", "C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd");
     expect(output.HOME).toBe(input.HOME);
     expect(input).toEqual({
       Path: "C:\\Windows\\System32;C:\\Git\\cmd",
@@ -34,11 +26,7 @@ describe("withPathPrepended", () => {
   });
 
   test("keeps inherited Windows PATH spelling", () => {
-    const output = withPathPrepended(
-      { PATH: "C:\\Windows\\System32" },
-      "C:\\onnxruntime",
-      "win32",
-    );
+    const output = withPathPrepended({ PATH: "C:\\Windows\\System32" }, "C:\\onnxruntime", "win32");
 
     expectSingleWindowsPath(output, "PATH", "C:\\onnxruntime;C:\\Windows\\System32");
   });
@@ -54,11 +42,7 @@ describe("withPathPrepended", () => {
       "win32",
     );
 
-    expectSingleWindowsPath(
-      output,
-      "Path",
-      "C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd",
-    );
+    expectSingleWindowsPath(output, "Path", "C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd");
   });
 
   test("uses PATH when Windows has no inherited path key", () => {
@@ -99,7 +83,11 @@ describe("withPathPrepended", () => {
   });
 
   test("on non-Windows adds PATH without treating Path as inherited PATH", () => {
-    const output = withPathPrepended({ Path: "/not-an-executable-path" }, "/opt/node/bin", "darwin");
+    const output = withPathPrepended(
+      { Path: "/not-an-executable-path" },
+      "/opt/node/bin",
+      "darwin",
+    );
 
     expect(output).toEqual({
       PATH: "/opt/node/bin",

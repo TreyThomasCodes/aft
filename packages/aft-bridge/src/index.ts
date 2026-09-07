@@ -161,13 +161,13 @@ export {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
-export { withPathPrepended } from "./path-env.js";
 export {
   InvalidRequestError,
   isWellFormedUnicodeString,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
 } from "./path-aliases.js";
+export { withPathPrepended } from "./path-env.js";
 export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,

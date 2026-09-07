@@ -35,10 +35,7 @@ export interface BashHostFallbackResult extends Record<string, unknown> {
  * while the transport is down - exactly the fallback state. Without this, a
  * transport outage silently converts bot speech into ambient-credential posts.
  */
-function pathKeyForPlatform(
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform,
-): string | undefined {
+function pathKeyForPlatform(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string | undefined {
   return platform === "win32"
     ? Object.keys(env).find((key) => key.toLowerCase() === "path")
     : "PATH";
@@ -80,10 +77,9 @@ function hostFallbackEnvWithShims(
   const separator = platform === "win32" ? ";" : ":";
   const entries = (inherited ?? "").split(separator).filter((entry) => entry.length > 0);
   if (entries[0] === shimsDir) return normalized;
-  normalized[pathKey ?? "PATH"] = [
-    shimsDir,
-    ...entries.filter((entry) => entry !== shimsDir),
-  ].join(separator);
+  normalized[pathKey ?? "PATH"] = [shimsDir, ...entries.filter((entry) => entry !== shimsDir)].join(
+    separator,
+  );
   return normalized;
 }
 

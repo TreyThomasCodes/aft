@@ -66,9 +66,7 @@ describe("BinaryBridge child PATH", () => {
       const pathKeys = Object.keys(childEnv).filter((key) => key.toLowerCase() === "path");
 
       expect(pathKeys).toEqual(["Path"]);
-      expect(childEnv.Path).toBe(
-        "C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd",
-      );
+      expect(childEnv.Path).toBe("C:\\onnxruntime;C:\\Windows\\System32;C:\\Git\\cmd");
     } finally {
       await bridge.shutdown();
     }
