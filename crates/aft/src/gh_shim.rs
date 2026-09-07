@@ -2456,7 +2456,21 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
         index += 1;
     }
     let path = path?;
-    (path != "-").then_some((method, path, has_fields))
+    if path == "-" {
+        return None;
+    }
+    // `gh api` accepts the endpoint with or without a leading slash
+    // (`repos/o/r/...` and `/repos/o/r/...` are the same request), and the
+    // slash-less spelling is the common one. Manifest globs are written with
+    // the leading slash, so normalize here; otherwise the everyday form of a
+    // declared admin endpoint reads as undeclared and refuses with the wrong
+    // reason (v13 round trip, 2026-09-07).
+    let path = if path.starts_with('/') || path.starts_with("http") {
+        path
+    } else {
+        format!("/{path}")
+    };
+    Some((method, path, has_fields))
 }
 
 fn is_api_field_argument(value: &str) -> bool {
@@ -6239,6 +6253,33 @@ mod tests {
         ));
         assert!(matches!(
             classify(&args, &v12_fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    /// `gh api repos/o/r/...` (no leading slash) is the everyday spelling and
+    /// the same request as `/repos/o/r/...`; a declared endpoint must classify
+    /// identically under both, or the common form refuses as undeclared.
+    #[test]
+    fn slashless_api_endpoint_classifies_like_the_declared_glob() {
+        let manifest = branch_protection_manifest("PUT", Tier::Admin);
+        for spelling in [
+            "/repos/o/r/branches/main/protection",
+            "repos/o/r/branches/main/protection",
+        ] {
+            let args = os_args(&["api", "-X", "PUT", spelling, "--input", "-"]);
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+                ),
+                "{spelling} must classify as the declared admin endpoint"
+            );
+        }
+        // An undeclared endpoint stays undeclared under either spelling.
+        let args = os_args(&["api", "-X", "PUT", "repos/o/r/topics", "--input", "-"]);
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
             Classification::Unclassified
         ));
     }
