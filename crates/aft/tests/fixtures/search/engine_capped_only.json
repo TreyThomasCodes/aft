@@ -1,0 +1,42 @@
+{
+  "id": "search-engine-capped",
+  "success": true,
+  "data": {
+    "query": "state_machine",
+    "result_count": 10,
+    "more_available": false,
+    "engine_capped": true,
+    "fully_degraded": false,
+    "complete": true,
+    "text": "Found 10 result(s).",
+    "results": [
+      { "file": "src/state.rs", "score": 0.94 },
+      { "file": "src/machine.rs", "score": 0.91 },
+      { "file": "src/fsm.rs", "score": 0.89 },
+      { "file": "src/transition.rs", "score": 0.86 },
+      { "file": "src/event.rs", "score": 0.83 },
+      { "file": "src/action.rs", "score": 0.81 },
+      { "file": "src/context.rs", "score": 0.79 },
+      { "file": "src/guard.rs", "score": 0.76 },
+      { "file": "src/timer.rs", "score": 0.73 },
+      { "file": "src/history.rs", "score": 0.7 }
+    ],
+    "results_list_envelope": {
+      "shown": 10,
+      "total": {
+        "kind": "at_least",
+        "value": 10
+      },
+      "unit": "results",
+      "reason": "budget",
+      "causes": [
+        "budget"
+      ],
+      "narrow": [
+        "topK",
+        "path",
+        "includeTests"
+      ]
+    }
+  }
+}

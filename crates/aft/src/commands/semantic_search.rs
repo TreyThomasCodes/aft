@@ -2394,6 +2394,7 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
+    let result_count = parts.result_count();
     let mut object = serde_json::Map::new();
     object.insert("status".to_string(), serde_json::json!(parts.status));
     object.insert("complete".to_string(), serde_json::json!(parts.complete));
@@ -2407,10 +2408,7 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
         "query_kind".to_string(),
         serde_json::json!(parts.query_kind),
     );
-    object.insert(
-        "result_count".to_string(),
-        serde_json::json!(parts.result_count()),
-    );
+    object.insert("result_count".to_string(), serde_json::json!(result_count));
     object.insert(
         "results".to_string(),
         serde_json::Value::Array(parts.results),
@@ -2434,6 +2432,12 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
     if !parts.warnings.is_empty() {
         object.insert("warnings".to_string(), serde_json::json!(parts.warnings));
     }
+    crate::list_surfaces::search::attach_search_envelope(
+        &mut object,
+        result_count,
+        parts.more_available,
+        parts.engine_capped,
+    );
     for (key, value) in parts.extras {
         object.insert(key, value);
     }

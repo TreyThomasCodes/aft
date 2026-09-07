@@ -1,0 +1,42 @@
+{
+  "id": "search-more-available",
+  "success": true,
+  "data": {
+    "query": "process_request",
+    "result_count": 10,
+    "more_available": true,
+    "engine_capped": false,
+    "fully_degraded": false,
+    "complete": true,
+    "text": "Found 10 result(s).",
+    "results": [
+      { "file": "src/server.rs", "score": 0.95 },
+      { "file": "src/handler.rs", "score": 0.92 },
+      { "file": "src/router.rs", "score": 0.9 },
+      { "file": "src/dispatcher.rs", "score": 0.88 },
+      { "file": "src/controller.rs", "score": 0.85 },
+      { "file": "src/middleware.rs", "score": 0.82 },
+      { "file": "src/service.rs", "score": 0.8 },
+      { "file": "src/client.rs", "score": 0.78 },
+      { "file": "src/worker.rs", "score": 0.75 },
+      { "file": "src/queue.rs", "score": 0.72 }
+    ],
+    "results_list_envelope": {
+      "shown": 10,
+      "total": {
+        "kind": "at_least",
+        "value": 11
+      },
+      "unit": "results",
+      "reason": "cap",
+      "causes": [
+        "cap"
+      ],
+      "narrow": [
+        "topK",
+        "path",
+        "includeTests"
+      ]
+    }
+  }
+}

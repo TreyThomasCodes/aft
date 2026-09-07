@@ -1,0 +1,43 @@
+{
+  "id": "search-both-flags-mixed",
+  "success": true,
+  "data": {
+    "query": "handle_event",
+    "result_count": 10,
+    "more_available": true,
+    "engine_capped": true,
+    "fully_degraded": true,
+    "complete": false,
+    "text": "Found 10 result(s).",
+    "results": [
+      { "file": "src/event_loop.rs", "score": 0.96 },
+      { "file": "src/subscriber.rs", "score": 0.93 },
+      { "file": "src/publisher.rs", "score": 0.91 },
+      { "file": "src/broker.rs", "score": 0.87 },
+      { "file": "src/channel.rs", "score": 0.84 },
+      { "file": "src/stream.rs", "score": 0.82 },
+      { "file": "src/sink.rs", "score": 0.79 },
+      { "file": "src/source.rs", "score": 0.77 },
+      { "file": "src/filter.rs", "score": 0.74 },
+      { "file": "src/transformer.rs", "score": 0.71 }
+    ],
+    "results_list_envelope": {
+      "shown": 10,
+      "total": {
+        "kind": "at_least",
+        "value": 11
+      },
+      "unit": "results",
+      "reason": "budget",
+      "causes": [
+        "budget",
+        "cap"
+      ],
+      "narrow": [
+        "topK",
+        "path",
+        "includeTests"
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "search-complete-4-result",
+  "success": true,
+  "data": {
+    "query": "unique_helper",
+    "result_count": 4,
+    "more_available": false,
+    "engine_capped": false,
+    "fully_degraded": false,
+    "complete": true,
+    "text": "Found 4 result(s).",
+    "results": [
+      { "file": "src/helper_a.rs", "score": 0.98 },
+      { "file": "src/helper_b.rs", "score": 0.95 },
+      { "file": "src/helper_c.rs", "score": 0.91 },
+      { "file": "src/helper_d.rs", "score": 0.88 }
+    ]
+  }
+}
