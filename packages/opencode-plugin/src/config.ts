@@ -435,6 +435,15 @@ const BackupConfigSchema = z.object({
   max_file_size: z.number().int().nonnegative().optional(),
 });
 
+export const PiToolPresentationEnum = z.enum(["top_level", "host_default"]);
+export type PiToolPresentation = z.infer<typeof PiToolPresentationEnum>;
+
+export const PiConfigSchema = z.object({
+  /** Tool presentation mode for Pi/OMP harnesses. */
+  tool_presentation: PiToolPresentationEnum.optional(),
+});
+export type PiConfig = z.infer<typeof PiConfigSchema>;
+
 const AftConfigFieldsSchema = z.object({
   /**
    * Optional JSON Schema URL for editor tooling. Ignored by the plugin at
@@ -565,6 +574,8 @@ const AftConfigFieldsSchema = z.object({
   gh_read: GhReadConfigSchema.optional(),
   /** Agent-child Git attribution. Project config may override user config. */
   git: GitConfigSchema.optional(),
+  /** Pi and OMP harness-specific configuration. */
+  pi: PiConfigSchema.optional(),
 });
 
 const HarnessOverrideSchema = z.preprocess((value) => {
@@ -1600,6 +1611,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",
+  "pi",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in
@@ -1642,6 +1654,11 @@ function mergeProjectBackupConfig(
   return { ...base, max_file_size: project.max_file_size };
 }
 
+function mergePiConfig(base?: PiConfig, override?: PiConfig): PiConfig | undefined {
+  if (!base && !override) return undefined;
+  return { ...base, ...override };
+}
+
 function getStrippedTopLevelKeys(override: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
@@ -1681,6 +1698,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
+  const pi = mergePiConfig(base.pi, override.pi);
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -1691,6 +1709,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.bash;
   delete safeOverride.inspect;
   delete safeOverride.worktree;
+  delete safeOverride.pi;
 
   return {
     ...base,
@@ -1704,6 +1723,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(backup !== undefined ? { backup } : {}),
+    ...(pi !== undefined ? { pi } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.

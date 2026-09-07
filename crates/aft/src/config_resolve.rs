@@ -126,6 +126,7 @@ pub struct RawAftConfig {
     pub gh_shim: Option<RawGhShim>,
     pub gh_read: Option<RawGhRead>,
     pub git: Option<RawGit>,
+    pub pi: Option<RawPi>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -532,6 +533,39 @@ pub struct RawGit {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawPi {
+    pub tool_presentation: Option<RawPiToolPresentation>,
+}
+
+impl RawPi {
+    fn is_empty(&self) -> bool {
+        self.tool_presentation.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawPiToolPresentation {
+    TopLevel,
+    HostDefault,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for RawPiToolPresentation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "top_level" => Ok(Self::TopLevel),
+            "host_default" => Ok(Self::HostDefault),
+            other => Ok(Self::Unknown(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawBackup {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
@@ -873,6 +907,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.git.is_some() {
         base.git = override_config.git;
     }
+    if override_config.pi.is_some() {
+        base.pi = override_config.pi;
+    }
     if override_config.sandbox.is_some() {
         base.sandbox = override_config.sandbox;
     }
@@ -955,6 +992,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     if project.git.is_some() {
         base.git = project.git;
     }
+    base.pi = merge_pi_config(base.pi.clone(), project.pi);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
 }
 
@@ -1257,6 +1295,19 @@ fn merge_worktree_config(
     let mut worktree = base.unwrap_or_default();
     worktree.ram_overlay = override_worktree.ram_overlay.or(worktree.ram_overlay);
     (!worktree.is_empty()).then_some(worktree)
+}
+
+fn merge_pi_config(
+    base: Option<RawPi>,
+    override_pi: Option<RawPi>,
+) -> Option<RawPi> {
+    let Some(override_pi) = override_pi else {
+        return base;
+    };
+
+    let mut pi = base.unwrap_or_default();
+    pi.tool_presentation = override_pi.tool_presentation.or(pi.tool_presentation);
+    (!pi.is_empty()).then_some(pi)
 }
 
 fn merge_inspect_duplicates(

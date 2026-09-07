@@ -126,18 +126,6 @@
       "default": false,
       "description": "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field."
     },
-    "views": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false,
-          "description": "Enable content-addressed index views. Default: false."
-        }
-      },
-      "additionalProperties": false,
-      "description": "Content-addressed index view assembly. Disabled by default."
-    },
     "callgraph_store": {
       "type": "boolean",
       "default": true,
@@ -655,6 +643,22 @@
       },
       "additionalProperties": false,
       "description": "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration."
+    },
+    "pi": {
+      "type": "object",
+      "properties": {
+        "tool_presentation": {
+          "type": "string",
+          "enum": [
+            "top_level",
+            "host_default"
+          ],
+          "default": "top_level",
+          "description": "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pi and OMP harness-specific configuration."
     },
     "auto_update": {
       "type": "boolean",
@@ -1305,6 +1309,22 @@
             },
             "additionalProperties": false,
             "description": "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration."
+          },
+          "pi": {
+            "type": "object",
+            "properties": {
+              "tool_presentation": {
+                "type": "string",
+                "enum": [
+                  "top_level",
+                  "host_default"
+                ],
+                "default": "top_level",
+                "description": "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence."
+              }
+            },
+            "additionalProperties": false,
+            "description": "Pi and OMP harness-specific configuration."
           },
           "auto_update": {
             "type": "boolean",

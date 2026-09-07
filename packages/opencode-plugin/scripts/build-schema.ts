@@ -722,6 +722,21 @@ function buildSchema(): Record<string, unknown> {
           "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration.",
       },
 
+      pi: {
+        type: "object",
+        properties: {
+          tool_presentation: {
+            type: "string",
+            enum: ["top_level", "host_default"],
+            default: "top_level",
+            description:
+              "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
+          },
+        },
+        additionalProperties: false,
+        description: "Pi and OMP harness-specific configuration.",
+      },
+
       auto_update: {
         type: "boolean",
         default: true,
