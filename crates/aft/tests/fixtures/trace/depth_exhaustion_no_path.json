@@ -1,0 +1,26 @@
+{
+  "target_symbol": "unreachable_target",
+  "target_file": "src/service.ts",
+  "paths": [],
+  "total_paths": 0,
+  "total_paths_is_lower_bound": false,
+  "entry_points_found": 0,
+  "max_depth_reached": true,
+  "truncated_paths": 0,
+  "paths_list_envelope": {
+    "shown": 0,
+    "total": {
+      "kind": "at_least",
+      "value": 0
+    },
+    "unit": "paths",
+    "reason": "depth",
+    "causes": [
+      "depth"
+    ],
+    "narrow": [
+      "depth",
+      "includeTests"
+    ]
+  }
+}

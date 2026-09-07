@@ -1,0 +1,26 @@
+{
+  "target_symbol": "leaf",
+  "target_file": "src/leaf.ts",
+  "paths": [
+    {
+      "hops": [
+        {
+          "symbol": "main",
+          "file": "src/main.ts",
+          "line": 5,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "leaf",
+          "file": "src/leaf.ts",
+          "line": 10
+        }
+      ]
+    }
+  ],
+  "total_paths": 1,
+  "total_paths_is_lower_bound": false,
+  "entry_points_found": 1,
+  "max_depth_reached": false,
+  "truncated_paths": 0
+}

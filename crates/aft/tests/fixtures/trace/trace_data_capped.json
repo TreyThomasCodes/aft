@@ -1,0 +1,62 @@
+{
+  "expression": "config",
+  "origin_file": "src/app.ts",
+  "origin_symbol": "bootstrap",
+  "hops": [
+    {
+      "variable": "config",
+      "flow_type": "origin",
+      "symbol": "bootstrap",
+      "file": "src/app.ts",
+      "line": 10
+    },
+    {
+      "variable": "opts",
+      "flow_type": "param",
+      "symbol": "initServer",
+      "file": "src/server.ts",
+      "line": 25,
+      "approximate": false
+    },
+    {
+      "variable": "settings",
+      "flow_type": "assign",
+      "symbol": "initServer",
+      "file": "src/server.ts",
+      "line": 30,
+      "approximate": false
+    },
+    {
+      "variable": "connOpts",
+      "flow_type": "param",
+      "symbol": "connectDb",
+      "file": "src/db.ts",
+      "line": 15,
+      "approximate": false
+    },
+    {
+      "variable": "poolConfig",
+      "flow_type": "param",
+      "symbol": "createPool",
+      "file": "src/pool.ts",
+      "line": 40,
+      "approximate": true
+    }
+  ],
+  "depth_limited": true,
+  "hops_list_envelope": {
+    "shown": 5,
+    "total": {
+      "kind": "at_least",
+      "value": 5
+    },
+    "unit": "hops",
+    "reason": "depth",
+    "causes": [
+      "depth"
+    ],
+    "narrow": [
+      "depth"
+    ]
+  }
+}

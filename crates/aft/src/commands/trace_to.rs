@@ -1,10 +1,12 @@
 use std::path::Path;
 
-use crate::commands::callgraph_store_adapter::serialized_response;
+#[path = "../list_surfaces/trace.rs"]
+pub mod trace;
+
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, note_callgraph_building, note_callgraph_served, store_error_response,
-    trace_to_result, unavailable_for,
+    building_response, note_callgraph_building, note_callgraph_served, serialized_value,
+    store_error_response, trace_to_result, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -86,7 +88,19 @@ pub fn handle_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
     match trace_to_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to", 0, "ok");
-            serialized_response(&req.id, "trace_to", &result)
+            let envelope = trace::build_trace_to_envelope(
+                result.paths.len(),
+                result.total_paths,
+                result.max_depth_reached,
+                result.total_paths_is_lower_bound,
+            );
+            match serialized_value(&req.id, "trace_to", &result) {
+                Ok(mut value) => {
+                    trace::attach_trace_to_envelope(&mut value, envelope.as_ref());
+                    Response::success(&req.id, value)
+                }
+                Err(response) => response,
+            }
         }
         Err(error) => store_error_response(&req.id, "trace_to", error),
     }

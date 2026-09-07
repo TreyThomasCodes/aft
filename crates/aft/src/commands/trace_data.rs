@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, note_callgraph_building, note_callgraph_served, store_error_response,
-    trace_data_result, unavailable_for,
+    building_response, note_callgraph_building, note_callgraph_served, serialized_value,
+    store_error_response, trace_data_result, unavailable_for,
 };
+use crate::commands::trace_to::trace;
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
 
@@ -123,7 +123,15 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_data", 0, "ok");
-            serialized_response(&req.id, "trace_data", &result)
+            let envelope =
+                trace::build_trace_data_envelope(result.hops.len(), result.depth_limited);
+            match serialized_value(&req.id, "trace_data", &result) {
+                Ok(mut value) => {
+                    trace::attach_trace_data_envelope(&mut value, envelope.as_ref());
+                    Response::success(&req.id, value)
+                }
+                Err(response) => response,
+            }
         }
         Err(error) => store_error_response(&req.id, "trace_data", error),
     }

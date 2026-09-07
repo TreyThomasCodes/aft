@@ -1,0 +1,252 @@
+{
+  "target_symbol": "hub_leaf",
+  "target_file": "src/leaf.ts",
+  "paths": [
+    {
+      "hops": [
+        {
+          "symbol": "entry_1",
+          "file": "src/entry_1.ts",
+          "line": 10,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_2",
+          "file": "src/entry_2.ts",
+          "line": 12,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_3",
+          "file": "src/entry_3.ts",
+          "line": 15,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_4",
+          "file": "src/entry_4.ts",
+          "line": 20,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_5",
+          "file": "src/entry_5.ts",
+          "line": 22,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_6",
+          "file": "src/entry_6.ts",
+          "line": 25,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_7",
+          "file": "src/entry_7.ts",
+          "line": 30,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_8",
+          "file": "src/entry_8.ts",
+          "line": 32,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_9",
+          "file": "src/entry_9.ts",
+          "line": 35,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_10",
+          "file": "src/entry_10.ts",
+          "line": 40,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_11",
+          "file": "src/entry_11.ts",
+          "line": 42,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_12",
+          "file": "src/entry_12.ts",
+          "line": 45,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_13",
+          "file": "src/entry_13.ts",
+          "line": 50,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_14",
+          "file": "src/entry_14.ts",
+          "line": 52,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    },
+    {
+      "hops": [
+        {
+          "symbol": "entry_15",
+          "file": "src/entry_15.ts",
+          "line": 55,
+          "is_entry_point": true
+        },
+        {
+          "symbol": "hub_leaf",
+          "file": "src/leaf.ts",
+          "line": 50
+        }
+      ]
+    }
+  ],
+  "total_paths": 15,
+  "total_paths_is_lower_bound": true,
+  "entry_points_found": 15,
+  "max_depth_reached": false,
+  "truncated_paths": 0,
+  "paths_list_envelope": {
+    "shown": 15,
+    "total": {
+      "kind": "at_least",
+      "value": 15
+    },
+    "unit": "paths",
+    "reason": "budget",
+    "causes": [
+      "budget"
+    ],
+    "narrow": [
+      "depth",
+      "includeTests"
+    ]
+  }
+}

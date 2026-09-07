@@ -1,0 +1,22 @@
+{
+  "expression": "x",
+  "origin_file": "src/math.ts",
+  "origin_symbol": "calc",
+  "hops": [
+    {
+      "variable": "x",
+      "flow_type": "origin",
+      "symbol": "calc",
+      "file": "src/math.ts",
+      "line": 2
+    },
+    {
+      "variable": "res",
+      "flow_type": "assign",
+      "symbol": "calc",
+      "file": "src/math.ts",
+      "line": 4
+    }
+  ],
+  "depth_limited": false
+}
