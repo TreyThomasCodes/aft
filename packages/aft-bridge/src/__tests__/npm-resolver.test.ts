@@ -107,11 +107,26 @@ describe("resolveNpm", () => {
     makeNpm(pathDir, "npm.cmd");
     const result = resolveNpm({
       platform: "win32",
-      env: { PATH: pathDir },
+      env: { Path: pathDir },
       home: root,
       execPath: "C:\\node\\node.exe",
     });
     expect(result?.command).toBe(join(pathDir, "npm.cmd"));
+  });
+
+  it("does not treat case-variant Path as executable PATH on non-Windows", () => {
+    const pathDir = join(root, "case-variant-bin");
+    makeNpm(pathDir);
+
+    expect(
+      resolveNpm({
+        platform: "linux",
+        env: { Path: pathDir },
+        home: root,
+        execPath: "/standalone/bun",
+        systemNpmDirs: [],
+      }),
+    ).toBeNull();
   });
 
   it("returns null when npm is nowhere to be found", () => {
@@ -522,5 +537,16 @@ describe("npmSpawnEnv", () => {
   it("leaves env unchanged when binDir is null (PATH-resolved)", () => {
     const env = npmSpawnEnv({ command: "npm", binDir: null }, { PATH: "/usr/bin" });
     expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("normalizes inherited Windows Path spelling at the npm spawn seam", () => {
+    const env = npmSpawnEnv(
+      { command: "C:\\nodejs\\npm.cmd", binDir: "C:\\nodejs" },
+      { Path: "C:\\Windows\\System32", PATH: "C:\\stale" },
+      "win32",
+    );
+
+    expect(Object.keys(env).filter((key) => key.toLowerCase() === "path")).toEqual(["Path"]);
+    expect(env.Path).toBe("C:\\nodejs;C:\\Windows\\System32");
   });
 });

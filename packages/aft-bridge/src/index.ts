@@ -161,6 +161,7 @@ export {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
+export { withPathPrepended } from "./path-env.js";
 export {
   InvalidRequestError,
   isWellFormedUnicodeString,
