@@ -11,6 +11,9 @@ use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::Pattern;
 
 /// Supported languages for AST pattern matching via ast-grep.
+///
+/// TOML remains outside this enum, like YAML: its data-oriented grammar does
+/// not accept ast-grep's identifier metavariable sentinels as keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstGrepLang {
     TypeScript,

@@ -4835,7 +4835,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gsh"
                 | "gradle"
                 | "m"
-                | "mm",
+                | "mm"
+                | "toml",
         )
     )
 }
@@ -7036,6 +7037,41 @@ Connection: close
         let snippet = build_snippet(&symbol, source);
 
         assert_eq!(snippet, "export const answer = 42;");
+    }
+
+    #[test]
+    fn toml_chunk_collection_uses_table_and_key_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("Cargo.toml");
+        let source = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies.foo]\nversion = \"1\"\n";
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Toml,
+            source,
+        )
+            .expect("collect TOML chunks");
+
+        let package = chunks
+            .iter()
+            .find(|chunk| chunk.name == "package")
+            .expect("package table chunk");
+        assert_eq!((package.start_line, package.end_line), (0, 2));
+        assert!(package.snippet.contains("name = \"demo\""));
+        assert!(!package.snippet.contains("dependencies.foo"));
+
+        let name = chunks
+            .iter()
+            .find(|chunk| chunk.qualified_name.as_deref() == Some("package.name"))
+            .expect("nested package.name key chunk");
+        assert_eq!((name.start_line, name.end_line), (1, 1));
+        assert_eq!(name.snippet, "name = \"demo\"");
+
+        let dependency = chunks
+            .iter()
+            .find(|chunk| chunk.name == "dependencies.foo")
+            .expect("dependency table chunk");
+        assert_eq!((dependency.start_line, dependency.end_line), (4, 5));
     }
 
     #[test]

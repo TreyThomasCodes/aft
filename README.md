@@ -162,6 +162,7 @@ _Coming soon._
 | HTML / Markdown (incl. Quarto / R-Markdown) | ✓ | ✓ | | | | |
 | YAML (incl. Kubernetes) | ✓ | ✓ | | ✓ | | |
 | JSON | ✓ | ✓ | ✓ | | | |
+| TOML | ✓ | ✓ | | ✓ | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Pascal | ✓ | ✓ | ✓ | ✓ | | |
 | R | ✓ | ✓ | ✓ | ✓ | | |
@@ -201,7 +202,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (27 lang)│
+                   │ • tree-sitter (28 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │

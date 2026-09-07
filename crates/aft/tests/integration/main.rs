@@ -134,6 +134,7 @@ mod subc_translate_test;
 mod symbol_cache_persist_test;
 mod tool_call_parity_test;
 mod tool_call_preview_test;
+mod toml_test;
 mod trace_to_symbol_test;
 mod url_fetch_test;
 mod view_assembly_wiring_test;

@@ -646,7 +646,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => false,
+        | LangId::ObjC
+        | LangId::Toml => false,
     }
 }
 

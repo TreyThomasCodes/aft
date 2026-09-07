@@ -595,7 +595,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => None,
+        | LangId::ObjC
+        | LangId::Toml => None,
     }
 }
 

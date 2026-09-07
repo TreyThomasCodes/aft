@@ -1196,6 +1196,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 
@@ -1348,7 +1349,8 @@ fn formatter_candidates(
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -1419,7 +1421,8 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }

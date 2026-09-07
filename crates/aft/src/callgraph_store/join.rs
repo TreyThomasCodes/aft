@@ -483,6 +483,7 @@ fn language_id(language: &str) -> Option<LangId> {
         "r" => LangId::R,
         "groovy" => LangId::Groovy,
         "objc" => LangId::ObjC,
+        "toml" => LangId::Toml,
         _ => return None,
     })
 }

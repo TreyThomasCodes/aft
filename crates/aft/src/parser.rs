@@ -688,6 +688,7 @@ pub enum LangId {
     R,
     Groovy,
     ObjC,
+    Toml,
 }
 
 /// Maps file extension to language identifier.
@@ -728,6 +729,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "R" | "r" => Some(LangId::R),
         "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
         "m" | "mm" => Some(LangId::ObjC),
+        "toml" => Some(LangId::Toml),
         _ => None,
     }
 }
@@ -765,6 +767,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::R => tree_sitter_r::LANGUAGE.into(),
         LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
+        LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
     }
 }
 
@@ -800,6 +803,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::R => Some(R_QUERY),
         LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
+        LangId::Toml => None,
     }
 }
 
@@ -888,7 +892,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Markdown
         | LangId::Vue
         | LangId::Json
-        | LangId::Yaml => None,
+        | LangId::Yaml
+        | LangId::Toml => None,
     };
 
     query
@@ -1659,6 +1664,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Yaml {
         return extract_yaml_symbols(source, &root);
     }
+    if lang == LangId::Toml {
+        return extract_toml_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -1693,7 +1701,8 @@ pub fn extract_symbols_from_tree(
         | LangId::Markdown
         | LangId::Vue
         | LangId::Json
-        | LangId::Yaml => unreachable!("handled before query lookup"),
+        | LangId::Yaml
+        | LangId::Toml => unreachable!("handled before query lookup"),
     }
 }
 
@@ -1807,7 +1816,12 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => false,
+            LangId::Html
+            | LangId::Markdown
+            | LangId::Vue
+            | LangId::Json
+            | LangId::Yaml
+            | LangId::Toml => false,
         };
 
         if should_include {
@@ -5163,6 +5177,110 @@ fn objc_declarator_name(source: &str, node: &Node) -> Option<String> {
             None
         }
     })
+}
+
+fn toml_key_text(source: &str, key: &Node) -> String {
+    let raw = node_text(source, key).trim();
+    if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn toml_pair_symbol(source: &str, pair: &Node, section: Option<&str>) -> Option<Symbol> {
+    let key = pair.child_by_field_name("key").or_else(|| {
+        let mut cursor = pair.walk();
+        let first = pair.named_children(&mut cursor).next();
+        first
+    })?;
+    let name = toml_key_text(source, &key);
+    if name.is_empty() {
+        return None;
+    }
+
+    let scope_chain = section
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default();
+    Some(Symbol {
+        name,
+        kind: SymbolKind::Variable,
+        range: node_range_with_decorators(pair, source, LangId::Toml),
+        signature: None,
+        scope_chain,
+        exported: false,
+        parent: section.map(str::to_string),
+    })
+}
+
+fn toml_table_name(source: &str, table: &Node) -> Option<String> {
+    let first_line = node_text(source, table).lines().next()?.trim();
+    let name = first_line
+        .strip_prefix("[[")
+        .and_then(|line| line.strip_suffix("]]"))
+        .or_else(|| {
+            first_line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+        })?
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn toml_table_range(source: &str, table: &Node) -> Range {
+    let start = table.start_position();
+    let text = node_text(source, table).trim_end();
+    let mut lines = text.lines();
+    let line_count = lines.clone().count().max(1);
+    let end_col = lines.next_back().map(str::len).unwrap_or_default();
+    Range {
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: start.row as u32 + line_count as u32 - 1,
+        end_col: end_col as u32,
+    }
+}
+
+fn extract_toml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "pair" => {
+                if let Some(symbol) = toml_pair_symbol(source, &child, None) {
+                    symbols.push(symbol);
+                }
+            }
+            "table" | "table_array_element" => {
+                let Some(name) = toml_table_name(source, &child) else {
+                    continue;
+                };
+                symbols.push(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Variable,
+                    range: toml_table_range(source, &child),
+                    signature: None,
+                    scope_chain: Vec::new(),
+                    exported: false,
+                    parent: None,
+                });
+
+                let mut table_cursor = child.walk();
+                for item in child.named_children(&mut table_cursor) {
+                    if item.kind() == "pair" {
+                        if let Some(symbol) = toml_pair_symbol(source, &item, Some(&name)) {
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(symbols)
 }
 
 /// Return the first non-comment value in a JSON document.

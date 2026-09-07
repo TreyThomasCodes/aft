@@ -683,6 +683,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 
@@ -918,7 +919,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1038,7 +1040,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1278,6 +1281,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::R => "aft-tool-detection.R",
         LangId::Groovy => "aft-tool-detection.groovy",
         LangId::ObjC => "aft-tool-detection.m",
+        LangId::Toml => "aft-tool-detection.toml",
     };
     project_root.join(filename)
 }

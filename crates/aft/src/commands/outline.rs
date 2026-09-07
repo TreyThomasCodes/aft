@@ -1101,6 +1101,7 @@ fn language_id(lang: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 

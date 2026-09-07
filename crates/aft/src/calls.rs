@@ -55,7 +55,8 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => vec![],
+        | LangId::ObjC
+        | LangId::Toml => vec![],
     }
 }
 
