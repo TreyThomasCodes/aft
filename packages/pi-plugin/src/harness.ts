@@ -48,11 +48,11 @@ export function resetRecordedExtensionApi(): void {
  *   and `types.ts:1252-1360`) has never exposed:
  *     - `api.arktype`: injected `@oh-my-pi/omptype` schema builder for extension tools (upstream Pi uses `@sinclair/typebox` and has no ArkType dependency).
  *     - `api.registerFileWriteFallback` / `api.registerFileDeleteFallback`: OMP's sandbox write/delete fallback handlers.
- *     - `api.events`: OMP's internal `EventBus` instance.
- *   Upstream Pi's `createExtensionAPI` returns a plain object with only standard Pi extension methods (`registerTool`,
- *   `registerCommand`, `registerShortcut`, `registerFlag`, `registerMessageRenderer`, `registerMarkdownTransformer`,
- *   `registerEntryRenderer`, `on`, `getFlag`). None of `arktype`, `events`, or `registerFileWriteFallback` exist on Pi's `ExtensionAPI`.
- *   Inspecting these fields cannot false-positive on upstream Pi.
+ *   Upstream Pi's `ExtensionAPI` (`pi-mono/packages/coding-agent/src/core/extensions/types.ts:1252-1500`) declares
+ *   neither `arktype` nor `registerFileWriteFallback`, so inspecting those two cannot false-positive on Pi.
+ *   NOT a signal: `api.events`. Upstream Pi's `ExtensionAPI` also carries `events: EventBus` (types.ts:1499,
+ *   populated by `loader.ts:447`), so testing for it would classify every upstream Pi host as OMP and fold the
+ *   guidance into descriptions that Pi already renders - the double-render this detector exists to prevent.
  *
  * @param api Optional ExtensionAPI instance. If omitted, the recorded API from extension initialization is checked,
  *            followed by global OMP environment indicators.
@@ -65,11 +65,7 @@ export function detectPiHarness(api?: unknown): PiHarness {
   const target = api === undefined ? recordedApi : api;
   if (target && typeof target === "object") {
     const candidate = target as Record<string, unknown>;
-    if (
-      "arktype" in candidate ||
-      "registerFileWriteFallback" in candidate ||
-      "events" in candidate
-    ) {
+    if ("arktype" in candidate || "registerFileWriteFallback" in candidate) {
       return "omp";
     }
     if (typeof candidate.registerTool === "function") {

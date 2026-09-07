@@ -52,13 +52,11 @@ describe("detectPiHarness", () => {
     expect(detectPiHarness(api)).toBe("omp");
   });
 
-  test("identifies OMP from events on ExtensionAPI", () => {
-    const api = { events: {}, registerTool: () => {} };
-    expect(detectPiHarness(api)).toBe("omp");
-  });
-
-  test("identifies upstream Pi when standard API methods exist without OMP members", () => {
-    const api = { registerTool: () => {}, registerCommand: () => {} };
+  // Upstream Pi's ExtensionAPI carries `events: EventBus` too
+  // (pi-mono core/extensions/types.ts:1499), so it is not an OMP signal; an
+  // upstream host shaped like the real one must still read as Pi.
+  test("identifies upstream Pi when standard API methods and events exist without OMP members", () => {
+    const api = { registerTool: () => {}, registerCommand: () => {}, events: {} };
     expect(detectPiHarness(api)).toBe("pi");
   });
 
