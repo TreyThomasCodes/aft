@@ -1877,8 +1877,7 @@ fn callgraph_trace_to_not_configured() {
 #[test]
 fn callgraph_trace_to_symbol_not_found() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -1900,6 +1899,28 @@ fn callgraph_trace_to_symbol_not_found() {
     aft.shutdown();
 }
 
+fn temp_callgraph_fixture() -> (tempfile::TempDir, String) {
+    let temp = tempdir().unwrap();
+    let fixtures = fixture_path("callgraph");
+    copy_dir_all(&fixtures, temp.path());
+    let root = temp.path().display().to_string();
+    (temp, root)
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &dest_path);
+        } else {
+            fs::copy(&path, &dest_path).unwrap();
+        }
+    }
+}
+
 /// `trace_to` on a deeply-nested symbol returns a single path through the chain.
 ///
 /// checkFormat is called by validate (helpers.ts), which is called by processData (utils.ts),
@@ -1907,8 +1928,7 @@ fn callgraph_trace_to_symbol_not_found() {
 #[test]
 fn callgraph_trace_to_single_path() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -1967,8 +1987,7 @@ fn callgraph_trace_to_single_path() {
 #[test]
 fn callgraph_trace_to_multi_path() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2035,8 +2054,7 @@ fn callgraph_trace_to_multi_path() {
 #[test]
 fn callgraph_trace_to_no_entry_points() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2300,8 +2318,7 @@ fn callgraph_trace_data_not_configured() {
 #[test]
 fn callgraph_trace_data_symbol_not_found() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2334,8 +2351,7 @@ fn callgraph_trace_data_symbol_not_found() {
 #[test]
 fn callgraph_trace_data_assignment_tracking() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2404,8 +2420,7 @@ fn sink_parameter_hop(hops: &[Value]) -> Option<&Value> {
 #[test]
 fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2457,8 +2472,7 @@ fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
 #[test]
 fn callgraph_trace_data_cross_file() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
@@ -2527,8 +2541,7 @@ fn callgraph_trace_data_cross_file() {
 #[test]
 fn callgraph_trace_data_approximation() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
-    let root = fixtures.display().to_string();
+    let (_temp, root) = temp_callgraph_fixture();
 
     aft.send(&format!(
         r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
