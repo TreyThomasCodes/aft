@@ -38,6 +38,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
     pub message: String,
@@ -62,6 +66,8 @@ pub struct StoreCallersResult {
     pub file: String,
     pub callers: Vec<StoreCallerGroup>,
     pub total_callers: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_test_callers: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_summary: Option<StoreHubSummary>,
     pub scanned_files: usize,
@@ -102,6 +108,8 @@ pub struct StoreCallTreeNode {
     pub children: Vec<StoreCallTreeNode>,
     pub depth_limited: bool,
     pub truncated: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_test_callers: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree_list_envelope: Option<ListEnvelope>,
 }
@@ -114,6 +122,8 @@ pub struct StoreImpactResult {
     pub signature: Option<String>,
     pub parameters: Vec<String>,
     pub total_affected: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_test_callers: usize,
     pub affected_files: usize,
     pub callers: Vec<StoreImpactCaller>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -439,6 +449,13 @@ fn retain_trace_path(retained: &mut Vec<StoreTracePath>, path: StoreTracePath) {
         .collect();
 }
 
+fn count_test_call_tree_nodes(node: &StoreCallTreeNode) -> usize {
+    node.children
+        .iter()
+        .map(|child| usize::from(is_test_file(&child.file)) + count_test_call_tree_nodes(child))
+        .sum()
+}
+
 fn filter_call_tree_tests(node: &mut StoreCallTreeNode) {
     node.children.retain(|child| !is_test_file(&child.file));
     for child in &mut node.children {
@@ -553,6 +570,7 @@ pub fn callers_result(
             .map(|(file, callers)| StoreCallerGroup { file, callers })
             .collect(),
         total_callers,
+        hidden_test_callers: if include_tests { 0 } else { hidden_tests },
         hub_summary,
         scanned_files: store.indexed_file_count()?,
         depth_limited,
@@ -580,10 +598,16 @@ pub fn call_tree_result(
         &mut adjacency_cache,
         true,
     )?;
+    let hidden_test_callers = if include_tests {
+        0
+    } else {
+        count_test_call_tree_nodes(&tree)
+    };
     if !include_tests {
         filter_call_tree_tests(&mut tree);
     }
     let (shown, total_children) = cap_items(&mut tree.children);
+    tree.hidden_test_callers = hidden_test_callers;
     tree.tree_list_envelope =
         build_callgraph_envelope(Unit::Items, shown, total_children, tree.truncated);
     Ok(tree)
@@ -718,6 +742,7 @@ pub fn impact_result(
         signature: target_signature,
         parameters: target_parameters,
         total_affected,
+        hidden_test_callers: if include_tests { 0 } else { hidden_tests },
         affected_files,
         callers,
         hub_summary,
@@ -2173,6 +2198,7 @@ fn call_tree_inner(
             children: Vec::new(),
             depth_limited: false,
             truncated: 0,
+            hidden_test_callers: 0,
             tree_list_envelope: None,
         });
     }
@@ -2232,6 +2258,7 @@ fn call_tree_inner(
                             children: Vec::new(),
                             depth_limited: false,
                             truncated: 0,
+                            hidden_test_callers: 0,
                             tree_list_envelope: None,
                         });
                     }
@@ -2247,6 +2274,7 @@ fn call_tree_inner(
                     children: Vec::new(),
                     depth_limited: false,
                     truncated: 0,
+                    hidden_test_callers: 0,
                     tree_list_envelope: None,
                 }),
             }
@@ -2267,6 +2295,7 @@ fn call_tree_inner(
         children,
         depth_limited,
         truncated,
+        hidden_test_callers: 0,
         tree_list_envelope: None,
     })
 }

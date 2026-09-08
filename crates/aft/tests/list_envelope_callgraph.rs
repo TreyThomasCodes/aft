@@ -115,6 +115,7 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
         signature: None,
         parameters: Vec::new(),
         total_affected: count, // R11: envelope total
+        hidden_test_callers: 0,
         affected_files: 1,
         callers: visible_callers,
         hub_summary,
@@ -166,6 +167,7 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
             callers: visible_entries,
         }],
         total_callers: count, // R11: envelope total
+        hidden_test_callers: 0,
         hub_summary,
         scanned_files: 1,
         depth_limited,
@@ -187,6 +189,7 @@ fn make_call_tree_node(count: usize, depth_limited: bool, truncated: usize) -> S
             children: Vec::new(),
             depth_limited: false,
             truncated: 0,
+            hidden_test_callers: 0,
             tree_list_envelope: None,
         })
         .collect::<Vec<_>>();
@@ -205,6 +208,7 @@ fn make_call_tree_node(count: usize, depth_limited: bool, truncated: usize) -> S
         children,
         depth_limited,
         truncated,
+        hidden_test_callers: 0,
         tree_list_envelope,
     }
 }
@@ -624,37 +628,60 @@ fn test_cut_inside_requested_depth() {
 
 #[test]
 fn test_r12_paired_fixtures() {
-    // R12 paired fixtures:
-    // With includeTests: false and pre/post-filter counts differing, the rendered total is
-    // the post-filter count (or ≥) and payload.hub_summary is OMITTED from that reply's JSON;
-    // the paired fixture without the correction asserts hub_summary present and byte-unchanged.
-    let pre_filter = 25;
+    // When test filtering changes the requested domain, the legacy total remains
+    // pre-filter while the heading comes from the post-filter envelope. The
+    // contradictory hub summary stays omitted, but the hidden-test disclosure remains.
+    let pre_filter = 26;
     let post_filter = 21;
-    let hidden_tests = 4;
+    let hidden_tests = 5;
 
-    // Filtered case: includeTests: false
-    let filtered_hub_summary = if !false && pre_filter != post_filter {
-        None
-    } else {
-        Some("should not be here")
-    };
-    assert!(filtered_hub_summary.is_none());
+    let mut filtered_impact = make_impact_result(post_filter, false, 0);
+    filtered_impact.total_affected = pre_filter;
+    filtered_impact.hidden_test_callers = hidden_tests;
+    filtered_impact.hub_summary = None;
+    let json_filtered = serde_json::to_value(&filtered_impact).unwrap();
 
-    let envelope_filtered = build_callgraph_envelope(Unit::Sites, 15, post_filter, 0).unwrap();
-    assert_eq!(envelope_filtered.total, Total::Exact(post_filter));
-
-    let json_filtered = json!({
-        "symbol": "target",
-        "file": "src/app.ts",
-        "total_affected": post_filter,
-        "affected_files": 1,
-        "callers": [],
-        "sites_list_envelope": envelope_filtered,
-    });
-    // payload.hub_summary is OMITTED from JSON
+    assert_eq!(json_filtered["total_affected"], json!(pre_filter));
+    assert_eq!(json_filtered["hidden_test_callers"], json!(hidden_tests));
     assert!(json_filtered.get("hub_summary").is_none());
+    assert_eq!(
+        filtered_impact
+            .sites_list_envelope
+            .as_ref()
+            .expect("post-filter cap envelope")
+            .total,
+        Total::Exact(post_filter)
+    );
 
-    // Unfiltered paired case: includeTests: true
+    let rendered_impact = format_subc("impact", &json_filtered);
+    assert!(rendered_impact.starts_with("21 affected call sites · 1 file"));
+    let hidden_line = "5 callers in tests hidden — includeTests: true shows them";
+    let hidden_index = rendered_impact
+        .find(hidden_line)
+        .expect("impact should disclose filtered test callers");
+    let trailer_index = rendered_impact
+        .find("shown 15 of 21 sites (cap) · narrow: depth, includeTests")
+        .expect("post-filter hub should render its cap trailer");
+    assert!(
+        hidden_index < trailer_index,
+        "hidden-test disclosure must render before the cap trailer: {rendered_impact}"
+    );
+
+    let mut filtered_tree = make_call_tree_node(20, false, 0);
+    filtered_tree.hidden_test_callers = hidden_tests;
+    let json_filtered_tree = serde_json::to_value(&filtered_tree).unwrap();
+    assert_eq!(
+        json_filtered_tree["hidden_test_callers"],
+        json!(hidden_tests)
+    );
+    let rendered_tree = format_subc("call_tree", &json_filtered_tree);
+    assert!(
+        rendered_tree.contains(hidden_line),
+        "call_tree should disclose filtered test callers without a hub: {rendered_tree}"
+    );
+    assert!(!rendered_tree.contains("shown "));
+
+    // The includeTests reply keeps its existing hub summary and has no hidden count.
     let unfiltered_hub_msg = format!("Next: {pre_filter} affected callers ({hidden_tests} in tests, included) — showing 15; narrow with scope");
     let unfiltered_hub_summary = json!({
         "message": unfiltered_hub_msg,
@@ -678,8 +705,8 @@ fn test_r12_paired_fixtures() {
         "hub_summary": unfiltered_hub_summary.clone(),
         "sites_list_envelope": envelope_unfiltered,
     });
-    // hub_summary is PRESENT and byte-unchanged
     assert_eq!(json_unfiltered["hub_summary"], unfiltered_hub_summary);
+    assert!(json_unfiltered.get("hidden_test_callers").is_none());
 }
 
 #[test]

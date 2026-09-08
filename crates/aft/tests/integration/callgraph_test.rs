@@ -4,6 +4,8 @@
 //! using the fixtures in `tests/fixtures/callgraph/`.
 
 use crate::helpers::{fixture_path, AftProcess};
+use aft::protocol::Response;
+use aft::subc_format::{format_response_with_context, FormatContext};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
@@ -29,6 +31,17 @@ fn flattened_caller_entries(resp: &Value) -> Vec<&Value> {
         .iter()
         .flat_map(|group| group["callers"].as_array().expect("caller entries"))
         .collect()
+}
+
+fn format_callgraph_response(op: &str, data: &Value) -> String {
+    let response = Response {
+        id: "callgraph-test".to_string(),
+        success: true,
+        data: data.clone(),
+    };
+    let mut context = FormatContext::default();
+    context.callgraph_op = Some(op.to_string());
+    format_response_with_context("callgraph", &response, &context)
 }
 
 /// `configure` sets project root and returns success.
@@ -965,20 +978,18 @@ export function smallCaller{idx:02}(): number {{
     );
     assert_eq!(
         callers["total_callers"], 25,
-        "summary count should include hidden tests"
+        "legacy total should include hidden tests"
     );
-    let summary = callers["hub_summary"]["message"]
-        .as_str()
-        .expect("hub summary");
+    assert_eq!(callers["hidden_test_callers"], 5);
     assert!(
-        summary.contains("Next: 25 callers (5 in tests, hidden — pass includeTests)"),
-        "summary should state hidden tests and honest total: {summary}"
+        callers.get("hub_summary").is_none(),
+        "post-filter count 20 should not activate the hub: {callers:?}"
     );
     let visible_callers = flattened_caller_entries(&callers);
     assert_eq!(
         visible_callers.len(),
-        15,
-        "hub summary should show top 15 callers"
+        20,
+        "all post-filter callers should render below the hub threshold"
     );
     assert!(
         callers["callers"]
@@ -987,6 +998,15 @@ export function smallCaller{idx:02}(): number {{
             .iter()
             .all(|group| !group["file"].as_str().unwrap().contains("__tests__")),
         "default callers should hide test files: {callers:?}"
+    );
+    let rendered_callers = format_callgraph_response("callers", &callers);
+    assert!(
+        rendered_callers.starts_with("20 callers · 20 file groups"),
+        "filtered heading should use the post-filter count: {rendered_callers}"
+    );
+    assert!(
+        rendered_callers.contains("5 callers in tests hidden — includeTests: true shows them"),
+        "filtered callers should disclose hidden tests: {rendered_callers}"
     );
 
     let callers_with_tests = aft.send(&format!(
@@ -1013,21 +1033,27 @@ export function smallCaller{idx:02}(): number {{
     assert_eq!(impact["success"], true, "impact should succeed: {impact:?}");
     assert_eq!(
         impact["total_affected"], 25,
-        "impact summary count should include hidden tests"
+        "legacy impact total should include hidden tests"
     );
-    let impact_summary = impact["hub_summary"]["message"]
-        .as_str()
-        .expect("impact summary");
+    assert_eq!(impact["hidden_test_callers"], 5);
     assert!(
-        impact_summary
-            .contains("Next: 25 affected callers (5 in tests, hidden — pass includeTests)"),
-        "impact summary should state hidden tests and honest total: {impact_summary}"
+        impact.get("hub_summary").is_none(),
+        "post-filter impact count 20 should not activate the hub: {impact:?}"
     );
     let impact_callers = impact["callers"].as_array().expect("impact callers");
     assert_eq!(
         impact_callers.len(),
-        15,
-        "impact hub summary should show top 15 callers"
+        20,
+        "all post-filter impact callers should render below the hub threshold"
+    );
+    let rendered_impact = format_callgraph_response("impact", &impact);
+    assert!(
+        rendered_impact.starts_with("20 affected call sites · 20 files"),
+        "filtered impact heading should use the post-filter count: {rendered_impact}"
+    );
+    assert!(
+        rendered_impact.contains("5 callers in tests hidden — includeTests: true shows them"),
+        "filtered impact should disclose hidden tests: {rendered_impact}"
     );
     assert!(
         impact_callers.iter().all(|caller| !caller["caller_file"]

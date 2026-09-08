@@ -2407,6 +2407,12 @@ fn format_call_tree_sections(
 
     let mut lines = Vec::new();
     render_call_tree_node(record, 0, &mut lines, include_unresolved);
+    let hidden_test_callers = number_field(record, "hidden_test_callers").unwrap_or(0);
+    if hidden_test_callers > 0 {
+        lines.push(format!(
+            "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
+        ));
+    }
     let is_envelope_governed =
         crate::list_surfaces::find_surface("callgraph", "call_tree", "payload.tree").is_some();
     let truncated = number_field(record, "truncated").unwrap_or(0);
@@ -2530,6 +2536,7 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let groups = records_field(record, "callers");
+    let hidden_test_callers = number_field(record, "hidden_test_callers").unwrap_or(0);
     let is_envelope_governed =
         crate::list_surfaces::find_surface("callgraph", "callers", "payload.callers").is_some();
     let truncated = number_field(record, "truncated").unwrap_or(0);
@@ -2547,7 +2554,7 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         crate::list_envelope::render_total(&env.total)
     } else {
         let total = number_field(record, "total_callers").unwrap_or(0);
-        format!("{total}")
+        format!("{}", total.saturating_sub(hidden_test_callers))
     };
     let mut sections = vec![join_non_empty(&[
         Some(format!(
@@ -2566,6 +2573,11 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     }
     for group in groups {
         sections.push(render_callers_group_lines(group).join("\n"));
+    }
+    if hidden_test_callers > 0 {
+        sections.push(format!(
+            "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
+        ));
     }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
@@ -2743,6 +2755,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let callers = records_field(record, "callers");
+    let hidden_test_callers = number_field(record, "hidden_test_callers").unwrap_or(0);
     let is_envelope_governed =
         crate::list_surfaces::find_surface("callgraph", "impact", "payload.sites").is_some();
     let truncated = number_field(record, "truncated").unwrap_or(0);
@@ -2760,7 +2773,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         crate::list_envelope::render_total(&env.total)
     } else {
         let total_affected = number_field(record, "total_affected").unwrap_or(callers.len() as i64);
-        format!("{total_affected}")
+        format!("{}", total_affected.saturating_sub(hidden_test_callers))
     };
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
@@ -2813,6 +2826,11 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
             lines.push(format!("  params: {params}"));
         }
         sections.push(lines.join("\n"));
+    }
+    if hidden_test_callers > 0 {
+        sections.push(format!(
+            "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
+        ));
     }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
