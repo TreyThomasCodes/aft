@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
-use aft::commands::inspect::{handle_inspect, handle_inspect_tier2_run};
+use aft::commands::inspect::handle_inspect_tier2_run;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
@@ -233,14 +233,13 @@ fn ensure_callgraph_store_ready(ctx: &AppContext) {
 }
 
 fn inspect(ctx: &AppContext) -> Value {
-    let response = handle_inspect(
-        &request(json!({
+    crate::helpers::inspect_reasking_tier1_deadline(
+        ctx,
+        json!({
             "id": "inspect",
             "command": "inspect",
-        })),
-        ctx,
-    );
-    serde_json::to_value(response).expect("inspect response serializes")
+        }),
+    )
 }
 
 fn enqueue_tier2_run(ctx: &AppContext, categories: &[&str]) -> Value {

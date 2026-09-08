@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aft::commands::configure::handle_configure;
-use aft::commands::inspect::handle_inspect;
 use aft::config::Config;
 use aft::context::AppContext;
 use aft::lsp::registry::ServerKind;
@@ -89,8 +88,7 @@ fn configure_fake_typescript_lsp(ctx: &AppContext) {
 }
 
 fn inspect(ctx: &AppContext, payload: Value) -> Value {
-    let response = handle_inspect(&request(payload), ctx);
-    serde_json::to_value(response).expect("inspect response serializes")
+    crate::helpers::inspect_reasking_tier1_deadline(ctx, payload)
 }
 
 fn diagnostics_details(response: &Value) -> &[Value] {
