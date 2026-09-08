@@ -509,8 +509,11 @@ pub fn callers_result(
     };
     let shown = visible_sites.len();
 
-    // Use post-filter count as total callers so the reported total matches callers after active filters are applied.
-    let total_callers = post_filter_count;
+    // `total_callers` is a legacy JSON field consumers read as the pre-filter
+    // count (hidden test callers included); it stays that way. The
+    // requested-domain count the agent sees lives in the envelope, and the
+    // text heading renders from the envelope when one is present.
+    let total_callers = pre_filter_count;
 
     // Omit hub_summary when test filtering changes the caller count to avoid contradictory summary figures in the JSON output.
     let hub_summary = if summarize {
@@ -654,8 +657,9 @@ pub fn impact_result(
     };
     let shown = visible_sites.len();
 
-    // Use post-filter count as total affected callers so the reported total matches callers after active filters are applied.
-    let total_affected = post_filter_count;
+    // `total_affected` is a legacy JSON field consumers read as the pre-filter
+    // count; the requested-domain count lives in the envelope (see callers).
+    let total_affected = pre_filter_count;
 
     // Omit hub_summary when test filtering changes the caller count to avoid contradictory summary figures in the JSON output.
     let hub_summary = if summarize {
