@@ -1749,20 +1749,41 @@ fn build_inspect_payload(
         }
         summary.insert(category.as_str().to_string(), category_summary);
         if sections.includes(*category) {
-            details.insert(
-                category.as_str().to_string(),
-                details_for(*category, payload, top_k),
-            );
+            let detail = details_for(*category, payload, top_k);
+            let total_count = payload
+                .get("items")
+                .or_else(|| payload.get("groups"))
+                .and_then(Value::as_array)
+                .map_or(0, |a| a.len());
+            let shown = detail.as_array().map_or(0, |a| a.len());
+            details.insert(category.as_str().to_string(), detail);
+            if *category != InspectCategory::Metrics {
+                crate::list_surfaces::inspect::attach_inspect_envelope(
+                    &mut details,
+                    category.as_str(),
+                    shown,
+                    total_count,
+                );
+            }
             if matches!(
                 *category,
                 InspectCategory::DeadCode | InspectCategory::UnusedExports
             ) {
                 let test_only_detail = test_only_details_for(payload, top_k);
-                if test_only_detail
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-                {
-                    details.insert(format!("{}_test_only", category.as_str()), test_only_detail);
+                let test_only_total = payload
+                    .get("test_only_items")
+                    .and_then(Value::as_array)
+                    .map_or(0, |a| a.len());
+                let test_only_shown = test_only_detail.as_array().map_or(0, |a| a.len());
+                if test_only_shown > 0 || (top_k == 0 && test_only_total > 0) {
+                    let key = format!("{}_test_only", category.as_str());
+                    details.insert(key.clone(), test_only_detail);
+                    crate::list_surfaces::inspect::attach_inspect_envelope(
+                        &mut details,
+                        &key,
+                        test_only_shown,
+                        test_only_total,
+                    );
                 }
             }
             if matches!(
@@ -1772,19 +1793,39 @@ fn build_inspect_payload(
                     | InspectCategory::Duplicates
             ) {
                 let generated_detail = generated_details_for(payload, top_k);
-                if generated_detail
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-                {
-                    details.insert(format!("{}_generated", category.as_str()), generated_detail);
+                let generated_total = payload
+                    .get("generated_items")
+                    .and_then(Value::as_array)
+                    .map_or(0, |a| a.len());
+                let generated_shown = generated_detail.as_array().map_or(0, |a| a.len());
+                if generated_shown > 0 || (top_k == 0 && generated_total > 0) {
+                    let key = format!("{}_generated", category.as_str());
+                    details.insert(key.clone(), generated_detail);
+                    crate::list_surfaces::inspect::attach_inspect_envelope(
+                        &mut details,
+                        &key,
+                        generated_shown,
+                        generated_total,
+                    );
                 }
             }
         } else if *category == InspectCategory::Diagnostics {
             // Diagnostics detail is actionable even without an explicit section.
             // `top_k` limits rows only; summaries are always computed in full.
             let detail = details_for(*category, payload, top_k);
-            if detail.as_array().is_some_and(|items| !items.is_empty()) {
+            let diag_total = payload
+                .get("items")
+                .and_then(Value::as_array)
+                .map_or(0, |a| a.len());
+            let diag_shown = detail.as_array().map_or(0, |a| a.len());
+            if diag_shown > 0 || (top_k == 0 && diag_total > 0) {
                 details.insert(category.as_str().to_string(), detail);
+                crate::list_surfaces::inspect::attach_inspect_envelope(
+                    &mut details,
+                    category.as_str(),
+                    diag_shown,
+                    diag_total,
+                );
             }
         }
     }
@@ -1831,6 +1872,7 @@ fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value
         "unused_exports",
     );
     render_todos(&mut lines, summary, details);
+    render_diagnostics_category(&mut lines, summary, details);
 
     lines.join("\n")
 }
@@ -1908,6 +1950,11 @@ fn render_complexity_category(
         let complexity = item.get("complexity").and_then(Value::as_u64).unwrap_or(0);
         lines.push(format!("  {file}:{line} {function} ({complexity})"));
     }
+    if let Some(trailer) =
+        crate::list_surfaces::inspect::trailer_from_details(details, "complexity")
+    {
+        lines.push(trailer);
+    }
 }
 
 fn render_cycles_category(
@@ -1969,6 +2016,9 @@ fn render_cycles_category(
             }
         }
     }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, "cycles") {
+        lines.push(trailer);
+    }
 }
 
 fn render_cycle_import(import: &Value) -> String {
@@ -1995,16 +2045,13 @@ fn category_items<'a>(
     details: &'a Map<String, Value>,
     key: &str,
 ) -> Option<&'a Vec<Value>> {
-    details
+    if let Some(items) = details.get(key).and_then(Value::as_array) {
+        return Some(items);
+    }
+    summary
         .get(key)
+        .and_then(|s| s.get("top"))
         .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-        .or_else(|| {
-            summary
-                .get(key)
-                .and_then(|s| s.get("top"))
-                .and_then(Value::as_array)
-        })
 }
 
 /// Categories whose findings are `{file, symbol}` (dead_code, unused_exports).
@@ -2053,6 +2100,9 @@ fn render_symbol_category(
                 lines.push(format!("  {file}::{symbol}"));
             }
         }
+        if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+            lines.push(trailer);
+        }
     }
     render_generated_symbol_usage(lines, summary, details, key);
     render_test_only_usage(lines, summary, details, key);
@@ -2096,6 +2146,11 @@ fn render_generated_symbol_usage(
             lines.push(format!("    {file}::{symbol}"));
         }
     }
+    if let Some(trailer) =
+        crate::list_surfaces::inspect::trailer_from_details(details, &format!("{key}_generated"))
+    {
+        lines.push(trailer);
+    }
 }
 
 fn render_test_only_usage(
@@ -2121,6 +2176,11 @@ fn render_test_only_usage(
             lines.push(format!("    {file}::{symbol} — used by {used_by}"));
         }
     }
+    if let Some(trailer) =
+        crate::list_surfaces::inspect::trailer_from_details(details, &format!("{key}_test_only"))
+    {
+        lines.push(trailer);
+    }
 }
 
 fn test_only_items<'a>(
@@ -2128,16 +2188,14 @@ fn test_only_items<'a>(
     details: &'a Map<String, Value>,
     key: &str,
 ) -> Option<&'a Vec<Value>> {
-    details
-        .get(&format!("{key}_test_only"))
+    let detail_key = format!("{key}_test_only");
+    if let Some(items) = details.get(&detail_key).and_then(Value::as_array) {
+        return Some(items);
+    }
+    summary
+        .get(key)
+        .and_then(|s| s.get("test_only_top"))
         .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-        .or_else(|| {
-            summary
-                .get(key)
-                .and_then(|s| s.get("test_only_top"))
-                .and_then(Value::as_array)
-        })
 }
 
 fn generated_items<'a>(
@@ -2145,16 +2203,14 @@ fn generated_items<'a>(
     details: &'a Map<String, Value>,
     key: &str,
 ) -> Option<&'a Vec<Value>> {
-    details
-        .get(&format!("{key}_generated"))
+    let detail_key = format!("{key}_generated");
+    if let Some(items) = details.get(&detail_key).and_then(Value::as_array) {
+        return Some(items);
+    }
+    summary
+        .get(key)
+        .and_then(|s| s.get("generated_top"))
         .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-        .or_else(|| {
-            summary
-                .get(key)
-                .and_then(|s| s.get("generated_top"))
-                .and_then(Value::as_array)
-        })
 }
 
 fn format_used_by_tests(value: Option<&Value>) -> String {
@@ -2257,6 +2313,9 @@ fn render_group_category(
             lines.push(format!("  {cost}  {}", files.join(" == ")));
         }
     }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+        lines.push(trailer);
+    }
 }
 
 fn render_duplicates_category(
@@ -2295,6 +2354,9 @@ fn render_duplicates_category(
             duplicate_suppression_clause(section)
         ));
         render_duplicate_rows(lines, summary, details, key);
+        if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+            lines.push(trailer);
+        }
         render_generated_duplicate_usage(lines, summary, details, key);
         return;
     };
@@ -2330,6 +2392,9 @@ fn render_duplicates_category(
     ));
     if count > 0 {
         render_duplicate_rows(lines, summary, details, key);
+    }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+        lines.push(trailer);
     }
     render_generated_duplicate_usage(lines, summary, details, key);
 }
@@ -2382,6 +2447,11 @@ fn render_generated_duplicate_usage(
                 .unwrap_or_default();
             lines.push(format!("    {cost}  {}", files.join(" == ")));
         }
+    }
+    if let Some(trailer) =
+        crate::list_surfaces::inspect::trailer_from_details(details, &format!("{key}_generated"))
+    {
+        lines.push(trailer);
     }
 }
 
@@ -2500,6 +2570,157 @@ fn render_todos(
             lines.push(format!("  {file}:{line} {marker} {text}"));
         }
     }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, "todos") {
+        lines.push(trailer);
+    }
+}
+
+fn render_diagnostics_category(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+) {
+    let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics")
+    else {
+        return;
+    };
+
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    if let Some(section) = summary.get("diagnostics").and_then(Value::as_object) {
+        let errors = section.get("errors").and_then(Value::as_u64);
+        let warnings = section.get("warnings").and_then(Value::as_u64);
+        let info = section.get("info").and_then(Value::as_u64);
+        let hints = section.get("hints").and_then(Value::as_u64);
+        let has_counts = [errors, warnings, info, hints].iter().any(|v| v.is_some());
+        let counts = format!(
+            "{} errors, {} warnings, {} info, {} hints",
+            errors.unwrap_or(0),
+            warnings.unwrap_or(0),
+            info.unwrap_or(0),
+            hints.unwrap_or(0)
+        );
+        let status = section.get("status").and_then(Value::as_str);
+        let provisional_counts = section.get("provisional_counts").and_then(Value::as_object);
+        let provisional_text = provisional_counts.map(|counts| {
+            format!(
+                " ({} errors, {} warnings, {} info, {} hints)",
+                counts.get("errors").and_then(Value::as_u64).unwrap_or(0),
+                counts.get("warnings").and_then(Value::as_u64).unwrap_or(0),
+                counts.get("info").and_then(Value::as_u64).unwrap_or(0),
+                counts.get("hints").and_then(Value::as_u64).unwrap_or(0),
+            )
+        });
+        let provisional_framing = || {
+            format!(
+                "provisional — analyzer not ready; counts excluded from E/W{}",
+                provisional_text.as_deref().unwrap_or("")
+            )
+        };
+
+        match status {
+            Some("pending") => lines.push(format!(
+                "diagnostics: {} — still pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
+                provisional_framing(),
+                diagnostics_server_summary(section)
+            )),
+            Some("incomplete") => lines.push(format!(
+                "diagnostics: {} (incomplete — servers: {})",
+                provisional_framing(),
+                diagnostics_server_summary(section)
+            )),
+            _ if provisional_counts.is_some() => lines.push(format!(
+                "diagnostics: {}",
+                provisional_framing()
+            )),
+            _ => {
+                if has_counts {
+                    lines.push(format!("diagnostics: {counts}"));
+                }
+            }
+        }
+    }
+
+    let provisional = summary.get("diagnostics").is_some_and(|section| {
+        section.get("status").and_then(Value::as_str) == Some("pending")
+            || section.get("status").and_then(Value::as_str) == Some("incomplete")
+            || section.get("provisional_counts").is_some()
+    });
+    lines.push(if provisional {
+        "diagnostics details (provisional — analyzer not ready; counts excluded from E/W):"
+            .to_string()
+    } else {
+        "diagnostics details:".to_string()
+    });
+
+    if let Some(items) = details.get("diagnostics").and_then(Value::as_array) {
+        for item in items {
+            if let Some(d) = item.as_object() {
+                let severity = d
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("information");
+                let message = d
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no message)");
+                let source = d.get("source").and_then(Value::as_str);
+                let suffix = source.map(|s| format!(" [{s}]")).unwrap_or_default();
+                lines.push(format!(
+                    "- {} {} {}{}",
+                    format_diagnostic_location(d),
+                    severity,
+                    message,
+                    suffix
+                ));
+            }
+        }
+    }
+    lines.push(trailer);
+}
+
+fn format_diagnostic_location(d: &Map<String, Value>) -> String {
+    let file = d
+        .get("file")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown file)");
+    let line = d.get("line").and_then(Value::as_u64);
+    let column = d.get("column").and_then(Value::as_u64);
+    match (line, column) {
+        (None, _) => file.to_string(),
+        (Some(line), None) => format!("{file}:{line}"),
+        (Some(line), Some(col)) => format!("{file}:{line}:{col}"),
+    }
+}
+
+fn diagnostics_server_summary(section: &Map<String, Value>) -> String {
+    let pending = string_array(section.get("servers_pending"));
+    let not_installed = string_array(section.get("servers_not_installed"));
+    let mut parts = Vec::new();
+    if !pending.is_empty() {
+        parts.push(format!("pending: {}", pending.join(", ")));
+    }
+    if !not_installed.is_empty() {
+        parts.push(format!("not installed: {}", not_installed.join(", ")));
+    }
+    if parts.is_empty() {
+        "none reported".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn summary_for(category: InspectCategory, payload: &Value) -> Value {
@@ -3503,6 +3724,242 @@ mod fresh_payload_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn build_inspect_payload_four_capped_lists_produces_four_sibling_envelopes_and_r10_trailers() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            serde_json::json!({
+                "count": 4,
+                "generated_count": 3,
+                "test_only_count": 3,
+                "items": [
+                    { "file": "src/a.rs", "symbol": "alpha" },
+                    { "file": "src/b.rs", "symbol": "beta" },
+                    { "file": "src/c.rs", "symbol": "gamma" },
+                    { "file": "src/d.rs", "symbol": "delta" },
+                ],
+                "generated_items": [
+                    { "file": "src/gen_a.rs", "symbol": "gen_one" },
+                    { "file": "src/gen_b.rs", "symbol": "gen_two" },
+                    { "file": "src/gen_c.rs", "symbol": "gen_three" },
+                ],
+                "test_only_items": [
+                    { "file": "src/test_a.rs", "symbol": "t_one", "used_by": ["tests/test_a.rs"] },
+                    { "file": "src/test_b.rs", "symbol": "t_two", "used_by": ["tests/test_b.rs"] },
+                    { "file": "src/test_c.rs", "symbol": "t_three", "used_by": ["tests/test_c.rs"] },
+                ],
+            }),
+        );
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({
+                "errors": 4,
+                "warnings": 0,
+                "info": 0,
+                "hints": 0,
+                "items": [
+                    { "file": "src/diag_a.rs", "line": 10, "column": 5, "severity": "error", "message": "syntax error", "source": "rustc" },
+                    { "file": "src/diag_b.rs", "line": 20, "column": 8, "severity": "error", "message": "missing type", "source": "rustc" },
+                    { "file": "src/diag_c.rs", "line": 30, "column": 2, "severity": "error", "message": "unresolved name", "source": "rustc" },
+                    { "file": "src/diag_d.rs", "line": 40, "column": 1, "severity": "error", "message": "borrow error", "source": "rustc" },
+                ],
+            }),
+        );
+
+        let sections = Sections {
+            detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
+        };
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 2, &ctx);
+
+        let details = payload["details"].as_object().expect("details object");
+        assert_eq!(details["dead_code"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            details["dead_code_generated"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            details["dead_code_test_only"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(details["diagnostics"].as_array().map(Vec::len), Some(2));
+
+        // Exactly four sibling envelopes with derivable keys
+        let envelope_keys: Vec<&String> = details
+            .keys()
+            .filter(|k| k.ends_with("_list_envelope"))
+            .collect();
+        assert_eq!(
+            envelope_keys.len(),
+            4,
+            "must have 4 envelopes: {envelope_keys:?}"
+        );
+        assert!(details.contains_key("dead_code_list_envelope"));
+        assert!(details.contains_key("dead_code_generated_list_envelope"));
+        assert!(details.contains_key("dead_code_test_only_list_envelope"));
+        assert!(details.contains_key("diagnostics_list_envelope"));
+
+        assert_eq!(details["dead_code_list_envelope"]["shown"], 2);
+        assert_eq!(details["dead_code_list_envelope"]["total"]["value"], 4);
+        assert_eq!(details["dead_code_generated_list_envelope"]["shown"], 2);
+        assert_eq!(
+            details["dead_code_generated_list_envelope"]["total"]["value"],
+            3
+        );
+        assert_eq!(details["dead_code_test_only_list_envelope"]["shown"], 2);
+        assert_eq!(
+            details["dead_code_test_only_list_envelope"]["total"]["value"],
+            3
+        );
+        assert_eq!(details["diagnostics_list_envelope"]["shown"], 2);
+        assert_eq!(details["diagnostics_list_envelope"]["total"]["value"], 4);
+
+        let text = payload["text"].as_str().expect("text");
+        let trailers: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("shown ") && line.contains(" items (cap)"))
+            .collect();
+        assert_eq!(
+            trailers.len(),
+            4,
+            "must render exactly four trailers: {text}"
+        );
+
+        // Verify that trailers are placed directly after their corresponding truncated sections in formatted output.
+        assert!(text.contains("  src/b.rs::beta\nshown 2 of 4 items (cap) · narrow: topK, scope, sections\n  generated: 3:"));
+        assert!(text.contains("    src/gen_b.rs::gen_two\nshown 2 of 3 items (cap) · narrow: topK, scope, sections\n  test-only usage: 3:"));
+        assert!(text.contains("    src/test_b.rs::t_two — used by tests/test_b.rs\nshown 2 of 3 items (cap) · narrow: topK, scope, sections"));
+        assert!(text.contains("- src/diag_b.rs:20:8 error missing type [rustc]\nshown 2 of 4 items (cap) · narrow: topK, scope, sections"));
+        assert!(text.ends_with("shown 2 of 4 items (cap) · narrow: topK, scope, sections"));
+    }
+
+    #[test]
+    fn build_inspect_payload_empty_capped_list_renders_heading_then_trailer() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            serde_json::json!({
+                "count": 3,
+                "generated_count": 2,
+                "test_only_count": 2,
+                "items": [
+                    { "file": "src/a.rs", "symbol": "alpha" },
+                    { "file": "src/b.rs", "symbol": "beta" },
+                    { "file": "src/c.rs", "symbol": "gamma" },
+                ],
+                "generated_items": [
+                    { "file": "src/gen_a.rs", "symbol": "gen_one" },
+                    { "file": "src/gen_b.rs", "symbol": "gen_two" },
+                ],
+                "test_only_items": [
+                    { "file": "src/test_a.rs", "symbol": "t_one", "used_by": ["tests/test_a.rs"] },
+                    { "file": "src/test_b.rs", "symbol": "t_two", "used_by": ["tests/test_b.rs"] },
+                ],
+            }),
+        );
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({
+                "errors": 2,
+                "warnings": 0,
+                "info": 0,
+                "hints": 0,
+                "items": [
+                    { "file": "src/diag_a.rs", "line": 10, "column": 5, "severity": "error", "message": "syntax error", "source": "rustc" },
+                    { "file": "src/diag_b.rs", "line": 20, "column": 8, "severity": "error", "message": "missing type", "source": "rustc" },
+                ],
+            }),
+        );
+
+        let sections = Sections {
+            detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
+        };
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 0, &ctx);
+
+        let details = payload["details"].as_object().expect("details object");
+        assert_eq!(details["dead_code"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            details["dead_code_generated"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            details["dead_code_test_only"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(details["diagnostics"].as_array().map(Vec::len), Some(0));
+
+        let text = payload["text"].as_str().expect("text");
+        assert!(text.contains("Dead code: 3 (generated: 2):\nshown 0 of 3 items (cap) · narrow: topK, scope, sections"));
+        assert!(text
+            .contains("  generated: 2:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections"));
+        assert!(text.contains(
+            "  test-only usage: 2:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections"
+        ));
+        assert!(text.contains(
+            "diagnostics details:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections"
+        ));
+    }
+
+    #[test]
+    fn build_inspect_payload_uncapped_renders_no_trailers_and_serializes_no_envelope() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            serde_json::json!({
+                "count": 1,
+                "items": [{ "file": "src/a.rs", "symbol": "alpha" }],
+            }),
+        );
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({
+                "errors": 1,
+                "warnings": 0,
+                "info": 0,
+                "hints": 0,
+                "items": [
+                    { "file": "src/diag_a.rs", "line": 10, "column": 5, "severity": "error", "message": "syntax error", "source": "rustc" },
+                ],
+            }),
+        );
+
+        let sections = Sections {
+            detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
+        };
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 10, &ctx);
+
+        let details = payload["details"].as_object().expect("details object");
+        let envelope_keys: Vec<&String> = details
+            .keys()
+            .filter(|k| k.ends_with("_list_envelope"))
+            .collect();
+        assert!(
+            envelope_keys.is_empty(),
+            "uncapped must have no envelopes: {envelope_keys:?}"
+        );
+
+        let text = payload["text"].as_str().expect("text");
+        assert!(
+            !text.contains("(cap)"),
+            "uncapped must have no trailer: {text}"
+        );
     }
 }
 

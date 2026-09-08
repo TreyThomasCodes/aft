@@ -1,0 +1,26 @@
+{
+  "id": "inspect-complete-uncapped",
+  "success": true,
+  "data": {
+    "summary": {
+      "dead_code": {
+        "count": 2,
+        "generated_count": 1,
+        "test_only_count": 1
+      }
+    },
+    "details": {
+      "dead_code": [
+        { "file": "src/a.rs", "symbol": "alpha" },
+        { "file": "src/b.rs", "symbol": "beta" }
+      ],
+      "dead_code_generated": [
+        { "file": "src/gen_a.rs", "symbol": "gen_one" }
+      ],
+      "dead_code_test_only": [
+        { "file": "src/test_a.rs", "symbol": "t_one", "used_by": ["tests/test_a.rs"] }
+      ]
+    },
+    "text": "Dead code: 2:\n  src/a.rs::alpha\n  src/b.rs::beta\n  generated: 1:\n    src/gen_a.rs::gen_one\n  test-only usage: 1:\n    src/test_a.rs::t_one — used by tests/test_a.rs"
+  }
+}

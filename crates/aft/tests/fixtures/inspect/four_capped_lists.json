@@ -1,0 +1,96 @@
+{
+  "id": "inspect-four-capped-lists",
+  "success": true,
+  "data": {
+    "summary": {
+      "dead_code": {
+        "count": 4,
+        "generated_count": 3,
+        "test_only_count": 3
+      },
+      "diagnostics": {
+        "errors": 4,
+        "warnings": 0,
+        "info": 0,
+        "hints": 0
+      }
+    },
+    "details": {
+      "dead_code": [
+        { "file": "src/a.rs", "symbol": "alpha" },
+        { "file": "src/b.rs", "symbol": "beta" }
+      ],
+      "dead_code_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 4
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "dead_code_generated": [
+        { "file": "src/gen_a.rs", "symbol": "gen_one" },
+        { "file": "src/gen_b.rs", "symbol": "gen_two" }
+      ],
+      "dead_code_generated_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 3
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "dead_code_test_only": [
+        { "file": "src/test_a.rs", "symbol": "t_one", "used_by": ["tests/test_a.rs"] },
+        { "file": "src/test_b.rs", "symbol": "t_two", "used_by": ["tests/test_b.rs"] }
+      ],
+      "dead_code_test_only_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 3
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "diagnostics": [
+        {
+          "file": "src/diag_a.rs",
+          "line": 10,
+          "column": 5,
+          "severity": "error",
+          "message": "syntax error",
+          "source": "rustc"
+        },
+        {
+          "file": "src/diag_b.rs",
+          "line": 20,
+          "column": 8,
+          "severity": "error",
+          "message": "missing type",
+          "source": "rustc"
+        }
+      ],
+      "diagnostics_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 4
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      }
+    },
+    "text": "Dead code: 4 (generated: 3):\n  src/a.rs::alpha\n  src/b.rs::beta\nshown 2 of 4 items (cap) · narrow: topK, scope, sections\n  generated: 3:\n    src/gen_a.rs::gen_one\n    src/gen_b.rs::gen_two\nshown 2 of 3 items (cap) · narrow: topK, scope, sections\n  test-only usage: 3:\n    src/test_a.rs::t_one — used by tests/test_a.rs\n    src/test_b.rs::t_two — used by tests/test_b.rs\nshown 2 of 3 items (cap) · narrow: topK, scope, sections\n\ndiagnostics: 4 errors, 0 warnings, 0 info, 0 hints\ndiagnostics details:\n- src/diag_a.rs:10:5 error syntax error [rustc]\n- src/diag_b.rs:20:8 error missing type [rustc]\nshown 2 of 4 items (cap) · narrow: topK, scope, sections"
+  }
+}

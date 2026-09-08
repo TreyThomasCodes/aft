@@ -1,0 +1,70 @@
+{
+  "id": "inspect-empty-capped-list",
+  "success": true,
+  "data": {
+    "summary": {
+      "dead_code": {
+        "count": 3,
+        "generated_count": 2,
+        "test_only_count": 2
+      },
+      "diagnostics": {
+        "errors": 2,
+        "warnings": 0,
+        "info": 0,
+        "hints": 0
+      }
+    },
+    "details": {
+      "dead_code": [],
+      "dead_code_list_envelope": {
+        "shown": 0,
+        "total": {
+          "kind": "exact",
+          "value": 3
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "dead_code_generated": [],
+      "dead_code_generated_list_envelope": {
+        "shown": 0,
+        "total": {
+          "kind": "exact",
+          "value": 2
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "dead_code_test_only": [],
+      "dead_code_test_only_list_envelope": {
+        "shown": 0,
+        "total": {
+          "kind": "exact",
+          "value": 2
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "diagnostics": [],
+      "diagnostics_list_envelope": {
+        "shown": 0,
+        "total": {
+          "kind": "exact",
+          "value": 2
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      }
+    },
+    "text": "Dead code: 3 (generated: 2):\nshown 0 of 3 items (cap) · narrow: topK, scope, sections\n  generated: 2:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections\n  test-only usage: 2:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections\n\ndiagnostics: 2 errors, 0 warnings, 0 info, 0 hints\ndiagnostics details:\nshown 0 of 2 items (cap) · narrow: topK, scope, sections"
+  }
+}

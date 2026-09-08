@@ -1,0 +1,43 @@
+{
+  "id": "inspect-todos-capped",
+  "success": true,
+  "data": {
+    "summary": {
+      "todos": {
+        "count": 3,
+        "by_kind": {
+          "TODO": 2,
+          "BUG": 1
+        }
+      }
+    },
+    "details": {
+      "todos": [
+        {
+          "file": "src/a.ts",
+          "line": 10,
+          "marker": "BUG",
+          "text": "fix leak"
+        },
+        {
+          "file": "src/b.ts",
+          "line": 20,
+          "marker": "TODO",
+          "text": "clean up"
+        }
+      ],
+      "todos_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 3
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      }
+    },
+    "text": "TODOs: 3 (BUG 1, TODO 2)\n  src/a.ts:10 BUG fix leak\n  src/b.ts:20 TODO clean up\nshown 2 of 3 items (cap) · narrow: topK, scope, sections"
+  }
+}

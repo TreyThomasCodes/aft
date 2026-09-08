@@ -1,0 +1,57 @@
+{
+  "id": "inspect-duplicates-capped",
+  "success": true,
+  "data": {
+    "summary": {
+      "duplicates": {
+        "count": 3,
+        "generated_count": 2,
+        "duplicated_lines": 50,
+        "total_analyzed_lines": 500,
+        "duplicated_percent": 10.0,
+        "duplicated_file_count": 4
+      }
+    },
+    "details": {
+      "duplicates": [
+        {
+          "cost": 30,
+          "files": ["src/a.rs:1-10", "src/b.rs:1-10"]
+        },
+        {
+          "cost": 20,
+          "files": ["src/c.rs:1-5", "src/d.rs:1-5"]
+        }
+      ],
+      "duplicates_list_envelope": {
+        "shown": 2,
+        "total": {
+          "kind": "exact",
+          "value": 3
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      },
+      "duplicates_generated": [
+        {
+          "cost": 15,
+          "files": ["src/gen_a.rs:1-5", "src/gen_b.rs:1-5"]
+        }
+      ],
+      "duplicates_generated_list_envelope": {
+        "shown": 1,
+        "total": {
+          "kind": "exact",
+          "value": 2
+        },
+        "unit": "items",
+        "reason": "cap",
+        "causes": ["cap"],
+        "narrow": ["topK", "scope", "sections"]
+      }
+    },
+    "text": "Duplicates: 50 duplicated lines (10.0% of 500 analyzed lines) across 4 files, 3 groups (generated: 2) (top by cost):\n  30  src/a.rs:1-10 == src/b.rs:1-10\n  20  src/c.rs:1-5 == src/d.rs:1-5\nshown 2 of 3 items (cap) · narrow: topK, scope, sections\n  generated: 2:\n    15  src/gen_a.rs:1-5 == src/gen_b.rs:1-5\nshown 1 of 2 items (cap) · narrow: topK, scope, sections"
+  }
+}
