@@ -1,0 +1,43 @@
+{
+  "id": "outline-collection-truncated-alone",
+  "success": true,
+  "text": "src/module_001.rs  rust  1 syms  10 lines\nsrc/module_002.rs  rust  2 syms  20 lines",
+  "files": [
+    {
+      "path": "src/module_001.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 10
+    },
+    {
+      "path": "src/module_002.rs",
+      "language": "rust",
+      "symbols": 2,
+      "lines": 20
+    }
+  ],
+  "complete": false,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": true,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [
+    "<additional files not counted: directory walk failed>"
+  ],
+  "rollup_count": 0,
+  "files_list_envelope": {
+    "shown": 412,
+    "total": {
+      "kind": "at_least",
+      "value": 412
+    },
+    "unit": "files",
+    "reason": "walk",
+    "causes": [
+      "walk"
+    ],
+    "narrow": [
+      "path"
+    ]
+  }
+}

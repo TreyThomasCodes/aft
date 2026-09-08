@@ -416,6 +416,65 @@ enum OutlineTableRow {
     Rollup(usize),
 }
 
+/// Rendered outline table output wrapping the formatted text with its budget-measured length (R13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineTable {
+    table: String,
+    rendered_len: usize,
+}
+
+impl std::ops::Deref for OutlineTable {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.table
+    }
+}
+
+impl AsRef<str> for OutlineTable {
+    fn as_ref(&self) -> &str {
+        &self.table
+    }
+}
+
+impl std::fmt::Display for OutlineTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.table)
+    }
+}
+
+impl serde::Serialize for OutlineTable {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.table)
+    }
+}
+
+impl OutlineTable {
+    pub fn len(&self) -> usize {
+        self.rendered_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rendered_len == 0
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.table
+    }
+
+    pub fn into_string(self) -> String {
+        self.table
+    }
+}
+
+impl From<OutlineTable> for String {
+    fn from(table: OutlineTable) -> Self {
+        table.table
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OutlineFileContentStats {
     binary: bool,
@@ -511,11 +570,36 @@ fn handle_outline_files_mode(
         max_output_bytes,
     );
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
-    let text = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
+    let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
+    let text = table.into_string();
     let rollup_count = rows
         .iter()
         .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
         .count();
+
+    let shown = rows
+        .iter()
+        .filter(|row| matches!(row, OutlineTableRow::File(_)))
+        .count();
+    let mut budget_rollup_files = 0;
+    let mut budget_rollups_present = false;
+    for row in &rows {
+        if let OutlineTableRow::Rollup(node_id) = row {
+            if !directory_is_data_heavy(&directory_nodes[*node_id]) {
+                budget_rollups_present = true;
+                budget_rollup_files += directory_nodes[*node_id].stats.files;
+            }
+        }
+    }
+
+    let envelope = crate::list_surfaces::outline::build_outline_files_envelope(
+        shown,
+        budget_rollup_files,
+        budget_rollups_present,
+        collection_truncated,
+        walk_truncated,
+        skipped_foreign_mounts,
+    );
 
     let mut unchecked_files = Vec::new();
     if walk_truncated {
@@ -532,22 +616,23 @@ fn handle_outline_files_mode(
     }
 
     file_entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "text": text,
-            "files": file_entries,
-            "complete": !walk_truncated
-                && !collection_truncated
-                && skipped_foreign_mounts == 0,
-            "walk_truncated": walk_truncated,
-            "walk_limit": OUTLINE_FILE_COLLECTION_CAP,
-            "collection_truncated": collection_truncated,
-            "skipped_foreign_mounts": skipped_foreign_mounts,
-            "unchecked_files": unchecked_files,
-            "rollup_count": rollup_count,
-        }),
-    )
+    let mut response_data = serde_json::json!({
+        "text": text,
+        "files": file_entries,
+        "complete": !walk_truncated
+            && !collection_truncated
+            && skipped_foreign_mounts == 0,
+        "walk_truncated": walk_truncated,
+        "walk_limit": OUTLINE_FILE_COLLECTION_CAP,
+        "collection_truncated": collection_truncated,
+        "skipped_foreign_mounts": skipped_foreign_mounts,
+        "unchecked_files": unchecked_files,
+        "rollup_count": rollup_count,
+    });
+    if let Some(env) = envelope {
+        response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
+    }
+    Response::success(&req.id, response_data)
 }
 
 fn outline_files_mode_targets(req: &RawRequest) -> Result<Vec<String>, Response> {
@@ -1111,8 +1196,8 @@ fn format_files_table(
     rows: &[OutlineTableRow],
     directory_nodes: &[OutlineDirectoryNode],
     file_entries: &[OutlineFileEntry],
-    max_bytes: usize,
-) -> String {
+    _max_bytes: usize,
+) -> OutlineTable {
     let path_width = rows
         .iter()
         .map(|row| match row {
@@ -1173,23 +1258,39 @@ fn format_files_table(
         ));
     }
 
-    let rollup_count = rows
+    let shown = rows
         .iter()
-        .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
+        .filter(|row| matches!(row, OutlineTableRow::File(_)))
         .count();
-    if rollup_count > 0 {
-        let (directory_word, rollup_phrase, expand_phrase) = if rollup_count == 1 {
-            ("directory", "a rollup", "it")
-        } else {
-            ("directories", "rollups", "one")
-        };
-        output.push_str(&format!(
-            "\n{rollup_count} {directory_word} shown as {rollup_phrase} (budget: {}); \
-             expand {expand_phrase} with aft_outline <dir> files:true\n",
-            format_outline_budget(max_bytes),
-        ));
+    let mut budget_rollup_files = 0;
+    let mut budget_rollups_present = false;
+    for row in rows {
+        if let OutlineTableRow::Rollup(node_id) = row {
+            if !directory_is_data_heavy(&directory_nodes[*node_id]) {
+                budget_rollups_present = true;
+                budget_rollup_files += directory_nodes[*node_id].stats.files;
+            }
+        }
     }
-    output
+
+    let rendered_len = if budget_rollups_present {
+        let envelope = crate::list_envelope::ListEnvelope::new(
+            shown,
+            crate::list_envelope::Total::Exact(shown + budget_rollup_files),
+            crate::list_envelope::Unit::Files,
+            vec![crate::list_envelope::Reason::Budget],
+            &["path"],
+        );
+        let trailer_len = crate::list_surfaces::outline::outline_trailer_byte_len(&envelope);
+        output.len() + 2 + trailer_len
+    } else {
+        output.len()
+    };
+
+    OutlineTable {
+        table: output,
+        rendered_len,
+    }
 }
 
 fn directory_rollup_summary(stats: &OutlineDirectoryStats) -> String {
@@ -1199,14 +1300,6 @@ fn directory_rollup_summary(stats: &OutlineDirectoryStats) -> String {
         format!("{} {file_word}", stats.files)
     } else {
         format!("{} {file_word}, {} {dir_word}", stats.files, stats.dirs)
-    }
-}
-
-fn format_outline_budget(max_bytes: usize) -> String {
-    if max_bytes >= 1024 && max_bytes % 1024 == 0 {
-        format!("{}KB", max_bytes / 1024)
-    } else {
-        format!("{max_bytes} bytes")
     }
 }
 
@@ -2605,7 +2698,7 @@ mod tests {
         assert!(text.contains("3 files"));
         assert!(text.contains("6 lines"));
         assert!(!text.contains("syms"), "rollup row: {text}");
-        assert!(text.contains("1 directory shown as a rollup (budget: 30KB)"));
+        assert!(!text.contains("shown as a rollup"));
         assert!(!text.contains(".json  "));
     }
 

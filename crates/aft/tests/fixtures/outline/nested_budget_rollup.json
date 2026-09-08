@@ -1,0 +1,35 @@
+{
+  "id": "outline-nested-budget-rollup",
+  "success": true,
+  "text": "src/file_01.rs  rust  1 syms  10 lines\nparent/         50 files  500 lines",
+  "files": [
+    {
+      "path": "src/file_01.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 10
+    }
+  ],
+  "complete": true,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [],
+  "rollup_count": 1,
+  "files_list_envelope": {
+    "shown": 10,
+    "total": {
+      "kind": "exact",
+      "value": 60
+    },
+    "unit": "files",
+    "reason": "budget",
+    "causes": [
+      "budget"
+    ],
+    "narrow": [
+      "path"
+    ]
+  }
+}

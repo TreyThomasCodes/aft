@@ -1,0 +1,20 @@
+{
+  "id": "outline-data-heavy-only",
+  "success": true,
+  "text": "src/main.rs   rust   5 syms   50 lines\nschema/json/  100 files  1000 lines",
+  "files": [
+    {
+      "path": "src/main.rs",
+      "language": "rust",
+      "symbols": 5,
+      "lines": 50
+    }
+  ],
+  "complete": true,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [],
+  "rollup_count": 1
+}

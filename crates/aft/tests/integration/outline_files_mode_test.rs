@@ -276,8 +276,8 @@ fn outline_files_mode_collapses_data_heavy_directory_without_marking_it_incomple
     assert!(text.contains("src/"), "missing top-level rollup: {text}");
     assert!(!text.contains("file-000-with-extra-name.txt"));
     assert!(
-        text.contains("1 directory shown as a rollup (budget: 30KB)"),
-        "missing rollup trailer: {text}"
+        !text.contains("shown as a rollup"),
+        "legacy rollup sentence must be absent under exemption (b): {text}"
     );
 
     assert!(aft.shutdown().success());
@@ -526,8 +526,8 @@ fn files_mode_breadth_first_rollups_keep_code_visible_past_large_json_tree() {
         .expect("schema rollup row");
     assert!(!schema_row.contains("syms"), "rollup row: {schema_row}");
     assert!(
-        text.contains("shown as rollups (budget: 30KB)"),
-        "rollup trailer missing: {text}"
+        !text.contains("shown as rollups"),
+        "legacy rollup sentence must be absent under exemption (b): {text}"
     );
 
     assert!(aft.shutdown().success());

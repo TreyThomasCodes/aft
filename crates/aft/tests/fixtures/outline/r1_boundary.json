@@ -1,0 +1,41 @@
+{
+  "id": "outline-r1-boundary",
+  "success": true,
+  "text": "src/module_001.rs  rust  1 syms  10 lines\nexpanded/sub.rs    rust  1 syms  10 lines\nother/             10 files  100 lines",
+  "files": [
+    {
+      "path": "src/module_001.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 10
+    },
+    {
+      "path": "expanded/sub.rs",
+      "language": "rust",
+      "symbols": 1,
+      "lines": 10
+    }
+  ],
+  "complete": true,
+  "walk_truncated": false,
+  "walk_limit": 10000,
+  "collection_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "unchecked_files": [],
+  "rollup_count": 1,
+  "files_list_envelope": {
+    "shown": 2,
+    "total": {
+      "kind": "exact",
+      "value": 12
+    },
+    "unit": "files",
+    "reason": "budget",
+    "causes": [
+      "budget"
+    ],
+    "narrow": [
+      "path"
+    ]
+  }
+}
