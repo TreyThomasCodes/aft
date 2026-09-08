@@ -5,9 +5,14 @@
 
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 
-/// Registered list ID for `trace_to` / `trace_to_symbol` paths.
+/// Registered list ID for `trace_to` paths.
+///
+/// Note: `trace_to_symbol` was originally grouped with `trace_to` under `payload.paths`,
+/// but its reply is a single shortest path with no list semantics
+/// (`path: Option<Vec<StoreTraceToSymbolHop>>`), rather than a `paths` list, so it
+/// carries no truncation envelope.
 pub const TRACE_TO_LIST_ID: &str = "payload.paths";
-/// Registered unit for `trace_to` / `trace_to_symbol` paths.
+/// Registered unit for `trace_to` paths.
 pub const TRACE_TO_UNIT: Unit = Unit::Paths;
 /// Narrow knobs for `trace_to` in display order.
 pub const TRACE_TO_NARROW: &[&str] = &["depth", "includeTests"];

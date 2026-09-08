@@ -98,6 +98,10 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             },
         ],
     },
+    // Note: `trace_to_symbol` was originally grouped with `trace_to` under `payload.paths`,
+    // but its reply is a single shortest path with no list semantics
+    // (`path: Option<Vec<...>>`), rather than a `paths` list. Truncation envelopes apply
+    // only to multi-path lists (`trace_to`).
     SurfaceEntry {
         command: "callgraph",
         mode: "trace_to",
@@ -318,6 +322,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "directory_outline_preserves_walk_truncation_footer, files_outline_uses_the_counting_walk_limit_in_partial_footer",
         location_or_primitive: "subc_format walk truncation footer tests",
         reason: "test assertions verifying legacy walk truncation footer",
+    },
+    ExclusionEntry {
+        file: "commands/trace_to_symbol.rs",
+        enclosing_item: "handle_trace_to_symbol",
+        location_or_primitive: "commands::trace_to_symbol::handle_trace_to_symbol",
+        reason: "trace_to_symbol reply is a single shortest path (path: Option<Vec<...>>) with no list semantics, so it carries no truncation envelope",
     },
 ];
 
