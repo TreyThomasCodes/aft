@@ -1,0 +1,29 @@
+{
+  "complete": true,
+  "files": [
+    "d1/file1.rs", "d1/file2.rs", "d1/file3.rs",
+    "d2/file1.rs", "d2/file2.rs", "d2/file3.rs",
+    "d3/file1.rs", "d3/file2.rs", "d3/file3.rs",
+    "d4/file1.rs", "d4/file2.rs", "d4/file3.rs",
+    "d5/file1.rs", "d5/file2.rs", "d5/file3.rs",
+    "d6/file1.rs", "d6/file2.rs", "d6/file3.rs",
+    "d7/file1.rs", "d7/file2.rs", "d7/file3.rs"
+  ],
+  "files_list_envelope": {
+    "causes": ["cap"],
+    "narrow": ["path"],
+    "reason": "cap",
+    "shown": 18,
+    "total": {
+      "kind": "exact",
+      "value": 21
+    },
+    "unit": "files"
+  },
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "text": "21 files matching **/*.rs\n\nd1/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\nd2/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\nd3/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\nd4/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\nd5/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\nd6/ (3 files)\n  file1.rs, file2.rs, file3.rs\n\n... and 3 more files in 1 directory",
+  "total": 21,
+  "truncated": false,
+  "walk_truncated": false
+}

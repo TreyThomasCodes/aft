@@ -1,0 +1,42 @@
+{
+  "complete": false,
+  "files": [
+    "dir/file001.rs", "dir/file002.rs", "dir/file003.rs", "dir/file004.rs", "dir/file005.rs",
+    "dir/file006.rs", "dir/file007.rs", "dir/file008.rs", "dir/file009.rs", "dir/file010.rs",
+    "dir/file011.rs", "dir/file012.rs", "dir/file013.rs", "dir/file014.rs", "dir/file015.rs",
+    "dir/file016.rs", "dir/file017.rs", "dir/file018.rs", "dir/file019.rs", "dir/file020.rs",
+    "dir/file021.rs", "dir/file022.rs", "dir/file023.rs", "dir/file024.rs", "dir/file025.rs",
+    "dir/file026.rs", "dir/file027.rs", "dir/file028.rs", "dir/file029.rs", "dir/file030.rs",
+    "dir/file031.rs", "dir/file032.rs", "dir/file033.rs", "dir/file034.rs", "dir/file035.rs",
+    "dir/file036.rs", "dir/file037.rs", "dir/file038.rs", "dir/file039.rs", "dir/file040.rs",
+    "dir/file041.rs", "dir/file042.rs", "dir/file043.rs", "dir/file044.rs", "dir/file045.rs",
+    "dir/file046.rs", "dir/file047.rs", "dir/file048.rs", "dir/file049.rs", "dir/file050.rs",
+    "dir/file051.rs", "dir/file052.rs", "dir/file053.rs", "dir/file054.rs", "dir/file055.rs",
+    "dir/file056.rs", "dir/file057.rs", "dir/file058.rs", "dir/file059.rs", "dir/file060.rs",
+    "dir/file061.rs", "dir/file062.rs", "dir/file063.rs", "dir/file064.rs", "dir/file065.rs",
+    "dir/file066.rs", "dir/file067.rs", "dir/file068.rs", "dir/file069.rs", "dir/file070.rs",
+    "dir/file071.rs", "dir/file072.rs", "dir/file073.rs", "dir/file074.rs", "dir/file075.rs",
+    "dir/file076.rs", "dir/file077.rs", "dir/file078.rs", "dir/file079.rs", "dir/file080.rs",
+    "dir/file081.rs", "dir/file082.rs", "dir/file083.rs", "dir/file084.rs", "dir/file085.rs",
+    "dir/file086.rs", "dir/file087.rs", "dir/file088.rs", "dir/file089.rs", "dir/file090.rs",
+    "dir/file091.rs", "dir/file092.rs", "dir/file093.rs", "dir/file094.rs", "dir/file095.rs",
+    "dir/file096.rs", "dir/file097.rs", "dir/file098.rs", "dir/file099.rs", "dir/file100.rs"
+  ],
+  "files_list_envelope": {
+    "causes": ["walk", "cap"],
+    "narrow": ["path"],
+    "reason": "walk",
+    "shown": 5,
+    "total": {
+      "kind": "at_least",
+      "value": 105
+    },
+    "unit": "files"
+  },
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "text": "100 files matching **/*.rs\n\ndir/ (100 files)\n  file001.rs, file002.rs, file003.rs, file004.rs, file005.rs, ...\n\n(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)",
+  "total": 105,
+  "truncated": true,
+  "walk_truncated": true
+}

@@ -1,0 +1,13 @@
+{
+  "complete": true,
+  "files": [
+    "a.rs",
+    "b.rs",
+    "c.rs"
+  ],
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "text": "3 files matching *.rs\n\na.rs\nb.rs\nc.rs",
+  "total": 3,
+  "truncated": false
+}

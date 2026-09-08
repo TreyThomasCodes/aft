@@ -1,0 +1,27 @@
+{
+  "complete": true,
+  "files": [
+    "dir1/file01.rs", "dir1/file02.rs", "dir1/file03.rs", "dir1/file04.rs", "dir1/file05.rs",
+    "dir1/file06.rs", "dir1/file07.rs", "dir1/file08.rs", "dir1/file09.rs", "dir1/file10.rs",
+    "dir1/file11.rs", "dir1/file12.rs", "dir1/file13.rs", "dir1/file14.rs", "dir1/file15.rs",
+    "dir1/file16.rs", "dir1/file17.rs", "dir1/file18.rs", "dir1/file19.rs", "dir1/file20.rs",
+    "dir1/file21.rs"
+  ],
+  "files_list_envelope": {
+    "causes": ["cap"],
+    "narrow": ["path"],
+    "reason": "cap",
+    "shown": 5,
+    "total": {
+      "kind": "exact",
+      "value": 21
+    },
+    "unit": "files"
+  },
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "text": "21 files matching **/*.rs\n\ndir1/ (21 files)\n  file01.rs, file02.rs, file03.rs, file04.rs, file05.rs, ...",
+  "total": 21,
+  "truncated": false,
+  "walk_truncated": false
+}

@@ -24,7 +24,7 @@ struct GlobDiscovery {
     skipped_foreign_mounts: usize,
 }
 
-const MAX_GLOB_RESULTS: usize = 100;
+pub const DEFAULT_MAX_RESULTS: usize = 100;
 const GLOB_TRUNCATED_MESSAGE: &str =
     "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)";
 const MAX_FLAT_FILES: usize = 20;
@@ -100,7 +100,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             &project_root,
             &search_roots[0],
             pattern,
-            MAX_GLOB_RESULTS + 1,
+            DEFAULT_MAX_RESULTS + 1,
         );
         (
             discovery.files,
@@ -115,7 +115,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
             .iter()
-            .map(|root| glob_root(ctx, &project_root, root, pattern, MAX_GLOB_RESULTS + 1))
+            .map(|root| glob_root(ctx, &project_root, root, pattern, DEFAULT_MAX_RESULTS + 1))
             .collect();
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -152,9 +152,9 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     // keeps the most recently modified matches instead of the lexically first.
     sort_paths_by_mtime_desc(&mut files, &project_root);
     let total = files.len();
-    let result_truncated = total > MAX_GLOB_RESULTS;
+    let result_truncated = total > DEFAULT_MAX_RESULTS;
     if result_truncated {
-        files.truncate(MAX_GLOB_RESULTS);
+        files.truncate(DEFAULT_MAX_RESULTS);
     }
 
     let mut body = serde_json::json!({
@@ -168,18 +168,36 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     });
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
-        let note = "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)";
-        body["text"] = serde_json::Value::String(format!(
-            "{}\n\n{}",
-            body["text"].as_str().unwrap_or_default(),
-            note
-        ));
     }
-    if skipped_foreign_mounts > 0 {
-        body["text"] = serde_json::Value::String(format!(
-            "{}\n\n(Fallback directory walk skipped {skipped_foreign_mounts} foreign filesystem mount(s); results may be incomplete.)",
-            body["text"].as_str().unwrap_or_default(),
-        ));
+
+    let rendered_count =
+        crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());
+
+    let envelope = crate::list_surfaces::glob::build_glob_envelope(
+        rendered_count,
+        total,
+        result_truncated,
+        walk_truncated,
+        skipped_foreign_mounts,
+    );
+
+    if let Some(env) = envelope {
+        body["files_list_envelope"] = serde_json::to_value(&env).unwrap_or_default();
+    } else {
+        if walk_truncated {
+            let note = "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)";
+            body["text"] = serde_json::Value::String(format!(
+                "{}\n\n{}",
+                body["text"].as_str().unwrap_or_default(),
+                note
+            ));
+        }
+        if skipped_foreign_mounts > 0 {
+            body["text"] = serde_json::Value::String(format!(
+                "{}\n\n(Fallback directory walk skipped {skipped_foreign_mounts} foreign filesystem mount(s); results may be incomplete.)",
+                body["text"].as_str().unwrap_or_default(),
+            ));
+        }
     }
 
     Response::success(&req.id, body)

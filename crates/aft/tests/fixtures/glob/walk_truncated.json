@@ -1,0 +1,24 @@
+{
+  "complete": false,
+  "files": [
+    "file01.rs", "file02.rs", "file03.rs", "file04.rs", "file05.rs", "file06.rs",
+    "file07.rs", "file08.rs", "file09.rs", "file10.rs", "file11.rs", "file12.rs"
+  ],
+  "files_list_envelope": {
+    "causes": ["walk"],
+    "narrow": ["path"],
+    "reason": "walk",
+    "shown": 12,
+    "total": {
+      "kind": "at_least",
+      "value": 12
+    },
+    "unit": "files"
+  },
+  "no_files_matched_scope": false,
+  "skipped_foreign_mounts": 0,
+  "text": "12 files matching *.rs\n\nfile01.rs\nfile02.rs\nfile03.rs\nfile04.rs\nfile05.rs\nfile06.rs\nfile07.rs\nfile08.rs\nfile09.rs\nfile10.rs\nfile11.rs\nfile12.rs",
+  "total": 12,
+  "truncated": false,
+  "walk_truncated": true
+}
