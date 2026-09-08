@@ -3141,17 +3141,18 @@ impl AppContext {
         )
     }
 
-    /// Record the warm-maintenance key for a successful configure and return
-    /// the generation this configure operates under.
+    /// Commit the warm-maintenance identity for a successful configure.
     ///
-    /// An unchanged key ADOPTS the running generation without advancing it:
-    /// in-flight build workers gate their publish on the generation flag being
-    /// unchanged, so advancing on an equivalent rebind would silently discard
-    /// every adopted build's result at completion (the receiver never
-    /// resolves, and long builds can never finish under rebind traffic). Only
-    /// a genuinely different warm config advances the generation, which is
-    /// what cancels superseded in-flight builds.
-    pub fn note_configure_warm_key(&self, key: String) -> (u64, bool) {
+    /// The semantic epoch decision shares the warm-state lock with equivalence
+    /// detection. A configure that prepared its input comparison before another
+    /// matching configure committed can therefore adopt the matching generation
+    /// and semantic worker instead of invalidating that worker from stale input
+    /// snapshots.
+    pub fn note_configure_warm_key(
+        &self,
+        key: String,
+        semantic_build_inputs_changed: bool,
+    ) -> (u64, bool) {
         let mut state = self.configure_warm_state.lock();
         let equivalent = state.key.as_ref().is_some_and(|previous| *previous == key);
         let generation = if equivalent {
@@ -3161,6 +3162,9 @@ impl AppContext {
                 .fetch_add(1, Ordering::SeqCst);
             self.advance_configure_generation()
         };
+        if !equivalent && semantic_build_inputs_changed {
+            self.advance_semantic_build_epoch();
+        }
         state.generation = generation;
         state.key = Some(key);
         (generation, equivalent)
@@ -7460,7 +7464,7 @@ mod subc_lifecycle_admission_tests {
     #[test]
     fn route_teardown_does_not_supersede_disk_artifact_compatibility() {
         let ctx = AppContext::new(default_language_provider_factory(), Config::default());
-        ctx.note_configure_warm_key("config-a".to_string());
+        ctx.note_configure_warm_key("config-a".to_string(), false);
         let content_generation = ctx.configure_content_generation();
         let lifecycle_generation = ctx.configure_generation();
         let search_epoch = ctx.next_search_persist_epoch();
@@ -7475,7 +7479,7 @@ mod subc_lifecycle_admission_tests {
         assert_eq!(semantic_persist_epoch.current(), semantic_epoch);
 
         ctx.mark_subc_bound();
-        ctx.note_configure_warm_key("config-b".to_string());
+        ctx.note_configure_warm_key("config-b".to_string(), false);
         assert!(ctx.configure_content_generation() > content_generation);
         let replacement_search_epoch = ctx.next_search_persist_epoch();
         let replacement_semantic_epoch = ctx.next_semantic_persist_epoch();

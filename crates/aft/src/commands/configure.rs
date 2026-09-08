@@ -53,6 +53,9 @@ static CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 static CONFIGURE_DEFERRED_MAINTENANCE_GATE: OnceLock<
     Mutex<Option<ConfigureDeferredMaintenanceGate>>,
 > = OnceLock::new();
+#[cfg(test)]
+static CONFIGURE_SEMANTIC_SNAPSHOT_GATE: OnceLock<Mutex<Option<ConfigureSemanticSnapshotGate>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -107,6 +110,90 @@ pub(crate) fn gate_configure_deferred_maintenance_for_test(
         release_tx,
     )
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ConfigureSemanticSnapshotGate {
+    request_id: String,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ConfigureSemanticSnapshotGateGuard {
+    request_id: String,
+}
+
+#[cfg(test)]
+impl Drop for ConfigureSemanticSnapshotGateGuard {
+    fn drop(&mut self) {
+        let mut slot = CONFIGURE_SEMANTIC_SNAPSHOT_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.request_id == self.request_id)
+        {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn gate_configure_after_semantic_snapshot_for_test(
+    request_id: String,
+) -> (
+    ConfigureSemanticSnapshotGateGuard,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let gate = ConfigureSemanticSnapshotGate {
+        request_id: request_id.clone(),
+        reached: reached_tx,
+        release: release_rx,
+    };
+    let mut slot = CONFIGURE_SEMANTIC_SNAPSHOT_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        slot.is_none(),
+        "configure semantic snapshot gate already installed"
+    );
+    *slot = Some(gate);
+    (
+        ConfigureSemanticSnapshotGateGuard { request_id },
+        reached_rx,
+        release_tx,
+    )
+}
+
+#[cfg(test)]
+fn wait_on_configure_semantic_snapshot_gate_for_test(request_id: &str) {
+    let gate = {
+        let slot = CONFIGURE_SEMANTIC_SNAPSHOT_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_ref()
+            .filter(|gate| gate.request_id == request_id)
+            .cloned()
+    };
+    if let Some(gate) = gate {
+        gate.reached
+            .send(())
+            .expect("signal configure semantic snapshot gate");
+        gate.release
+            .recv_timeout(Duration::from_secs(12))
+            .expect("release configure semantic snapshot gate");
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_semantic_snapshot_gate_for_test(_request_id: &str) {}
 
 #[cfg(test)]
 thread_local! {
@@ -2146,6 +2233,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
     let project_root_changed =
         previous_canonical_cache_root.as_deref() != Some(canonical_cache_root.as_path());
+    wait_on_configure_semantic_snapshot_gate_for_test(&req.id);
     let mut next_config = previous_config.as_ref().clone();
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness.clone());
@@ -2690,7 +2778,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.shared_artifacts_read_only(),
         workspace_manifests.as_deref(),
     );
-    let (configure_generation, equivalent_warm_config) = ctx.note_configure_warm_key(warm_key);
+    let semantic_build_inputs_changed = project_root_changed
+        || previous_config.semantic_search != next_config.semantic_search
+        || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
+        || previous_config.semantic.max_files != next_config.semantic.max_files;
+    let (configure_generation, equivalent_warm_config) =
+        ctx.note_configure_warm_key(warm_key, semantic_build_inputs_changed);
     release_callgraph_start_waiters_for_generation_change(
         previous_canonical_cache_root.as_deref(),
         &canonical_cache_root,
@@ -2707,15 +2800,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
     let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
-    let semantic_build_inputs_changed = project_root_changed
-        || previous_config.semantic_search != next_config.semantic_search
-        || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
-        || previous_config.semantic.max_files != next_config.semantic.max_files;
     let semantic_build_adopted =
         !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
-    if semantic_build_inputs_changed {
-        ctx.advance_semantic_build_epoch();
-    }
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
     if !equivalent_warm_config {
@@ -7508,6 +7594,83 @@ mod tests {
         assert_eq!(
             manifest.git_common_dir.as_deref(),
             Some(common_dir_string.as_str())
+        );
+    }
+
+    #[test]
+    fn equivalent_reconfigure_adopts_epoch_after_stale_input_snapshot() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        super::reset_semantic_stale_generation_discards_for_test();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn adopted_semantic_epoch() {}\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        let disabled =
+            configure_semantic_with_options(&project, &storage, &server.base_url, false, 64, false);
+        assert!(super::handle_configure(&disabled, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let mut stale =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, false);
+        stale.id = "stale-semantic-snapshot".to_string();
+        let mut winner =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, false);
+        winner.id = "winning-semantic-configure".to_string();
+        let (_gate, snapshot_reached, release_snapshot) =
+            super::gate_configure_after_semantic_snapshot_for_test(stale.id.clone());
+
+        std::thread::scope(|scope| {
+            let stale_configure = scope.spawn(|| super::handle_configure(&stale, &ctx));
+            snapshot_reached
+                .recv_timeout(Duration::from_secs(5))
+                .expect("stale configure captures disabled semantic inputs");
+
+            assert!(super::handle_configure(&winner, &ctx).success);
+            super::drain_deferred_configure_maintenance(&ctx);
+            assert!(
+                server.wait_for_non_probe_request_count(1, Duration::from_secs(5)),
+                "winning configure did not start its semantic build"
+            );
+            release_snapshot
+                .send(())
+                .expect("release stale semantic snapshot");
+            assert!(stale_configure.join().unwrap().success);
+        });
+
+        server.release_responses();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            crate::runtime_drain::drain_build_completions(&ctx);
+            let ready = matches!(
+                &*ctx
+                    .semantic_index_status()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                crate::context::SemanticIndexStatus::Ready { .. }
+            );
+            if ready || super::semantic_stale_generation_discards_for_test() > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for semantic build"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            super::semantic_stale_generation_discards_for_test(),
+            0,
+            "the adopted semantic build must publish instead of being discarded"
         );
     }
 
