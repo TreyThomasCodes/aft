@@ -149,6 +149,10 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         ));
     }
 
+    if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
+        body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();
+    }
+
     let service_ms = total_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     match result.index_status {
         crate::search_index::IndexStatus::Ready => {

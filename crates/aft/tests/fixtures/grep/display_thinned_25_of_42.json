@@ -1,0 +1,325 @@
+{
+  "id": "grep-display-thinned-25-of-42",
+  "success": true,
+  "matches": [
+    {
+      "file": "src/thinned_1.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "thinned line 1",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "thinned line 2",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "thinned line 3",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "thinned line 4",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "thinned line 5",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 6,
+      "column": 1,
+      "line_text": "thinned line 6",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 7,
+      "column": 1,
+      "line_text": "thinned line 7",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_1.rs",
+      "line": 8,
+      "column": 1,
+      "line_text": "thinned line 8",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "thinned line 1",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "thinned line 2",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "thinned line 3",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "thinned line 4",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "thinned line 5",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 6,
+      "column": 1,
+      "line_text": "thinned line 6",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 7,
+      "column": 1,
+      "line_text": "thinned line 7",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_2.rs",
+      "line": 8,
+      "column": 1,
+      "line_text": "thinned line 8",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "thinned line 1",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "thinned line 2",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "thinned line 3",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "thinned line 4",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "thinned line 5",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 6,
+      "column": 1,
+      "line_text": "thinned line 6",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 7,
+      "column": 1,
+      "line_text": "thinned line 7",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_3.rs",
+      "line": 8,
+      "column": 1,
+      "line_text": "thinned line 8",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "thinned line 1",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "thinned line 2",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "thinned line 3",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "thinned line 4",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "thinned line 5",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 6,
+      "column": 1,
+      "line_text": "thinned line 6",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 7,
+      "column": 1,
+      "line_text": "thinned line 7",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 8,
+      "column": 1,
+      "line_text": "thinned line 8",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_4.rs",
+      "line": 9,
+      "column": 1,
+      "line_text": "thinned line 9",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "thinned line 1",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "thinned line 2",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "thinned line 3",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "thinned line 4",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "thinned line 5",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 6,
+      "column": 1,
+      "line_text": "thinned line 6",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 7,
+      "column": 1,
+      "line_text": "thinned line 7",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 8,
+      "column": 1,
+      "line_text": "thinned line 8",
+      "match_text": "thinned"
+    },
+    {
+      "file": "src/thinned_5.rs",
+      "line": 9,
+      "column": 1,
+      "line_text": "thinned line 9",
+      "match_text": "thinned"
+    }
+  ],
+  "total_matches": 42,
+  "files_searched": 10,
+  "files_with_matches": 5,
+  "index_status": "ready",
+  "truncated": false,
+  "walk_truncated": false,
+  "skipped_foreign_mounts": 0,
+  "text": "src/thinned_1.rs:1: thinned line 1\n\nFound 42 match across 5 file",
+  "matches_list_envelope": {
+    "shown": 25,
+    "total": {
+      "kind": "exact",
+      "value": 42
+    },
+    "unit": "rows",
+    "reason": "cap",
+    "causes": [
+      "cap"
+    ],
+    "narrow": [
+      "path",
+      "include",
+      "exclude"
+    ]
+  }
+}

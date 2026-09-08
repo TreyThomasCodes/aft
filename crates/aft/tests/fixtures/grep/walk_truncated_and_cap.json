@@ -1,0 +1,732 @@
+{
+  "id": "grep-walk-truncated-and-cap",
+  "success": true,
+  "matches": [
+    {
+      "file": "src/file_00.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_00.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_00.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_00.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_00.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_01.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_01.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_01.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_01.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_01.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_02.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_02.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_02.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_02.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_02.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_03.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_03.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_03.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_03.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_03.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_04.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_04.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_04.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_04.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_04.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_05.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_05.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_05.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_05.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_05.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_06.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_06.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_06.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_06.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_06.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_07.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_07.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_07.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_07.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_07.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_08.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_08.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_08.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_08.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_08.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_09.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_09.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_09.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_09.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_09.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_10.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_10.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_10.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_10.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_10.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_11.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_11.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_11.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_11.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_11.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_12.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_12.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_12.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_12.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_12.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_13.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_13.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_13.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_13.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_13.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_14.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_14.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_14.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_14.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_14.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_15.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_15.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_15.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_15.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_15.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_16.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_16.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_16.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_16.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_16.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_17.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_17.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_17.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_17.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_17.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_18.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_18.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_18.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_18.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_18.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_19.rs",
+      "line": 1,
+      "column": 1,
+      "line_text": "match line 1",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_19.rs",
+      "line": 2,
+      "column": 1,
+      "line_text": "match line 2",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_19.rs",
+      "line": 3,
+      "column": 1,
+      "line_text": "match line 3",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_19.rs",
+      "line": 4,
+      "column": 1,
+      "line_text": "match line 4",
+      "match_text": "match"
+    },
+    {
+      "file": "src/file_19.rs",
+      "line": 5,
+      "column": 1,
+      "line_text": "match line 5",
+      "match_text": "match"
+    }
+  ],
+  "total_matches": 100,
+  "files_searched": 30,
+  "files_with_matches": 20,
+  "index_status": "fallback",
+  "truncated": true,
+  "walk_truncated": true,
+  "skipped_foreign_mounts": 0,
+  "text": "src/file_00.rs:1: match line 1\n\nFound 100 match across 20 file (capped)\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
+  "matches_list_envelope": {
+    "shown": 100,
+    "total": {
+      "kind": "at_least",
+      "value": 100
+    },
+    "unit": "rows",
+    "reason": "walk",
+    "causes": [
+      "walk",
+      "cap"
+    ],
+    "narrow": [
+      "path",
+      "include",
+      "exclude"
+    ]
+  }
+}
