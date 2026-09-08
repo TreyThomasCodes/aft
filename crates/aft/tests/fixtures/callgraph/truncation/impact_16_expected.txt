@@ -1,0 +1,33 @@
+16 affected call sites · 1 file
+src/app.ts:1
+  ↳ caller1
+src/app.ts:2
+  ↳ caller2
+src/app.ts:3
+  ↳ caller3
+src/app.ts:4
+  ↳ caller4
+src/app.ts:5
+  ↳ caller5
+src/app.ts:6
+  ↳ caller6
+src/app.ts:7
+  ↳ caller7
+src/app.ts:8
+  ↳ caller8
+src/app.ts:9
+  ↳ caller9
+src/app.ts:10
+  ↳ caller10
+src/app.ts:11
+  ↳ caller11
+src/app.ts:12
+  ↳ caller12
+src/app.ts:13
+  ↳ caller13
+src/app.ts:14
+  ↳ caller14
+src/app.ts:15
+  ↳ caller15
+src/app.ts:16
+  ↳ caller16

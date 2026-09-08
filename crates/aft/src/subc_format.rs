@@ -2407,7 +2407,10 @@ fn format_call_tree_sections(
 
     let mut lines = Vec::new();
     render_call_tree_node(record, 0, &mut lines, include_unresolved);
-    let warning = if envelope.is_some() {
+    let is_envelope_governed =
+        crate::list_surfaces::find_surface("callgraph", "call_tree", "payload.tree").is_some();
+    let truncated = number_field(record, "truncated").unwrap_or(0);
+    let warning = if envelope.is_some() || (is_envelope_governed && truncated == 0) {
         String::new()
     } else {
         depth_warning(record, "depth_limited", "truncated")
@@ -2420,6 +2423,7 @@ fn format_call_tree_sections(
     } else {
         if let Some(env) = envelope {
             if let Some(trailer) = render_envelope_trailer(&env) {
+                lines.push(String::new());
                 lines.push(trailer);
             }
         }
@@ -2526,7 +2530,10 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let groups = records_field(record, "callers");
-    let warning = if envelope.is_some() {
+    let is_envelope_governed =
+        crate::list_surfaces::find_surface("callgraph", "callers", "payload.callers").is_some();
+    let truncated = number_field(record, "truncated").unwrap_or(0);
+    let warning = if envelope.is_some() || (is_envelope_governed && truncated == 0) {
         String::new()
     } else {
         depth_warning(record, "depth_limited", "truncated")
@@ -2536,11 +2543,16 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     } else {
         hub_summary_line(record)
     };
-    let total = number_field(record, "total_callers").unwrap_or(0);
+    let total_str = if let Some(env) = &envelope {
+        crate::list_envelope::render_total(&env.total)
+    } else {
+        let total = number_field(record, "total_callers").unwrap_or(0);
+        format!("{total}")
+    };
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total} caller{}",
-            if total == 1 { "" } else { "s" }
+            "{total_str} caller{}",
+            if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
             "{} file group{}",
@@ -2557,6 +2569,7 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
     }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(String::new());
             sections.push(trailer);
         }
     }
@@ -2659,16 +2672,21 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
         .get("total_paths_is_lower_bound")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let total_paths_str = if let Some(env) = &envelope {
+        crate::list_envelope::render_total(&env.total)
+    } else {
+        let prefix = if total_paths_is_lower_bound {
+            "at least "
+        } else {
+            ""
+        };
+        format!("{prefix}{total_paths}")
+    };
     let entry_points = number_field(record, "entry_points_found").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{}{total_paths} path{}",
-            if total_paths_is_lower_bound {
-                "at least "
-            } else {
-                ""
-            },
-            if total_paths == 1 { "" } else { "s" }
+            "{total_paths_str} path{}",
+            if total_paths_str == "1" { "" } else { "s" }
         )),
         Some(format!(
             "{entry_points} entry point{}",
@@ -2725,7 +2743,10 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
 
     let callers = records_field(record, "callers");
-    let warning = if envelope.is_some() {
+    let is_envelope_governed =
+        crate::list_surfaces::find_surface("callgraph", "impact", "payload.sites").is_some();
+    let truncated = number_field(record, "truncated").unwrap_or(0);
+    let warning = if envelope.is_some() || (is_envelope_governed && truncated == 0) {
         String::new()
     } else {
         depth_warning(record, "depth_limited", "truncated")
@@ -2735,12 +2756,17 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
     } else {
         hub_summary_line(record)
     };
-    let total_affected = number_field(record, "total_affected").unwrap_or(callers.len() as i64);
+    let total_str = if let Some(env) = &envelope {
+        crate::list_envelope::render_total(&env.total)
+    } else {
+        let total_affected = number_field(record, "total_affected").unwrap_or(callers.len() as i64);
+        format!("{total_affected}")
+    };
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_affected} affected call site{}",
-            if total_affected == 1 { "" } else { "s" }
+            "{total_str} affected call site{}",
+            if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
             "{affected_files} file{}",
@@ -2790,6 +2816,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
     }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
+            sections.push(String::new());
             sections.push(trailer);
         }
     }

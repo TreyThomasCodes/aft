@@ -132,6 +132,19 @@ impl ListEnvelope {
     }
 }
 
+/// Format a total count in the envelope's form: bare integer for Exact,
+/// prefixed with `≥` for AtLeast, and clamped to `≥999999999` if >= 1e9 (R23).
+pub fn render_total(total: &Total) -> String {
+    if total.value() >= R23_CLAMP_THRESHOLD {
+        format!("≥{R23_MAX_DISPLAY_TOTAL}")
+    } else {
+        match *total {
+            Total::Exact(v) => format!("{v}"),
+            Total::AtLeast(v) => format!("≥{v}"),
+        }
+    }
+}
+
 /// Render the trailer text for a list envelope.
 ///
 /// Trailer grammar (pinned):
@@ -146,14 +159,7 @@ pub fn render_trailer(envelope: &ListEnvelope) -> Option<String> {
     let reason = envelope.reason?;
     let shown = envelope.shown;
 
-    let total_str = if envelope.total.value() >= R23_CLAMP_THRESHOLD {
-        format!("≥{R23_MAX_DISPLAY_TOTAL}")
-    } else {
-        match envelope.total {
-            Total::Exact(v) => format!("{v}"),
-            Total::AtLeast(v) => format!("≥{v}"),
-        }
-    };
+    let total_str = render_total(&envelope.total);
 
     let unit_str = envelope.unit.as_str();
     let reason_str = reason.as_str();

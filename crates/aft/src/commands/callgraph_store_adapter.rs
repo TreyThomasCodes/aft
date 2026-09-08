@@ -12,6 +12,7 @@ use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
+use crate::list_envelope::{ListEnvelope, Unit};
 use crate::parser::{
     detect_language, extract_symbols_from_tree, grammar_for, FileParser, SharedSymbolCache,
 };
@@ -20,9 +21,13 @@ use crate::symbols::Symbol;
 
 pub type StoreAdapterResult<T> = Result<T, CallGraphStoreError>;
 
+#[path = "../list_surfaces/callgraph.rs"]
+pub mod callgraph_surface;
+use callgraph_surface::*;
+
 const TRACE_DATA_RESOLVER_PROVENANCE: &str = "treesitter+resolver";
-const HUB_SUMMARY_THRESHOLD: usize = 20;
-const HUB_SUMMARY_LIMIT: usize = 15;
+pub const HUB_SUMMARY_THRESHOLD: usize = 20;
+pub const HUB_SUMMARY_LIMIT: usize = 15;
 // The agent only receives 15 representative paths once a trace becomes a hub. A
 // 10k expansion budget leaves ample room for ordinary traces while preventing a
 // layered call graph from unfolding millions of path prefixes synchronously.
@@ -62,6 +67,8 @@ pub struct StoreCallersResult {
     pub scanned_files: usize,
     pub depth_limited: bool,
     pub truncated: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callers_list_envelope: Option<ListEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +102,8 @@ pub struct StoreCallTreeNode {
     pub children: Vec<StoreCallTreeNode>,
     pub depth_limited: bool,
     pub truncated: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree_list_envelope: Option<ListEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,6 +120,8 @@ pub struct StoreImpactResult {
     pub hub_summary: Option<StoreHubSummary>,
     pub depth_limited: bool,
     pub truncated: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sites_list_envelope: Option<ListEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -476,16 +487,18 @@ pub fn callers_result(
             .then(left.line.cmp(&right.line))
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
-    let total_callers = sites.len();
+    let pre_filter_count = sites.len();
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
         .count();
-    let summarize = total_callers > HUB_SUMMARY_THRESHOLD;
     let visible_sites = sites
         .into_iter()
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
+    let post_filter_count = visible_sites.len();
+
+    let summarize = hub_selector_activated(post_filter_count);
     let visible_sites = if summarize {
         dedup_sites_for_summary(visible_sites)
             .into_iter()
@@ -494,15 +507,28 @@ pub fn callers_result(
     } else {
         visible_sites
     };
+    let shown = visible_sites.len();
+
+    // Use post-filter count as total callers so the reported total matches callers after active filters are applied.
+    let total_callers = post_filter_count;
+
+    // Omit hub_summary when test filtering changes the caller count to avoid contradictory summary figures in the JSON output.
     let hub_summary = if summarize {
-        Some(if include_tests {
-            included_summary("callers", total_callers, hidden_tests, visible_sites.len())
+        if !include_tests && pre_filter_count != post_filter_count {
+            None
         } else {
-            test_hidden_summary("callers", total_callers, hidden_tests, visible_sites.len())
-        })
+            Some(if include_tests {
+                included_summary("callers", pre_filter_count, hidden_tests, shown)
+            } else {
+                test_hidden_summary("callers", pre_filter_count, hidden_tests, shown)
+            })
+        }
     } else {
         None
     };
+
+    let callers_list_envelope =
+        build_callgraph_envelope(Unit::Items, shown, post_filter_count, truncated);
     let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
     for site in visible_sites {
         groups
@@ -528,6 +554,7 @@ pub fn callers_result(
         scanned_files: store.indexed_file_count()?,
         depth_limited,
         truncated,
+        callers_list_envelope,
     })
 }
 
@@ -553,6 +580,9 @@ pub fn call_tree_result(
     if !include_tests {
         filter_call_tree_tests(&mut tree);
     }
+    let (shown, total_children) = cap_items(&mut tree.children);
+    tree.tree_list_envelope =
+        build_callgraph_envelope(Unit::Items, shown, total_children, tree.truncated);
     Ok(tree)
 }
 
@@ -597,21 +627,23 @@ pub fn impact_result(
             .then(left.line.cmp(&right.line))
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
-    let total_affected = sites.len();
+    let pre_filter_count = sites.len();
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
         .count();
-    let summarize = total_affected > HUB_SUMMARY_THRESHOLD;
-    let affected_files = sites
-        .iter()
-        .map(|site| site.caller.file.clone())
-        .collect::<BTreeSet<_>>()
-        .len();
     let visible_sites = sites
         .into_iter()
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
+    let post_filter_count = visible_sites.len();
+
+    let summarize = hub_selector_activated(post_filter_count);
+    let affected_files = visible_sites
+        .iter()
+        .map(|site| site.caller.file.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
     let visible_sites = if summarize {
         dedup_sites_for_summary(visible_sites)
             .into_iter()
@@ -620,25 +652,28 @@ pub fn impact_result(
     } else {
         visible_sites
     };
+    let shown = visible_sites.len();
+
+    // Use post-filter count as total affected callers so the reported total matches callers after active filters are applied.
+    let total_affected = post_filter_count;
+
+    // Omit hub_summary when test filtering changes the caller count to avoid contradictory summary figures in the JSON output.
     let hub_summary = if summarize {
-        Some(if include_tests {
-            included_summary(
-                "affected callers",
-                total_affected,
-                hidden_tests,
-                visible_sites.len(),
-            )
+        if !include_tests && pre_filter_count != post_filter_count {
+            None
         } else {
-            test_hidden_summary(
-                "affected callers",
-                total_affected,
-                hidden_tests,
-                visible_sites.len(),
-            )
-        })
+            Some(if include_tests {
+                included_summary("affected callers", pre_filter_count, hidden_tests, shown)
+            } else {
+                test_hidden_summary("affected callers", pre_filter_count, hidden_tests, shown)
+            })
+        }
     } else {
         None
     };
+
+    let sites_list_envelope =
+        build_callgraph_envelope(Unit::Sites, shown, post_filter_count, truncated);
     let target_signature = target.representative.signature.clone();
     let target_parameters = target_signature
         .as_deref()
@@ -684,6 +719,7 @@ pub fn impact_result(
         hub_summary,
         depth_limited,
         truncated,
+        sites_list_envelope,
     })
 }
 
@@ -2059,7 +2095,6 @@ fn collect_callers_recursive(
         let omitted = counts.get(&target).copied().unwrap_or_default();
         if omitted > 0 {
             *depth_limited = true;
-            *truncated += omitted;
         }
         return Ok(());
     }
@@ -2104,7 +2139,6 @@ fn collect_callers_recursive(
             let omitted = boundary_counts.get(&key).copied().unwrap_or_default();
             if omitted > 0 {
                 *depth_limited = true;
-                *truncated += omitted;
             }
         }
     }
@@ -2135,6 +2169,7 @@ fn call_tree_inner(
             children: Vec::new(),
             depth_limited: false,
             truncated: 0,
+            tree_list_envelope: None,
         });
     }
     visited.insert(visit_key.clone());
@@ -2193,6 +2228,7 @@ fn call_tree_inner(
                             children: Vec::new(),
                             depth_limited: false,
                             truncated: 0,
+                            tree_list_envelope: None,
                         });
                     }
                 }
@@ -2207,12 +2243,12 @@ fn call_tree_inner(
                     children: Vec::new(),
                     depth_limited: false,
                     truncated: 0,
+                    tree_list_envelope: None,
                 }),
             }
         }
     } else if !calls.is_empty() {
         depth_limited = true;
-        truncated = calls.len();
     }
 
     visited.remove(&visit_key);
@@ -2227,6 +2263,7 @@ fn call_tree_inner(
         children,
         depth_limited,
         truncated,
+        tree_list_envelope: None,
     })
 }
 
@@ -2757,7 +2794,7 @@ mod trace_to_tests {
         };
         let mut visited = HashSet::new();
         let mut unused_cache = HashMap::new();
-        let uncached = call_tree_inner(
+        let mut uncached = call_tree_inner(
             &store,
             &resolved_root,
             3,
@@ -2769,7 +2806,15 @@ mod trace_to_tests {
         .expect("uncached call tree");
         let uncached_queries = store.total_forward_queries();
 
-        assert_eq!(call_tree_node_count(&memoized), 601);
+        let (uncached_shown, uncached_total) = cap_items(&mut uncached.children);
+        uncached.tree_list_envelope = build_callgraph_envelope(
+            Unit::Items,
+            uncached_shown,
+            uncached_total,
+            uncached.truncated,
+        );
+
+        assert_eq!(call_tree_node_count(&memoized), 46);
         assert_eq!(
             serde_json::to_vec(&memoized).expect("serialize memoized tree"),
             serde_json::to_vec(&uncached).expect("serialize uncached tree"),
@@ -2819,7 +2864,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&callers).expect("serialize callers result"),
-            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":42}"#
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":0,"callers_list_envelope":{"shown":1,"total":{"kind":"exact","value":21},"unit":"items","reason":"cap","causes":["cap"],"narrow":["depth","includeTests"]}}"#
         );
 
         store.reset_query_counts();
@@ -2832,7 +2877,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&impact).expect("serialize impact result"),
-            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":42}"#
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":0,"sites_list_envelope":{"shown":1,"total":{"kind":"exact","value":21},"unit":"sites","reason":"cap","causes":["cap"],"narrow":["depth","includeTests"]}}"#
         );
     }
 
