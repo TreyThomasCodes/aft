@@ -243,9 +243,14 @@ fn fallback_result_is_cached_for_the_requested_hanging_shell() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
 
     let (second_elapsed, second_response) = run_ping(&storage, &home, &candidates, &marker);
+    // Each run spawns a fresh binary and configures it, so an absolute bound
+    // measures runner load as much as the cache (a contended macOS runner spent
+    // 529 ms on this spawn alone). What the cache buys is the absence of the
+    // 2 s hanging-shell probe: assert the second run is at least that much
+    // faster than the first, and let the marker prove the shell never re-ran.
     assert!(
-        second_elapsed < Duration::from_millis(500),
-        "cached fallback path took {second_elapsed:?}"
+        second_elapsed + Duration::from_millis(1500) < first_elapsed,
+        "cached fallback path took {second_elapsed:?} against a first run of {first_elapsed:?}"
     );
     assert_eq!(second_response["id"], "1");
     assert_eq!(
