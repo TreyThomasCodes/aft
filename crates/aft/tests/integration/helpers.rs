@@ -44,6 +44,10 @@ pub fn watcher_serial_lock() -> std::sync::MutexGuard<'static, ()> {
 /// other refusal (diagnostics prerequisites, producer failures) is returned
 /// unchanged for the fixtures to assert on, and the loop is bounded by a
 /// liveness deadline so a real stall still fails.
+///
+/// `#[allow(dead_code)]` because this module is `#[path]`-shared with the
+/// `watcher_integration` binary, which has no inspect tests.
+#[allow(dead_code)]
 pub fn inspect_reasking_tier1_deadline(
     ctx: &aft::context::AppContext,
     payload: serde_json::Value,
